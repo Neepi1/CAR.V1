@@ -1,0 +1,10 @@
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pgm binary
+*.pcd binary
+*.ply binary
+*.db3 binary
+*.mcap binary
