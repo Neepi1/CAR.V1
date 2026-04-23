@@ -78,6 +78,7 @@ The current field runtime path reuses the validated Jetson `car` stack inside a 
 - navigation and relocalization now keep the verified live JT128 ingress profile instead of switching the Hesai driver into the upstream `navigation` timestamp mode that leaves `/lidar_points` and `/lidar_imu` without live samples on the current Jetson stack
 - `robot_localization_bridge` now latches a successful Isaac `localization_result` and keeps publishing the derived `map -> odom` from live odometry, instead of timing out one-shot occupancy-localizer results after one second
 - occupancy localization sensing is now repository-owned as well: it reuses the same repo-owned `jt128_scan_slam2d.yaml` scan contract as live `slam_toolbox` mapping (`/lidar_points -> pointcloud_to_laserscan -> scan_flip_republisher -> /scan`) plus `laser_scan_to_flatscan`, instead of the older upstream `jt128_nav_sensing.launch.py` filter chain
+- Isaac NITROS graph cache under `/tmp/isaac_ros_nitros/graphs` is prepared by the container launcher as `root:root` with `1777` permissions, so the `admin` runtime can create graph folders without handing directory ownership away from root
 - live TF cutover status on Jetson:
   - the live 2D mapping path no longer starts any extra static TF publishers
   - raw `/lidar_points` and `/lidar_imu` now publish with `header.frame_id=lidar_link`

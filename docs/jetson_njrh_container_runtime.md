@@ -114,6 +114,8 @@ Isaac Occupancy Grid Localizer does not accept Nav2 `pgm` images directly. The o
 
 This aligns the runtime with the repository rule that Nav2 map assets and localizer assets are related but not interchangeable.
 
+The Isaac NITROS runtime also needs to create graph files under `/tmp/isaac_ros_nitros/graphs`. The container launcher keeps `/tmp/isaac_ros_nitros` and `graphs` owned by `root:root` with `1777` permissions, matching `/tmp` semantics: root owns the runtime directory, while the dashboard's `admin` user can still create per-run NITROS graph folders. If this directory is left root-owned without write permission for `admin`, the occupancy localizer exits before `/trigger_grid_search_localization` becomes available.
+
 ## Container Layout
 
 - Host workspace mount: `/home/nvidia/workspaces/njrh-v3/workspace1 -> /workspaces/njrh-v3/workspace1`

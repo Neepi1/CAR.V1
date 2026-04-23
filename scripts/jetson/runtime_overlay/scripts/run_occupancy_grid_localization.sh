@@ -9,6 +9,7 @@ LAUNCH_FILE="${NJRH_OVERLAY_ROOT}/launch/occupancy_localization_stack.launch.py"
 NAV2_MAP_YAML="${NAV2_MAP_YAML:-}"
 NAV2_LOCALIZER_PARAMS="${NAV2_LOCALIZER_PARAMS:-}"
 LOCALIZER_MAP_PREPARE_SCRIPT="${NJRH_OVERLAY_ROOT}/scripts/prepare_localizer_map.py"
+NITROS_TMP_DIR="${ISAAC_ROS_NITROS_TMP_DIR:-/tmp/isaac_ros_nitros}"
 
 [[ -n "${NAV2_MAP_YAML}" ]] || {
   echo "NAV2_MAP_YAML is not set. Please choose a saved 2D map before starting occupancy localization." >&2
@@ -28,6 +29,17 @@ LOCALIZER_MAP_PREPARE_SCRIPT="${NJRH_OVERLAY_ROOT}/scripts/prepare_localizer_map
 }
 
 require_can_interface_up
+
+mkdir -p "${NITROS_TMP_DIR}/graphs" 2>/dev/null || {
+  echo "[runtime-overlay] Isaac NITROS tmp is not writable: ${NITROS_TMP_DIR}" >&2
+  echo "[runtime-overlay] restart with scripts/jetson/njrh_container.sh start-runtime to repair root-owned 1777 permissions." >&2
+  exit 1
+}
+if [[ ! -w "${NITROS_TMP_DIR}" || ! -w "${NITROS_TMP_DIR}/graphs" ]]; then
+  echo "[runtime-overlay] Isaac NITROS graph directory is not writable: ${NITROS_TMP_DIR}/graphs" >&2
+  echo "[runtime-overlay] expected root:root owner with 1777 mode so the admin runtime can create graph files." >&2
+  exit 1
+fi
 
 LOCALIZER_MAP_YAML="$(python3 "${LOCALIZER_MAP_PREPARE_SCRIPT}" --nav-yaml "${NAV2_MAP_YAML}")"
 [[ -f "${LOCALIZER_MAP_YAML}" ]] || {

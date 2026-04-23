@@ -169,6 +169,8 @@ run_container() {
 start_container() {
   if container_running; then
     RUNTIME_IMAGE_NAME="$(docker inspect --format '{{.Config.Image}}' "$CONTAINER_NAME")"
+    wait_for_container_ready
+    prepare_nitros_tmp
     echo "[njrh-container] container already running: $CONTAINER_NAME"
     return
   fi
@@ -179,6 +181,8 @@ start_container() {
     docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   fi
   run_container
+  wait_for_container_ready
+  prepare_nitros_tmp
   echo "[njrh-container] container started: $CONTAINER_NAME"
 }
 
@@ -251,9 +255,18 @@ wait_for_container_ready() {
   die "container did not become ready for exec: $CONTAINER_NAME"
 }
 
+prepare_nitros_tmp() {
+  container_running || return 0
+  docker exec "$CONTAINER_NAME" /bin/bash -lc \
+    "mkdir -p /tmp/isaac_ros_nitros/graphs \
+      && chown root:root /tmp/isaac_ros_nitros /tmp/isaac_ros_nitros/graphs \
+      && chmod 1777 /tmp/isaac_ros_nitros /tmp/isaac_ros_nitros/graphs" >/dev/null
+}
+
 start_dashboard() {
   container_running || start_container
   wait_for_container_ready
+  prepare_nitros_tmp
   if dashboard_running_overlay && dashboard_assets_ready && dashboard_http_ready; then
     echo "[njrh-container] dashboard already running: $(dashboard_url)"
     return
