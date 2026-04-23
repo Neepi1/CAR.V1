@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>robot_bringup</name>
+  <version>0.1.0</version>
+  <description>Phase-ordered bringup launch composition for localization and navigation.</description>
+  <maintainer email="codex@example.com">Codex</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>nav2_behaviors</exec_depend>
+  <exec_depend>nav2_bt_navigator</exec_depend>
+  <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>nav2_collision_monitor</exec_depend>
+  <exec_depend>nav2_common</exec_depend>
+  <exec_depend>nav2_controller</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
+  <exec_depend>nav2_map_server</exec_depend>
+  <exec_depend>nav2_planner</exec_depend>
+  <exec_depend>nav2_smoother</exec_depend>
+  <exec_depend>nav2_velocity_smoother</exec_depend>
+  <exec_depend>nav2_waypoint_follower</exec_depend>
+  <exec_depend>robot_chassis_bridge</exec_depend>
+  <exec_depend>robot_description</exec_depend>
+  <exec_depend>robot_global_localization</exec_depend>
+  <exec_depend>robot_hesai_jt128</exec_depend>
+  <exec_depend>robot_local_perception</exec_depend>
+  <exec_depend>robot_local_state</exec_depend>
+  <exec_depend>robot_localization_bridge</exec_depend>
+  <exec_depend>robot_nav_config</exec_depend>
+  <exec_depend>robot_safety</exec_depend>
+
+  <export/>
+</package>

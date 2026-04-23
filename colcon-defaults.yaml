@@ -1,0 +1,9 @@
+build:
+  symlink-install: true
+  cmake-args:
+    - -DCMAKE_BUILD_TYPE=RelWithDebInfo
+  event-handlers:
+    - console_cohesion+
+test:
+  event-handlers:
+    - console_cohesion+

@@ -1,0 +1,13 @@
+robot_safety:
+  ros__parameters:
+    mock_mode: true
+    watchdog_timeout_sec: 1.0
+    publish_rate_hz: 10.0
+    cmd_vel_in_topic: /cmd_vel_collision_checked
+    cmd_vel_out_topic: /cmd_vel
+    estop_topic: /safety/estop
+    localization_ok_topic: /localization/health
+    require_localization_health: false
+    status_topic: /safety/status
+    motion_allowed_topic: /safety/motion_allowed
+    publish_zero_on_startup: true

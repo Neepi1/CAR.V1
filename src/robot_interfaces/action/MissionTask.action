@@ -1,0 +1,10 @@
+string mission_id
+string source_floor
+string target_floor
+string target_pose
+---
+bool success
+string message
+---
+string stage
+float32 progress

@@ -1,0 +1,15 @@
+robot_global_localization:
+  ros__parameters:
+    mock_mode: true
+    publish_tf: false
+    pose_topic: /global_localization/pose
+    health_topic: /global_localization/health
+    default_floor_id: floor_1
+    local_flatscan_config: D:/codespace/car/nav2_test/params/jt128_flatscan.yaml
+    local_localizer_config: D:/codespace/car/nav2_test/params/jt128_occupancy_grid_localizer.yaml
+    local_localizer_launch: D:/codespace/car/nav2_test/jt128_occupancy_localization.launch.py
+    local_bridge_reference_config: D:/codespace/car/nav2_test/params/jt128_map_to_odom_tf_bridge.yaml
+    remote_pointcloud_to_flatscan_launch: /home/nvidia/workspaces/isaac_ros-dev/install/isaac_ros_pointcloud_utils/share/isaac_ros_pointcloud_utils/launch/isaac_ros_pointcloud_to_flatscan.launch.py
+    remote_laserscan_to_flatscan_launch: /home/nvidia/workspaces/isaac_ros-dev/install/isaac_ros_pointcloud_utils/share/isaac_ros_pointcloud_utils/launch/isaac_ros_laserscan_to_flatscan.launch.py
+    remote_localizer_install_prefix: /home/nvidia/workspaces/isaac_ros-dev/install/isaac_ros_occupancy_grid_localizer
+    localization_result_topic: /localization_result

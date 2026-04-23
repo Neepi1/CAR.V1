@@ -1,0 +1,10 @@
+robot_local_state:
+  ros__parameters:
+    mock_mode: true
+    publish_tf: true
+    output_topic: /local_state/odometry
+    input_odom_topic: /wheel/odom
+    input_imu_topic: /sensors/lidar/imu
+    odom_frame: odom
+    base_frame: base_link
+    publish_rate_hz: 20.0

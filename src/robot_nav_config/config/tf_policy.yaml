@@ -1,0 +1,10 @@
+tf_policy:
+  ros__parameters:
+    map_to_odom_owner: robot_localization_bridge
+    odom_to_base_owner: robot_local_state
+    static_extrinsics_owner: robot_description
+    suppress_third_party_tf: true
+    forbidden_internal_frames:
+      - camera_init
+      - aft_mapped
+      - wheel_odom

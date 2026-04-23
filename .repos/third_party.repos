@@ -1,0 +1,25 @@
+repositories:
+  HesaiLidar_ROS_2.0:
+    type: git
+    url: https://github.com/HesaiTechnology/HesaiLidar_ROS_2.0.git
+    version: main
+  FAST_LIO:
+    type: git
+    url: https://github.com/hku-mars/FAST_LIO.git
+    version: main
+  nav2:
+    type: git
+    url: https://github.com/ros-navigation/navigation2.git
+    version: humble
+  robot_localization:
+    type: git
+    url: https://github.com/cra-ros-pkg/robot_localization.git
+    version: ros2
+  isaac_ros_map_localization:
+    type: git
+    url: https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_map_localization.git
+    version: main
+  isaac_ros_pointcloud_utils:
+    type: git
+    url: https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_nitros.git
+    version: main

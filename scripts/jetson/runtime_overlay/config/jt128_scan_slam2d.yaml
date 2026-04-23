@@ -1,0 +1,22 @@
+pointcloud_to_laserscan:
+  ros__parameters:
+    # Keep mapping and localization on the same leveled 2D structural slice.
+    # The slice frame is base_link -> lidar_level_link: same XYZ as lidar_link,
+    # same yaw as lidar_link, but roll/pitch zeroed so the 2D scan stays
+    # horizontal even when the real lidar is pitched on the vehicle.
+    target_frame: lidar_level_link
+    transform_tolerance: 0.10
+    # Keep the slice above the floor while still broad enough to retain a
+    # useful first frame. With lidar_level_link at z ~= 1.05 m, this keeps
+    # roughly 0.20 m .. 0.85 m in base_link and avoids the strong near-ground
+    # ring that polluted the previous wider band.
+    min_height: -0.85
+    max_height: -0.20
+    angle_min: -3.141592653589793
+    angle_max: 3.141592653589793
+    angle_increment: 0.004363323129985824
+    scan_time: 0.05
+    range_min: 0.25
+    range_max: 40.0
+    use_inf: true
+    inf_epsilon: 1.0

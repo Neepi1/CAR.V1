@@ -1,0 +1,28 @@
+local_reuse:
+  ros__parameters:
+    car_repo_root_windows: D:/codespace/car
+    jetson_host_ssh: nvidia@192.168.31.23
+    jetson_workspace_host: /home/nvidia/workspaces/njrh-v3/workspace1
+    jetson_workspace_container: /workspaces/njrh-v3/workspace1
+    jetson_upstream_workspace_host: /home/nvidia/workspaces/isaac_ros-dev
+    jetson_upstream_workspace_container: /workspaces/isaac_ros-dev
+    jetson_upstream_workspace_alias_container: /workspaces/isaac_ros-dev-upstream
+    jt128_device_ip: 192.168.1.201
+    jt128_host_ip: 192.168.1.100
+    jt128_preferred_iface: eth1
+    jt128_fallback_iface: eth0
+    hesai_network_yaml: D:/codespace/car/hesai_jt128/configs/jt128_network.yaml
+    hesai_driver_yaml: D:/codespace/car/ros2_ws/src/hesai_lidar_ros2/config/config.yaml
+    fastlio_yaml: D:/codespace/car/ros2_ws/src/fast_lio/config/jt128.yaml
+    pgo_yaml: D:/codespace/car/ros2_ws/src/fastlio_pgo/config/pgo.yaml
+    localizer_yaml: D:/codespace/car/nav2_test/params/jt128_occupancy_grid_localizer.yaml
+    flatscan_yaml: D:/codespace/car/nav2_test/params/jt128_flatscan.yaml
+    bridge_yaml: D:/codespace/car/nav2_test/params/jt128_map_to_odom_tf_bridge.yaml
+    dockerfile_car: /home/nvidia/workspaces/njrh-v3/workspace1/Dockerfile.car
+    dashboard_root_host: /home/nvidia/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/web_dashboard
+    dashboard_entrypoint: /home/nvidia/workspaces/njrh-v3/workspace1/scripts/jetson/njrh_container.sh
+    dashboard_url: http://192.168.31.23:2048
+    isaac_localizer_install_prefix: /home/nvidia/workspaces/isaac_ros-dev/install/isaac_ros_occupancy_grid_localizer
+    isaac_pointcloud_utils_install_prefix: /home/nvidia/workspaces/isaac_ros-dev/install/isaac_ros_pointcloud_utils
+    isaac_pointcloud_to_flatscan_launch: /home/nvidia/workspaces/isaac_ros-dev/install/isaac_ros_pointcloud_utils/share/isaac_ros_pointcloud_utils/launch/isaac_ros_pointcloud_to_flatscan.launch.py
+    robot_localization_prefix: /opt/ros/humble

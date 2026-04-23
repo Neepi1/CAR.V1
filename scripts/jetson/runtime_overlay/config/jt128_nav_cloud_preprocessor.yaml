@@ -1,0 +1,51 @@
+nav_cloud_preprocessor:
+  ros__parameters:
+    input_topic: /lidar_points
+    output_topic: /points_nav
+    output_frame_id: lidar_level_link
+    lookup_timeout_sec: 0.1
+    publish_debug_log: false
+
+    # Transform the raw lidar_link cloud into the leveled slice frame first, and
+    # then keep a broad structural band. The exact 2D cut is performed later by
+    # pointcloud_to_laserscan in the same lidar_level_link frame.
+    range_filter.min: 0.5
+    range_filter.max: 40.0
+
+    height_filter.min_z: -1.20
+    height_filter.max_z: 1.60
+
+    # Do not hard-gate the scan sector until the current vehicle installation
+    # is fully revalidated. The car-project forward-sector assumption can cut
+    # away valid structure on this platform and starve the localizer.
+    azimuth_filter.enabled: false
+    azimuth_filter.min_angle_deg: -110.0
+    azimuth_filter.max_angle_deg: 110.0
+
+    # Remove vehicle-body self-returns in lidar_level_link.
+    # This platform mounts JT128 near the vehicle front, so keep the mask
+    # rear-biased: cover more space behind the lidar (vehicle body), and keep
+    # only a very small positive-X exclusion for the immediate bracket / shell
+    # right in front of the sensor.
+    self_mask.enabled: true
+    self_mask.min_x: -0.85
+    self_mask.max_x: 0.12
+    self_mask.min_y: -0.45
+    self_mask.max_y: 0.45
+    self_mask.min_z: -1.05
+    self_mask.max_z: 0.60
+
+    # Keep the separate forward blind-zone mask disabled. For this vehicle the
+    # lidar is already installed near the front edge, so an extra forward mask
+    # would remove real environment structure instead of only self-returns.
+    front_mask.enabled: false
+    front_mask.min_x: 0.10
+    front_mask.max_x: 0.45
+    front_mask.min_y: -0.25
+    front_mask.max_y: 0.25
+    front_mask.min_z: 0.70
+    front_mask.max_z: 1.60
+
+    outlier_filter.enabled: false
+    outlier_filter.mean_k: 16
+    outlier_filter.stddev_mul_thresh: 1.0

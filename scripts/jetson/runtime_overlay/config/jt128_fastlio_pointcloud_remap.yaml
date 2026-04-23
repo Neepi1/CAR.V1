@@ -1,0 +1,15 @@
+pointcloud_axis_remap:
+  ros__parameters:
+    input_topic: /lidar_points
+    output_topic: /lidar_points_fastlio
+    output_frame_id: hesai_lidar_fastlio
+    rotation_matrix:
+      - -0.2567402
+      - -0.687
+      - 0.6797907
+      - 0.9271735
+      - -0.3736277
+      - -0.02741957
+      - 0.2728259
+      - 0.6232442
+      - 0.7328933

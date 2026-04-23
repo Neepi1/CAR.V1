@@ -1,0 +1,9 @@
+string elevator_id
+string source_floor
+string target_floor
+---
+bool success
+string message
+---
+string state
+float32 progress

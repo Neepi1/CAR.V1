@@ -1,0 +1,42 @@
+[
+  {
+    "path": "D:/codespace/car/hesai_jt128/configs/jt128_network.yaml",
+    "category": "jt128",
+    "reason": "known_reuse_path"
+  },
+  {
+    "path": "D:/codespace/car/ros2_ws/src/hesai_lidar_ros2/config/config.yaml",
+    "category": "jt128",
+    "reason": "known_reuse_path"
+  },
+  {
+    "path": "D:/codespace/car/ros2_ws/src/car_description/urdf/hesai_lidar_mount.urdf.xacro",
+    "category": "extrinsics",
+    "reason": "known_reuse_path"
+  },
+  {
+    "path": "D:/codespace/car/ros2_ws/src/fast_lio/config/jt128.yaml",
+    "category": "fastlio",
+    "reason": "known_reuse_path"
+  },
+  {
+    "path": "D:/codespace/car/ros2_ws/src/fastlio_pgo/config/pgo.yaml",
+    "category": "pgo",
+    "reason": "known_reuse_path"
+  },
+  {
+    "path": "D:/codespace/car/nav2_test/params/jt128_occupancy_grid_localizer.yaml",
+    "category": "isaac_localizer",
+    "reason": "known_reuse_path"
+  },
+  {
+    "path": "/home/nvidia/workspaces/isaac_ros-dev/install/isaac_ros_occupancy_grid_localizer",
+    "category": "isaac_localizer",
+    "reason": "remote_install_prefix"
+  },
+  {
+    "path": "/home/nvidia/workspaces/isaac_ros-dev/install/isaac_ros_pointcloud_utils",
+    "category": "isaac_localizer",
+    "reason": "remote_install_prefix"
+  }
+]

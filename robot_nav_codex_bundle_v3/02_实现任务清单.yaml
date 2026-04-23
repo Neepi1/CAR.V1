@@ -1,0 +1,260 @@
+version: 3
+project: multi_floor_delivery_robot
+
+defaults:
+  ros_distro: humble
+  rmw: rmw_fastrtps_cpp
+  mapping_frontend: fastlio2
+  mapping_backend: pgo
+  nav2_default_planner: smac_2d
+  nav2_default_controller: mppi
+  nav2_fallback_controller: rpp
+  localizer: isaac_occupancy_grid_localizer
+  local_odom_default: wheel_imu_ekf
+
+phases:
+  - id: P0
+    name: local_reuse_and_tf_audit
+    tasks:
+      - id: P0-001
+        package: scripts
+        summary: Scan current workspace and parent paths for car project assets, params, launch files, third-party repos, docker/devcontainer, and generate reports/car_project_reuse_report.md
+        done_when:
+          - report exists
+          - reused candidates are indexed
+      - id: P0-002
+        package: scripts
+        summary: Implement TF audit tools to enumerate TF publishers, dump view_frames, detect duplicate publishers for map->odom and odom->base_link, and generate reports/tf_audit_report.md
+        done_when:
+          - report exists
+          - duplicate publishers are listed
+      - id: P0-003
+        package: robot_nav_config
+        summary: Define canonical TF tree and disable/override duplicate TF publication in wrappers or configs
+        depends_on: [P0-001, P0-002]
+        done_when:
+          - canonical tf policy document exists
+          - configs exist to suppress duplicate TF where possible
+
+  - id: P1
+    name: bootstrap_and_dependencies
+    tasks:
+      - id: P1-001
+        package: repo
+        summary: Create workspace skeleton, colcon mixins, scripts/env.sh, scripts/bootstrap.sh, CI placeholders, and .repos files prioritizing local car project copies before network fetch
+        depends_on: [P0-001]
+        done_when:
+          - workspace skeleton exists
+          - scripts/env.sh exists
+          - scripts/bootstrap.sh exists
+      - id: P1-002
+        package: repo
+        summary: Add dependency resolution script that first links local car project sources, then downloads missing third-party repos only if absent
+        depends_on: [P0-001]
+        done_when:
+          - third_party resolution script exists
+          - reports/third_party_resolution_report.md is generated
+      - id: P1-003
+        package: robot_interfaces
+        summary: Define messages, services, actions for floor switching, localization trigger, mission task, elevator task, safety, health, mapping jobs
+        depends_on: [P1-001]
+        done_when:
+          - package builds
+          - interfaces documented
+      - id: P1-004
+        package: robot_description
+        summary: Implement URDF/xacro, static transforms, sensor frames, base frames; keep static sensor extrinsics single-sourced
+        depends_on: [P0-003, P1-001]
+        done_when:
+          - robot_state_publisher launch works
+          - TF tree matches canonical design
+
+  - id: P2
+    name: platform_wrappers
+    tasks:
+      - id: P2-001
+        package: robot_chassis_bridge
+        summary: Wrap Ranger Mini 3 chassis odom/cmd/diagnostics into standard topics; support mock mode and calibration scale factors
+        depends_on: [P1-003]
+        done_when:
+          - wheel odom topic exists
+          - cmd_vel passthrough works
+      - id: P2-002
+        package: robot_hesai_jt128
+        summary: Wrap JT128 driver using existing car project configs first; preserve IP/UDP/extrinsic configs; support mock/bag mode
+        depends_on: [P1-002, P1-004]
+        done_when:
+          - points_raw and imu topics exist
+          - no duplicate static TF publication remains
+      - id: P2-003
+        package: robot_fastlio_mapping
+        summary: Wrap FAST-LIO2 frontend using local car project params first; export frontend_result and suppress non-canonical TF in navigation mode
+        depends_on: [P2-002]
+        done_when:
+          - frontend wrapper launches
+          - standardized frontend_result artifacts exist
+      - id: P2-004
+        package: robot_pgo_mapping
+        summary: Wrap existing PGO/loop closure backend from car project first; export mapping_result with optimized_map.pcd, optimized_trajectory.csv, loop_report.json
+        depends_on: [P2-003]
+        done_when:
+          - pgo wrapper launches
+          - standardized mapping_result exists
+
+  - id: P3
+    name: mapping_toolchain
+    tasks:
+      - id: P3-001
+        package: robot_map_toolkit
+        summary: Implement import of mapping_result and build occupancy intermediate products
+        depends_on: [P2-004]
+        done_when:
+          - mapping_result import command works
+      - id: P3-002
+        package: robot_map_toolkit
+        summary: Implement clean, floor_split, traversability, occupancy export, filter mask export, localizer png export, asset validation
+        depends_on: [P3-001]
+        done_when:
+          - floor asset directory is generated
+          - asset report exists
+      - id: P3-003
+        package: robot_map_toolkit
+        summary: Add CLI and batch processing for multiple floors and building assets
+        depends_on: [P3-002]
+        done_when:
+          - CLI documented
+          - multiple floor generation works
+
+  - id: P4
+    name: localization_and_tf
+    tasks:
+      - id: P4-001
+        package: robot_local_state
+        summary: Fuse wheel odom and JT128 IMU with robot_localization EKF to publish the only odom->base_link transform
+        depends_on: [P2-001, P2-002]
+        done_when:
+          - local odom topic exists
+          - odom->base_link is unique
+      - id: P4-002
+        package: robot_global_localization
+        summary: Wrap pointcloud_to_flatscan and Isaac localizer; apply floor assets; expose trigger/reload/restart/health services; do not publish duplicate odom->base_link
+        depends_on: [P2-002, P3-002]
+        done_when:
+          - localization pose topic exists
+          - floor asset apply service exists
+          - health topic exists
+      - id: P4-003
+        package: robot_localization_bridge
+        summary: Compute and publish the only map->odom transform using global pose and local odom, with jump suppression and timeout gating
+        depends_on: [P4-001, P4-002]
+        done_when:
+          - map->odom is unique
+          - localization health state exists
+      - id: P4-004
+        package: robot_local_perception
+        summary: Filter raw JT128 pointcloud into obstacle cloud for local costmap; support NORMAL/RAMP/ELEVATOR_WAIT/DOORWAY modes
+        depends_on: [P2-002]
+        done_when:
+          - obstacle cloud topic exists
+          - mode-specific parameter switching works
+
+  - id: P5
+    name: nav2_stack_and_safety
+    tasks:
+      - id: P5-001
+        package: robot_nav_config
+        summary: Generate Nav2 configs for SmacPlanner2D, MPPI, RPP, Simple Smoother, goal/progress checkers, costmaps, filters, lifecycle managers, velocity smoother, collision monitor, BT XML
+        depends_on: [P4-004]
+        done_when:
+          - config files exist
+          - BT XML exists
+      - id: P5-002
+        package: robot_safety
+        summary: Implement cmd_vel arbiter, watchdog, estop hook, localization invalid gating, final command publication policy
+        depends_on: [P5-001, P2-001]
+        done_when:
+          - final cmd_vel arbitration works
+          - watchdog stop works
+      - id: P5-003
+        package: robot_bringup
+        summary: Compose localization and navigation launch files with lifecycle managers and canonical tf policy
+        depends_on: [P4-003, P5-001, P5-002]
+        done_when:
+          - localization bringup works
+          - navigation bringup works
+          - final command chain matches spec
+
+  - id: P6
+    name: floor_elevator_mission
+    tasks:
+      - id: P6-001
+        package: robot_floor_manager
+        summary: Implement atomic floor switch: stop -> swap Nav2 map -> apply localizer assets -> trigger localization -> resume
+        depends_on: [P4-002, P5-003]
+        done_when:
+          - floor switch service/action works
+          - floor switch log is generated
+      - id: P6-002
+        package: robot_elevator_manager
+        summary: Implement elevator state machine with mock mode and clear interfaces for real protocol integration
+        depends_on: [P6-001, P1-003]
+        done_when:
+          - mock elevator flow works
+      - id: P6-003
+        package: robot_mode_manager
+        summary: Implement NORMAL/RAMP/ELEVATOR_WAIT/ELEVATOR_RIDE/DOORWAY/RECOVERY mode switching and outputs to local perception/nav profiles
+        depends_on: [P4-004, P6-002]
+        done_when:
+          - mode topic exists
+          - binary filter / mission / elevator events change mode
+      - id: P6-004
+        package: robot_mission_manager
+        summary: Implement same-floor and cross-floor mission orchestration with cancel/retry/pause/resume
+        depends_on: [P6-001, P6-002, P6-003]
+        done_when:
+          - MissionTask action works
+          - cross-floor mocked mission test passes
+
+  - id: P7
+    name: tests_docs_and_packaging
+    tasks:
+      - id: P7-001
+        package: robot_system_tests
+        summary: Add tests for TF uniqueness, mapping_result export, floor asset generation, localizer reload, map->odom bridge, MPPI default stack, floor switching, elevator mock, odom anomaly, localizer failure
+        depends_on: [P6-004]
+        done_when:
+          - regression suite runs
+          - required scenarios are covered
+      - id: P7-002
+        package: docs
+        summary: Generate package READMEs, operator guide, map build guide, tf debug guide, floor asset guide, car project reuse guide
+        depends_on: [P7-001]
+        done_when:
+          - docs exist
+          - each package has README
+      - id: P7-003
+        package: scripts
+        summary: Add scripts for bootstrap, resolve_local_reuse, build_maps, run_mapping, run_navigation, run_mock, run_tests, tf_audit
+        depends_on: [P7-001]
+        done_when:
+          - scripts are executable and documented
+      - id: P7-004
+        package: docker
+        summary: Add Dockerfile and devcontainer; if local car project image/build assets exist, reuse them first
+        depends_on: [P1-002]
+        done_when:
+          - docker assets exist
+
+success_criteria:
+  - car project reuse report exists
+  - tf audit report exists
+  - canonical TF tree has unique map->odom and odom->base_link publishers
+  - FAST-LIO2 frontend wrapper works with local configs if found
+  - PGO wrapper produces optimized mapping_result artifacts
+  - map toolkit generates floor assets from mapping_result
+  - local odom publishes with EKF in mock mode
+  - global localization wrapper can reload assets and publish health
+  - Nav2 launches with MPPI default profile and SmacPlanner2D
+  - safety command chain is wired end-to-end
+  - floor switching works with mock assets and localizer reload
+  - regression suite covers tf, mapping, localization, navigation, floor switching

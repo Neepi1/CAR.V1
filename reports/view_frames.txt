@@ -1,0 +1,20 @@
+`ros2 run tf2_tools view_frames` was not executed in this pass because:
+- `ros2` is not installed locally on this Windows host
+- Jetson live verification was performed through targeted ROS CLI checks over SSH instead of a full graph dump
+
+Observed live evidence on Jetson (`2026-04-19`):
+- `/tf_static` publisher: `robot_description_static_tf`
+- `/lidar_points.header.frame_id`: `lidar_link`
+- `/lidar_imu.header.frame_id`: `lidar_link`
+- mapping-side `view_frames` graph: `odom -> base_link -> {base_footprint, lidar_mount_link, lidar_link, imu_link}`
+- `hesai_lidar_fastlio`: not present in the mapping-side TF graph
+- Jetson host `can0`: `up`
+- localization-side runtime starts `robot_localization_bridge`, but `/localization/health` remains `false` on current `test-11` / `test-12` assets
+
+The runtime TF validation still needs to be executed on the ROS 2 Humble target stack after bringup:
+- `robot_description`
+- `robot_local_state`
+- `robot_global_localization`
+- `robot_localization_bridge`
+- `robot_local_perception`
+- `robot_safety`

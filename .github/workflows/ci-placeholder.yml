@@ -1,0 +1,10 @@
+name: ci-placeholder
+
+on:
+  workflow_dispatch:
+
+jobs:
+  placeholder:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "CI placeholder for ROS 2 Humble workspace bootstrap"

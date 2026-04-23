@@ -1,0 +1,14 @@
+robot_description:
+  ros__parameters:
+    base_frame: base_link
+    lidar_mount_frame: lidar_mount_link
+    lidar_frame: lidar_link
+    lidar_level_frame: lidar_level_link
+    imu_frame: imu_link
+    base_footprint_frame: base_footprint
+    lidar_xyz: [0.25, 0.0, 1.05]
+    lidar_rpy: [0.0, -0.7853981633974483, -2.6878070480712677]
+    lidar_axis_rpy: [0.0, 0.0, -1.5707963267948966]
+    imu_xyz: [0.25, 0.0, 1.05]
+    imu_rpy: [0.0, -0.7853981633974483, -2.6878070480712677]
+    local_reuse_description_xacro: D:/codespace/car/ros2_ws/src/car_description/urdf/hesai_lidar_mount.urdf.xacro

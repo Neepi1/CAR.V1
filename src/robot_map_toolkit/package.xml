@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>robot_map_toolkit</name>
+  <version>0.1.0</version>
+  <description>Offline map import and export skeleton for mapping_result assets.</description>
+  <maintainer email="codex@example.com">Codex</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <export/>
+</package>

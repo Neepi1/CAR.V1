@@ -1,0 +1,7 @@
+string floor_id
+string nav_map_yaml
+string localizer_map_png
+string localizer_params_yaml
+---
+bool success
+string message

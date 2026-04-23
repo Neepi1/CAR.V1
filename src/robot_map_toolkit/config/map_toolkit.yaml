@@ -1,0 +1,6 @@
+robot_map_toolkit:
+  ros__parameters:
+    mapping_result_dir: mapping_result
+    maps_root: maps
+    default_building_id: building_1
+    default_floor_id: floor_1

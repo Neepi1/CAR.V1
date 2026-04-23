@@ -1,0 +1,13 @@
+robot_localization_bridge:
+  ros__parameters:
+    publish_tf: true
+    map_frame: map
+    odom_frame: odom
+    base_frame: base_link
+    jump_threshold_m: 1.0
+    timeout_sec: 1.0
+    localization_topic: /global_localization/pose
+    local_odom_topic: /local_state/odometry
+    health_topic: /localization/health
+    two_d_mode: true
+    local_reference_bridge_config: D:/codespace/car/nav2_test/params/jt128_map_to_odom_tf_bridge.yaml

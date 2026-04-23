@@ -1,0 +1,9 @@
+robot_chassis_bridge:
+  ros__parameters:
+    mock_mode: true
+    publish_rate_hz: 20.0
+    wheel_odom_topic: /wheel/odom
+    cmd_vel_in_topic: /cmd_vel
+    cmd_vel_out_topic: /platform/cmd_vel
+    odom_frame: odom
+    base_frame: base_link

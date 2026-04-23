@@ -1,0 +1,12 @@
+robot_pgo_mapping:
+  ros__parameters:
+    mock_mode: true
+    frontend_artifact_dir: mapping_result/frontend_result
+    output_dir: mapping_result
+    loop_report_name: loop_report.json
+    local_config: D:/codespace/car/ros2_ws/src/fastlio_pgo/config/pgo.yaml
+    upstream_cloud_topic: /cloud_registered_body
+    upstream_odom_topic: /Odometry
+    upstream_map_frame: slam_map
+    upstream_local_frame: camera_init
+    canonical_publish_tf: false

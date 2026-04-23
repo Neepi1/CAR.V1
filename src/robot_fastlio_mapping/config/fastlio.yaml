@@ -1,0 +1,20 @@
+robot_fastlio_mapping:
+  ros__parameters:
+    mock_mode: true
+    navigation_mode: false
+    publish_tf: false
+    points_topic: /sensors/lidar/points_raw
+    imu_topic: /sensors/lidar/imu
+    frontend_pose_topic: /mapping/frontend_pose
+    frontend_status_topic: /mapping/frontend/status
+    artifact_dir: mapping_result/frontend_result
+    local_config: D:/codespace/car/ros2_ws/src/fast_lio/config/jt128.yaml
+    upstream_points_topic: /lidar_points
+    upstream_imu_topic: /lidar_imu
+    upstream_sensor_frame: lidar_link
+    upstream_odom_frame: odom
+    upstream_send_odom_base_tf: false
+    wrapper_override_points_topic: /sensors/lidar/points_raw
+    wrapper_override_imu_topic: /sensors/lidar/imu
+    wrapper_override_sensor_frame: lidar_link
+    wrapper_override_publish_tf: false

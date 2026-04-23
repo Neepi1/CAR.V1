@@ -1,0 +1,23 @@
+base_frame: base_link
+base_footprint_frame: base_footprint
+lidar_mount_frame: lidar_mount_link
+lidar_frame: lidar_link
+lidar_level_frame: lidar_level_link
+imu_frame: imu_link
+lidar_x: 0.25
+lidar_y: 0.0
+lidar_z: 1.05
+lidar_roll: -0.348
+lidar_pitch: -0.648
+lidar_yaw: -2.639
+# /lidar_points is already canonicalized by pointcloud_axis_remap, so the
+# static TF chain should not apply a second axis normalization here.
+lidar_axis_roll: 0.0
+lidar_axis_pitch: 0.0
+lidar_axis_yaw: 0.0
+imu_x: 0.25
+imu_y: 0.0
+imu_z: 1.05
+imu_roll: -0.348
+imu_pitch: -0.648
+imu_yaw: -2.639

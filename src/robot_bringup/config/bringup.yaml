@@ -1,0 +1,16 @@
+bringup:
+  ros__parameters:
+    use_sim_time: false
+    mock_mode: true
+    autostart: true
+    load_nav2: true
+    load_mapping_wrappers: true
+    load_local_perception: true
+    load_robot_safety: true
+    map_yaml: ""
+    nav2_params_file: robot_nav_config/config/nav2.yaml
+    use_respawn: false
+    use_composition: false
+    car_repo_root: D:/codespace/car
+    jetson_host_ssh: nvidia@192.168.31.23
+    canonical_tf_policy: robot_nav_config/config/tf_policy.yaml

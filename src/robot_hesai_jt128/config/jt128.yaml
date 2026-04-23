@@ -1,0 +1,30 @@
+robot_hesai_jt128:
+  ros__parameters:
+    mock_mode: true
+    bag_mode: false
+    car_repo_root: D:/codespace/car
+    jetson_host_ssh: nvidia@192.168.31.23
+    jetson_workspace_host: /home/nvidia/workspaces/isaac_ros-dev
+    jetson_workspace_container: /workspaces/isaac_ros-dev
+    network_interface_preferred: eth1
+    network_interface_fallbacks: [eth0]
+    device_ip: 192.168.1.201
+    host_ip: 192.168.1.100
+    lidar_port: 2368
+    cmd_port: 9347
+    imu_port: 10110
+    points_topic: /lidar_points
+    imu_topic: /lidar_imu
+    vendor_points_topic: /jt128/vendor/points_raw
+    vendor_imu_topic: /jt128/vendor/imu_raw
+    lidar_frame: lidar_link
+    imu_frame: imu_link
+    extrinsics_yaml: D:/codespace/car/ros2_ws/src/car_description/urdf/hesai_lidar_mount.urdf.xacro
+    local_network_config: D:/codespace/car/hesai_jt128/configs/jt128_network.yaml
+    local_driver_reference_config: D:/codespace/car/hesai_jt128/configs/ros2_driver_params.yaml
+    local_vendor_driver_config: D:/codespace/car/ros2_ws/src/hesai_lidar_ros2/config/config.yaml
+    local_pointcloud_axis_remap_config: /workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/config/jt128_canonical_pointcloud_remap.yaml
+    local_imu_axis_remap_config: /workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/config/jt128_canonical_imu_remap.yaml
+    correction_file_container: /workspaces/isaac_ros-dev/ros2_ws/src/hesai_lidar_ros2/src/driver/HesaiLidar_SDK_2.0/correction/angle_correction/JT128_default_angle.csv
+    firetimes_file_container: /workspaces/isaac_ros-dev/ros2_ws/src/hesai_lidar_ros2/src/driver/HesaiLidar_SDK_2.0/correction/firetime_correction/JT128_Firetime Correction File.csv
+    publish_vendor_tf: false

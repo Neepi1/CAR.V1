@@ -1,0 +1,65 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="multi_floor_delivery_robot">
+  <xacro:arg name="base_frame" default="base_link"/>
+  <xacro:arg name="base_footprint_frame" default="base_footprint"/>
+  <xacro:arg name="lidar_mount_frame" default="lidar_mount_link"/>
+  <xacro:arg name="lidar_frame" default="lidar_link"/>
+  <xacro:arg name="lidar_level_frame" default="lidar_level_link"/>
+  <xacro:arg name="imu_frame" default="imu_link"/>
+  <xacro:arg name="lidar_x" default="0.25"/>
+  <xacro:arg name="lidar_y" default="0.0"/>
+  <xacro:arg name="lidar_z" default="1.05"/>
+  <xacro:arg name="lidar_roll" default="-0.682"/>
+  <xacro:arg name="lidar_pitch" default="0.273"/>
+  <xacro:arg name="lidar_yaw" default="-1.278"/>
+  <xacro:arg name="lidar_axis_roll" default="0.0"/>
+  <xacro:arg name="lidar_axis_pitch" default="0.0"/>
+  <xacro:arg name="lidar_axis_yaw" default="-1.5707963267948966"/>
+  <xacro:arg name="lidar_level_x" default="0.25"/>
+  <xacro:arg name="lidar_level_y" default="0.0"/>
+  <xacro:arg name="lidar_level_z" default="1.05"/>
+  <xacro:arg name="lidar_level_yaw" default="-1.5707963267948966"/>
+  <xacro:arg name="imu_x" default="0.25"/>
+  <xacro:arg name="imu_y" default="0.0"/>
+  <xacro:arg name="imu_z" default="1.05"/>
+  <xacro:arg name="imu_roll" default="-0.682"/>
+  <xacro:arg name="imu_pitch" default="0.273"/>
+  <xacro:arg name="imu_yaw" default="-1.278"/>
+
+  <link name="$(arg base_frame)"/>
+  <link name="$(arg base_footprint_frame)"/>
+  <link name="$(arg lidar_mount_frame)"/>
+  <link name="$(arg lidar_frame)"/>
+  <link name="$(arg lidar_level_frame)"/>
+  <link name="$(arg imu_frame)"/>
+
+  <joint name="$(arg base_frame)_to_$(arg base_footprint_frame)" type="fixed">
+    <parent link="$(arg base_frame)"/>
+    <child link="$(arg base_footprint_frame)"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <joint name="$(arg base_frame)_to_$(arg lidar_mount_frame)" type="fixed">
+    <parent link="$(arg base_frame)"/>
+    <child link="$(arg lidar_mount_frame)"/>
+    <origin xyz="$(arg lidar_x) $(arg lidar_y) $(arg lidar_z)" rpy="$(arg lidar_roll) $(arg lidar_pitch) $(arg lidar_yaw)"/>
+  </joint>
+
+  <joint name="$(arg lidar_mount_frame)_to_$(arg lidar_frame)" type="fixed">
+    <parent link="$(arg lidar_mount_frame)"/>
+    <child link="$(arg lidar_frame)"/>
+    <origin xyz="0 0 0" rpy="$(arg lidar_axis_roll) $(arg lidar_axis_pitch) $(arg lidar_axis_yaw)"/>
+  </joint>
+
+  <joint name="$(arg base_frame)_to_$(arg lidar_level_frame)" type="fixed">
+    <parent link="$(arg base_frame)"/>
+    <child link="$(arg lidar_level_frame)"/>
+    <origin xyz="$(arg lidar_level_x) $(arg lidar_level_y) $(arg lidar_level_z)" rpy="0 0 $(arg lidar_level_yaw)"/>
+  </joint>
+
+  <joint name="$(arg base_frame)_to_$(arg imu_frame)" type="fixed">
+    <parent link="$(arg base_frame)"/>
+    <child link="$(arg imu_frame)"/>
+    <origin xyz="$(arg imu_x) $(arg imu_y) $(arg imu_z)" rpy="$(arg imu_roll) $(arg imu_pitch) $(arg imu_yaw)"/>
+  </joint>
+</robot>

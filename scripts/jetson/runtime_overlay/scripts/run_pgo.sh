@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/common_env.sh"
+
+export CONFIG_FILE="${NJRH_PGO_CONFIG_FILE:-${UPSTREAM_WS}/src/fastlio_pgo/config/pgo.yaml}"
+
+exec bash "$(require_upstream_script run_pgo.sh)"

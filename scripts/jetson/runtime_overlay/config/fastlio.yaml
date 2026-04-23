@@ -1,0 +1,56 @@
+/**:
+  ros__parameters:
+    feature_extract_enable: false
+    point_filter_num: 3
+    max_iteration: 3
+    filter_size_surf: 0.5
+    filter_size_map: 0.5
+    cube_side_length: 1000.0
+    runtime_pos_log_enable: false
+    map_file_path: "./jt128_map.pcd"
+
+    common:
+      lid_topic: /lidar_points
+      imu_topic: /lidar_imu
+      time_sync_en: false
+      time_offset_lidar_to_imu: 0.0
+      odom_frame_id: odom
+      sensor_frame_id: lidar_link
+      base_frame_id: base_link
+      send_odom_base_tf: false
+
+    preprocess:
+      lidar_type: 0
+      scan_line: 128
+      scan_rate: 20
+      timestamp_unit: 3
+      blind: 1.0
+
+    mapping:
+      acc_cov: 0.1
+      gyr_cov: 0.1
+      b_acc_cov: 0.0001
+      b_gyr_cov: 0.0001
+      fov_degree: 360.0
+      det_range: 100.0
+      extrinsic_est_en: false
+      extrinsic_T: [0.0, 0.0, 0.0]
+      extrinsic_R: [1.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0,
+                    0.0, 0.0, 1.0]
+
+    publish:
+      path_en: true
+      effect_map_en: false
+      map_en: true
+      ikd_tree_en: false
+      scan_publish_en: true
+      dense_publish_en: false
+      scan_bodyframe_pub_en: true
+
+    locate_in_prior_map: false
+    prior_map_path: ""
+
+    pcd_save:
+      pcd_save_en: false
+      interval: -1

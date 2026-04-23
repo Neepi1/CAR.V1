@@ -1,0 +1,41 @@
+ARG BASE_IMAGE=isaac_ros_dev-aarch64:latest
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN if [[ -f /etc/apt/sources.list.d/yarn.list ]]; then mv /etc/apt/sources.list.d/yarn.list /etc/apt/sources.list.d/yarn.list.disabled; fi \
+ && apt-get update && apt-get install -y \
+    iproute2 \
+    can-utils \
+    python3-tk \
+    ros-humble-navigation2 \
+    ros-humble-nav2-bringup \
+    ros-humble-gtsam \
+    ros-humble-pcl-conversions \
+    ros-humble-cartographer \
+    ros-humble-cartographer-ros \
+    ros-humble-nvblox-ros-python-utils \
+    ros-humble-nvblox-examples-bringup \
+    ros-humble-isaac-ros-nvblox \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN sed -i \
+    -e 's/^\(\s*lidar_width:\).*/\1 900/' \
+    -e 's/^\(\s*lidar_height:\).*/\1 128/' \
+    -e 's/^\(\s*use_non_equal_vertical_fov_lidar_params:\).*/\1 true/' \
+    -e 's/^\(\s*min_angle_below_zero_elevation_rad:\).*/\1 0.0866555973615185/' \
+    -e 's/^\(\s*max_angle_above_zero_elevation_rad:\).*/\1 1.55098683978476/' \
+    /opt/ros/humble/share/nvblox_examples_bringup/config/nvblox/nvblox_base.yaml
+
+RUN printf '%s\n' \
+  'source /opt/ros/humble/setup.bash' \
+  'export ISAAC_ROS_WS=${ISAAC_ROS_WS:-/workspaces/njrh-v3/workspace1}' \
+  '[ -f "${ISAAC_ROS_WS}/install/setup.bash" ] && source "${ISAAC_ROS_WS}/install/setup.bash"' \
+  'export NJRH_UPSTREAM_ROOT=${NJRH_UPSTREAM_ROOT:-/workspaces/isaac_ros-dev}' \
+  '[ -f "${NJRH_UPSTREAM_ROOT}/ros2_ws/install/setup.bash" ] && source "${NJRH_UPSTREAM_ROOT}/ros2_ws/install/setup.bash"' \
+  '[ -f "${NJRH_UPSTREAM_ROOT}/install/setup.bash" ] && source "${NJRH_UPSTREAM_ROOT}/install/setup.bash"' \
+  'export DISPLAY=${DISPLAY:-:0}' \
+  'export XAUTHORITY=${XAUTHORITY:-/home/nvidia/.Xauthority}' \
+  'export QT_X11_NO_MITSHM=1' \
+  > /etc/profile.d/car_env.sh

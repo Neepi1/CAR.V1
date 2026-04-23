@@ -1,0 +1,15 @@
+imu_axis_remap:
+  ros__parameters:
+    input_topic: /jt128/vendor/imu_raw
+    output_topic: /lidar_imu
+    output_frame_id: imu_link
+    rotation_matrix:
+      - 0.0
+      - 1.0
+      - 0.0
+      - -1.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
