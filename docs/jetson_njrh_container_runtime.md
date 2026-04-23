@@ -159,6 +159,8 @@ After opening the dashboard:
 
 For obstacle-layer debugging only, click `只启动局部障碍地图`. This opens the local costmap view (`source=local_costmap`) and should be used before full navigation when verifying `/perception/obstacle_points` marking and `/perception/clearing_points` clearing behavior.
 
+Dynamic avoidance uses a two-stage policy. `/perception/obstacle_points` marks the local voxel costmap, while `/perception/clearing_points` clears stale voxels. MPPI is allowed to deviate from the global path around local obstacles; `collision_monitor` should only hard-stop for close body-risk returns and should otherwise slow the robot rather than suppress forward motion.
+
 ## Saved Asset Locations
 
 - 3D maps: `/home/nvidia/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/maps3d`
