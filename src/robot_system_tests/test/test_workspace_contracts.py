@@ -19,6 +19,10 @@ def test_nav_defaults_are_fixed():
     assert "SmacPlanner2D" in nav2
     assert "MPPIController" in nav2
     assert "RegulatedPurePursuitController" in nav2
+    assert 'motion_model: "Ackermann"' in nav2
+    assert "AckermannConstraints:" in nav2
+    assert "nav2_rotation_shim_controller" not in nav2
+    assert "use_rotate_to_heading: false" in nav2
     assert "/perception/obstacle_points" in nav2
     assert "/perception/clearing_points" in nav2
     assert "origin_z: -0.20" in nav2

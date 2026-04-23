@@ -45,14 +45,7 @@ controller_server:
       xy_goal_tolerance: 0.20
       yaw_goal_tolerance: 0.35
     FollowPath:
-      plugin: "nav2_rotation_shim_controller::RotationShimController"
-      primary_controller: "nav2_mppi_controller::MPPIController"
-      angular_dist_threshold: 0.85
-      forward_sampling_distance: 0.55
-      rotate_to_heading_angular_vel: 0.80
-      max_angular_accel: 2.0
-      simulate_ahead_time: 1.0
-      rotate_to_goal_heading: true
+      plugin: "nav2_mppi_controller::MPPIController"
       time_steps: 42
       model_dt: 0.07
       batch_size: 1400
@@ -61,7 +54,9 @@ controller_server:
       transform_tolerance: 0.30
       temperature: 0.30
       gamma: 0.03
-      motion_model: "DiffDrive"
+      motion_model: "Ackermann"
+      AckermannConstraints:
+        min_turning_r: 0.35
       visualize: false
       regenerate_noises: false
       retry_attempt_limit: 3
@@ -142,6 +137,7 @@ controller_server:
       rotate_to_heading_angular_vel: 1.00
       transform_tolerance: 0.35
       use_velocity_scaled_lookahead_dist: true
+      use_rotate_to_heading: false
       min_approach_linear_velocity: 0.05
       approach_velocity_scaling_dist: 0.80
       use_collision_detection: true
