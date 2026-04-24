@@ -8,6 +8,9 @@ robot_local_perception:
     clearing_output_topic: /perception/clearing_points
     output_frame_id: base_link
     restamp_to_now: true
+    restamp_to_latest_tf: true
+    require_output_stamp_tf: true
+    output_stamp_tf_target_frame: odom
     lookup_timeout_sec: 0.1
     processing_rate_hz: 8.0
     point_sample_stride: 4
@@ -18,12 +21,12 @@ robot_local_perception:
     clearing.height_filter.min_z: -0.30
     clearing.height_filter.max_z: 1.40
     clearing.point_sample_stride: 1
-    clearing.max_points: 72000
+    clearing.max_points: 30000
     clearing.virtual_rays.enabled: true
-    clearing.virtual_rays.angular_resolution_deg: 0.5
+    clearing.virtual_rays.angular_resolution_deg: 0.75
     clearing.virtual_rays.range: 6.00
-    clearing.virtual_rays.range_steps: [0.35, 0.50, 0.75, 1.25, 2.00, 3.50, 6.00]
-    clearing.virtual_rays.endpoint_z_values: [-0.15, -0.05, 0.00, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95, 1.05, 1.15, 1.25, 1.35]
+    clearing.virtual_rays.range_steps: [0.50, 1.00, 2.00, 3.50, 6.00]
+    clearing.virtual_rays.endpoint_z_values: [-0.10, 0.05, 0.20, 0.40, 0.60, 0.85, 1.10, 1.30]
     publish_debug_log: false
     local_nav_preprocessor_reference: D:/codespace/car/nav2_test/params/jt128_nav_cloud_preprocessor.yaml
     supported_modes: [NORMAL, RAMP, ELEVATOR_WAIT, DOORWAY]

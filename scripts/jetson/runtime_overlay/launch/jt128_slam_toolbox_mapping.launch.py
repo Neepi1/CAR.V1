@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -20,7 +19,6 @@ def generate_launch_description() -> LaunchDescription:
     slam_params_default = overlay_root / "config" / "jt128_slam_toolbox_mapping.yaml"
     scan_params_default = overlay_root / "config" / "jt128_scan_slam2d.yaml"
     upstream_slam_params = upstream_params_dir / "jt128_slam_toolbox_mapping.yaml"
-    scan_flip_republisher = overlay_root / "scripts" / "scan_flip_republisher.py"
 
     preprocessor_params = LaunchConfiguration("preprocessor_params")
     slam_params = LaunchConfiguration("slam_params")
@@ -60,12 +58,18 @@ def generate_launch_description() -> LaunchDescription:
         ],
     )
 
-    restamp_scan = ExecuteProcess(
-        cmd=["python3", str(scan_flip_republisher)],
-        additional_env={
-            "NJRH_SLAM2D_FLIP_SCAN": os.environ.get("NJRH_SLAM2D_FLIP_SCAN", "0"),
-        },
+    restamp_scan = Node(
+        package="robot_hesai_jt128",
+        executable="scan_republisher_node",
+        name="scan_republisher",
         output="screen",
+        parameters=[
+            {
+                "input_topic": "/scan_raw",
+                "output_topic": scan_topic,
+                "restamp_to_now": True,
+            }
+        ],
     )
 
     slam_toolbox_node = Node(

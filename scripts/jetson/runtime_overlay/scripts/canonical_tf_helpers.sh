@@ -16,11 +16,13 @@ kill_canonical_pattern() {
 stop_existing_canonical_tf_publishers() {
   kill_canonical_pattern "hesai_lidar_state_publisher"
   kill_canonical_pattern "${NJRH_OVERLAY_ROOT}/scripts/run_robot_description.sh"
-  kill_canonical_pattern "robot_description_static_tf_node.py"
+  kill_canonical_pattern "robot_description_static_tf_node"
   kill_canonical_pattern "${NJRH_OVERLAY_ROOT}/scripts/run_local_state.sh"
-  kill_canonical_pattern "local_state_node.py"
+  kill_canonical_pattern "robot_local_state/local_state_node"
+  kill_canonical_pattern "local_state_node --ros-args"
   kill_canonical_pattern "${NJRH_OVERLAY_ROOT}/scripts/run_localization_bridge.sh"
-  kill_canonical_pattern "localization_bridge_node.py"
+  kill_canonical_pattern "robot_localization_bridge/localization_bridge_node"
+  kill_canonical_pattern "localization_bridge_node --ros-args"
   kill_canonical_pattern "map_to_odom_tf_bridge"
 }
 

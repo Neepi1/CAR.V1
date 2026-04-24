@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/canonical_tf_helpers.sh"
+source "${SCRIPT_DIR}/map_server_helpers.sh"
 
 export PUBLISH_LIDAR_TF="${PUBLISH_LIDAR_TF:-false}"
 LAUNCH_FILE="${NJRH_OVERLAY_ROOT}/launch/occupancy_localization_stack.launch.py"
@@ -64,7 +65,8 @@ patterns=(
   "laser_scan_to_flatscan"
   "pointcloud_to_laserscan_node"
   "pointcloud_to_laserscan"
-  "scan_flip_republisher.py"
+  "robot_hesai_jt128/scan_republisher_node"
+  "scan_republisher_node"
   "nav_cloud_preprocessor"
   "map_server"
   "lifecycle_manager_map"
@@ -127,5 +129,16 @@ wait_for_topic_message "/local_state/odometry" 12 || {
 
 ros2 launch "${LAUNCH_FILE}" "${launch_args[@]}" &
 localization_pid=$!
+
+ensure_map_server_active "${NAV2_MAP_YAML}" 30 || {
+  echo "[runtime-overlay] map_server did not become active for occupancy localization" >&2
+  exit 1
+}
+
+wait_for_occupancy_grid "/map" 30 || {
+  echo "[runtime-overlay] /map did not become available for occupancy localization" >&2
+  exit 1
+}
+
 wait "${localization_pid}" || localization_exit_code=$?
 exit "${localization_exit_code}"

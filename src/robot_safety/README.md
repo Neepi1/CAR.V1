@@ -5,7 +5,7 @@ Final command arbitration point before the chassis bridge.
 ## Canonical Contract
 
 - input command: `/cmd_vel_collision_checked`
-- final output: `/cmd_vel`
+- safe output: `/cmd_vel_safe`
 - estop input: `/safety/estop`
 - optional localization gate: `/localization/health`
 - state output: `/safety/status`
@@ -13,7 +13,7 @@ Final command arbitration point before the chassis bridge.
 
 ## Arbitration Policy
 
-`robot_safety` is the only package allowed to publish the final `/cmd_vel` in the canonical stack.
+`robot_safety` is the only package allowed to publish the post-arbitration safe command. The Ranger Mini 3 mode controller consumes `/cmd_vel_safe` and publishes `/cmd_vel` for `ranger_base_node`.
 
 The current arbitration order is:
 
@@ -34,4 +34,4 @@ When any blocking state is active, the node publishes a zero twist and latches t
 ## Notes
 
 - This package does not own planners, controllers, or collision monitoring. It only arbitrates the final command.
-- Jetson runtime should execute this repository node directly so field behavior and source behavior stay aligned.
+- Jetson runtime executes the compiled C++ node directly and fails fast if the binary is missing; the Python fallback path has been removed.

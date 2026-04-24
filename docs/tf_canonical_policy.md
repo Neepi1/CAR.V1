@@ -40,6 +40,8 @@ controller_server
   -> collision_monitor
   -> /cmd_vel_collision_checked
   -> robot_safety
+  -> /cmd_vel_safe
+  -> ranger_mini3_mode_controller
   -> /cmd_vel
-  -> robot_chassis_bridge
+  -> ranger_base_node
 ```

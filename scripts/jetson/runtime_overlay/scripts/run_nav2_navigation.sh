@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/nav_runtime_helpers.sh"
+source "${SCRIPT_DIR}/map_server_helpers.sh"
 
 export NAV2_PARAMS_FILE="${NAV2_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/nav2.yaml}"
 LAUNCH_FILE="${NJRH_PROJECT_ROOT}/src/robot_bringup/launch/standard_navigation.launch.py"
@@ -13,6 +14,16 @@ LAUNCH_FILE="${NJRH_PROJECT_ROOT}/src/robot_bringup/launch/standard_navigation.l
 }
 
 stop_existing_overlay_nav_helpers
+
+ensure_map_server_active "${NAV2_MAP_YAML:-}" 30 || {
+  echo "[runtime-overlay] map_server is not active. Start localization and load a Nav2 map before navigation." >&2
+  exit 1
+}
+
+wait_for_occupancy_grid "/map" 30 || {
+  echo "[runtime-overlay] /map is not available. Navigation cannot build the global costmap." >&2
+  exit 1
+}
 
 nav_pid=""
 nav_exit_code=0
@@ -41,11 +52,18 @@ trap on_signal INT TERM
 
 start_overlay_helper "local_perception" bash "${SCRIPT_DIR}/run_local_perception.sh"
 start_overlay_helper "robot_safety" bash "${SCRIPT_DIR}/run_robot_safety.sh"
+start_overlay_helper "ranger_mini3_mode_controller" bash "${SCRIPT_DIR}/run_ranger_mini3_mode_controller.sh"
 
 ros2 launch "${LAUNCH_FILE}" \
   use_sim_time:=false \
   autostart:=true \
   params_file:="${NAV2_PARAMS_FILE}" &
 nav_pid=$!
+
+wait_for_global_costmap_static 45 || {
+  echo "[runtime-overlay] global costmap did not receive the static map; stopping navigation startup" >&2
+  exit 1
+}
+
 wait "${nav_pid}" || nav_exit_code=$?
 exit "${nav_exit_code}"

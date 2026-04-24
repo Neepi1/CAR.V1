@@ -45,7 +45,14 @@ controller_server:
       xy_goal_tolerance: 0.20
       yaw_goal_tolerance: 0.35
     FollowPath:
-      plugin: "nav2_mppi_controller::MPPIController"
+      plugin: "nav2_rotation_shim_controller::RotationShimController"
+      primary_controller: "nav2_mppi_controller::MPPIController"
+      angular_dist_threshold: 0.85
+      forward_sampling_distance: 0.55
+      rotate_to_heading_angular_vel: 0.85
+      max_angular_accel: 2.4
+      simulate_ahead_time: 1.0
+      rotate_to_goal_heading: true
       time_steps: 42
       model_dt: 0.07
       batch_size: 1400
@@ -56,18 +63,18 @@ controller_server:
       gamma: 0.03
       motion_model: "Ackermann"
       AckermannConstraints:
-        min_turning_r: 0.35
+        min_turning_r: 0.81
       visualize: false
       regenerate_noises: false
       retry_attempt_limit: 3
       reset_period: 1.0
-      vx_std: 0.30
+      vx_std: 0.25
       vy_std: 0.0
-      wz_std: 0.55
+      wz_std: 0.35
       vx_max: 0.55
       vx_min: 0.0
       vy_max: 0.0
-      wz_max: 1.15
+      wz_max: 0.70
       critics:
         - "ObstaclesCritic"
         - "GoalCritic"
@@ -89,22 +96,20 @@ controller_server:
       ObstaclesCritic:
         enabled: true
         cost_power: 1
-        repulsion_weight: 3.0
-        critical_weight: 18.0
+        repulsion_weight: 2.0
+        critical_weight: 20.0
         consider_footprint: true
         collision_cost: 100000.0
-        collision_margin_distance: 0.10
+        collision_margin_distance: 0.08
         near_goal_distance: 0.25
-        inflation_radius: 0.45
+        inflation_radius: 0.35
         cost_scaling_factor: 6.0
-        inflation_layer_name:
-          - "local_inflation_layer"
-          - "global_inflation_layer"
+        inflation_layer_name: "local_inflation_layer"
       PathAlignCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 4.0
-        max_path_occupancy_ratio: 0.20
+        cost_weight: 2.5
+        max_path_occupancy_ratio: 0.08
         trajectory_point_step: 4
         threshold_to_consider: 0.8
         offset_from_furthest: 10
@@ -112,7 +117,7 @@ controller_server:
       PathFollowCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 4.0
+        cost_weight: 5.0
         offset_from_furthest: 8
         threshold_to_consider: 0.8
       PathAngleCritic:
@@ -305,9 +310,9 @@ collision_monitor:
     cmd_vel_in_topic: "/cmd_vel_nav"
     cmd_vel_out_topic: "/cmd_vel_collision_checked"
     transform_tolerance: 0.25
-    source_timeout: 1.5
+    source_timeout: 0.6
     base_shift_correction: true
-    stop_pub_timeout: 1.0
+    stop_pub_timeout: 0.3
     polygons: ["StopZone", "SlowZone"]
     StopZone:
       type: "polygon"

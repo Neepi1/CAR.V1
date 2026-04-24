@@ -15,13 +15,16 @@ kill_overlay_pattern() {
 
 stop_existing_overlay_nav_helpers() {
   kill_overlay_pattern "${NJRH_OVERLAY_ROOT}/scripts/run_local_perception.sh"
-  kill_overlay_pattern "${NJRH_OVERLAY_ROOT}/scripts/local_perception_node.py"
-  kill_overlay_pattern "src/robot_local_perception/scripts/local_perception_node.py"
-  kill_overlay_pattern "python3 .*local_perception_node.py"
   kill_overlay_pattern "/install/robot_local_perception/lib/robot_local_perception/local_perception_node"
   kill_overlay_pattern "robot_local_perception/local_perception_node"
   kill_overlay_pattern "${NJRH_OVERLAY_ROOT}/scripts/run_robot_safety.sh"
-  kill_overlay_pattern "${NJRH_OVERLAY_ROOT}/scripts/robot_safety_node.py"
+  kill_overlay_pattern "/install/robot_safety/lib/robot_safety/robot_safety_node"
+  kill_overlay_pattern "robot_safety/robot_safety_node"
+  kill_overlay_pattern "${NJRH_OVERLAY_ROOT}/scripts/run_ranger_mini3_mode_controller.sh"
+  kill_overlay_pattern "ranger_mini3_mode_controller/mode_controller_node.py"
+  kill_overlay_pattern "python3 .*mode_controller_node.py"
+  kill_overlay_pattern "/install/ranger_mini3_mode_controller/lib/ranger_mini3_mode_controller/mode_controller_node"
+  kill_overlay_pattern "ranger_mini3_mode_controller/mode_controller_node"
 }
 
 start_overlay_helper() {

@@ -35,6 +35,7 @@ trap on_signal INT TERM
 
 start_overlay_helper "local_perception_rapid" bash "${SCRIPT_DIR}/run_local_perception.sh"
 start_overlay_helper "robot_safety_rapid" bash "${SCRIPT_DIR}/run_robot_safety.sh"
+start_overlay_helper "ranger_mini3_mode_controller_rapid" bash "${SCRIPT_DIR}/run_ranger_mini3_mode_controller.sh"
 
 bash "$(require_upstream_script run_nav2_rapid_avoidance.sh)" &
 nav_pid=$!

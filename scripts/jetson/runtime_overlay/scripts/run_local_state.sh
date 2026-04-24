@@ -10,4 +10,11 @@ PARAMS_FILE="${LOCAL_STATE_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/local_state.
   exit 1
 }
 
-exec env PYTHONUNBUFFERED=1 python3 "${SCRIPT_DIR}/local_state_node.py" --ros-args --params-file "${PARAMS_FILE}"
+NODE_BIN="${NJRH_PROJECT_ROOT}/install/robot_local_state/lib/robot_local_state/local_state_node"
+[[ -x "${NODE_BIN}" ]] || {
+  echo "[runtime-overlay] compiled local state node missing or not executable: ${NODE_BIN}" >&2
+  echo "[runtime-overlay] build robot_local_state; Python fallback has been removed." >&2
+  exit 1
+}
+
+exec "${NODE_BIN}" --ros-args --params-file "${PARAMS_FILE}"

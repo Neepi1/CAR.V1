@@ -22,7 +22,8 @@ for pattern in \
   "jt128_slam_toolbox_mapping.launch.py" \
   "nav_cloud_preprocessor" \
   "pointcloud_to_laserscan_node" \
-  "scan_flip_republisher.py"
+  "robot_hesai_jt128/scan_republisher_node" \
+  "scan_republisher_node"
 do
   pkill -INT -f "$pattern" 2>/dev/null || true
 done
@@ -38,7 +39,8 @@ for pattern in \
   "jt128_slam_toolbox_mapping.launch.py" \
   "nav_cloud_preprocessor" \
   "pointcloud_to_laserscan_node" \
-  "scan_flip_republisher.py"
+  "robot_hesai_jt128/scan_republisher_node" \
+  "scan_republisher_node"
 do
   pkill -9 -f "$pattern" 2>/dev/null || true
 done

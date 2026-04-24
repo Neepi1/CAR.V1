@@ -11,19 +11,11 @@ PARAMS_FILE="${LOCAL_PERCEPTION_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/local_p
   exit 1
 }
 
-NODE_SCRIPT="${REPO_ROOT}/src/robot_local_perception/scripts/local_perception_node.py"
-[[ -f "${NODE_SCRIPT}" ]] || {
-  echo "[runtime-overlay] local perception node missing: ${NODE_SCRIPT}" >&2
+NODE_BIN="${REPO_ROOT}/install/robot_local_perception/lib/robot_local_perception/local_perception_node"
+[[ -x "${NODE_BIN}" ]] || {
+  echo "[runtime-overlay] compiled local perception node missing or not executable: ${NODE_BIN}" >&2
+  echo "[runtime-overlay] build robot_local_perception; Python fallback has been removed." >&2
   exit 1
 }
 
-NODE_BIN="${REPO_ROOT}/install/robot_local_perception/lib/robot_local_perception/local_perception_node"
-if [[ "${NJRH_USE_CPP_LOCAL_PERCEPTION:-auto}" == "1" && -x "${NODE_BIN}" ]]; then
-  exec "${NODE_BIN}" --ros-args --params-file "${PARAMS_FILE}"
-fi
-
-if [[ "${NJRH_USE_CPP_LOCAL_PERCEPTION:-auto}" == "auto" && -x "${NODE_BIN}" ]]; then
-  exec "${NODE_BIN}" --ros-args --params-file "${PARAMS_FILE}"
-fi
-
-exec env PYTHONUNBUFFERED=1 python3 "${NODE_SCRIPT}" --ros-args --params-file "${PARAMS_FILE}"
+exec "${NODE_BIN}" --ros-args --params-file "${PARAMS_FILE}"

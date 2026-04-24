@@ -9,7 +9,7 @@ def generate_launch_description():
         [
             Node(
                 package="robot_local_state",
-                executable="local_state_node.py",
+                executable="local_state_node",
                 name="robot_local_state",
                 output="screen",
                 parameters=[

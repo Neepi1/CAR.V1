@@ -10,4 +10,11 @@ PARAMS_FILE="${LOCALIZATION_BRIDGE_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/loca
   exit 1
 }
 
-exec env PYTHONUNBUFFERED=1 python3 "${SCRIPT_DIR}/localization_bridge_node.py" --ros-args --params-file "${PARAMS_FILE}"
+NODE_BIN="${NJRH_PROJECT_ROOT}/install/robot_localization_bridge/lib/robot_localization_bridge/localization_bridge_node"
+[[ -x "${NODE_BIN}" ]] || {
+  echo "[runtime-overlay] compiled localization bridge node missing or not executable: ${NODE_BIN}" >&2
+  echo "[runtime-overlay] build robot_localization_bridge; Python fallback has been removed." >&2
+  exit 1
+}
+
+exec "${NODE_BIN}" --ros-args --params-file "${PARAMS_FILE}"

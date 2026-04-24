@@ -17,4 +17,4 @@ Bridge that synthesizes the only canonical `map -> odom` transform.
 
 - Sole publisher of `map -> odom`
 - Consumes `robot_global_localization` pose and `robot_local_state` odometry
-- The current implementation computes `map -> odom` from planar `map -> base_link` and `odom -> base_link`, and rejects large jumps
+- The current implementation is C++, computes `map -> odom` from planar `map -> base_link` and `odom -> base_link`, latches one-shot localization results, and rejects large jumps

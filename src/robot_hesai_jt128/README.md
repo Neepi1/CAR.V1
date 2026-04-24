@@ -14,6 +14,7 @@ JT128 wrapper that keeps vendor networking and frame IDs parameterized.
 - `publish_vendor_tf`: defaults to `false` so the vendor driver cannot pollute the main TF tree
 - `local_vendor_driver_config`: reuses `D:/codespace/car/ros2_ws/src/hesai_lidar_ros2/config/config.yaml`
 - `local_pointcloud_axis_remap_config`, `local_imu_axis_remap_config`: repository-owned canonical ingress remap configs reused by the Jetson runtime
+- `scan_republisher_node`: C++ `/scan_raw -> /scan` restamp/pass-through helper shared by 2D mapping and Isaac flatscan localization
 
 ## TF Contract
 

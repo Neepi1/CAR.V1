@@ -9,7 +9,7 @@ def generate_launch_description():
         [
             Node(
                 package="robot_localization_bridge",
-                executable="localization_bridge_node.py",
+                executable="localization_bridge_node",
                 name="robot_localization_bridge",
                 output="screen",
                 parameters=[

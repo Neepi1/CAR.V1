@@ -9,7 +9,7 @@ def generate_launch_description():
         [
             Node(
                 package="robot_safety",
-                executable="robot_safety_node.py",
+                executable="robot_safety_node",
                 name="robot_safety",
                 output="screen",
                 parameters=[

@@ -1,0 +1,28 @@
+ranger_mini3_mode_controller:
+  ros__parameters:
+    cmd_vel_in_topic: /cmd_vel_safe
+    cmd_vel_out_topic: /cmd_vel
+
+    wheelbase_m: 0.494
+    track_m: 0.364
+    max_linear_mps: 1.5
+    max_linear_high_angle_mps: 0.75
+    max_ackermann_angle_rad: 0.698
+    max_spin_radps: 3.259
+
+    publish_rate_hz: 50.0
+    cmd_timeout_s: 0.25
+    mode_policy: auto
+    allow_reverse: false
+    lateral_policy: reject
+    dual_ackermann_angle: inner
+    spin_steering_threshold_rad: 0.698
+    linear_epsilon_mps: 0.02
+    lateral_epsilon_mps: 0.02
+    yaw_epsilon_radps: 0.02
+    publish_zero_on_startup: true
+
+    status_topic: /ranger_mini3_mode_controller/status
+    desired_mode_topic: /ranger_mini3/desired_motion_mode
+    forced_mode_topic: /ranger_mini3/forced_mode
+    park_topic: /ranger_mini3/park

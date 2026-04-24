@@ -21,7 +21,17 @@ def test_nav_defaults_are_fixed():
     assert "RegulatedPurePursuitController" in nav2
     assert 'motion_model: "Ackermann"' in nav2
     assert "AckermannConstraints:" in nav2
-    assert "nav2_rotation_shim_controller" not in nav2
+    assert "min_turning_r: 0.81" in nav2
+    assert "vx_std: 0.25" in nav2
+    assert "vy_std: 0.0" in nav2
+    assert "wz_std: 0.35" in nav2
+    assert "vx_max: 0.55" in nav2
+    assert "vx_min: 0.0" in nav2
+    assert "vy_max: 0.0" in nav2
+    assert "wz_max: 0.70" in nav2
+    assert "nav2_rotation_shim_controller::RotationShimController" in nav2
+    assert 'primary_controller: "nav2_mppi_controller::MPPIController"' in nav2
+    assert "angular_dist_threshold: 0.85" in nav2
     assert "use_rotate_to_heading: false" in nav2
     assert "/perception/obstacle_points" in nav2
     assert "/perception/clearing_points" in nav2
@@ -33,6 +43,14 @@ def test_nav_defaults_are_fixed():
     assert "clearing: true" in nav2
     assert "observation_persistence: 0.0" in nav2
     assert "raytrace_max_range: 6.00" in nav2
+    assert "repulsion_weight: 2.0" in nav2
+    assert "critical_weight: 20.0" in nav2
+    assert "collision_margin_distance: 0.08" in nav2
+    assert "inflation_radius: 0.35" in nav2
+    assert 'inflation_layer_name: "local_inflation_layer"' in nav2
+    assert "max_path_occupancy_ratio: 0.08" in nav2
+    assert "source_timeout: 0.6" in nav2
+    assert "stop_pub_timeout: 0.3" in nav2
     assert "/local_state/odometry" in nav2
     assert "/cmd_vel_collision_checked" in nav2
     assert "collision_monitor" in nav2
@@ -83,9 +101,9 @@ def test_jetson_runtime_assets_exist():
     assert (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_local_state.sh").exists()
     assert (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_localization_bridge.sh").exists()
     assert (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "prepare_localizer_map.py").exists()
-    assert (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "pointcloud_axis_remap.py").exists()
-    assert (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "imu_axis_remap.py").exists()
-    assert (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "scan_flip_republisher.py").exists()
+    assert (ROOT / "src" / "robot_hesai_jt128" / "src" / "pointcloud_axis_remap_node.cpp").exists()
+    assert (ROOT / "src" / "robot_hesai_jt128" / "src" / "imu_axis_remap_node.cpp").exists()
+    assert (ROOT / "src" / "robot_hesai_jt128" / "src" / "scan_republisher_node.cpp").exists()
     assert (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "frontend_pose_from_odometry.py").exists()
     assert (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "release_rebuild_compat.py").exists()
     assert (ROOT / "scripts" / "jetson" / "runtime_overlay" / "launch" / "occupancy_localization.launch.py").exists()
@@ -149,13 +167,16 @@ def test_project_runtime_helpers_are_wired():
     assert "input_topic: /lidar_points" in local_perception
     assert "output_topic: /perception/obstacle_points" in local_perception
     assert "clearing_output_topic: /perception/clearing_points" in local_perception
+    assert "restamp_to_latest_tf: true" in local_perception
+    assert "require_output_stamp_tf: true" in local_perception
+    assert "output_stamp_tf_target_frame: odom" in local_perception
     assert "clearing.enabled: true" in local_perception
     assert "clearing.virtual_rays.enabled: true" in local_perception
-    assert "clearing.virtual_rays.angular_resolution_deg: 0.5" in local_perception
+    assert "clearing.virtual_rays.angular_resolution_deg: 0.75" in local_perception
     assert "clearing.virtual_rays.range: 6.00" in local_perception
-    assert "clearing.virtual_rays.range_steps: [0.35, 0.50, 0.75, 1.25, 2.00, 3.50, 6.00]" in local_perception
-    assert "clearing.max_points: 72000" in local_perception
-    assert "0.00, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30" in local_perception
+    assert "clearing.virtual_rays.range_steps: [0.50, 1.00, 2.00, 3.50, 6.00]" in local_perception
+    assert "clearing.max_points: 30000" in local_perception
+    assert "-0.10, 0.05, 0.20, 0.40, 0.60, 0.85, 1.10, 1.30" in local_perception
     assert "profiles.NORMAL.range_filter.max: 4.50" in local_perception
     assert "profiles.NORMAL.height_filter.min_z: 0.40" in local_perception
     assert "profiles.NORMAL.height_filter.max_z: 1.30" in local_perception
@@ -165,15 +186,18 @@ def test_project_runtime_helpers_are_wired():
     assert "require_localization_health" in robot_safety
     assert "status_topic: /safety/status" in robot_safety
     assert "motion_allowed_topic: /safety/motion_allowed" in robot_safety
+    assert "cmd_vel_out_topic: /cmd_vel_safe" in robot_safety
     assert "run_local_perception.sh" in overlay_nav
     assert "run_robot_safety.sh" in overlay_nav
-    assert "src/robot_local_perception/scripts/local_perception_node.py" in overlay_local_perception
+    assert "run_ranger_mini3_mode_controller.sh" in overlay_nav
     assert "install/robot_local_perception/lib/robot_local_perception/local_perception_node" in overlay_local_perception
-    assert 'NJRH_USE_CPP_LOCAL_PERCEPTION:-auto' in overlay_local_perception
-    assert "src/robot_local_perception/scripts/local_perception_node.py" in overlay_nav_helpers
-    assert "python3 .*local_perception_node.py" in overlay_nav_helpers
+    assert "Python fallback has been removed" in overlay_local_perception
+    assert "src/robot_local_perception/scripts/local_perception_node.py" not in overlay_nav_helpers
+    assert "python3 .*local_perception_node.py" not in overlay_nav_helpers
     assert "robot_local_perception/local_perception_node" in overlay_nav_helpers
-    assert "src/robot_safety/scripts/robot_safety_node.py" in overlay_robot_safety
+    assert "install/robot_safety/lib/robot_safety/robot_safety_node" in overlay_robot_safety
+    assert "Python fallback has been removed" in overlay_robot_safety
+    assert "ranger_mini3_mode_controller" in overlay_nav_helpers
     assert "require_can_interface_up" in overlay_tf_helpers
     assert 'if [[ -e "${helper_log}" && ! -w "${helper_log}" ]]; then' in overlay_tf_helpers
     assert 'rm -f "${helper_log}"' in overlay_tf_helpers
@@ -194,6 +218,37 @@ def test_project_runtime_helpers_are_wired():
     assert "CAN_BITRATE" in overlay_can_up
     assert 'link set "${CAN_IFACE}" up type can bitrate "${CAN_BITRATE}"' in overlay_can_up
     assert 'link set "${CAN_IFACE}" down' in overlay_can_down
+
+
+def test_ranger_mini3_mode_controller_is_cpp_and_rejects_lateral_reverse():
+    package_root = ROOT / "src" / "ranger_mini3_mode_controller"
+    cmake = (package_root / "CMakeLists.txt").read_text(encoding="utf-8")
+    package_xml = (package_root / "package.xml").read_text(encoding="utf-8")
+    node_cpp = (package_root / "src" / "mode_controller_node.cpp").read_text(encoding="utf-8")
+    config = (package_root / "config" / "ranger_mini3_mode_controller.yaml").read_text(encoding="utf-8")
+    overlay_config = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "ranger_mini3_mode_controller.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_runner = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_ranger_mini3_mode_controller.sh"
+    ).read_text(encoding="utf-8")
+    assert "ament_cmake" in cmake
+    assert "rclcpp" in package_xml
+    assert "ament_python" not in package_xml
+    assert "add_executable(mode_controller_node src/mode_controller_node.cpp)" in cmake
+    assert "lateral_policy: reject" in config
+    assert "allow_reverse: false" in config
+    assert "spin_steering_threshold_rad: 0.698" in config
+    assert "lateral_policy: reject" in overlay_config
+    assert "allow_reverse: false" in overlay_config
+    assert "Lateral / crab commands are disabled" in node_cpp
+    assert "vx = std::max(0.0, vx)" in node_cpp
+    assert "return makeSpin(wz)" in node_cpp
+    assert "python3" not in overlay_runner
+    assert "set +u" in overlay_runner
+    assert 'source "${REPO_ROOT}/install/local_setup.bash"' in overlay_runner
+    assert "set -u" in overlay_runner
+    assert "colcon build --packages-select ranger_mini3_mode_controller" in overlay_runner
 
 
 def test_occupancy_builder_package_exists():
@@ -221,33 +276,40 @@ def test_occupancy_builder_contracts_are_repo_owned():
 
 
 def test_local_perception_node_ports_validated_base_link_filter_contract():
-    node_script = (ROOT / "src" / "robot_local_perception" / "scripts" / "local_perception_node.py").read_text(encoding="utf-8")
-    assert "sensor_msgs_py import point_cloud2" in node_script
+    node_script = (ROOT / "src" / "robot_local_perception" / "src" / "local_perception_node.cpp").read_text(encoding="utf-8")
+    assert "pcl_conversions" in node_script
     assert "TransformListener" in node_script
-    assert "lookup_transform(" in node_script
-    assert "output_frame_id\", \"base_link\"" in node_script
-    assert "input_topic\", \"/lidar_points\"" in node_script
-    assert "clearing_output_topic\", \"/perception/clearing_points\"" in node_script
+    assert "lookupTransform(" in node_script
+    assert 'declare_parameter<std::string>("output_frame_id", "base_link")' in node_script
+    assert 'declare_parameter<std::string>("input_topic", "/lidar_points")' in node_script
+    assert 'declare_parameter<std::string>("clearing_output_topic", "/perception/clearing_points")' in node_script
     assert "clearing.virtual_rays.enabled" in node_script
-    assert "build_virtual_clearing_points" in node_script
-    assert "update_clearing_bin" in node_script
-    assert "self.sensor_qos = QoSProfile" in node_script
-    assert "ReliabilityPolicy.BEST_EFFORT" in node_script
-    assert "apply_voxel_outlier_filter" in node_script
+    assert "buildVirtualClearingCloud" in node_script
+    assert "updateClearingBin" in node_script
+    assert "outputStampForCostmap" in node_script
+    assert 'declare_parameter<std::string>("output_stamp_tf_target_frame", "odom")' in node_script
+    assert 'declare_parameter<bool>("restamp_to_latest_tf", true)' in node_script
+    assert 'declare_parameter<bool>("require_output_stamp_tf", true)' in node_script
+    assert "return std::nullopt" in node_script
+    assert "lookupTransform(\n        output_stamp_tf_target_frame_, output_frame_id_, tf2::TimePointZero" in node_script
+    assert "rclcpp::QoS(rclcpp::KeepLast(1)).best_effort()" in node_script
+    assert "best_effort" in node_script
+    assert "applyVoxelOutlierFilter" in node_script
     assert "\"ELEVATOR_WAIT\"" in node_script
     assert "\"DOORWAY\"" in node_script
 
 
 def test_robot_safety_node_exports_stateful_final_cmd_vel_contract():
-    node_script = (ROOT / "src" / "robot_safety" / "scripts" / "robot_safety_node.py").read_text(encoding="utf-8")
+    node_script = (ROOT / "src" / "robot_safety" / "src" / "robot_safety_node.cpp").read_text(encoding="utf-8")
     config_text = (ROOT / "src" / "robot_safety" / "config" / "robot_safety.yaml").read_text(encoding="utf-8")
-    assert "class SafetyState" in node_script
-    assert 'status_topic", "/safety/status"' in node_script
-    assert 'motion_allowed_topic", "/safety/motion_allowed"' in node_script
+    assert "enum class SafetyState" in node_script
+    assert '"status_topic", "/safety/status"' in node_script
+    assert '"motion_allowed_topic", "/safety/motion_allowed"' in node_script
     assert "COMMAND_STALE" in node_script
     assert "LOCALIZATION_INVALID" in node_script
     assert "status_topic: /safety/status" in config_text
     assert "motion_allowed_topic: /safety/motion_allowed" in config_text
+    assert "cmd_vel_out_topic: /cmd_vel_safe" in config_text
 
 
 def test_robot_bringup_wires_repo_owned_localization_and_navigation_launches():
@@ -298,8 +360,8 @@ def test_runtime_overlay_live_2d_mapping_uses_slam_toolbox():
     assert "slam_toolbox" in slam_launch
     assert "nav_cloud_preprocessor" in slam_launch
     assert "pointcloud_to_laserscan_node" in slam_launch
-    assert "scan_flip_republisher.py" in slam_launch
-    assert "scan_flip_republisher.py" in run_projected_map
+    assert "scan_republisher_node" in slam_launch
+    assert "scan_republisher_node" in run_projected_map
     assert "preprocessor_params" in slam_launch
     assert "nav_points_topic" in slam_launch
     assert '"output_frame_id": "lidar_level_link"' in slam_launch
@@ -310,7 +372,7 @@ def test_runtime_overlay_live_2d_mapping_uses_slam_toolbox():
     assert "target_frame: lidar_level_link" in slam_scan_cfg
     assert "min_height: -0.85" in slam_scan_cfg
     assert "max_height: -0.20" in slam_scan_cfg
-    assert "scan_flip_republisher.py" in slam_launch
+    assert "scan_republisher_node" in slam_launch
     assert "'topic': '/map'" in dashboard_patch
     assert "slam_toolbox_map_grid" in dashboard_patch
     assert "timeout=45.0" in dashboard_patch
@@ -337,16 +399,17 @@ def test_runtime_overlay_live_2d_mapping_uses_slam_toolbox():
 
 
 def test_localization_bridge_uses_pose_receive_time_for_freshness():
-    repo_bridge = (ROOT / "src" / "robot_localization_bridge" / "scripts" / "localization_bridge_node.py").read_text(
+    repo_bridge = (ROOT / "src" / "robot_localization_bridge" / "src" / "localization_bridge_node.cpp").read_text(
         encoding="utf-8"
     )
-    overlay_bridge = (
-        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "localization_bridge_node.py"
+    overlay_runner = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_localization_bridge.sh"
     ).read_text(encoding="utf-8")
-    for text in (repo_bridge, overlay_bridge):
-        assert "self.latest_pose_received_sec" in text
-        assert "pose_received_sec = self.latest_pose_received_sec" in text
-        assert "now_sec - pose_received_sec > timeout_sec" in text
+    assert "latest_pose_received_sec_" in repo_bridge
+    assert "pose_received_sec = latest_pose_received_sec_" in repo_bridge
+    assert "now_sec - pose_received_sec > timeout_sec_" in repo_bridge
+    assert "install/robot_localization_bridge/lib/robot_localization_bridge/localization_bridge_node" in overlay_runner
+    assert "Python fallback has been removed" in overlay_runner
 
 
 def test_dashboard_runtime_patches_nav2_params_to_repo_owned_config():
@@ -468,22 +531,19 @@ def test_jt128_driver_normalizes_vendor_raw_to_canonical_topics():
     assert 'export IMU_TOPIC="${NJRH_JT128_IMU_TOPIC:-/lidar_imu}"' in driver_script
     assert 'export VENDOR_POINTS_TOPIC="${NJRH_JT128_VENDOR_POINTS_TOPIC:-/jt128/vendor/points_raw}"' in driver_script
     assert 'export VENDOR_IMU_TOPIC="${NJRH_JT128_VENDOR_IMU_TOPIC:-/jt128/vendor/imu_raw}"' in driver_script
-    assert 'export POINTCLOUD_REMAP_IMPL="${NJRH_POINTCLOUD_REMAP_IMPL:-auto}"' in driver_script
     assert 'export POINTCLOUD_REMAP_CPP_BIN="${NJRH_POINTCLOUD_REMAP_CPP_BIN:-${NJRH_PROJECT_ROOT}/install/robot_hesai_jt128/lib/robot_hesai_jt128/pointcloud_axis_remap_node}"' in driver_script
-    assert 'export IMU_REMAP_IMPL="${NJRH_IMU_REMAP_IMPL:-auto}"' in driver_script
     assert 'export IMU_REMAP_CPP_BIN="${NJRH_IMU_REMAP_CPP_BIN:-${NJRH_PROJECT_ROOT}/install/robot_hesai_jt128/lib/robot_hesai_jt128/imu_axis_remap_node}"' in driver_script
     assert "ros_send_point_cloud_topic" in driver_script
     assert "ros_send_imu_topic" in driver_script
     assert "/jt128/vendor/points_raw" in driver_script
     assert "/jt128/vendor/imu_raw" in driver_script
-    assert 'if [[ "${POINTCLOUD_REMAP_IMPL}" == "cpp" ]]; then' in driver_script
-    assert 'elif [[ "${POINTCLOUD_REMAP_IMPL}" == "auto" && -x "${POINTCLOUD_REMAP_CPP_BIN}" ]]; then' in driver_script
+    assert '[[ -x "${POINTCLOUD_REMAP_CPP_BIN}" ]]' in driver_script
     assert '"${POINTCLOUD_REMAP_CPP_BIN}" --ros-args --params-file "${POINTCLOUD_REMAP_CONFIG}" &' in driver_script
-    assert 'if [[ "${IMU_REMAP_IMPL}" == "cpp" ]]; then' in driver_script
-    assert 'elif [[ "${IMU_REMAP_IMPL}" == "auto" && -x "${IMU_REMAP_CPP_BIN}" ]]; then' in driver_script
+    assert '[[ -x "${IMU_REMAP_CPP_BIN}" ]]' in driver_script
     assert '"${IMU_REMAP_CPP_BIN}" --ros-args --params-file "${IMU_REMAP_CONFIG}" &' in driver_script
-    assert 'python3 "${SCRIPT_DIR}/pointcloud_axis_remap.py"' in driver_script
-    assert 'python3 "${SCRIPT_DIR}/imu_axis_remap.py"' in driver_script
+    assert 'pointcloud_axis_remap.py' not in driver_script
+    assert 'imu_axis_remap.py' not in driver_script
+    assert "Python remap fallback has been removed" in driver_script
     assert "points_topic: /lidar_points" in jt128_cfg
     assert "imu_topic: /lidar_imu" in jt128_cfg
     assert "vendor_points_topic: /jt128/vendor/points_raw" in jt128_cfg
@@ -494,17 +554,15 @@ def test_jt128_driver_normalizes_vendor_raw_to_canonical_topics():
 
 
 def test_localization_bridge_latches_one_shot_localizer_pose():
-    overlay_bridge = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "localization_bridge_node.py").read_text(encoding="utf-8")
-    repo_bridge = (ROOT / "src" / "robot_localization_bridge" / "scripts" / "localization_bridge_node.py").read_text(encoding="utf-8")
-    for bridge_code in (overlay_bridge, repo_bridge):
-        assert "self.last_pose_stamp_used = None" in bridge_code
-        assert 'self._refresh_state("pose")' in bridge_code
-        assert 'self._refresh_state("timer")' in bridge_code
-        assert 'bridge waiting for localization_result' in bridge_code
-        assert "elif self.latest_map_to_odom is None:" in bridge_code
-        assert "if self.latest_map_to_odom is None:" in bridge_code
-        assert 'tf.transform.translation.x = self.latest_map_to_odom["x"]' in bridge_code
-        assert 'tf.transform.rotation = quaternion_from_yaw(self.latest_map_to_odom["yaw"])' in bridge_code
+    bridge_code = (ROOT / "src" / "robot_localization_bridge" / "src" / "localization_bridge_node.cpp").read_text(encoding="utf-8")
+    assert "has_last_pose_stamp_used_" in bridge_code
+    assert 'refresh_state("pose")' in bridge_code
+    assert 'refresh_state("timer")' in bridge_code
+    assert 'bridge waiting for localization_result' in bridge_code
+    assert "else if (!has_map_to_odom_)" in bridge_code
+    assert "if (!has_map_to_odom_)" in bridge_code
+    assert "tf.transform.translation.x = map_to_odom_.x" in bridge_code
+    assert "tf.transform.rotation = quaternion_from_yaw(map_to_odom_.yaw)" in bridge_code
 
 
 def test_localization_sensing_reuses_slam2d_scan_contract():
@@ -520,8 +578,8 @@ def test_localization_sensing_reuses_slam2d_scan_contract():
     assert '\"points_topic\": \"/lidar_points\"' in occupancy_stack
     assert 'overlay_root / "config" / "jt128_scan_slam2d.yaml"' in localization_sensing
     assert "jt128_flatscan.yaml" in localization_sensing
-    assert "scan_flip_republisher.py" in localization_sensing
-    assert "scan_flip_republisher.py" in localization_script
+    assert "scan_republisher_node" in localization_sensing
+    assert "scan_republisher_node" in localization_script
     assert "nav_points_topic" in localization_sensing
     assert '"output_frame_id": "lidar_level_link"' in localization_sensing
     assert "output_frame_id: lidar_level_link" in preprocessor_cfg

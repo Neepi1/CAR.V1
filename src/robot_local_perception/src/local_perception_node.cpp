@@ -5,6 +5,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -111,8 +112,11 @@ public:
     output_topic_ = declare_parameter<std::string>("output_topic", "/perception/obstacle_points");
     clearing_output_topic_ = declare_parameter<std::string>("clearing_output_topic", "/perception/clearing_points");
     output_frame_id_ = declare_parameter<std::string>("output_frame_id", "base_link");
+    output_stamp_tf_target_frame_ = declare_parameter<std::string>("output_stamp_tf_target_frame", "odom");
     current_mode_ = declare_parameter<std::string>("mode", "NORMAL");
     restamp_to_now_ = declare_parameter<bool>("restamp_to_now", true);
+    restamp_to_latest_tf_ = declare_parameter<bool>("restamp_to_latest_tf", true);
+    require_output_stamp_tf_ = declare_parameter<bool>("require_output_stamp_tf", true);
     lookup_timeout_sec_ = declare_parameter<double>("lookup_timeout_sec", 0.1);
     processing_rate_hz_ = std::max(declare_parameter<double>("processing_rate_hz", 8.0), 0.1);
     point_sample_stride_ = static_cast<int>(std::max<std::int64_t>(
@@ -537,6 +541,41 @@ private:
     return stamp;
   }
 
+  std::optional<builtin_interfaces::msg::Time> outputStampForCostmap()
+  {
+    if (!restamp_to_now_) {
+      builtin_interfaces::msg::Time zero;
+      return zero;
+    }
+
+    if (
+      !restamp_to_latest_tf_ ||
+      output_stamp_tf_target_frame_.empty() ||
+      output_frame_id_.empty() ||
+      output_stamp_tf_target_frame_ == output_frame_id_)
+    {
+      return nowMsg();
+    }
+
+    try {
+      const auto timeout = tf2::durationFromSec(std::min(lookup_timeout_sec_, 0.05));
+      const auto latest_tf = tf_buffer_.lookupTransform(
+        output_stamp_tf_target_frame_, output_frame_id_, tf2::TimePointZero, timeout);
+      if (latest_tf.header.stamp.sec != 0 || latest_tf.header.stamp.nanosec != 0) {
+        return latest_tf.header.stamp;
+      }
+    } catch (const tf2::TransformException & ex) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "Failed to restamp local perception cloud with latest %s <- %s TF: %s.",
+        output_stamp_tf_target_frame_.c_str(), output_frame_id_.c_str(), ex.what());
+      if (require_output_stamp_tf_) {
+        return std::nullopt;
+      }
+    }
+    return nowMsg();
+  }
+
   void publishEmptyCloud(const sensor_msgs::msg::PointCloud2 & input_msg)
   {
     pcl::PointCloud<PointT> empty_cloud;
@@ -548,7 +587,11 @@ private:
     output_msg.header = input_msg.header;
     output_msg.header.frame_id = output_frame_id_;
     if (restamp_to_now_) {
-      output_msg.header.stamp = nowMsg();
+      const auto output_stamp = outputStampForCostmap();
+      if (!output_stamp) {
+        return;
+      }
+      output_msg.header.stamp = *output_stamp;
     }
     publisher_->publish(output_msg);
   }
@@ -663,7 +706,11 @@ private:
     output_msg.header = msg->header;
     output_msg.header.frame_id = output_frame_id_;
     if (restamp_to_now_) {
-      output_msg.header.stamp = nowMsg();
+      const auto output_stamp = outputStampForCostmap();
+      if (!output_stamp) {
+        return;
+      }
+      output_msg.header.stamp = *output_stamp;
     }
     if (clearing_enabled_) {
       sensor_msgs::msg::PointCloud2 clearing_output_msg;
@@ -689,9 +736,12 @@ private:
   std::string output_topic_;
   std::string clearing_output_topic_;
   std::string output_frame_id_;
+  std::string output_stamp_tf_target_frame_;
   std::string current_mode_;
   std::vector<std::string> supported_modes_;
   bool restamp_to_now_{true};
+  bool restamp_to_latest_tf_{true};
+  bool require_output_stamp_tf_{true};
   double lookup_timeout_sec_{0.1};
   double processing_rate_hz_{8.0};
   int point_sample_stride_{4};

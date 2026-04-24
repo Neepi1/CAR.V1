@@ -28,6 +28,5 @@ target_link_libraries(local_perception_node ${PCL_LIBRARIES})
 
 install(TARGETS local_perception_node DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
-install(PROGRAMS scripts/local_perception_node.py DESTINATION lib/${PROJECT_NAME})
 
 ament_package()

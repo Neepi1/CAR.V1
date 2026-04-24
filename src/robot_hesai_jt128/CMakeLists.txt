@@ -10,9 +10,15 @@ add_executable(pointcloud_axis_remap_node src/pointcloud_axis_remap_node.cpp)
 ament_target_dependencies(pointcloud_axis_remap_node rclcpp sensor_msgs)
 add_executable(imu_axis_remap_node src/imu_axis_remap_node.cpp)
 ament_target_dependencies(imu_axis_remap_node rclcpp sensor_msgs tf2)
+add_executable(scan_republisher_node src/scan_republisher_node.cpp)
+ament_target_dependencies(scan_republisher_node rclcpp sensor_msgs)
 
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
-install(PROGRAMS scripts/jt128_wrapper_node.py DESTINATION lib/${PROJECT_NAME})
-install(TARGETS pointcloud_axis_remap_node imu_axis_remap_node DESTINATION lib/${PROJECT_NAME})
+install(TARGETS
+  pointcloud_axis_remap_node
+  imu_axis_remap_node
+  scan_republisher_node
+  DESTINATION lib/${PROJECT_NAME}
+)
 
 ament_package()

@@ -11,10 +11,11 @@ PARAMS_FILE="${ROBOT_SAFETY_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/robot_safet
   exit 1
 }
 
-NODE_SCRIPT="${REPO_ROOT}/src/robot_safety/scripts/robot_safety_node.py"
-[[ -f "${NODE_SCRIPT}" ]] || {
-  echo "[runtime-overlay] robot safety node missing: ${NODE_SCRIPT}" >&2
+NODE_BIN="${REPO_ROOT}/install/robot_safety/lib/robot_safety/robot_safety_node"
+[[ -x "${NODE_BIN}" ]] || {
+  echo "[runtime-overlay] compiled robot safety node missing or not executable: ${NODE_BIN}" >&2
+  echo "[runtime-overlay] build robot_safety; Python fallback has been removed." >&2
   exit 1
 }
 
-exec env PYTHONUNBUFFERED=1 python3 "${NODE_SCRIPT}" --ros-args --params-file "${PARAMS_FILE}"
+exec "${NODE_BIN}" --ros-args --params-file "${PARAMS_FILE}"

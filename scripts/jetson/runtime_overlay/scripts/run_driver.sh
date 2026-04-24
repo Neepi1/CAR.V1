@@ -14,9 +14,7 @@ export VENDOR_POINTS_TOPIC="${NJRH_JT128_VENDOR_POINTS_TOPIC:-/jt128/vendor/poin
 export VENDOR_IMU_TOPIC="${NJRH_JT128_VENDOR_IMU_TOPIC:-/jt128/vendor/imu_raw}"
 export POINTCLOUD_REMAP_CONFIG="${NJRH_JT128_CANONICAL_POINTCLOUD_REMAP_CONFIG:-${NJRH_OVERLAY_ROOT}/config/jt128_canonical_pointcloud_remap.yaml}"
 export IMU_REMAP_CONFIG="${NJRH_JT128_CANONICAL_IMU_REMAP_CONFIG:-${NJRH_OVERLAY_ROOT}/config/jt128_canonical_imu_remap.yaml}"
-export POINTCLOUD_REMAP_IMPL="${NJRH_POINTCLOUD_REMAP_IMPL:-auto}"
 export POINTCLOUD_REMAP_CPP_BIN="${NJRH_POINTCLOUD_REMAP_CPP_BIN:-${NJRH_PROJECT_ROOT}/install/robot_hesai_jt128/lib/robot_hesai_jt128/pointcloud_axis_remap_node}"
-export IMU_REMAP_IMPL="${NJRH_IMU_REMAP_IMPL:-auto}"
 export IMU_REMAP_CPP_BIN="${NJRH_IMU_REMAP_CPP_BIN:-${NJRH_PROJECT_ROOT}/install/robot_hesai_jt128/lib/robot_hesai_jt128/imu_axis_remap_node}"
 UPSTREAM_DRIVER_PROFILE="${DRIVER_PROFILE}"
 
@@ -78,39 +76,22 @@ done
   echo "[runtime-overlay] canonical imu remap config missing: ${IMU_REMAP_CONFIG}" >&2
   exit 1
 }
-
-use_cpp_pointcloud_remap="false"
-if [[ "${POINTCLOUD_REMAP_IMPL}" == "cpp" ]]; then
-  use_cpp_pointcloud_remap="true"
-elif [[ "${POINTCLOUD_REMAP_IMPL}" == "auto" && -x "${POINTCLOUD_REMAP_CPP_BIN}" ]]; then
-  use_cpp_pointcloud_remap="true"
-fi
-
-if [[ "${use_cpp_pointcloud_remap}" == "true" ]]; then
-  echo "[runtime-overlay] using compiled pointcloud remap: ${POINTCLOUD_REMAP_CPP_BIN}" >&2
-  "${POINTCLOUD_REMAP_CPP_BIN}" --ros-args --params-file "${POINTCLOUD_REMAP_CONFIG}" &
-else
-  echo "[runtime-overlay] using python pointcloud remap fallback" >&2
-  env PYTHONUNBUFFERED=1 python3 "${SCRIPT_DIR}/pointcloud_axis_remap.py" \
-    --ros-args --params-file "${POINTCLOUD_REMAP_CONFIG}" &
-fi
+[[ -x "${POINTCLOUD_REMAP_CPP_BIN}" ]] || {
+  echo "[runtime-overlay] compiled pointcloud remap missing or not executable: ${POINTCLOUD_REMAP_CPP_BIN}" >&2
+  echo "[runtime-overlay] build robot_hesai_jt128; Python remap fallback has been removed." >&2
+  exit 1
+}
+echo "[runtime-overlay] using compiled pointcloud remap: ${POINTCLOUD_REMAP_CPP_BIN}" >&2
+"${POINTCLOUD_REMAP_CPP_BIN}" --ros-args --params-file "${POINTCLOUD_REMAP_CONFIG}" &
 pointcloud_remap_pid=$!
 
-use_cpp_imu_remap="false"
-if [[ "${IMU_REMAP_IMPL}" == "cpp" ]]; then
-  use_cpp_imu_remap="true"
-elif [[ "${IMU_REMAP_IMPL}" == "auto" && -x "${IMU_REMAP_CPP_BIN}" ]]; then
-  use_cpp_imu_remap="true"
-fi
-
-if [[ "${use_cpp_imu_remap}" == "true" ]]; then
-  echo "[runtime-overlay] using compiled imu remap: ${IMU_REMAP_CPP_BIN}" >&2
-  "${IMU_REMAP_CPP_BIN}" --ros-args --params-file "${IMU_REMAP_CONFIG}" &
-else
-  echo "[runtime-overlay] using python imu remap fallback" >&2
-  env PYTHONUNBUFFERED=1 python3 "${SCRIPT_DIR}/imu_axis_remap.py" \
-    --ros-args --params-file "${IMU_REMAP_CONFIG}" &
-fi
+[[ -x "${IMU_REMAP_CPP_BIN}" ]] || {
+  echo "[runtime-overlay] compiled imu remap missing or not executable: ${IMU_REMAP_CPP_BIN}" >&2
+  echo "[runtime-overlay] build robot_hesai_jt128; Python remap fallback has been removed." >&2
+  exit 1
+}
+echo "[runtime-overlay] using compiled imu remap: ${IMU_REMAP_CPP_BIN}" >&2
+"${IMU_REMAP_CPP_BIN}" --ros-args --params-file "${IMU_REMAP_CONFIG}" &
 imu_remap_pid=$!
 
 DRIVER_PROFILE="${UPSTREAM_DRIVER_PROFILE}" bash "$(require_upstream_script run_driver.sh)" &
