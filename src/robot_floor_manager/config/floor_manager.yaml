@@ -1,0 +1,16 @@
+robot_floor_manager:
+  ros__parameters:
+    maps_root: maps_release
+    default_building_id: building_1
+    status_topic: /floor_manager/status
+    map_server_load_service: /map_server/load_map
+    localizer_apply_service: /global_localization/apply_floor_assets
+    localization_trigger_service: /global_localization/trigger
+    global_costmap_clear_service: /global_costmap/clear_entirely_global_costmap
+    local_costmap_clear_service: /local_costmap/clear_entirely_local_costmap
+    service_timeout_sec: 10.0
+    call_map_server_load: true
+    call_localizer_apply: true
+    call_localization_trigger: true
+    clear_costmaps_after_switch: true
+    require_filter_assets: true

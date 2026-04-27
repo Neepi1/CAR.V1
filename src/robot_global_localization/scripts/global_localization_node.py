@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from pathlib import Path
+
 import rclpy
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from rclpy.node import Node
@@ -16,6 +18,10 @@ class GlobalLocalizationNode(Node):
         self.declare_parameter("pose_topic", "/global_localization/pose")
         self.declare_parameter("health_topic", "/global_localization/health")
         self.declare_parameter("default_floor_id", "floor_1")
+        self.active_floor_id = self.get_parameter("default_floor_id").value
+        self.active_nav_map_yaml = ""
+        self.active_localizer_map_png = ""
+        self.active_localizer_params_yaml = ""
         self.pose_pub = self.create_publisher(PoseWithCovarianceStamped, self.get_parameter("pose_topic").value, 10)
         self.health_pub = self.create_publisher(String, self.get_parameter("health_topic").value, 10)
         self.create_service(TriggerLocalization, "/global_localization/trigger", self.on_trigger)
@@ -28,8 +34,23 @@ class GlobalLocalizationNode(Node):
         return response
 
     def on_apply_floor(self, request: ApplyFloorAssets.Request, response: ApplyFloorAssets.Response):
+        required = {
+            "nav_map_yaml": request.nav_map_yaml,
+            "localizer_map_png": request.localizer_map_png,
+            "localizer_params_yaml": request.localizer_params_yaml,
+        }
+        missing = [f"{name}={path}" for name, path in required.items() if not path or not Path(path).exists()]
+        if missing:
+            response.success = False
+            response.message = "missing floor assets: " + "; ".join(missing)
+            return response
+
+        self.active_floor_id = request.floor_id
+        self.active_nav_map_yaml = request.nav_map_yaml
+        self.active_localizer_map_png = request.localizer_map_png
+        self.active_localizer_params_yaml = request.localizer_params_yaml
         response.success = True
-        response.message = f"applied floor {request.floor_id}"
+        response.message = f"applied floor {request.floor_id}: {request.nav_map_yaml}"
         return response
 
     def on_timer(self) -> None:
@@ -37,7 +58,7 @@ class GlobalLocalizationNode(Node):
         pose.header.stamp = self.get_clock().now().to_msg()
         pose.header.frame_id = "map"
         self.pose_pub.publish(pose)
-        self.health_pub.publish(String(data="localizer_ready"))
+        self.health_pub.publish(String(data=f"localizer_ready floor={self.active_floor_id}"))
 
 
 def main() -> None:

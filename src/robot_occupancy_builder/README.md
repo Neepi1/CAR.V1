@@ -6,6 +6,7 @@ Repository-owned occupancy builder package for the v3 mapping workflow.
 
 - `live_draft`: subscribes to JT128 points plus `/mapping/frontend_pose` and publishes `/mapping/draft_map`
 - `release_rebuild`: replays raw bag data against the optimized trajectory and rebuilds formal `nav_map` and `localizer_map` assets from the same occupancy intermediate
+- `release_rebuild` now also emits empty filter mask placeholders and `poses.yaml` so the output satisfies the multi-floor asset contract consumed by `robot_floor_manager`
 
 ## Reuse Sources
 

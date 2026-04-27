@@ -69,6 +69,7 @@ def generate_launch_description():
             include("robot_local_state", "local_state.launch.py"),
             include("robot_global_localization", "global_localization.launch.py"),
             include("robot_localization_bridge", "localization_bridge.launch.py"),
+            include("robot_floor_manager", "floor_manager.launch.py"),
             include("robot_safety", "robot_safety.launch.py"),
             map_server,
             lifecycle_manager_map_server,

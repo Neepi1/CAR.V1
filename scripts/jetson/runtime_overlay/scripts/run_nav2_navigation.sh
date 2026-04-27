@@ -4,9 +4,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/nav_runtime_helpers.sh"
 source "${SCRIPT_DIR}/map_server_helpers.sh"
+source "${SCRIPT_DIR}/floor_asset_helpers.sh"
 
 export NAV2_PARAMS_FILE="${NAV2_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/nav2.yaml}"
 LAUNCH_FILE="${NJRH_PROJECT_ROOT}/src/robot_bringup/launch/standard_navigation.launch.py"
+
+if [[ -n "${NJRH_FLOOR_ID:-}" || -n "${NAV2_FLOOR_ID:-}" ]]; then
+  resolve_floor_assets "${NJRH_BUILDING_ID:-${NAV2_BUILDING_ID:-building_1}}" "${NJRH_FLOOR_ID:-${NAV2_FLOOR_ID:-}}"
+fi
 
 [[ -f "${LAUNCH_FILE}" ]] || {
   echo "[runtime-overlay] missing repository launch file: ${LAUNCH_FILE}" >&2
@@ -51,6 +56,7 @@ trap cleanup EXIT
 trap on_signal INT TERM
 
 start_overlay_helper "local_perception" bash "${SCRIPT_DIR}/run_local_perception.sh"
+start_overlay_helper "floor_manager" bash "${SCRIPT_DIR}/run_floor_manager.sh"
 start_overlay_helper "robot_safety" bash "${SCRIPT_DIR}/run_robot_safety.sh"
 start_overlay_helper "ranger_mini3_mode_controller" bash "${SCRIPT_DIR}/run_ranger_mini3_mode_controller.sh"
 

@@ -4,11 +4,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/canonical_tf_helpers.sh"
 source "${SCRIPT_DIR}/map_server_helpers.sh"
+source "${SCRIPT_DIR}/floor_asset_helpers.sh"
 
 export PUBLISH_LIDAR_TF="${PUBLISH_LIDAR_TF:-false}"
 LAUNCH_FILE="${NJRH_OVERLAY_ROOT}/launch/occupancy_localization_stack.launch.py"
+
+if [[ -n "${NJRH_FLOOR_ID:-}" || -n "${NAV2_FLOOR_ID:-}" ]]; then
+  resolve_floor_assets "${NJRH_BUILDING_ID:-${NAV2_BUILDING_ID:-building_1}}" "${NJRH_FLOOR_ID:-${NAV2_FLOOR_ID:-}}"
+fi
+
 NAV2_MAP_YAML="${NAV2_MAP_YAML:-}"
 NAV2_LOCALIZER_PARAMS="${NAV2_LOCALIZER_PARAMS:-}"
+NAV2_LOCALIZER_MAP_YAML="${NAV2_LOCALIZER_MAP_YAML:-}"
 LOCALIZER_MAP_PREPARE_SCRIPT="${NJRH_OVERLAY_ROOT}/scripts/prepare_localizer_map.py"
 NITROS_TMP_DIR="${ISAAC_ROS_NITROS_TMP_DIR:-/tmp/isaac_ros_nitros}"
 
@@ -42,7 +49,11 @@ if [[ ! -w "${NITROS_TMP_DIR}" || ! -w "${NITROS_TMP_DIR}/graphs" ]]; then
   exit 1
 fi
 
-LOCALIZER_MAP_YAML="$(python3 "${LOCALIZER_MAP_PREPARE_SCRIPT}" --nav-yaml "${NAV2_MAP_YAML}")"
+if [[ -n "${NAV2_LOCALIZER_MAP_YAML}" ]]; then
+  LOCALIZER_MAP_YAML="${NAV2_LOCALIZER_MAP_YAML}"
+else
+  LOCALIZER_MAP_YAML="$(python3 "${LOCALIZER_MAP_PREPARE_SCRIPT}" --nav-yaml "${NAV2_MAP_YAML}")"
+fi
 [[ -f "${LOCALIZER_MAP_YAML}" ]] || {
   echo "[runtime-overlay] prepared localizer yaml does not exist: ${LOCALIZER_MAP_YAML}" >&2
   exit 1

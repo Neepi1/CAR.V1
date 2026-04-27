@@ -22,9 +22,9 @@ def test_nav_defaults_are_fixed():
     assert 'motion_model: "Ackermann"' in nav2
     assert "AckermannConstraints:" in nav2
     assert "min_turning_r: 0.81" in nav2
-    assert "vx_std: 0.25" in nav2
+    assert "vx_std: 0.28" in nav2
     assert "vy_std: 0.0" in nav2
-    assert "wz_std: 0.35" in nav2
+    assert "wz_std: 0.45" in nav2
     assert "vx_max: 0.55" in nav2
     assert "vx_min: 0.0" in nav2
     assert "vy_max: 0.0" in nav2
@@ -42,13 +42,20 @@ def test_nav_defaults_are_fixed():
     assert "sensor_frame: lidar_link" in nav2
     assert "clearing: true" in nav2
     assert "observation_persistence: 0.0" in nav2
-    assert "raytrace_max_range: 6.00" in nav2
+    assert "controller_frequency: 12.0" in nav2
+    assert "time_steps: 44" in nav2
+    assert "model_dt: 0.09" in nav2
+    assert "batch_size: 1200" in nav2
+    assert "width: 10" in nav2
+    assert "height: 10" in nav2
+    assert "obstacle_max_range: 5.50" in nav2
+    assert "raytrace_max_range: 8.00" in nav2
     assert "repulsion_weight: 2.0" in nav2
     assert "critical_weight: 20.0" in nav2
     assert "collision_margin_distance: 0.08" in nav2
     assert "inflation_radius: 0.35" in nav2
     assert 'inflation_layer_name: "local_inflation_layer"' in nav2
-    assert "max_path_occupancy_ratio: 0.08" in nav2
+    assert "max_path_occupancy_ratio: 0.05" in nav2
     assert "source_timeout: 0.6" in nav2
     assert "stop_pub_timeout: 0.3" in nav2
     assert "/local_state/odometry" in nav2
@@ -92,6 +99,10 @@ def test_jetson_runtime_assets_exist():
     assert (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_local_perception.sh").exists()
     assert (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_local_costmap_debug.sh").exists()
     assert (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_robot_safety.sh").exists()
+    assert (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_floor_manager.sh").exists()
+    assert (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "floor_asset_helpers.sh").exists()
+    assert (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "select_floor_assets.sh").exists()
+    assert (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "promote_map_to_floor.sh").exists()
     assert (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "bringup_ranger_can.sh").exists()
     assert (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "shutdown_ranger_can.sh").exists()
     assert (ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "local_perception.yaml").exists()
@@ -157,6 +168,9 @@ def test_project_runtime_helpers_are_wired():
     overlay_mapping = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_fastlio_tf.sh").read_text(encoding="utf-8")
     overlay_localization = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_occupancy_grid_localization.sh").read_text(encoding="utf-8")
     overlay_local_costmap_debug = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_local_costmap_debug.sh").read_text(encoding="utf-8")
+    overlay_floor_helpers = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "floor_asset_helpers.sh").read_text(encoding="utf-8")
+    overlay_floor_manager = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_floor_manager.sh").read_text(encoding="utf-8")
+    overlay_promote_floor = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "promote_map_to_floor.sh").read_text(encoding="utf-8")
     overlay_localizer_prepare = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "prepare_localizer_map.py").read_text(encoding="utf-8")
     overlay_localization_launch = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "launch" / "occupancy_localization.launch.py").read_text(encoding="utf-8")
     overlay_local_perception = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_local_perception.sh").read_text(encoding="utf-8")
@@ -173,11 +187,11 @@ def test_project_runtime_helpers_are_wired():
     assert "clearing.enabled: true" in local_perception
     assert "clearing.virtual_rays.enabled: true" in local_perception
     assert "clearing.virtual_rays.angular_resolution_deg: 0.75" in local_perception
-    assert "clearing.virtual_rays.range: 6.00" in local_perception
-    assert "clearing.virtual_rays.range_steps: [0.50, 1.00, 2.00, 3.50, 6.00]" in local_perception
+    assert "clearing.virtual_rays.range: 8.00" in local_perception
+    assert "clearing.virtual_rays.range_steps: [0.50, 1.00, 2.00, 3.50, 5.50, 8.00]" in local_perception
     assert "clearing.max_points: 30000" in local_perception
     assert "-0.10, 0.05, 0.20, 0.40, 0.60, 0.85, 1.10, 1.30" in local_perception
-    assert "profiles.NORMAL.range_filter.max: 4.50" in local_perception
+    assert "profiles.NORMAL.range_filter.max: 5.50" in local_perception
     assert "profiles.NORMAL.height_filter.min_z: 0.40" in local_perception
     assert "profiles.NORMAL.height_filter.max_z: 1.30" in local_perception
     assert "profiles.NORMAL.outlier_filter.enabled: true" in local_perception
@@ -188,6 +202,7 @@ def test_project_runtime_helpers_are_wired():
     assert "motion_allowed_topic: /safety/motion_allowed" in robot_safety
     assert "cmd_vel_out_topic: /cmd_vel_safe" in robot_safety
     assert "run_local_perception.sh" in overlay_nav
+    assert "run_floor_manager.sh" in overlay_nav
     assert "run_robot_safety.sh" in overlay_nav
     assert "run_ranger_mini3_mode_controller.sh" in overlay_nav
     assert "install/robot_local_perception/lib/robot_local_perception/local_perception_node" in overlay_local_perception
@@ -195,6 +210,7 @@ def test_project_runtime_helpers_are_wired():
     assert "src/robot_local_perception/scripts/local_perception_node.py" not in overlay_nav_helpers
     assert "python3 .*local_perception_node.py" not in overlay_nav_helpers
     assert "robot_local_perception/local_perception_node" in overlay_nav_helpers
+    assert "robot_floor_manager/floor_manager_node" in overlay_nav_helpers
     assert "install/robot_safety/lib/robot_safety/robot_safety_node" in overlay_robot_safety
     assert "Python fallback has been removed" in overlay_robot_safety
     assert "ranger_mini3_mode_controller" in overlay_nav_helpers
@@ -205,6 +221,17 @@ def test_project_runtime_helpers_are_wired():
     assert "require_can_interface_up" in overlay_mapping
     assert "require_can_interface_up" in overlay_localization
     assert "localizer_map_yaml" in overlay_localization
+    assert "NAV2_LOCALIZER_MAP_YAML" in overlay_localization
+    assert "resolve_floor_assets" in overlay_localization
+    assert "resolve_floor_assets" in overlay_nav
+    assert "validate_floor_assets" in overlay_floor_helpers
+    assert "NAV2_MAP_YAML" in overlay_floor_helpers
+    assert "NAV2_LOCALIZER_MAP_YAML" in overlay_floor_helpers
+    assert "NAV2_KEEP_OUT_MASK_YAML" in overlay_floor_helpers
+    assert "install/robot_floor_manager/lib/robot_floor_manager/floor_manager_node" in overlay_floor_manager
+    assert "colcon build --packages-select robot_interfaces robot_floor_manager" in overlay_floor_manager
+    assert "--flat-map-name" in overlay_promote_floor
+    assert "robot_map_toolkit/scripts/map_toolkit_cli.py" in overlay_promote_floor
     assert "local_costmap_debug.launch.py" in overlay_local_costmap_debug
     assert "run_local_perception.sh" in overlay_local_costmap_debug
     assert "run_robot_description.sh" in overlay_local_costmap_debug
@@ -321,6 +348,7 @@ def test_robot_bringup_wires_repo_owned_localization_and_navigation_launches():
     bringup_readme = (ROOT / "src" / "robot_bringup" / "README.md").read_text(encoding="utf-8")
     package_xml = (ROOT / "src" / "robot_bringup" / "package.xml").read_text(encoding="utf-8")
     assert "nav2_map_server" in localization_launch
+    assert 'include("robot_floor_manager", "floor_manager.launch.py")' in localization_launch
     assert 'include("robot_safety", "robot_safety.launch.py")' in localization_launch
     assert "standard_navigation.launch.py" in navigation_launch
     assert 'package="nav2_controller"' in standard_navigation_launch
@@ -342,6 +370,36 @@ def test_robot_bringup_wires_repo_owned_localization_and_navigation_launches():
     assert "standard_navigation.launch.py" in bringup_readme
     assert "<exec_depend>nav2_bringup</exec_depend>" in package_xml
     assert "<exec_depend>nav2_collision_monitor</exec_depend>" in package_xml
+    assert "<exec_depend>robot_floor_manager</exec_depend>" in package_xml
+
+
+def test_floor_manager_package_and_asset_contracts_exist():
+    package_root = ROOT / "src" / "robot_floor_manager"
+    cmake = (package_root / "CMakeLists.txt").read_text(encoding="utf-8")
+    package_xml = (package_root / "package.xml").read_text(encoding="utf-8")
+    node_cpp = (package_root / "src" / "floor_manager_node.cpp").read_text(encoding="utf-8")
+    config = (package_root / "config" / "floor_manager.yaml").read_text(encoding="utf-8")
+    map_toolkit = (ROOT / "src" / "robot_map_toolkit" / "scripts" / "map_toolkit_cli.py").read_text(encoding="utf-8")
+    interfaces_cmake = (ROOT / "src" / "robot_interfaces" / "CMakeLists.txt").read_text(encoding="utf-8")
+    assert (package_root / "launch" / "floor_manager.launch.py").exists()
+    assert "add_executable(floor_manager_node src/floor_manager_node.cpp)" in cmake
+    assert "nav2_msgs" in package_xml
+    assert "SwitchFloor" in node_cpp
+    assert "/floor_manager/switch_floor" in node_cpp
+    assert "/map_server/load_map" in node_cpp
+    assert "/global_localization/apply_floor_assets" in node_cpp
+    assert "/global_localization/trigger" in node_cpp
+    assert "clear_entirely_global_costmap" in node_cpp
+    assert '"nav" / "nav_map.yaml"' in node_cpp
+    assert '"localizer" / "localizer_map.png"' in node_cpp
+    assert '"filters" / "keepout_mask.yaml"' in node_cpp
+    assert "poses.yaml" in node_cpp
+    assert "require_filter_assets: true" in config
+    assert "srv/SwitchFloor.srv" in interfaces_cmake
+    assert "REQUIRED_RELATIVE_ASSETS" in map_toolkit
+    assert "--flat-map-name" in map_toolkit
+    assert "promote_flat_map" in map_toolkit
+    assert "localizer/localizer_params.yaml" in map_toolkit
 
 
 def test_runtime_overlay_live_2d_mapping_uses_slam_toolbox():
@@ -436,6 +494,19 @@ def test_dashboard_runtime_patches_nav2_params_to_repo_owned_config():
     assert "run_local_costmap_debug.sh" in patch_v2
     assert "local_costmap_debug.launch.py" in patch_v2
     assert "openMap2dPopup('', true, false, false, 'local_costmap')" in patch_v2
+    assert "/api/floors/list" in patch_v2
+    assert "/api/floors/promote" in patch_v2
+    assert "/api/floors/select" in patch_v2
+    assert "/api/floors/switch" in patch_v2
+    assert "promote_map_to_floor.sh" in patch_v2
+    assert "select_floor_assets.sh" in patch_v2
+    assert "/floor_manager/switch_floor" in patch_v2
+    assert "/workspaces/isaac_ros-dev" in patch_v2
+    assert "listFloorAssetsTestBtn" in patch_v2
+    assert "promoteFloorAssetTestBtn" in patch_v2
+    assert "selectFloorAssetTestBtn" in patch_v2
+    assert "switchFloorAssetTestBtn" in patch_v2
+    assert "测试：归档地图到楼层" in patch_v2
 
 
 def test_runtime_overlay_standard_navigation_uses_repo_owned_launch():

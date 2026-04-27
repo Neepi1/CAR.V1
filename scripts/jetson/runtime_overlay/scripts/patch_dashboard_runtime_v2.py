@@ -104,6 +104,250 @@ LOCAL_COSTMAP_DEBUG_METHODS = """    def _local_costmap_debug_patterns(self) -> 
 """
 
 
+FLOOR_TESTING_METHODS = """    @staticmethod
+    def _sanitize_floor_token(value: str, label: str) -> str:
+        token = str(value or '').strip()
+        if not token:
+            raise RuntimeError(f'{label} is required')
+        allowed = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-')
+        if any(ch not in allowed for ch in token):
+            raise RuntimeError(f'{label} may only contain letters, digits, _ and -')
+        return token
+
+    def _floor_release_assets_dir(self) -> Path:
+        upstream_root = self.env.get('NJRH_UPSTREAM_ROOT') or os.environ.get(
+            'NJRH_UPSTREAM_ROOT',
+            '/workspaces/isaac_ros-dev',
+        )
+        return Path(self.env.get('NJRH_RELEASE_ASSETS_DIR') or os.environ.get(
+            'NJRH_RELEASE_ASSETS_DIR',
+            str(Path(upstream_root) / 'maps_release'),
+        ))
+
+    def _floor_required_assets(self) -> List[str]:
+        return [
+            'nav/nav_map.yaml',
+            'nav/nav_map.pgm',
+            'localizer/localizer_map.png',
+            'localizer/localizer_params.yaml',
+            'filters/keepout_mask.yaml',
+            'filters/keepout_mask.pgm',
+            'filters/speed_mask.yaml',
+            'filters/speed_mask.pgm',
+            'filters/binary_mask.yaml',
+            'filters/binary_mask.pgm',
+            'reports/asset_report.json',
+            'poses.yaml',
+        ]
+
+    def _floor_bundle_snapshot(self, building_dir: Path, floor_dir: Path) -> dict:
+        missing = [
+            str(floor_dir / rel)
+            for rel in self._floor_required_assets()
+            if not (floor_dir / rel).is_file()
+        ]
+        report_path = floor_dir / 'reports' / 'asset_report.json'
+        report = {}
+        if report_path.is_file():
+            try:
+                report = json.loads(report_path.read_text(encoding='utf-8'))
+            except Exception as exc:
+                report = {'error': f'failed to parse asset_report.json: {exc}'}
+        return {
+            'building_id': building_dir.name,
+            'floor_id': floor_dir.name,
+            'floor_root': str(floor_dir),
+            'valid': not missing,
+            'missing': missing,
+            'nav_map': str(floor_dir / 'nav' / 'nav_map.yaml'),
+            'localizer_map': str(floor_dir / 'localizer' / 'localizer_params.yaml'),
+            'asset_report': report,
+        }
+
+    def list_floor_assets(self) -> dict:
+        release_root = self._floor_release_assets_dir()
+        floors = []
+        if release_root.is_dir():
+            for building_dir in sorted(path for path in release_root.iterdir() if path.is_dir()):
+                for floor_dir in sorted(path for path in building_dir.iterdir() if path.is_dir()):
+                    floors.append(self._floor_bundle_snapshot(building_dir, floor_dir))
+        with self._lock:
+            selected = {
+                'building_id': self.env.get('NJRH_BUILDING_ID', ''),
+                'floor_id': self.env.get('NJRH_FLOOR_ID', ''),
+                'floor_root': self.env.get('NJRH_CURRENT_FLOOR_ROOT', ''),
+                'nav_map': self.env.get('NAV2_MAP_YAML', ''),
+                'localizer_map': self.env.get('NAV2_LOCALIZER_MAP_YAML', ''),
+            }
+        return {
+            'ok': True,
+            'root': str(release_root),
+            'selected': selected,
+            'floors': floors,
+        }
+
+    def _run_floor_script(self, script_name: str, args: List[str], timeout: float) -> str:
+        script_path = self.root_dir / 'scripts' / script_name
+        if not script_path.is_file():
+            raise RuntimeError(f'floor test helper missing: {script_path}')
+        completed = subprocess.run(
+            ['bash', str(script_path), *[str(arg) for arg in args]],
+            cwd=str(self.root_dir),
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=float(timeout),
+            check=False,
+        )
+        output = '\\n'.join(
+            part.strip()
+            for part in (completed.stdout or '', completed.stderr or '')
+            if part and part.strip()
+        ).strip()
+        if completed.returncode != 0:
+            raise RuntimeError(output or f'{script_name} failed with rc={completed.returncode}')
+        return output
+
+    def _parse_floor_export_env(self, output: str) -> dict:
+        parsed = {}
+        for raw_line in str(output or '').splitlines():
+            line = raw_line.strip()
+            if not line.startswith('export ') or '=' not in line:
+                continue
+            key, value = line[len('export '):].split('=', 1)
+            key = key.strip()
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] == "'":
+                value = value[1:-1]
+            if key:
+                parsed[key] = value
+        return parsed
+
+    def promote_map_to_floor(self, map_name: str, building_id: str, floor_id: str) -> dict:
+        try:
+            safe_map = self._sanitize_asset_name(map_name, 'Invalid map name')
+            safe_building = self._sanitize_floor_token(building_id, 'building_id')
+            safe_floor = self._sanitize_floor_token(floor_id, 'floor_id')
+            output = self._run_floor_script(
+                'promote_map_to_floor.sh',
+                [safe_map, safe_building, safe_floor],
+                timeout=180.0,
+            )
+            return {
+                'ok': True,
+                'message': f'测试：已将地图 {safe_map} 归档到 {safe_building}/{safe_floor}',
+                'details': output,
+                'floors': self.list_floor_assets(),
+            }
+        except Exception as exc:
+            return {'ok': False, 'error': str(exc)}
+
+    def select_floor_assets(self, building_id: str, floor_id: str) -> dict:
+        try:
+            safe_building = self._sanitize_floor_token(building_id, 'building_id')
+            safe_floor = self._sanitize_floor_token(floor_id, 'floor_id')
+            output = self._run_floor_script(
+                'select_floor_assets.sh',
+                [safe_building, safe_floor],
+                timeout=30.0,
+            )
+            env_updates = self._parse_floor_export_env(output)
+            with self._lock:
+                self.env.update(env_updates)
+            os.environ.update(env_updates)
+            return {
+                'ok': True,
+                'message': f'测试：已选择楼层资产 {safe_building}/{safe_floor}，后续 Web 启动流程会继承该选择',
+                'details': output,
+                'selected': {
+                    'building_id': env_updates.get('NJRH_BUILDING_ID', safe_building),
+                    'floor_id': env_updates.get('NJRH_FLOOR_ID', safe_floor),
+                    'floor_root': env_updates.get('NJRH_CURRENT_FLOOR_ROOT', ''),
+                    'nav_map': env_updates.get('NAV2_MAP_YAML', ''),
+                    'localizer_map': env_updates.get('NAV2_LOCALIZER_MAP_YAML', ''),
+                },
+            }
+        except Exception as exc:
+            return {'ok': False, 'error': str(exc)}
+
+    def _floor_manager_patterns(self) -> List[str]:
+        return [
+            'run_floor_manager.sh',
+            'floor_manager_node',
+            'robot_floor_manager/floor_manager_node',
+        ]
+
+    def _floor_switch_service_available(self) -> bool:
+        output = self._ros_cli_text(
+            ['bash', '-lc', 'source /opt/ros/humble/setup.bash && ros2 service list'],
+            timeout=6.0,
+        )
+        return '/floor_manager/switch_floor' in output
+
+    def _ensure_floor_manager_ready(self) -> List[str]:
+        actions = []
+        if not self._floor_switch_service_available():
+            self._start('floor_manager', ['bash', '-lc', 'bash scripts/run_floor_manager.sh'])
+            actions.append('floor manager start requested')
+            self._wait_until(
+                self._floor_switch_service_available,
+                timeout=25.0,
+                description='/floor_manager/switch_floor service',
+            )
+        else:
+            actions.append('floor manager already running')
+        return actions
+
+    def switch_floor(self, building_id: str, floor_id: str) -> dict:
+        with self._operation_lock:
+            try:
+                safe_building = self._sanitize_floor_token(building_id, 'building_id')
+                safe_floor = self._sanitize_floor_token(floor_id, 'floor_id')
+                actions = []
+                select_result = self.select_floor_assets(safe_building, safe_floor)
+                if not select_result.get('ok'):
+                    return select_result
+                actions.append(select_result.get('message', 'floor assets selected'))
+                actions.extend(self._ensure_floor_manager_ready())
+                payload = "{building_id: '" + safe_building + "', floor_id: '" + safe_floor + "', resume_navigation: true}"
+                ros_command = (
+                    'PROJECT_ROOT="${NJRH_PROJECT_ROOT:-/workspaces/njrh-v3/workspace1}"; '
+                    'cd "${PROJECT_ROOT}" && '
+                    'source /opt/ros/humble/setup.bash && '
+                    '[ ! -f install/local_setup.bash ] || source install/local_setup.bash; '
+                    f'ros2 service call /floor_manager/switch_floor robot_interfaces/srv/SwitchFloor {shlex.quote(payload)}'
+                )
+                completed = subprocess.run(
+                    ['bash', '-lc', ros_command],
+                    cwd=str(self.root_dir),
+                    env=self.env,
+                    capture_output=True,
+                    text=True,
+                    timeout=120.0,
+                    check=False,
+                )
+                output = '\\n'.join(
+                    part.strip()
+                    for part in (completed.stdout or '', completed.stderr or '')
+                    if part and part.strip()
+                ).strip()
+                if completed.returncode != 0:
+                    raise RuntimeError(output or 'floor switch service call failed')
+                lowered = output.lower()
+                if 'success=false' in lowered or 'success: false' in lowered:
+                    raise RuntimeError(output or 'floor switch service returned failure')
+                actions.append('floor switch service call completed')
+                return {
+                    'ok': True,
+                    'message': '测试：' + ', '.join(actions),
+                    'details': output,
+                }
+            except Exception as exc:
+                return {'ok': False, 'error': str(exc)}
+
+"""
+
+
 def patch_dashboard_server_runtime_fixed(path: Path) -> None:
     text = path.read_text(encoding="utf-8")
     text = base.replace_once(
@@ -202,6 +446,46 @@ def patch_dashboard_server_local_costmap_debug(path: Path) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def patch_dashboard_server_floor_testing(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    if "def list_floor_assets(self) -> dict:" not in text:
+        text = base.replace_once(
+            text,
+            "    def start_nvblox(self) -> dict:\n",
+            FLOOR_TESTING_METHODS + "    def start_nvblox(self) -> dict:\n",
+            "floor testing manager methods",
+        )
+    if "            'run_floor_manager.sh',\n            'floor_manager_node',\n        ]\n        patterns.extend" not in text:
+        text = base.replace_once(
+            text,
+            "            'nav_cloud_preprocessor',\n        ]\n",
+            "            'nav_cloud_preprocessor',\n            'run_floor_manager.sh',\n            'floor_manager_node',\n        ]\n",
+            "floor manager stop_core kill patterns",
+        )
+    if "self._stop('floor_manager')" not in text:
+        text = base.replace_once(
+            text,
+            "        self._stop('map_align')\n        self._stop('pgo')\n",
+            "        self._stop('map_align')\n        self._stop('floor_manager')\n        self._stop('pgo')\n",
+            "floor manager stop_core managed process stop",
+        )
+    if "/api/floors/list" not in text:
+        text = base.replace_once(
+            text,
+            "        if parsed.path == '/api/status':\n            self._send_json(self.manager.status_snapshot())\n            return\n",
+            "        if parsed.path == '/api/floors/list':\n            self.manager._trace('HTTP /api/floors/list')\n            self._send_json(self.manager.list_floor_assets())\n            return\n        if parsed.path == '/api/status':\n            self._send_json(self.manager.status_snapshot())\n            return\n",
+            "floor testing list route",
+        )
+    if "/api/floors/promote" not in text:
+        text = base.replace_once(
+            text,
+            "        if parsed.path == '/api/core/stop':\n            self.manager._trace('HTTP /api/core/stop')\n            self._send_json(self.manager.stop_core())\n            return\n",
+            "        if parsed.path == '/api/floors/promote':\n            body = self._read_json()\n            self.manager._trace(\n                f'HTTP /api/floors/promote map={body.get(\"map_name\", \"\")} building={body.get(\"building_id\", \"\")} floor={body.get(\"floor_id\", \"\")}'\n            )\n            result = self.manager.promote_map_to_floor(\n                body.get('map_name', ''),\n                body.get('building_id', ''),\n                body.get('floor_id', ''),\n            )\n            self._send_json(result, status=HTTPStatus.OK if result.get('ok') else HTTPStatus.BAD_REQUEST)\n            return\n        if parsed.path == '/api/floors/select':\n            body = self._read_json()\n            self.manager._trace(\n                f'HTTP /api/floors/select building={body.get(\"building_id\", \"\")} floor={body.get(\"floor_id\", \"\")}'\n            )\n            result = self.manager.select_floor_assets(\n                body.get('building_id', ''),\n                body.get('floor_id', ''),\n            )\n            self._send_json(result, status=HTTPStatus.OK if result.get('ok') else HTTPStatus.BAD_REQUEST)\n            return\n        if parsed.path == '/api/floors/switch':\n            body = self._read_json()\n            self.manager._trace(\n                f'HTTP /api/floors/switch building={body.get(\"building_id\", \"\")} floor={body.get(\"floor_id\", \"\")}'\n            )\n            result = self.manager.switch_floor(\n                body.get('building_id', ''),\n                body.get('floor_id', ''),\n            )\n            self._send_json(result, status=HTTPStatus.OK if result.get('ok') else HTTPStatus.BAD_REQUEST)\n            return\n        if parsed.path == '/api/core/stop':\n            self.manager._trace('HTTP /api/core/stop')\n            self._send_json(self.manager.stop_core())\n            return\n",
+            "floor testing routes",
+        )
+    path.write_text(text, encoding="utf-8")
+
+
 def patch_index_local_costmap_debug(path: Path) -> None:
     text = path.read_text(encoding="utf-8")
     if "startLocalCostmapDebugBtn" not in text:
@@ -216,6 +500,39 @@ def patch_index_local_costmap_debug(path: Path) -> None:
             "    document.getElementById('stopMappingBtn').onclick = () => runAction(async () => {\n",
             "    document.getElementById('startLocalCostmapDebugBtn').onclick = () => runAction(async () => {\n      const result = await callApi('/api/local_costmap_debug/start', 'POST', null, 90000);\n      openMap2dPopup('', true, false, false, 'local_costmap');\n      alert(result.message || '局部障碍地图已启动');\n      refreshRuntime(true);\n    });\n\n    document.getElementById('stopLocalCostmapDebugBtn').onclick = () => runAction(async () => {\n      const result = await callApi('/api/local_costmap_debug/stop', 'POST', null, 30000);\n      alert(result.message || '局部障碍地图已停止');\n      refreshRuntime(true);\n    });\n\n    document.getElementById('stopMappingBtn').onclick = () => runAction(async () => {\n",
             "local costmap debug button handlers",
+        )
+    path.write_text(text, encoding="utf-8")
+
+
+def patch_index_floor_testing(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    if "listFloorAssetsTestBtn" not in text:
+        buttons = (
+            '          <button id="listFloorAssetsTestBtn">测试：列出楼层资产</button>\n'
+            '          <button class="warn" id="promoteFloorAssetTestBtn">测试：归档地图到楼层</button>\n'
+            '          <button class="primary" id="selectFloorAssetTestBtn">测试：选择楼层资产</button>\n'
+            '          <button class="primary" id="switchFloorAssetTestBtn">测试：切换楼层</button>\n'
+        )
+        marker = '          <button class="danger" id="stopLocalCostmapDebugBtn">停止局部障碍地图</button>\n'
+        if marker in text:
+            text = base.replace_once(
+                text,
+                marker,
+                marker + buttons,
+                "floor testing buttons after local costmap debug",
+            )
+        else:
+            text = base.replace_once(
+                text,
+                '          <button class="primary" id="startChassisBtn">启动底盘驱动</button>\n',
+                '          <button class="primary" id="startChassisBtn">启动底盘驱动</button>\n' + buttons,
+                "floor testing buttons",
+            )
+        text = base.replace_once(
+            text,
+            "    document.getElementById('stopMappingBtn').onclick = () => runAction(async () => {\n",
+            "    function floorTestSelection() {\n      const defaultBuilding = localStorage.getItem('njrh_test_building_id') || 'building_1';\n      const buildingId = prompt('测试 building_id', defaultBuilding);\n      if (buildingId === null) return null;\n      const defaultFloor = localStorage.getItem('njrh_test_floor_id') || 'floor_1';\n      const floorId = prompt('测试 floor_id', defaultFloor);\n      if (floorId === null) return null;\n      const cleanBuilding = buildingId.trim();\n      const cleanFloor = floorId.trim();\n      if (!cleanBuilding || !cleanFloor) {\n        alert('building_id 和 floor_id 不能为空');\n        return null;\n      }\n      localStorage.setItem('njrh_test_building_id', cleanBuilding);\n      localStorage.setItem('njrh_test_floor_id', cleanFloor);\n      return { building_id: cleanBuilding, floor_id: cleanFloor };\n    }\n\n    function floorTestMapName() {\n      const mapNameInput = document.getElementById('mapNameInput');\n      const savedMap2dInput = document.getElementById('savedMap2dInput');\n      const navMap2dInput = document.getElementById('navMap2dInput');\n      const defaultName = (\n        (mapNameInput && mapNameInput.value.trim()) ||\n        (savedMap2dInput && savedMap2dInput.value.trim()) ||\n        (navMap2dInput && navMap2dInput.value.trim()) ||\n        localStorage.getItem('njrh_test_map_name') ||\n        ''\n      );\n      const mapName = prompt('测试 map_name（来自已保存的 2D/3D 同名地图）', defaultName);\n      if (mapName === null) return null;\n      const cleanName = mapName.trim();\n      if (!cleanName) {\n        alert('map_name 不能为空');\n        return null;\n      }\n      localStorage.setItem('njrh_test_map_name', cleanName);\n      return cleanName;\n    }\n\n    document.getElementById('listFloorAssetsTestBtn').onclick = () => runAction(async () => {\n      const result = await callApi('/api/floors/list', 'GET', null, 30000);\n      const selected = result.selected || {};\n      const floors = Array.isArray(result.floors) ? result.floors : [];\n      const summary = floors.map((floor) => `${floor.valid ? 'OK' : 'MISSING'} ${floor.building_id}/${floor.floor_id}`).join('\\n');\n      alert(`测试楼层资产根目录: ${result.root}\\n当前选择: ${selected.building_id || '-'} / ${selected.floor_id || '-'}\\n\\n${summary || '未发现楼层资产'}`);\n    });\n\n    document.getElementById('promoteFloorAssetTestBtn').onclick = () => runAction(async () => {\n      const mapName = floorTestMapName();\n      if (!mapName) return;\n      const floor = floorTestSelection();\n      if (!floor) return;\n      const result = await callApi('/api/floors/promote', 'POST', { map_name: mapName, ...floor }, 180000);\n      alert(result.message || '测试：楼层资产归档完成');\n      await Promise.allSettled([refreshRuntime(true), loadAssets(true)]);\n    });\n\n    document.getElementById('selectFloorAssetTestBtn').onclick = () => runAction(async () => {\n      const floor = floorTestSelection();\n      if (!floor) return;\n      const result = await callApi('/api/floors/select', 'POST', floor, 60000);\n      alert(result.message || '测试：楼层资产已选择');\n      refreshRuntime(true);\n    });\n\n    document.getElementById('switchFloorAssetTestBtn').onclick = () => runAction(async () => {\n      const floor = floorTestSelection();\n      if (!floor) return;\n      const result = await callApi('/api/floors/switch', 'POST', floor, 150000);\n      alert(result.message || '测试：楼层切换完成');\n      refreshRuntime(true);\n    });\n\n    document.getElementById('stopMappingBtn').onclick = () => runAction(async () => {\n",
+            "floor testing button handlers",
         )
     path.write_text(text, encoding="utf-8")
 
@@ -405,9 +722,11 @@ def main() -> int:
     base.patch_dashboard_server(dashboard_server_path)
     patch_dashboard_server_runtime_fixed(dashboard_server_path)
     patch_dashboard_server_local_costmap_debug(dashboard_server_path)
+    patch_dashboard_server_floor_testing(dashboard_server_path)
     index_path = Path(args.index_html)
     base.patch_index_html(index_path)
     patch_index_local_costmap_debug(index_path)
+    patch_index_floor_testing(index_path)
     base.patch_map2d_view(Path(args.map2d_view_html))
     patch_nvblox_view_runtime_fixed(Path(args.nvblox_view_html))
 

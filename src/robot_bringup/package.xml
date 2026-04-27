@@ -24,6 +24,7 @@
   <exec_depend>robot_chassis_bridge</exec_depend>
   <exec_depend>robot_description</exec_depend>
   <exec_depend>robot_global_localization</exec_depend>
+  <exec_depend>robot_floor_manager</exec_depend>
   <exec_depend>robot_hesai_jt128</exec_depend>
   <exec_depend>robot_local_perception</exec_depend>
   <exec_depend>robot_local_state</exec_depend>

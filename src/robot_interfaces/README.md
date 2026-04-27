@@ -5,6 +5,7 @@ Shared ROS 2 interfaces for the first-round delivery robot stack.
 ## Scope
 
 - Floor asset apply and localization trigger services
+- Atomic floor switch service for selecting `building_id/floor_id` assets
 - Mission and elevator action contracts
 - Health and mapping status messages
 

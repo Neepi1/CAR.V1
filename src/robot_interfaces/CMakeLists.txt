@@ -9,6 +9,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/LocalizationHealth.msg"
   "msg/MappingJobStatus.msg"
   "srv/ApplyFloorAssets.srv"
+  "srv/SwitchFloor.srv"
   "srv/TriggerLocalization.srv"
   "srv/SetMode.srv"
   "action/MissionTask.action"

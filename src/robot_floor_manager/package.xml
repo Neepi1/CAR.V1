@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>robot_floor_manager</name>
+  <version>0.1.0</version>
+  <description>Atomic floor asset switch manager for map server, global localization, and Nav2 costmap reload.</description>
+  <maintainer email="codex@example.com">Codex</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>nav2_msgs</depend>
+  <depend>rclcpp</depend>
+  <depend>robot_interfaces</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

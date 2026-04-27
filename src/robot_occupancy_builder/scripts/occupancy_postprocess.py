@@ -486,9 +486,10 @@ class OccupancyAccumulator:
         output_root.mkdir(parents=True, exist_ok=True)
         nav_dir = output_root / "nav"
         localizer_dir = output_root / "localizer"
+        filters_dir = output_root / "filters"
         reports_dir = output_root / "reports"
         intermediate_dir = output_root / "intermediate"
-        for directory in (nav_dir, localizer_dir, reports_dir, intermediate_dir):
+        for directory in (nav_dir, localizer_dir, filters_dir, reports_dir, intermediate_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
         occupancy_data = self.occupancy_data()
@@ -498,13 +499,28 @@ class OccupancyAccumulator:
         nav_yaml = nav_dir / "nav_map.yaml"
         localizer_png = localizer_dir / "localizer_map.png"
         localizer_yaml = localizer_dir / "localizer_params.yaml"
+        keepout_mask_pgm = filters_dir / "keepout_mask.pgm"
+        keepout_mask_yaml = filters_dir / "keepout_mask.yaml"
+        speed_mask_pgm = filters_dir / "speed_mask.pgm"
+        speed_mask_yaml = filters_dir / "speed_mask.yaml"
+        binary_mask_pgm = filters_dir / "binary_mask.pgm"
+        binary_mask_yaml = filters_dir / "binary_mask.yaml"
         asset_report = reports_dir / "asset_report.json"
         intermediate_npz = intermediate_dir / "occupancy_layers.npz"
+        poses_yaml = output_root / "poses.yaml"
 
         save_pgm(nav_pgm, self.width, self.height, pixels)
         save_png(localizer_png, self.width, self.height, pixels)
         save_map_yaml(nav_yaml, nav_pgm.name, self.resolution, self.origin_x, self.origin_y)
         save_map_yaml(localizer_yaml, localizer_png.name, self.resolution, self.origin_x, self.origin_y)
+        empty_mask_pixels = [0] * (self.width * self.height)
+        save_pgm(keepout_mask_pgm, self.width, self.height, empty_mask_pixels)
+        save_pgm(speed_mask_pgm, self.width, self.height, empty_mask_pixels)
+        save_pgm(binary_mask_pgm, self.width, self.height, empty_mask_pixels)
+        save_map_yaml(keepout_mask_yaml, keepout_mask_pgm.name, self.resolution, self.origin_x, self.origin_y)
+        save_map_yaml(speed_mask_yaml, speed_mask_pgm.name, self.resolution, self.origin_x, self.origin_y)
+        save_map_yaml(binary_mask_yaml, binary_mask_pgm.name, self.resolution, self.origin_x, self.origin_y)
+        poses_yaml.write_text("poses: []\n", encoding="utf-8")
 
         np.savez_compressed(
             intermediate_npz,
@@ -529,6 +545,12 @@ class OccupancyAccumulator:
             "source_summary": source_summary,
             "nav_map": str(nav_yaml),
             "localizer_map": str(localizer_yaml),
+            "filters": {
+                "keepout": str(keepout_mask_yaml),
+                "speed": str(speed_mask_yaml),
+                "binary": str(binary_mask_yaml),
+            },
+            "poses": str(poses_yaml),
             "intermediate_layers": str(intermediate_npz),
         }
         asset_report.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
@@ -537,7 +559,14 @@ class OccupancyAccumulator:
             "nav_pgm": nav_pgm,
             "localizer_png": localizer_png,
             "localizer_yaml": localizer_yaml,
+            "keepout_mask_yaml": keepout_mask_yaml,
+            "keepout_mask_pgm": keepout_mask_pgm,
+            "speed_mask_yaml": speed_mask_yaml,
+            "speed_mask_pgm": speed_mask_pgm,
+            "binary_mask_yaml": binary_mask_yaml,
+            "binary_mask_pgm": binary_mask_pgm,
             "asset_report": asset_report,
+            "poses_yaml": poses_yaml,
             "intermediate_npz": intermediate_npz,
         }
 

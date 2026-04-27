@@ -1,0 +1,9 @@
+string building_id
+string floor_id
+bool resume_navigation
+---
+bool success
+string message
+string nav_map_yaml
+string localizer_map_png
+string localizer_params_yaml

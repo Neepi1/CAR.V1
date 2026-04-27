@@ -6,6 +6,7 @@ Bringup composition for the repository-owned localization and navigation baselin
 
 - `mock_navigation.launch.py`: first-round lightweight stack for scaffold and mock validation
 - `localization_bringup.launch.py`: canonical platform stack plus optional `nav2_map_server`
+- `localization_bringup.launch.py`: also starts `robot_floor_manager` so floor switches can reuse the active map server and localization services
 - `navigation_bringup.launch.py`: `localization_bringup` + repo-owned standard navigation chain
 - `standard_navigation.launch.py`: repo-owned standard Nav2 stack only, for runtime paths that already started localization separately
 - `local_costmap_debug.launch.py`: repo-owned local-costmap-only debug stack; it starts only `controller_server` and its local costmap lifecycle owner, with `cmd_vel` remapped away from the real control chain
