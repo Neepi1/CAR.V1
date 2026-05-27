@@ -894,6 +894,7 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "docking_undock_service: \"/docking/undock\"" in config
     assert "docking_pre_dock_distance_m: 0.60" in config
     assert "navigation_auto_undock_timeout_sec: 18.0" in config
+    assert "docking_undock_charging_retry_sec: 3.0" in config
     assert "mapping_2d_live_map_topic: \"/map\"" in config
     assert "scan_topic: \"/scan\"" in config
     assert "tf_topic: \"/tf\"" in config
@@ -940,6 +941,7 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "docking_undock_service: \"/docking/undock\"" in overlay_config
     assert "docking_pre_dock_distance_m: 0.60" in overlay_config
     assert "navigation_auto_undock_timeout_sec: 18.0" in overlay_config
+    assert "docking_undock_charging_retry_sec: 3.0" in overlay_config
     assert "teleop_cmd_topic: \"/cmd_vel_collision_checked\"" in overlay_config
     assert "teleop_reverse_enable_topic: \"/ranger_mini3/allow_reverse\"" in overlay_config
     assert "teleop_socket_idle_timeout_sec: 5.0" in overlay_config
@@ -1061,6 +1063,8 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "undock_before_navigation_if_needed" in node_cpp
     assert "start_pre_navigation_undock" in node_cpp
     assert "wait_for_pre_navigation_undock" in node_cpp
+    assert "call_undock_service_with_charging_retry" in node_cpp
+    assert "waiting for docking manager charging state before undock" in node_cpp
     assert "pre_navigation_undock" in node_cpp
     assert "docking_undock_client_" in node_cpp
     assert "docking_status_is_undocked" in node_cpp

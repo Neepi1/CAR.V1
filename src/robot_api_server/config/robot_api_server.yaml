@@ -36,6 +36,7 @@ robot_api_server:
     docking_navigation_start_wait_sec: 45.0
     docking_predock_nav_timeout_sec: 180.0
     navigation_auto_undock_timeout_sec: 18.0
+    docking_undock_charging_retry_sec: 3.0
     mapping_2d_live_map_topic: "/map"
     mapping_2d_live_map_max_age_sec: 3.0
     scan_topic: "/scan"

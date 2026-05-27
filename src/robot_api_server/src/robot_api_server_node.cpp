@@ -1033,6 +1033,8 @@ public:
       std::max(5.0, declare_parameter<double>("docking_predock_nav_timeout_sec", 180.0));
     navigation_auto_undock_timeout_sec_ =
       std::max(service_timeout_sec_, declare_parameter<double>("navigation_auto_undock_timeout_sec", 18.0));
+    docking_undock_charging_retry_sec_ =
+      std::max(0.0, declare_parameter<double>("docking_undock_charging_retry_sec", 3.0));
 
     estop_pub_ = create_publisher<std_msgs::msg::Bool>(safety_estop_topic_, rclcpp::QoS(10).transient_local());
     teleop_cmd_pub_ = create_publisher<geometry_msgs::msg::Twist>(teleop_cmd_topic_, rclcpp::QoS(10));
@@ -5587,7 +5589,7 @@ private:
     }
 
     std::string service_detail;
-    if (!call_docking_trigger_service(docking_undock_client_, docking_undock_service_, service_detail)) {
+    if (!call_undock_service_with_charging_retry(service_detail, teleop_charging_guard_active())) {
       finish_docking_job(job_id, false, "failed", service_detail);
       detail = service_detail;
       return false;
@@ -5603,6 +5605,26 @@ private:
     set_docking_runtime_state(true, "undocking", service_detail);
     detail = service_detail;
     return true;
+  }
+
+  bool call_undock_service_with_charging_retry(std::string & detail, const bool allow_charging_retry)
+  {
+    const auto deadline = std::chrono::steady_clock::now() +
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(docking_undock_charging_retry_sec_));
+    while (true) {
+      if (call_docking_trigger_service(docking_undock_client_, docking_undock_service_, detail)) {
+        return true;
+      }
+      const bool retryable_rejection =
+        detail.find("not docked and no charging contact") != std::string::npos ||
+        detail.find("undock rejected") != std::string::npos;
+      if (!allow_charging_retry || !retryable_rejection || std::chrono::steady_clock::now() >= deadline) {
+        return false;
+      }
+      set_docking_runtime_state(true, "undocking", "waiting for docking manager charging state before undock");
+      std::this_thread::sleep_for(200ms);
+    }
   }
 
   bool wait_for_pre_navigation_undock(std::string & detail)
@@ -6709,7 +6731,7 @@ private:
     }
 
     std::string service_detail;
-    if (!call_docking_trigger_service(docking_undock_client_, docking_undock_service_, service_detail)) {
+    if (!call_undock_service_with_charging_retry(service_detail, charging_contact)) {
       finish_docking_job(job_id, false, "failed", service_detail);
       return {409, "application/json", error_json(service_detail)};
     }
@@ -7322,6 +7344,7 @@ private:
   double docking_navigation_start_wait_sec_{45.0};
   double docking_predock_nav_timeout_sec_{180.0};
   double navigation_auto_undock_timeout_sec_{18.0};
+  double docking_undock_charging_retry_sec_{3.0};
   std::string mapping_2d_live_map_topic_;
   double mapping_2d_live_map_max_age_sec_{3.0};
   std::string scan_topic_;
