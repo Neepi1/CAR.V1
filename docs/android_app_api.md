@@ -571,7 +571,7 @@ GET http://<robot-ip>:8080/api/v1/navigation/state
 
 ## Docking
 
-The App stores a charger as a semantic pose on the selected map. Use `type: "dock"` and make the pose represent the final robot `base_link` pose where the front charging contacts are aligned with the dock. The backend computes the pre-dock pose automatically by backing away along the dock yaw using `docking_pre_dock_distance_m` (default `0.80 m`).
+The App stores a charger as a semantic pose on the selected map. Use `type: "dock"` and make the pose represent the final robot `base_link` pose where the front charging contacts are aligned with the dock. The backend computes the pre-dock pose automatically by backing away along the dock yaw using `docking_pre_dock_distance_m` (default `0.60 m`).
 
 Save or update a dock pose:
 
@@ -630,6 +630,19 @@ The cancel endpoint cancels the pre-dock Nav2 goal, calls `/docking/stop`, and p
 GET http://<robot-ip>:8080/api/v1/docking/state
 GET http://<robot-ip>:8080/api/v1/status
 ```
+
+Undock from a charger:
+
+```text
+POST http://<robot-ip>:8080/api/v1/docking/undock
+Content-Type: application/json
+```
+
+```json
+{"dock_id":"dock_main","reason":"app_manual_undock"}
+```
+
+The undock endpoint is accepted only when the car is already docked or the backend sees live charging contact. It calls the car-side `/docking/undock` service; the App must not send reverse velocity directly. The car backs out through `/cmd_vel_collision_checked`, `robot_safety`, and the Ranger mode controller. Poll `/api/v1/docking/state` until `state` becomes `undocked` or `failed`.
 
 The App must not use mapping teleop or direct velocity commands for docking. Docking motion is owned by Nav2 plus `robot_docking_manager`.
 

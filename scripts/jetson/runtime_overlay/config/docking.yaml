@@ -9,11 +9,13 @@ docking:
     status_topic: /docking/status
     start_service: /docking/start
     stop_service: /docking/stop
+    undock_service: /docking/undock
     charging_state_topic: /battery_state
 
     mode:
       forced_mode_topic: /ranger_mini3/forced_mode
       park_topic: /ranger_mini3/park
+      reverse_enable_topic: /ranger_mini3/allow_reverse
       use_crab_mode: true
       crab_forced_mode: crab
       release_forced_mode: auto
@@ -37,11 +39,17 @@ docking:
       negative_electrode_position: lower
 
     approach:
-      pre_dock_distance_m: 0.80
+      pre_dock_distance_m: 0.60
       blind_approach_max_distance_m: 0.50
       blind_approach_speed_mps: 0.06
       gs2_acquire_distance_m: 0.28
       final_target_distance_m: 0.05
+
+    undock:
+      distance_m: 0.60
+      speed_mps: 0.06
+      min_clear_distance_m: 0.45
+      timeout_s: 12.0
 
     tolerances:
       lateral_soft_limit_m: 0.015

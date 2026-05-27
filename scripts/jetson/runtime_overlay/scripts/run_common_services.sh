@@ -88,7 +88,7 @@ start_overlay_helper "local_perception_common" bash "${SCRIPT_DIR}/run_local_per
 start_overlay_helper "floor_manager_common" bash "${SCRIPT_DIR}/run_floor_manager.sh"
 start_overlay_helper "robot_safety_common" bash "${SCRIPT_DIR}/run_robot_safety.sh"
 start_overlay_helper "ranger_mini3_mode_controller_common" bash "${SCRIPT_DIR}/run_ranger_mini3_mode_controller.sh"
-start_common_process "robot_api_server" "run_robot_api_server_supervised.sh|robot_api_server/robot_api_server_node|robot_api_server_node --ros-args" \
+start_common_process "robot_api_server" "run_robot_api_server.sh|run_robot_api_server_supervised.sh|robot_api_server/robot_api_server_node|robot_api_server_node --ros-args" \
   bash "${SCRIPT_DIR}/run_robot_api_server_supervised.sh"
 
 echo "[runtime-overlay] common services are running; start mapping or navigation scripts in reuse mode" >&2

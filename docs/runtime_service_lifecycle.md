@@ -23,7 +23,7 @@ Mode services are allowed to start and stop when switching between navigation an
 
 - Navigation: Isaac localization stack, `robot_localization_bridge`, Nav2, velocity smoother, collision monitor.
 - Mapping: FAST-LIO2, PGO, slam_toolbox 2D mapping, scan slicing helpers.
-- Docking: `robot_docking_manager`, started only for near-field charging alignment after Nav2 reaches the pre-dock pose.
+- Docking: `robot_docking_manager`, started for near-field charging alignment after Nav2 reaches the pre-dock pose, and reused for controlled `/docking/undock` so reverse motion stays behind `robot_safety`.
 - Current field-default mapping: slam_toolbox 2D mapping only. FAST-LIO2/PGO are retained as optional formal mapping services, not the default daily mapping mode.
 
 By default, runtime scripts reuse common services:

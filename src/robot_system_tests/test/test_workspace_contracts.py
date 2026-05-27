@@ -134,8 +134,10 @@ def test_docking_geometry_is_configured():
         assert "status_topic: /docking/status" in cfg
         assert "start_service: /docking/start" in cfg
         assert "stop_service: /docking/stop" in cfg
+        assert "undock_service: /docking/undock" in cfg
         assert "forced_mode_topic: /ranger_mini3/forced_mode" in cfg
         assert "park_topic: /ranger_mini3/park" in cfg
+        assert "reverse_enable_topic: /ranger_mini3/allow_reverse" in cfg
         assert "use_crab_mode: true" in cfg
         assert "gs2_z_m: 0.290" in cfg
         assert "charge_contact_x_m: 0.398" in cfg
@@ -150,6 +152,11 @@ def test_docking_geometry_is_configured():
         assert "stable_frames_required: 3" in cfg
         assert "filter_alpha: 0.25" in cfg
         assert "use_yaw_fit: false" in cfg
+        assert "pre_dock_distance_m: 0.60" in cfg
+        assert "distance_m: 0.60" in cfg
+        assert "speed_mps: 0.06" in cfg
+        assert "min_clear_distance_m: 0.45" in cfg
+        assert "timeout_s: 12.0" in cfg
         assert "max_angular_speed_radps: 0.12" in cfg
         assert "ky: 0.55" in cfg
         assert "ky_lateral: 0.70" in cfg
@@ -189,13 +196,20 @@ def test_robot_docking_manager_is_safety_chained_cpp():
     assert 'declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel_collision_checked")' in node
     assert 'declare_parameter<std::string>("start_service", "/docking/start")' in node
     assert 'declare_parameter<std::string>("stop_service", "/docking/stop")' in node
+    assert 'declare_parameter<std::string>("undock_service", "/docking/undock")' in node
     assert 'declare_parameter<std::string>("mode.forced_mode_topic", "/ranger_mini3/forced_mode")' in node
+    assert 'declare_parameter<std::string>("mode.reverse_enable_topic", "/ranger_mini3/allow_reverse")' in node
     assert 'declare_parameter<bool>("mode.use_crab_mode", true)' in node
     assert "create_service<std_srvs::srv::Trigger>" in node
     assert "create_subscription<sensor_msgs::msg::LaserScan>" in node
     assert "create_subscription<sensor_msgs::msg::BatteryState>" in node
     assert "State::BlindApproach" in node
     assert "State::ContactVerify" in node
+    assert "State::Undocking" in node
+    assert "start_undocking" in node
+    assert "handle_undocking" in node
+    assert "publish_reverse_enable(true)" in node
+    assert "cmd.linear.x = -speed" in node
     assert "POWER_SUPPLY_STATUS_CHARGING" in node
     assert "battery_indicates_charging" in node
     assert "docked_stop(\"docked_charging_detected\")" in node
@@ -215,9 +229,12 @@ def test_robot_docking_manager_is_safety_chained_cpp():
     assert "install/robot_docking_manager/lib/robot_docking_manager/docking_manager_node" in runner
     assert "Python fallback has been removed" in runner
     assert "/cmd_vel_collision_checked" in readme
+    assert "/docking/undock" in readme
+    assert "/ranger_mini3/allow_reverse=true" in readme
     assert "robot_safety" in readme
     assert "rosbag" in readme
     assert "Do not publish docking control directly to `/cmd_vel_safe`" in gs2_doc
+    assert "POST /api/v1/docking/undock" in gs2_doc
 
 
 def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
@@ -874,6 +891,8 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "run_projected_map.sh" in config
     assert "navigation_resume_command" in config
     assert "run_floor_navigation.sh" in config
+    assert "docking_undock_service: \"/docking/undock\"" in config
+    assert "docking_pre_dock_distance_m: 0.60" in config
     assert "mapping_2d_live_map_topic: \"/map\"" in config
     assert "scan_topic: \"/scan\"" in config
     assert "tf_topic: \"/tf\"" in config
@@ -917,6 +936,8 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "mapping_2d_start_command" in overlay_config
     assert "navigation_resume_command" in overlay_config
     assert "run_floor_navigation.sh" in overlay_config
+    assert "docking_undock_service: \"/docking/undock\"" in overlay_config
+    assert "docking_pre_dock_distance_m: 0.60" in overlay_config
     assert "teleop_cmd_topic: \"/cmd_vel_collision_checked\"" in overlay_config
     assert "teleop_reverse_enable_topic: \"/ranger_mini3/allow_reverse\"" in overlay_config
     assert "teleop_socket_idle_timeout_sec: 5.0" in overlay_config
@@ -958,6 +979,8 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "POST /api/v1/maps/poses/save_current" in app_doc
     assert "POST /api/v1/maps/filters/keepout/save" in app_doc
     assert "POST /api/v1/navigation/goal" in app_doc
+    assert "POST http://<robot-ip>:8080/api/v1/docking/undock" in app_doc
+    assert "The App must not use mapping teleop or direct velocity commands for docking" in app_doc
     assert "NavigateToPose" in app_doc
     assert "The App must not send `/cmd_vel` for task navigation" in app_doc
     assert "mapping_active" in app_doc
@@ -1030,6 +1053,11 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "patch_dashboard_runtime" not in node_cpp
     assert "system(" not in node_cpp
     assert "popen(" not in node_cpp
+    assert "/api/v1/docking/undock" in node_cpp
+    assert "handle_docking_undock" in node_cpp
+    assert "docking_undock_client_" in node_cpp
+    assert "docking_status_is_undocked" in node_cpp
+    assert "undock requires docked state or live charging contact" in node_cpp
 
 
 def test_ranger_mini3_mode_controller_is_cpp_and_rejects_lateral_reverse():
@@ -1055,11 +1083,13 @@ def test_ranger_mini3_mode_controller_is_cpp_and_rejects_lateral_reverse():
     assert "reverse_enable_topic: /ranger_mini3/allow_reverse" in config
     assert "reverse_enable_timeout_s: 0.75" in config
     assert "spin_steering_threshold_rad: 0.698" in config
+    assert "spin_enter_steering_threshold_rad: 0.698" in config
     assert "lateral_policy: reject" in overlay_config
     assert "max_lateral_mps: 0.08" in overlay_config
     assert "max_crab_yaw_radps: 0.15" in overlay_config
     assert "allow_reverse: false" in overlay_config
     assert "reverse_enable_topic: /ranger_mini3/allow_reverse" in overlay_config
+    assert "spin_enter_steering_threshold_rad: 0.698" in overlay_config
     assert "Lateral / crab commands are disabled" in node_cpp
     assert "forced_policy_ = \"crab\"" in node_cpp
     assert "msg.linear.y = command.lateral_mps" in node_cpp

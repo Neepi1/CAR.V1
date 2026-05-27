@@ -985,9 +985,10 @@ public:
       declare_parameter<std::string>("docking_manager_log_file", "/tmp/njrh_docking_manager.log");
     docking_start_service_ = declare_parameter<std::string>("docking_start_service", "/docking/start");
     docking_stop_service_ = declare_parameter<std::string>("docking_stop_service", "/docking/stop");
+    docking_undock_service_ = declare_parameter<std::string>("docking_undock_service", "/docking/undock");
     docking_status_topic_ = declare_parameter<std::string>("docking_status_topic", "/docking/status");
     docking_pre_dock_distance_m_ =
-      std::max(0.05, declare_parameter<double>("docking_pre_dock_distance_m", 0.80));
+      std::max(0.05, declare_parameter<double>("docking_pre_dock_distance_m", 0.60));
     mapping_2d_live_map_topic_ = declare_parameter<std::string>("mapping_2d_live_map_topic", "/map");
     mapping_2d_live_map_max_age_sec_ =
       std::max(0.1, declare_parameter<double>("mapping_2d_live_map_max_age_sec", 3.0));
@@ -1071,6 +1072,8 @@ public:
       docking_start_service_, rmw_qos_profile_services_default, callback_group_);
     docking_stop_client_ = create_client<std_srvs::srv::Trigger>(
       docking_stop_service_, rmw_qos_profile_services_default, callback_group_);
+    docking_undock_client_ = create_client<std_srvs::srv::Trigger>(
+      docking_undock_service_, rmw_qos_profile_services_default, callback_group_);
     navigate_to_pose_client_ = rclcpp_action::create_client<NavigateToPose>(this, navigate_to_pose_action_);
 
     start_server();
@@ -1950,6 +1953,9 @@ private:
     if (request.method == "POST" && request.path == "/api/v1/docking/start") {
       return handle_docking_start(request.body);
     }
+    if (request.method == "POST" && request.path == "/api/v1/docking/undock") {
+      return handle_docking_undock(request.body);
+    }
     if (request.method == "POST" &&
       (request.path == "/api/v1/docking/cancel" || request.path == "/api/v1/docking/stop")) {
       return handle_docking_cancel(request.body);
@@ -2160,6 +2166,7 @@ private:
       "\"POST /api/v1/navigation/cancel\","
       "\"GET /api/v1/docking/state\","
       "\"POST /api/v1/docking/start\","
+      "\"POST /api/v1/docking/undock\","
       "\"POST /api/v1/docking/cancel\","
       "\"POST /api/v1/docking/stop\","
       "\"WS /ws/v1/teleop\""
@@ -6039,13 +6046,23 @@ private:
 
   bool docking_status_is_success(const std::string & status) const
   {
-    return status.find("docked") != std::string::npos || status.find("charging") != std::string::npos;
+    return starts_with(status, "docked") || starts_with(status, "charging");
   }
 
   bool docking_status_is_failure(const std::string & status) const
   {
     return status.find("failed") != std::string::npos || status.find("timeout") != std::string::npos ||
-      status.find("outside hard limit") != std::string::npos;
+      status.find("outside hard limit") != std::string::npos || starts_with(status, "undock_failed");
+  }
+
+  bool docking_status_is_undocking(const std::string & status) const
+  {
+    return starts_with(status, "undocking");
+  }
+
+  bool docking_status_is_undocked(const std::string & status) const
+  {
+    return starts_with(status, "undocked");
   }
 
   bool docking_status_is_stopped(const std::string & status) const
@@ -6063,9 +6080,23 @@ private:
     std::lock_guard<std::mutex> lock(docking_job_mutex_);
     docking_job_.last_status = status;
     if (docking_job_.state != "running") {
+      if (docking_status_is_undocking(status)) {
+        set_docking_runtime_state(true, "undocking", status);
+      } else if (docking_status_is_undocked(status)) {
+        set_docking_runtime_state(false, "undocked", status);
+      } else if (starts_with(status, "undock_failed")) {
+        set_docking_runtime_state(false, "failed", status);
+      }
       return;
     }
-    if (docking_status_is_success(status)) {
+    if (docking_status_is_undocked(status)) {
+      finish_docking_job_locked(true, "undocked", status);
+    } else if (starts_with(status, "undock_failed")) {
+      finish_docking_job_locked(false, "failed", status);
+    } else if (docking_status_is_undocking(status)) {
+      docking_job_.phase = "undocking";
+      set_docking_runtime_state(true, "undocking", status);
+    } else if (docking_status_is_success(status)) {
       finish_docking_job_locked(true, "docked", status);
     } else if (docking_status_is_failure(status)) {
       finish_docking_job_locked(false, "failed", status);
@@ -6471,6 +6502,99 @@ private:
     response << "{\"ok\":true,\"accepted\":true,\"navigation_cancel_detail\":"
              << json_string(nav_detail) << ",\"docking_stop_detail\":" << json_string(stop_detail)
              << ",\"docking\":" << docking_job_json_locked() << "}";
+    return {202, "application/json", response.str()};
+  }
+
+  HttpResponse handle_docking_undock(const std::string & body)
+  {
+    const auto reason = json_string_value(body, "reason").value_or("app_manual_undock");
+    auto dock_id = json_string_value(body, "dock_id").value_or("");
+    if (!dock_id.empty() && !safe_pose_id(dock_id)) {
+      return {400, "application/json", error_json("dock_id must be a safe pose id when provided")};
+    }
+
+    clear_teleop_command();
+    publish_teleop_zero_burst();
+
+    std::lock_guard<std::mutex> start_lock(docking_start_mutex_);
+    {
+      std::lock_guard<std::mutex> lock(docking_job_mutex_);
+      if (docking_job_.state == "running") {
+        if (docking_job_.phase == "undocking") {
+          std::ostringstream response;
+          response << "{\"ok\":true,\"accepted\":true,\"already_running\":true,"
+                   << "\"docking\":" << docking_job_json_locked() << "}";
+          return {202, "application/json", response.str()};
+        }
+        return {409, "application/json", error_json("cannot undock while docking job is running")};
+      }
+      if (dock_id.empty()) {
+        dock_id = docking_job_.dock_id;
+      }
+    }
+
+    join_docking_worker();
+
+    const auto runtime = runtime_mode_snapshot();
+    if (dock_id.empty()) {
+      dock_id = runtime.docking_dock_id;
+    }
+    const bool charging_contact = teleop_charging_guard_active();
+    const bool docked_state = runtime.docking_state == "docked" ||
+      docking_status_is_success(runtime.docking_status);
+    if (!docked_state && !charging_contact) {
+      return {
+        409,
+        "application/json",
+        error_json("undock requires docked state or live charging contact")};
+    }
+
+    std::string ensure_detail;
+    if (!ensure_docking_manager_running(ensure_detail)) {
+      return {500, "application/json", error_json(ensure_detail)};
+    }
+
+    DockingJob next_job;
+    next_job.state = "running";
+    next_job.phase = "undocking";
+    next_job.dock_id = dock_id;
+    next_job.detail = reason;
+    next_job.last_status = "undocking accepted";
+    next_job.started_at = utc_timestamp_iso8601();
+    next_job.resume_navigation = false;
+
+    std::uint64_t job_id = 0U;
+    {
+      std::lock_guard<std::mutex> lock(docking_job_mutex_);
+      job_id = ++docking_job_seq_;
+      next_job.id = job_id;
+      docking_job_ = next_job;
+    }
+    set_docking_runtime_state(true, "undocking", "undocking accepted");
+    {
+      std::lock_guard<std::mutex> runtime_lock(runtime_mode_mutex_);
+      docking_runtime_dock_id_ = dock_id;
+      runtime_message_ = "undocking accepted";
+    }
+
+    std::string service_detail;
+    if (!call_docking_trigger_service(docking_undock_client_, docking_undock_service_, service_detail)) {
+      finish_docking_job(job_id, false, "failed", service_detail);
+      return {409, "application/json", error_json(service_detail)};
+    }
+    {
+      std::lock_guard<std::mutex> lock(docking_job_mutex_);
+      if (docking_job_.id == job_id && docking_job_.state == "running") {
+        docking_job_.docking_service_called = true;
+        docking_job_.detail = service_detail;
+        docking_job_.last_status = service_detail;
+      }
+    }
+    set_docking_runtime_state(true, "undocking", service_detail);
+
+    std::lock_guard<std::mutex> lock(docking_job_mutex_);
+    std::ostringstream response;
+    response << "{\"ok\":true,\"accepted\":true,\"docking\":" << docking_job_json_locked() << "}";
     return {202, "application/json", response.str()};
   }
 
@@ -7061,8 +7185,9 @@ private:
   std::string docking_manager_log_file_;
   std::string docking_start_service_;
   std::string docking_stop_service_;
+  std::string docking_undock_service_;
   std::string docking_status_topic_;
-  double docking_pre_dock_distance_m_{0.80};
+  double docking_pre_dock_distance_m_{0.60};
   double docking_navigation_start_wait_sec_{45.0};
   double docking_predock_nav_timeout_sec_{180.0};
   std::string mapping_2d_live_map_topic_;
@@ -7206,6 +7331,7 @@ private:
   rclcpp::Client<robot_interfaces::srv::TriggerLocalization>::SharedPtr localization_trigger_client_;
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr docking_start_client_;
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr docking_stop_client_;
+  rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr docking_undock_client_;
   rclcpp_action::Client<NavigateToPose>::SharedPtr navigate_to_pose_client_;
 };
 

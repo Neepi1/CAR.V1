@@ -30,8 +30,9 @@ robot_api_server:
     docking_manager_log_file: "/tmp/njrh_docking_manager.log"
     docking_start_service: "/docking/start"
     docking_stop_service: "/docking/stop"
+    docking_undock_service: "/docking/undock"
     docking_status_topic: "/docking/status"
-    docking_pre_dock_distance_m: 0.80
+    docking_pre_dock_distance_m: 0.60
     docking_navigation_start_wait_sec: 45.0
     docking_predock_nav_timeout_sec: 180.0
     mapping_2d_live_map_topic: "/map"

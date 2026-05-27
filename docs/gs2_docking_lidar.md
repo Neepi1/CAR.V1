@@ -85,13 +85,15 @@ source /workspaces/njrh-v3/workspace1/install/setup.bash
 ros2 launch robot_eai_gs2 gs2.launch.py serial_port:=/dev/gs2
 ```
 
-Start the near-field docking controller only when entering docking mode:
+Start the near-field docking controller only when entering docking or controlled undocking mode:
 
 ```bash
 bash /workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/run_docking_manager.sh
 ros2 service call /docking/start std_srvs/srv/Trigger {}
 ros2 topic echo /docking/status
 ```
+
+For App-triggered undocking, call `POST /api/v1/docking/undock`; the API forwards the intent to `/docking/undock`. Do not publish reverse `/cmd_vel` directly, because reverse permission and final motion arbitration must remain inside `robot_docking_manager`, `robot_safety`, and the Ranger mode controller.
 
 Normal execution does not require `rosbag`. Use `rosbag2` for tuning and regression captures of `/dock/gs2_scan`, `/battery_state`, `/tf`, `/cmd_vel_collision_checked`, `/cmd_vel_safe`, `/ranger_mini3/forced_mode`, and `/ranger_mini3_mode_controller/status`.
 

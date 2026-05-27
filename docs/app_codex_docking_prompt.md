@@ -31,7 +31,7 @@ Content-Type: application/json
 }
 ```
 
-点位语义：这是最终充电接触成功时机器人 `base_link` 在地图中的位姿，不是预对桩点。车端会按配置自动从这个位姿后退 `0.80m` 生成预对桩点。
+点位语义：这是最终充电接触成功时机器人 `base_link` 在地图中的位姿，不是预对桩点。车端会按配置自动从这个位姿后退 `0.60m` 生成预对桩点。
 
 启动对桩：
 
@@ -61,6 +61,20 @@ Content-Type: application/json
 {"reason":"app_cancel"}
 ```
 
+离桩：
+
+```http
+POST /api/v1/docking/undock
+Content-Type: application/json
+```
+
+```json
+{
+  "dock_id": "dock_main",
+  "reason": "app_manual_undock"
+}
+```
+
 查询对桩状态：
 
 ```http
@@ -76,7 +90,7 @@ GET /api/v1/status
   "docking_active": true,
   "docking": {
     "active": true,
-    "state": "accepted|nav_to_predock|fine_docking|docked|failed|canceled",
+    "state": "accepted|nav_to_predock|fine_docking|docked|undocking|undocked|failed|canceled",
     "dock_id": "dock_main",
     "last_status": "..."
   }
@@ -89,8 +103,10 @@ GET /api/v1/status
 - 用户点“回充/对桩”时调用 `POST /api/v1/docking/start`，不要直接发速度。
 - 对桩过程中轮询 `/status` 或 `/docking/state`。
 - `docking.state == "docked"` 显示已对桩/充电。
+- `docking.state == "undocking"` 显示正在离桩，`docking.state == "undocked"` 显示离桩完成。
 - `docking.state == "failed"` 显示失败原因 `docking.last_status` 或 `message`。
 - 用户点取消时调用 `/api/v1/docking/cancel`。
+- 用户点“离桩”时调用 `/api/v1/docking/undock`，不要直接发倒车速度。
 
 ## 工程边界
 
@@ -107,3 +123,14 @@ App
 ```
 
 App 不启动 Nav2 lifecycle，不订阅 ROS DDS，不直接控制底盘。
+
+离桩链路是：
+
+```text
+App
+ -> robot_api_server
+ -> robot_docking_manager /docking/undock
+ -> robot_safety
+ -> ranger_mini3_mode_controller
+ -> ranger_base_node
+```

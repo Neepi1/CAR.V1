@@ -32,6 +32,7 @@ It does not own mapping, localization, navigation, or chassis control logic. It 
 - `POST /api/v1/navigation/cancel` accepts a background cancel job, publishes zero velocity immediately, then cancels Nav2 and stops the Nav2 plus 2D localization runtime while keeping common services alive.
 - `GET /api/v1/navigation/state` returns the latest background navigation cancel job state for App polling and diagnostics.
 - `POST /api/v1/docking/start` resolves a saved dock pose, computes a pre-dock approach pose, sends Nav2 to that pose, then calls `/docking/start` for GS2 fine docking.
+- `POST /api/v1/docking/undock` accepts the App's undock intent only when the robot is docked or live charging contact is detected, then calls `/docking/undock`; the App must not publish reverse velocity directly.
 - `POST /api/v1/docking/cancel` / `POST /api/v1/docking/stop` cancels the pre-dock Nav2 goal, publishes zero velocity, and calls `/docking/stop`.
 - `GET /api/v1/docking/state` returns the latest docking job and `/docking/status` state.
 - `GET /api/v1/status` includes HTTP active/max connection counters; the server rejects excess clients with `503` instead of spawning unbounded detached threads.
@@ -88,6 +89,7 @@ ros2 launch robot_api_server robot_api_server.launch.py \
 - `POST /api/v1/navigation/cancel`
 - `GET /api/v1/docking/state`
 - `POST /api/v1/docking/start`
+- `POST /api/v1/docking/undock`
 - `POST /api/v1/docking/cancel`
 - `POST /api/v1/docking/stop`
 - `WS /ws/v1/teleop`
@@ -412,7 +414,7 @@ GET /api/v1/navigation/state
 
 ## Docking
 
-Docking is a two-stage backend workflow. The App stores a dock pose in the same `poses.yaml` mechanism as delivery points, normally with `type: "dock"`. That pose represents the final robot `base_link` pose when the front charging contacts are aligned with the physical dock. The API computes the pre-dock pose by backing up from that final pose along its yaw by `docking_pre_dock_distance_m` (default `0.80 m`).
+Docking is a two-stage backend workflow. The App stores a dock pose in the same `poses.yaml` mechanism as delivery points, normally with `type: "dock"`. That pose represents the final robot `base_link` pose when the front charging contacts are aligned with the physical dock. The API computes the pre-dock pose by backing up from that final pose along its yaw by `docking_pre_dock_distance_m` (default `0.60 m`).
 
 Start docking:
 
@@ -445,7 +447,22 @@ GET /api/v1/docking/state
 GET /api/v1/status
 ```
 
-Relevant states are `accepted`, `nav_to_predock`, `fine_docking`, `docked`, `failed`, and `canceled`.
+Undock from a charger:
+
+```http
+POST /api/v1/docking/undock
+```
+
+```json
+{
+  "dock_id": "dock_main",
+  "reason": "app_manual_undock"
+}
+```
+
+The undock endpoint is accepted only when the backend state is already docked or the API sees live charging contact. It starts `robot_docking_manager` if needed, calls `/docking/undock`, and tracks the job as `undocking` until `/docking/status` reports `undocked` or `undock_failed...`. Reverse motion remains inside the normal safety chain: `robot_docking_manager -> /cmd_vel_collision_checked -> robot_safety -> /cmd_vel_safe -> ranger_mini3_mode_controller -> /cmd_vel`.
+
+Relevant states are `accepted`, `nav_to_predock`, `fine_docking`, `docked`, `undocking`, `undocked`, `failed`, and `canceled`.
 
 Saved-map preview is explicit:
 

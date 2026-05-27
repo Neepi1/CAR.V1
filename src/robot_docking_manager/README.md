@@ -6,10 +6,11 @@ Runtime contract:
 
 - Input scan: `/dock/gs2_scan` in `gs2_link`
 - Charging state: `/battery_state`
-- Start/stop services: `/docking/start`, `/docking/stop`
+- Start/stop/undock services: `/docking/start`, `/docking/stop`, `/docking/undock`
 - Status: `/docking/status`
 - Command output: `/cmd_vel_collision_checked`
 - Mode request: `/ranger_mini3/forced_mode=crab` during active docking, then `auto` on stop or `park` after charging is detected
+- Reverse enable: `/ranger_mini3/allow_reverse=true` only during controlled undocking, then `false`
 
 The node deliberately publishes before `robot_safety`, not directly to `/cmd_vel_safe` or `/cmd_vel`. The command path remains:
 
@@ -28,3 +29,5 @@ robot_docking_manager
 The first field profile is intentionally conservative: GS2 yaw line-fitting is disabled by default, lateral error is low-pass filtered and deadbanded, and active docking forces Ranger crab mode so `linear.y` can correct lateral offset directly. The GS2 lateral sign is inverted for the current physical mounting through `controller.lateral_command_sign=-1.0`; if a future mount reports `y` with the ROS `base_link` sign, change that value back to `1.0`. Docking is staged: while lateral or yaw error is outside the priority threshold, `max_forward_while_lateral_mps=0.000` keeps the robot from advancing. The lateral tolerance is `1.5cm`, and `min_lateral_speed_mps=0.025` keeps small residual corrections above the downstream Ranger command deadband. Once centered, `lock_lateral_during_final_insert=true` forces `linear.y=0` so the final contact insert is straight forward only.
 
 Charging detection is a global hard stop. If `/battery_state` reports charging/full or the charging current exceeds `charging.min_current_a`, the node immediately publishes zero velocity and enters `Docked`, even if the controller is still in the align phase.
+
+Undocking is a separate low-speed safety strategy, not an App velocity command. `/docking/undock` is accepted only from `Docked` or when live charging contact is detected. The node releases park/charging hold, enables reverse at the Ranger mode controller, and backs out along `base_link` negative X using `undock.speed_mps` until `undock.distance_m` is reached or `undock.timeout_s` expires. Commands still go through `/cmd_vel_collision_checked` and `robot_safety`; any downstream obstacle, estop, or chassis rejection must stop the robot before `/cmd_vel`.

@@ -79,6 +79,8 @@ public:
       forced_mode_topic_, rclcpp::QoS(1).transient_local());
     park_pub_ = create_publisher<std_msgs::msg::Bool>(
       park_topic_, rclcpp::QoS(1).transient_local());
+    reverse_enable_pub_ = create_publisher<std_msgs::msg::Bool>(
+      reverse_enable_topic_, rclcpp::QoS(1).transient_local());
 
     start_srv_ = create_service<std_srvs::srv::Trigger>(
       start_service_,
@@ -100,6 +102,16 @@ public:
         response->message = "docking stopped";
       });
 
+    undock_srv_ = create_service<std_srvs::srv::Trigger>(
+      undock_service_,
+      [this](
+        const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+        std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+        std::string message;
+        response->success = start_undocking(message);
+        response->message = message;
+      });
+
     timer_ = create_wall_timer(
       std::chrono::milliseconds(static_cast<int>(1000.0 / control_rate_hz_)),
       [this]() { control_step(); });
@@ -116,6 +128,7 @@ private:
     Acquire,
     Align,
     ContactVerify,
+    Undocking,
     Docked,
     Failed
   };
@@ -138,9 +151,12 @@ private:
     status_topic_ = declare_parameter<std::string>("status_topic", "/docking/status");
     start_service_ = declare_parameter<std::string>("start_service", "/docking/start");
     stop_service_ = declare_parameter<std::string>("stop_service", "/docking/stop");
+    undock_service_ = declare_parameter<std::string>("undock_service", "/docking/undock");
     charging_state_topic_ = declare_parameter<std::string>("charging_state_topic", "/battery_state");
     forced_mode_topic_ = declare_parameter<std::string>("mode.forced_mode_topic", "/ranger_mini3/forced_mode");
     park_topic_ = declare_parameter<std::string>("mode.park_topic", "/ranger_mini3/park");
+    reverse_enable_topic_ =
+      declare_parameter<std::string>("mode.reverse_enable_topic", "/ranger_mini3/allow_reverse");
     use_crab_mode_ = declare_parameter<bool>("mode.use_crab_mode", true);
     crab_forced_mode_ = declare_parameter<std::string>("mode.crab_forced_mode", "crab");
     release_forced_mode_ = declare_parameter<std::string>("mode.release_forced_mode", "auto");
@@ -154,6 +170,10 @@ private:
     blind_approach_speed_mps_ = declare_parameter<double>("approach.blind_approach_speed_mps", 0.06);
     gs2_acquire_distance_m_ = declare_parameter<double>("approach.gs2_acquire_distance_m", 0.28);
     final_target_distance_m_ = declare_parameter<double>("approach.final_target_distance_m", 0.05);
+    undock_distance_m_ = declare_parameter<double>("undock.distance_m", 0.60);
+    undock_speed_mps_ = declare_parameter<double>("undock.speed_mps", 0.06);
+    undock_min_clear_distance_m_ = declare_parameter<double>("undock.min_clear_distance_m", 0.45);
+    undock_timeout_s_ = declare_parameter<double>("undock.timeout_s", 12.0);
 
     lateral_soft_limit_m_ = declare_parameter<double>("tolerances.lateral_soft_limit_m", 0.030);
     lateral_hard_limit_m_ = declare_parameter<double>("tolerances.lateral_hard_limit_m", 0.050);
@@ -221,6 +241,7 @@ private:
   {
     state_ = State::Idle;
     publish_zero();
+    publish_reverse_enable(false);
     release_docking_motion_mode(false);
     publish_status(reason);
   }
@@ -229,8 +250,32 @@ private:
   {
     state_ = State::Failed;
     publish_zero();
+    publish_reverse_enable(false);
     release_docking_motion_mode(false);
     publish_status(reason);
+  }
+
+  bool start_undocking(std::string & message)
+  {
+    charging_detected_ = latest_battery_ && battery_indicates_charging(*latest_battery_);
+    if (state_ == State::Undocking) {
+      message = "undocking already active";
+      return true;
+    }
+    if (state_ != State::Docked && !charging_detected_) {
+      message = "undock rejected: robot is not docked and no charging contact is detected";
+      publish_status("undock_rejected_not_docked");
+      return false;
+    }
+
+    publish_park(false);
+    publish_forced_mode(release_forced_mode_);
+    publish_reverse_enable(true);
+    state_ = State::Undocking;
+    state_entered_time_ = now();
+    message = "undocking started";
+    publish_status("undocking");
+    return true;
   }
 
   void transition(State next, const std::string & status)
@@ -242,6 +287,11 @@ private:
 
   void control_step()
   {
+    if (state_ == State::Undocking) {
+      handle_undocking();
+      return;
+    }
+
     if (state_ == State::Idle || state_ == State::Docked || state_ == State::Failed) {
       return;
     }
@@ -278,6 +328,9 @@ private:
         break;
       case State::ContactVerify:
         handle_contact_verify();
+        break;
+      case State::Undocking:
+        handle_undocking();
         break;
       case State::Idle:
       case State::Docked:
@@ -503,6 +556,44 @@ private:
     publish_cmd(cmd);
   }
 
+  void handle_undocking()
+  {
+    const double speed = clamp(undock_speed_mps_, 0.0, max_linear_speed_mps_);
+    if (speed <= 1.0e-3) {
+      fail("undock_failed_invalid_speed");
+      return;
+    }
+
+    const double elapsed = (now() - state_entered_time_).seconds();
+    const double distance = std::max(0.0, undock_distance_m_);
+    const double traveled = elapsed * speed;
+    if (traveled >= distance) {
+      state_ = State::Idle;
+      publish_zero();
+      publish_reverse_enable(false);
+      release_docking_motion_mode(false);
+      std::ostringstream status;
+      status << "undocked distance=" << std::fixed << std::setprecision(3) << distance;
+      publish_status(status.str());
+      return;
+    }
+    if (elapsed > undock_timeout_s_) {
+      fail("undock_failed_timeout");
+      return;
+    }
+
+    geometry_msgs::msg::Twist cmd;
+    cmd.linear.x = -speed;
+    publish_reverse_enable(true);
+    publish_cmd(cmd);
+
+    std::ostringstream status;
+    status << (traveled >= undock_min_clear_distance_m_ ? "undocking clear_distance_reached" : "undocking backing_out")
+           << " distance=" << std::fixed << std::setprecision(3) << traveled
+           << "/" << distance;
+    publish_status(status.str());
+  }
+
   double apply_deadband(double value, double deadband) const
   {
     if (std::abs(value) <= deadband) {
@@ -520,13 +611,15 @@ private:
 
   bool docking_is_active() const
   {
-    return state_ != State::Idle && state_ != State::Docked && state_ != State::Failed;
+    return state_ == State::BlindApproach || state_ == State::Acquire ||
+      state_ == State::Align || state_ == State::ContactVerify;
   }
 
   void docked_stop(const std::string & status)
   {
     state_ = State::Docked;
     publish_zero();
+    publish_reverse_enable(false);
     release_docking_motion_mode(park_on_docked_);
     publish_status(status);
   }
@@ -545,6 +638,7 @@ private:
 
   void enter_docking_motion_mode() const
   {
+    publish_reverse_enable(false);
     publish_park(false);
     if (use_crab_mode_) {
       publish_forced_mode(crab_forced_mode_);
@@ -553,6 +647,7 @@ private:
 
   void release_docking_motion_mode(bool park) const
   {
+    publish_reverse_enable(false);
     if (park) {
       publish_forced_mode("park");
       publish_park(true);
@@ -574,6 +669,13 @@ private:
     std_msgs::msg::Bool msg;
     msg.data = park;
     park_pub_->publish(msg);
+  }
+
+  void publish_reverse_enable(bool enabled) const
+  {
+    std_msgs::msg::Bool msg;
+    msg.data = enabled;
+    reverse_enable_pub_->publish(msg);
   }
 
   std::string detection_status(const std::string & state, const Detection & detection) const
@@ -611,9 +713,11 @@ private:
   std::string status_topic_;
   std::string start_service_;
   std::string stop_service_;
+  std::string undock_service_;
   std::string charging_state_topic_;
   std::string forced_mode_topic_;
   std::string park_topic_;
+  std::string reverse_enable_topic_;
   std::string crab_forced_mode_{"crab"};
   std::string release_forced_mode_{"auto"};
   bool use_crab_mode_{true};
@@ -626,6 +730,10 @@ private:
   double blind_approach_speed_mps_{0.06};
   double gs2_acquire_distance_m_{0.28};
   double final_target_distance_m_{0.05};
+  double undock_distance_m_{0.60};
+  double undock_speed_mps_{0.06};
+  double undock_min_clear_distance_m_{0.45};
+  double undock_timeout_s_{12.0};
   double lateral_soft_limit_m_{0.030};
   double lateral_hard_limit_m_{0.050};
   double yaw_soft_limit_rad_{deg_to_rad(2.0)};
@@ -680,8 +788,10 @@ private:
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr forced_mode_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr park_pub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr reverse_enable_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr start_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr stop_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr undock_srv_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 

@@ -339,7 +339,7 @@ class RangerMini3ModeController : public rclcpp::Node {
 
     if (has_wz && !has_vx && !has_vy) {
       resetSpinHysteresis();
-      return makeSpin(wz, "pure_yaw");
+      return makeSpin(wz);
     }
     return makeDualAckermann(vx, wz, reverse_allowed, now);
   }
