@@ -107,6 +107,7 @@ GET /api/v1/status
 - `docking.state == "failed"` 显示失败原因 `docking.last_status` 或 `message`。
 - 用户点取消时调用 `/api/v1/docking/cancel`。
 - 用户点“离桩”时调用 `/api/v1/docking/undock`，不要直接发倒车速度。
+- 用户点普通配送/导航点位时只调用 `/api/v1/navigation/goal`；如果车端当前在桩上或检测到充电接触，后端会先执行 `/docking/undock`，离桩成功后再发送 Nav2 目标。
 
 ## 工程边界
 

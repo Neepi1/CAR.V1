@@ -893,6 +893,7 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "run_floor_navigation.sh" in config
     assert "docking_undock_service: \"/docking/undock\"" in config
     assert "docking_pre_dock_distance_m: 0.60" in config
+    assert "navigation_auto_undock_timeout_sec: 18.0" in config
     assert "mapping_2d_live_map_topic: \"/map\"" in config
     assert "scan_topic: \"/scan\"" in config
     assert "tf_topic: \"/tf\"" in config
@@ -938,6 +939,7 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "run_floor_navigation.sh" in overlay_config
     assert "docking_undock_service: \"/docking/undock\"" in overlay_config
     assert "docking_pre_dock_distance_m: 0.60" in overlay_config
+    assert "navigation_auto_undock_timeout_sec: 18.0" in overlay_config
     assert "teleop_cmd_topic: \"/cmd_vel_collision_checked\"" in overlay_config
     assert "teleop_reverse_enable_topic: \"/ranger_mini3/allow_reverse\"" in overlay_config
     assert "teleop_socket_idle_timeout_sec: 5.0" in overlay_config
@@ -980,6 +982,7 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "POST /api/v1/maps/filters/keepout/save" in app_doc
     assert "POST /api/v1/navigation/goal" in app_doc
     assert "POST http://<robot-ip>:8080/api/v1/docking/undock" in app_doc
+    assert "automatically performs controlled undocking first" in app_doc
     assert "The App must not use mapping teleop or direct velocity commands for docking" in app_doc
     assert "NavigateToPose" in app_doc
     assert "The App must not send `/cmd_vel` for task navigation" in app_doc
@@ -1055,6 +1058,10 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "popen(" not in node_cpp
     assert "/api/v1/docking/undock" in node_cpp
     assert "handle_docking_undock" in node_cpp
+    assert "undock_before_navigation_if_needed" in node_cpp
+    assert "start_pre_navigation_undock" in node_cpp
+    assert "wait_for_pre_navigation_undock" in node_cpp
+    assert "pre_navigation_undock" in node_cpp
     assert "docking_undock_client_" in node_cpp
     assert "docking_status_is_undocked" in node_cpp
     assert "undock requires docked state or live charging contact" in node_cpp

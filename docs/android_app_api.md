@@ -132,7 +132,7 @@ The App should use these lightweight business fields instead of inferring state 
 
 - Mapping: `mode == "MAPPING_2D" && mapping_active == true`.
 - Navigation: `mode == "NAVIGATION" && navigation_active == true`.
-- Docking: `mode == "DOCKING" || docking.active == true || docking.state in ["accepted","nav_to_predock","fine_docking","docked","failed","canceled"]`.
+- Docking: `mode == "DOCKING" || docking.active == true || docking.state in ["accepted","nav_to_predock","fine_docking","docked","undocking","undocked","failed","canceled"]`.
 - Idle: `mode == "IDLE"`.
 - Error: `mode == "ERROR" || healthy == false`.
 
@@ -540,7 +540,7 @@ Content-Type: application/json
 }
 ```
 
-Successful response returns `202 Accepted`. The server resolves the pose from `maps_release/<building_id>/<floor_id>/poses.yaml` and sends a Nav2 `NavigateToPose` goal on `/navigate_to_pose`. The App must not send `/cmd_vel` for task navigation.
+Successful response returns `202 Accepted`. The server resolves the pose from `maps_release/<building_id>/<floor_id>/poses.yaml` and sends a Nav2 `NavigateToPose` goal on `/navigate_to_pose`. If the car is already docked or the backend sees live charging contact, this endpoint automatically performs controlled undocking first, waits for `docking.state == "undocked"`, and only then sends the Nav2 goal. If undocking fails or times out, the response is an error and no navigation goal is sent. The App must not send `/cmd_vel` for task navigation, and it should not call `/api/v1/docking/undock` separately before every normal point navigation.
 
 Cancel active navigation goals:
 

@@ -1031,6 +1031,8 @@ public:
       std::max(service_timeout_sec_, declare_parameter<double>("docking_navigation_start_wait_sec", 45.0));
     docking_predock_nav_timeout_sec_ =
       std::max(5.0, declare_parameter<double>("docking_predock_nav_timeout_sec", 180.0));
+    navigation_auto_undock_timeout_sec_ =
+      std::max(service_timeout_sec_, declare_parameter<double>("navigation_auto_undock_timeout_sec", 18.0));
 
     estop_pub_ = create_publisher<std_msgs::msg::Bool>(safety_estop_topic_, rclcpp::QoS(10).transient_local());
     teleop_cmd_pub_ = create_publisher<geometry_msgs::msg::Twist>(teleop_cmd_topic_, rclcpp::QoS(10));
@@ -5436,6 +5438,16 @@ private:
     if (frame_id != "map") {
       return {400, "application/json", error_json("navigation goals must be in map frame")};
     }
+
+    bool pre_navigation_undock = false;
+    std::string pre_navigation_undock_detail;
+    if (!undock_before_navigation_if_needed(pre_navigation_undock_detail, pre_navigation_undock)) {
+      return {
+        409,
+        "application/json",
+        error_json("navigation requires successful undock first: " + pre_navigation_undock_detail)};
+    }
+
     NavigateToPose::Goal goal;
     goal.pose.header.frame_id = frame_id;
     goal.pose.header.stamp = now();
@@ -5492,8 +5504,127 @@ private:
     if (floor_id) {
       response << "\"floor_id\":" << json_string(*floor_id) << ",";
     }
-    response << "\"goal\":{\"x\":" << target.x << ",\"y\":" << target.y << ",\"yaw\":" << target.yaw << "}}";
+    response << "\"pre_navigation_undock\":" << (pre_navigation_undock ? "true" : "false") << ","
+             << "\"pre_navigation_undock_detail\":" << json_string(pre_navigation_undock_detail) << ","
+             << "\"goal\":{\"x\":" << target.x << ",\"y\":" << target.y << ",\"yaw\":" << target.yaw << "}}";
     return {202, "application/json", response.str()};
+  }
+
+  bool undock_before_navigation_if_needed(std::string & detail, bool & undock_performed)
+  {
+    undock_performed = false;
+    const auto runtime = runtime_mode_snapshot();
+    const bool charging_contact = teleop_charging_guard_active();
+    const bool docked_state = runtime.docking_state == "docked" ||
+      docking_status_is_success(runtime.docking_status);
+    const bool undocking_state = runtime.docking_state == "undocking" ||
+      docking_status_is_undocking(runtime.docking_status);
+
+    if (!docked_state && !charging_contact && !undocking_state) {
+      if (runtime.docking_active) {
+        detail = "docking is active but not docked: " + runtime.docking_state;
+        return false;
+      }
+      detail = "not docked";
+      return true;
+    }
+
+    undock_performed = true;
+    if (!undocking_state && !start_pre_navigation_undock(detail)) {
+      return false;
+    }
+    return wait_for_pre_navigation_undock(detail);
+  }
+
+  bool start_pre_navigation_undock(std::string & detail)
+  {
+    clear_teleop_command();
+    publish_teleop_zero_burst();
+
+    std::lock_guard<std::mutex> start_lock(docking_start_mutex_);
+    {
+      std::lock_guard<std::mutex> lock(docking_job_mutex_);
+      if (docking_job_.state == "running") {
+        if (docking_job_.phase == "undocking") {
+          detail = "undocking already active";
+          return true;
+        }
+        detail = "cannot auto-undock while docking job is running";
+        return false;
+      }
+    }
+
+    join_docking_worker();
+
+    const auto runtime = runtime_mode_snapshot();
+    std::string dock_id = runtime.docking_dock_id;
+    std::string ensure_detail;
+    if (!ensure_docking_manager_running(ensure_detail)) {
+      detail = ensure_detail;
+      return false;
+    }
+
+    DockingJob next_job;
+    next_job.state = "running";
+    next_job.phase = "undocking";
+    next_job.dock_id = dock_id;
+    next_job.detail = "auto_undock_before_navigation";
+    next_job.last_status = "undocking before navigation accepted";
+    next_job.started_at = utc_timestamp_iso8601();
+    next_job.resume_navigation = true;
+
+    std::uint64_t job_id = 0U;
+    {
+      std::lock_guard<std::mutex> lock(docking_job_mutex_);
+      job_id = ++docking_job_seq_;
+      next_job.id = job_id;
+      docking_job_ = next_job;
+    }
+    set_docking_runtime_state(true, "undocking", "undocking before navigation accepted");
+    {
+      std::lock_guard<std::mutex> runtime_lock(runtime_mode_mutex_);
+      docking_runtime_dock_id_ = dock_id;
+    }
+
+    std::string service_detail;
+    if (!call_docking_trigger_service(docking_undock_client_, docking_undock_service_, service_detail)) {
+      finish_docking_job(job_id, false, "failed", service_detail);
+      detail = service_detail;
+      return false;
+    }
+    {
+      std::lock_guard<std::mutex> lock(docking_job_mutex_);
+      if (docking_job_.id == job_id && docking_job_.state == "running") {
+        docking_job_.docking_service_called = true;
+        docking_job_.detail = service_detail;
+        docking_job_.last_status = service_detail;
+      }
+    }
+    set_docking_runtime_state(true, "undocking", service_detail);
+    detail = service_detail;
+    return true;
+  }
+
+  bool wait_for_pre_navigation_undock(std::string & detail)
+  {
+    const auto deadline = std::chrono::steady_clock::now() +
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(navigation_auto_undock_timeout_sec_));
+    while (std::chrono::steady_clock::now() < deadline) {
+      const auto runtime = runtime_mode_snapshot();
+      if (runtime.docking_state == "undocked" || docking_status_is_undocked(runtime.docking_status)) {
+        detail = runtime.docking_status.empty() ? "undocked before navigation" : runtime.docking_status;
+        return true;
+      }
+      if (runtime.docking_state == "failed" || starts_with(runtime.docking_status, "undock_failed") ||
+        runtime.docking_status.find("undock_rejected") != std::string::npos) {
+        detail = runtime.docking_status.empty() ? "undock failed before navigation" : runtime.docking_status;
+        return false;
+      }
+      std::this_thread::sleep_for(100ms);
+    }
+    detail = "timed out waiting for undock before navigation";
+    return false;
   }
 
   bool cancel_active_navigation_goal(std::string & detail)
@@ -7190,6 +7321,7 @@ private:
   double docking_pre_dock_distance_m_{0.60};
   double docking_navigation_start_wait_sec_{45.0};
   double docking_predock_nav_timeout_sec_{180.0};
+  double navigation_auto_undock_timeout_sec_{18.0};
   std::string mapping_2d_live_map_topic_;
   double mapping_2d_live_map_max_age_sec_{3.0};
   std::string scan_topic_;

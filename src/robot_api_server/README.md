@@ -28,7 +28,7 @@ It does not own mapping, localization, navigation, or chassis control logic. It 
 - `POST /api/v1/maps/poses/save_current` writes a semantic point using the same fresh `map -> base_link` pose as `/api/v1/robot/pose`, so the App does not convert pixels to metric coordinates for live marking.
 - `GET /api/v1/maps/filters/keepout` reads the keepout mask asset metadata plus App-authored keepout semantic JSON.
 - `POST /api/v1/maps/filters/keepout/save` stores App-authored keepout semantic JSON beside the map bundle and synchronizes `current/filters/` for the active map.
-- `POST /api/v1/navigation/goal` resolves a saved pose or direct map-frame pose and sends a Nav2 `NavigateToPose` goal.
+- `POST /api/v1/navigation/goal` resolves a saved pose or direct map-frame pose and sends a Nav2 `NavigateToPose` goal. If the robot is docked or live charging contact is detected, the API first performs `/docking/undock` and only sends the Nav2 goal after `/docking/status` reports `undocked`.
 - `POST /api/v1/navigation/cancel` accepts a background cancel job, publishes zero velocity immediately, then cancels Nav2 and stops the Nav2 plus 2D localization runtime while keeping common services alive.
 - `GET /api/v1/navigation/state` returns the latest background navigation cancel job state for App polling and diagnostics.
 - `POST /api/v1/docking/start` resolves a saved dock pose, computes a pre-dock approach pose, sends Nav2 to that pose, then calls `/docking/start` for GS2 fine docking.
@@ -391,6 +391,8 @@ POST /api/v1/navigation/goal
 ```
 
 The API server reads `maps_release/<building_id>/<floor_id>/poses.yaml` and sends a `NavigateToPose` action to `/navigate_to_pose`. Direct map-frame goals are also accepted with `x`, `y`, and `yaw`, but phone clients should normally use `pose_id` so the car remains the source of truth for floor assets. Goal and cancel calls are serialized around the Nav2 action client; transient rclcpp action-client exceptions are returned as HTTP errors or logged without taking down port 8080. All HTTP handlers are wrapped by a request-level exception guard, so individual ROS service/action/file failures return JSON errors instead of aborting the API process.
+
+When the backend state is `docked`, `/docking/status` starts with `docked` or `charging`, or live BMS charging contact is fresh, `/api/v1/navigation/goal` automatically performs controlled undocking before sending the Nav2 goal. If undocking fails or times out, the navigation goal is not sent. Successful responses include `pre_navigation_undock` and `pre_navigation_undock_detail` so the App can show whether departure from the charger happened inside the request.
 
 Cancel requests are wired to Nav2, not only acknowledged over HTTP:
 
