@@ -1,0 +1,61 @@
+robot_api_server:
+  ros__parameters:
+    host: "0.0.0.0"
+    port: 8080
+    api_token: ""
+
+    maps_root: "/workspaces/njrh-v3/workspace1/maps_release"
+    runtime_maps_dir: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/maps"
+
+    safety_estop_topic: "/safety/estop"
+    safety_status_topic: "/safety/status"
+    safety_motion_allowed_topic: "/safety/motion_allowed"
+    floor_status_topic: "/floor_manager/status"
+    bms_state_topic: "/battery_state"
+    bms_state_max_age_sec: 3.0
+    teleop_stop_on_charging: true
+    teleop_charging_current_min_a: 0.10
+    floor_switch_service: "/floor_manager/switch_floor"
+    localization_trigger_service: "/global_localization/trigger"
+    navigate_to_pose_action: "/navigate_to_pose"
+
+    mapping_2d_start_command: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/run_projected_map.sh"
+    mapping_2d_log_file: "/tmp/njrh_mapping2d_slam_toolbox.log"
+    navigation_resume_command: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/run_floor_navigation.sh"
+    navigation_resume_log_file: "/tmp/njrh_navigation_resume.log"
+    runtime_map_context_file: "/tmp/njrh_runtime_map_context.json"
+    navigation_stop_command: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/stop_floor_navigation.sh"
+    navigation_stop_log_file: "/tmp/njrh_navigation_stop.log"
+    docking_manager_start_command: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/run_docking_manager.sh"
+    docking_manager_log_file: "/tmp/njrh_docking_manager.log"
+    docking_start_service: "/docking/start"
+    docking_stop_service: "/docking/stop"
+    docking_status_topic: "/docking/status"
+    docking_pre_dock_distance_m: 0.80
+    docking_navigation_start_wait_sec: 45.0
+    docking_predock_nav_timeout_sec: 180.0
+    mapping_2d_live_map_topic: "/map"
+    mapping_2d_live_map_max_age_sec: 3.0
+    scan_topic: "/scan"
+    scan_max_age_sec: 2.0
+    tf_topic: "/tf"
+    tf_map_frame: "map"
+    tf_odom_frame: "odom"
+    tf_base_frame: "base_link"
+    tf_pose_max_age_sec: 2.0
+    robot_pose_freshness_sec: 0.5
+
+    teleop_cmd_topic: "/cmd_vel_collision_checked"
+    teleop_reverse_enable_topic: "/ranger_mini3/allow_reverse"
+    teleop_pose_topic: "/local_state/odometry"
+    teleop_max_linear_x_mps: 0.30
+    teleop_max_angular_z_radps: 0.55
+    teleop_allow_reverse: true
+    teleop_require_mapping_active: true
+    teleop_watchdog_timeout_sec: 0.5
+    teleop_socket_idle_timeout_sec: 5.0
+    teleop_repeat_rate_hz: 20.0
+    subscription_default_ttl_ms: 10000
+    subscription_max_ttl_ms: 60000
+
+    service_timeout_sec: 8.0

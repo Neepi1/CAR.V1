@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <memory>
 #include <string>
 
@@ -9,6 +10,39 @@
 #include "tf2_ros/transform_broadcaster.h"
 
 using namespace std::chrono_literals;
+
+namespace
+{
+double normalize_angle(const double angle)
+{
+  return std::atan2(std::sin(angle), std::cos(angle));
+}
+
+double yaw_from_quaternion(const geometry_msgs::msg::Quaternion & q)
+{
+  const double siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
+  const double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+  return std::atan2(siny_cosp, cosy_cosp);
+}
+
+geometry_msgs::msg::Quaternion quaternion_from_yaw(const double yaw)
+{
+  geometry_msgs::msg::Quaternion q;
+  q.z = std::sin(yaw * 0.5);
+  q.w = std::cos(yaw * 0.5);
+  return q;
+}
+
+void rotate_xy(double & x, double & y, const double yaw)
+{
+  const double c = std::cos(yaw);
+  const double s = std::sin(yaw);
+  const double rx = c * x - s * y;
+  const double ry = s * x + c * y;
+  x = rx;
+  y = ry;
+}
+}  // namespace
 
 class LocalStateNode : public rclcpp::Node
 {
@@ -21,9 +55,13 @@ public:
     publish_tf_ = declare_parameter<bool>("publish_tf", true);
     output_topic_ = declare_parameter<std::string>("output_topic", "/local_state/odometry");
     input_odom_topic_ = declare_parameter<std::string>("input_odom_topic", "/wheel/odom");
+    input_base_frame_ = declare_parameter<std::string>("input_base_frame", "ranger_base_link");
     declare_parameter<std::string>("input_imu_topic", "/lidar_imu");
     odom_frame_ = declare_parameter<std::string>("odom_frame", "odom");
     base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
+    odom_yaw_offset_rad_ = declare_parameter<double>("odom_yaw_offset_rad", 0.0);
+    rotate_odom_position_with_yaw_offset_ =
+      declare_parameter<bool>("rotate_odom_position_with_yaw_offset", true);
     publish_rate_hz_ = std::max(1.0, declare_parameter<double>("publish_rate_hz", 20.0));
 
     odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(output_topic_, rclcpp::QoS(20));
@@ -42,6 +80,20 @@ public:
   }
 
 private:
+  void apply_canonical_odom_transform(nav_msgs::msg::Odometry & odom) const
+  {
+    if (std::abs(odom_yaw_offset_rad_) < 1e-12) {
+      return;
+    }
+
+    if (rotate_odom_position_with_yaw_offset_) {
+      rotate_xy(odom.pose.pose.position.x, odom.pose.pose.position.y, odom_yaw_offset_rad_);
+    }
+
+    const double yaw = yaw_from_quaternion(odom.pose.pose.orientation);
+    odom.pose.pose.orientation = quaternion_from_yaw(normalize_angle(yaw + odom_yaw_offset_rad_));
+  }
+
   void publish_local_state(const nav_msgs::msg::Odometry & odom)
   {
     odom_pub_->publish(odom);
@@ -61,7 +113,19 @@ private:
 
   void on_wheel_odom(const nav_msgs::msg::Odometry::SharedPtr msg)
   {
+    if (!msg->child_frame_id.empty() && msg->child_frame_id != input_base_frame_) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(),
+        *get_clock(),
+        5000,
+        "Input odom child_frame_id is '%s', expected native chassis frame '%s'. "
+        "Publishing canonical child frame '%s'.",
+        msg->child_frame_id.c_str(),
+        input_base_frame_.c_str(),
+        base_frame_.c_str());
+    }
     nav_msgs::msg::Odometry local_odom = *msg;
+    apply_canonical_odom_transform(local_odom);
     local_odom.header.frame_id = odom_frame_;
     local_odom.child_frame_id = base_frame_;
     publish_local_state(local_odom);
@@ -81,8 +145,11 @@ private:
   bool publish_tf_{true};
   std::string output_topic_;
   std::string input_odom_topic_;
+  std::string input_base_frame_;
   std::string odom_frame_;
   std::string base_frame_;
+  double odom_yaw_offset_rad_{0.0};
+  bool rotate_odom_position_with_yaw_offset_{true};
   double publish_rate_hz_{20.0};
 
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;

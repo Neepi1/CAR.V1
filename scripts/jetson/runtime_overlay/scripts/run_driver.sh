@@ -6,6 +6,7 @@ source "${SCRIPT_DIR}/common_env.sh"
 
 CONFIG_FILE="${NJRH_HESAI_CONFIG_FILE:-${UPSTREAM_WS}/src/hesai_lidar_ros2/config/config.yaml}"
 export DRIVER_PROFILE="${DRIVER_PROFILE:-mapping}"
+export NJRH_HESAI_UPSTREAM_DRIVER_PROFILE="${NJRH_HESAI_UPSTREAM_DRIVER_PROFILE:-navigation}"
 export LIDAR_FRAME="${LIDAR_FRAME:-lidar_link}"
 export IMU_FRAME="${IMU_FRAME:-imu_link}"
 export POINTS_TOPIC="${NJRH_JT128_POINTS_TOPIC:-/lidar_points}"
@@ -16,14 +17,7 @@ export POINTCLOUD_REMAP_CONFIG="${NJRH_JT128_CANONICAL_POINTCLOUD_REMAP_CONFIG:-
 export IMU_REMAP_CONFIG="${NJRH_JT128_CANONICAL_IMU_REMAP_CONFIG:-${NJRH_OVERLAY_ROOT}/config/jt128_canonical_imu_remap.yaml}"
 export POINTCLOUD_REMAP_CPP_BIN="${NJRH_POINTCLOUD_REMAP_CPP_BIN:-${NJRH_PROJECT_ROOT}/install/robot_hesai_jt128/lib/robot_hesai_jt128/pointcloud_axis_remap_node}"
 export IMU_REMAP_CPP_BIN="${NJRH_IMU_REMAP_CPP_BIN:-${NJRH_PROJECT_ROOT}/install/robot_hesai_jt128/lib/robot_hesai_jt128/imu_axis_remap_node}"
-UPSTREAM_DRIVER_PROFILE="${DRIVER_PROFILE}"
-
-# JT128 on the current Jetson stack drops live point/IMU output when the
-# upstream helper switches to its "navigation" timestamp mode. Keep the
-# repository-owned canonical ingress on the verified live profile by default.
-if [[ "${DRIVER_PROFILE}" == "navigation" ]]; then
-  UPSTREAM_DRIVER_PROFILE="${NJRH_HESAI_NAV_UPSTREAM_PROFILE:-mapping}"
-fi
+UPSTREAM_DRIVER_PROFILE="${NJRH_HESAI_UPSTREAM_DRIVER_PROFILE}"
 
 [[ -f "${CONFIG_FILE}" ]] || {
   echo "[runtime-overlay] driver config missing: ${CONFIG_FILE}" >&2
@@ -35,6 +29,7 @@ sed -E \
   -e "s|^([[:space:]]*ros_frame_id:[[:space:]]*).*|\\1hesai_lidar|" \
   -e "s|^([[:space:]]*ros_send_point_cloud_topic:[[:space:]]*).*|\\1${VENDOR_POINTS_TOPIC}|" \
   -e "s|^([[:space:]]*ros_send_imu_topic:[[:space:]]*).*|\\1${VENDOR_IMU_TOPIC}|" \
+  -e "s|^([[:space:]]*)use_timestamp_type:.*|\\1use_timestamp_type: 1                 # 0 use lidar point cloud timestamp; 1 use host receive timestamp|" \
   "${CONFIG_FILE}" > "${RUNTIME_CONFIG_FILE}"
 export CONFIG_FILE="${RUNTIME_CONFIG_FILE}"
 
@@ -60,13 +55,49 @@ cleanup() {
 
 trap cleanup EXIT
 
-for pattern in "hesai_ros_driver_node" "ros2 run hesai_ros_driver" "imu_axis_remap" "pointcloud_axis_remap"; do
-  pkill -INT -f "$pattern" 2>/dev/null || true
-done
-sleep 1
-for pattern in "hesai_ros_driver_node" "ros2 run hesai_ros_driver" "imu_axis_remap" "pointcloud_axis_remap"; do
-  pkill -9 -f "$pattern" 2>/dev/null || true
-done
+jt128_driver_process_running() {
+  pgrep -f "hesai_ros_driver_node" >/dev/null 2>&1
+}
+
+jt128_pointcloud_remap_running() {
+  pgrep -f "pointcloud_axis_remap" >/dev/null 2>&1
+}
+
+jt128_imu_remap_running() {
+  pgrep -f "imu_axis_remap" >/dev/null 2>&1
+}
+
+canonical_jt128_ingress_running() {
+  jt128_driver_process_running && jt128_pointcloud_remap_running && jt128_imu_remap_running
+}
+
+any_jt128_ingress_process_running() {
+  jt128_driver_process_running || jt128_pointcloud_remap_running || jt128_imu_remap_running
+}
+
+stop_jt128_ingress_processes() {
+  for pattern in "hesai_ros_driver_node" "ros2 run hesai_ros_driver" "imu_axis_remap" "pointcloud_axis_remap"; do
+    pkill -INT -f "$pattern" 2>/dev/null || true
+  done
+  sleep 1
+  for pattern in "hesai_ros_driver_node" "ros2 run hesai_ros_driver" "imu_axis_remap" "pointcloud_axis_remap"; do
+    pkill -9 -f "$pattern" 2>/dev/null || true
+  done
+}
+
+if any_jt128_ingress_process_running; then
+  if [[ "${NJRH_FORCE_RESTART_DRIVER:-false}" != "true" ]]; then
+    if canonical_jt128_ingress_running; then
+      echo "[runtime-overlay] canonical JT128 driver/remap chain already running; reusing existing ingress" >&2
+      while canonical_jt128_ingress_running; do
+        sleep 2
+      done
+      exit 0
+    fi
+    echo "[runtime-overlay] incomplete JT128 ingress detected; restarting driver plus canonical pointcloud/IMU remaps" >&2
+  fi
+  stop_jt128_ingress_processes
+fi
 
 [[ -f "${POINTCLOUD_REMAP_CONFIG}" ]] || {
   echo "[runtime-overlay] canonical pointcloud remap config missing: ${POINTCLOUD_REMAP_CONFIG}" >&2

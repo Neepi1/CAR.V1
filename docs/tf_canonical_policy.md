@@ -3,7 +3,7 @@
 ## Ownership
 
 - `robot_localization_bridge`: only owner of `map -> odom`
-- `robot_local_state`: only owner of `odom -> base_link`
+- `robot_local_state`: only owner of `odom -> base_link`; production runtime is a `robot_localization` EKF named `robot_local_state`
 - `robot_description` with `robot_state_publisher`: only owner of static sensor extrinsics
 - `robot_hesai_jt128`, `robot_fastlio_mapping`, `robot_pgo_mapping`, `robot_global_localization`: must not inject third-party internal frames into the navigation main tree
 

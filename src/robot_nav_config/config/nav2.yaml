@@ -3,6 +3,10 @@ lifecycle_manager_navigation:
     use_sim_time: false
     autostart: true
     node_names:
+      - keepout_filter_mask_server
+      - keepout_costmap_filter_info_server
+      - speed_filter_mask_server
+      - speed_costmap_filter_info_server
       - controller_server
       - smoother_server
       - planner_server
@@ -28,6 +32,7 @@ controller_server:
     use_sim_time: false
     controller_frequency: 12.0
     odom_topic: /local_state/odometry
+    speed_limit_topic: /speed_limit
     min_x_velocity_threshold: 0.01
     min_y_velocity_threshold: 0.0
     min_theta_velocity_threshold: 0.01
@@ -229,6 +234,7 @@ global_costmap:
       footprint: "[[0.36, 0.25], [0.36, -0.25], [-0.36, -0.25], [-0.36, 0.25]]"
       footprint_padding: 0.03
       plugins: ["static_layer", "global_inflation_layer"]
+      filters: ["keepout_filter", "speed_filter"]
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         enabled: true
@@ -240,6 +246,15 @@ global_costmap:
         enabled: true
         cost_scaling_factor: 5.0
         inflation_radius: 0.60
+      keepout_filter:
+        plugin: "nav2_costmap_2d::KeepoutFilter"
+        enabled: true
+        filter_info_topic: /costmap_filter_info/keepout
+      speed_filter:
+        plugin: "nav2_costmap_2d::SpeedFilter"
+        enabled: true
+        filter_info_topic: /costmap_filter_info/speed
+        speed_limit_topic: /speed_limit
       always_send_full_costmap: true
 
 local_costmap:

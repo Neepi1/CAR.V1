@@ -8,12 +8,15 @@ def generate_launch_description():
     return LaunchDescription(
         [
             Node(
-                package="robot_local_state",
-                executable="local_state_node",
+                package="robot_localization",
+                executable="ekf_node",
                 name="robot_local_state",
                 output="screen",
                 parameters=[
-                    PathJoinSubstitution([FindPackageShare("robot_local_state"), "config", "local_state.yaml"])
+                    PathJoinSubstitution([FindPackageShare("robot_local_state"), "config", "local_state_ekf.yaml"])
+                ],
+                remappings=[
+                    ("/odometry/filtered", "/local_state/odometry"),
                 ],
             )
         ]

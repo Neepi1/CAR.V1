@@ -3,6 +3,21 @@ imu_axis_remap:
     input_topic: /jt128/vendor/imu_raw
     output_topic: /lidar_imu
     output_frame_id: imu_link
+    # Hesai driver publishes zero IMU covariance. If passed through, robot_localization
+    # treats gyro yaw-rate as unrealistically certain and can pull wheel odom sideways.
+    override_angular_velocity_covariance: true
+    angular_velocity_covariance_diagonal:
+      - 0.10
+      - 0.10
+      - 0.25
+    override_linear_acceleration_covariance: true
+    linear_acceleration_covariance_diagonal:
+      - 0.50
+      - 0.50
+      - 0.50
+    mark_orientation_unavailable: true
+    # JT128 raw IMU vectors follow the same raw sensor axes as the point cloud.
+    # Publish canonical imu_link vectors as: x = raw_y, y = -raw_x, z = raw_z.
     rotation_matrix:
       - 0.0
       - 1.0

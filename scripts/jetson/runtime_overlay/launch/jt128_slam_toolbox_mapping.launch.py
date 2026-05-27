@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from launch import LaunchDescription
@@ -97,7 +98,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("map_frame", default_value="map"),
             DeclareLaunchArgument("odom_frame", default_value="odom"),
             DeclareLaunchArgument("base_frame", default_value="base_link"),
-            DeclareLaunchArgument("points_topic", default_value="/lidar_points"),
+            DeclareLaunchArgument("points_topic", default_value="/cloud_registered_body"),
             DeclareLaunchArgument("nav_points_topic", default_value="/points_nav"),
             DeclareLaunchArgument("scan_topic", default_value="/scan"),
             nav_cloud_preprocessor,

@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 0002
+
+export USER="$(id -un)"
+export HOME="$(getent passwd "$(id -u)" | cut -d: -f6)"
 
 OVERLAY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT_ROOT="${NJRH_PROJECT_ROOT:-/workspaces/njrh-v3/workspace1}"
@@ -12,10 +16,10 @@ export NJRH_OVERLAY_ROOT="$OVERLAY_ROOT"
 export NJRH_PROJECT_ROOT="$PROJECT_ROOT"
 export NJRH_UPSTREAM_ROOT="$UPSTREAM_ROOT"
 export NJRH_UPSTREAM_HOST_ROOT="$UPSTREAM_HOST_ROOT"
-export NJRH_MAPS_DIR="${NJRH_MAPS_DIR:-${UPSTREAM_ROOT}/maps}"
-export NJRH_MAPS3D_DIR="${NJRH_MAPS3D_DIR:-${UPSTREAM_ROOT}/maps3d}"
-export NJRH_RELEASE_ASSETS_DIR="${NJRH_RELEASE_ASSETS_DIR:-${UPSTREAM_ROOT}/maps_release}"
-export NJRH_WAYPOINTS_DIR="${NJRH_WAYPOINTS_DIR:-${UPSTREAM_ROOT}/waypoints}"
+export NJRH_MAPS_DIR="${NJRH_MAPS_DIR:-${OVERLAY_ROOT}/maps}"
+export NJRH_MAPS3D_DIR="${NJRH_MAPS3D_DIR:-${OVERLAY_ROOT}/maps3d}"
+export NJRH_RELEASE_ASSETS_DIR="${NJRH_RELEASE_ASSETS_DIR:-${PROJECT_ROOT}/maps_release}"
+export NJRH_WAYPOINTS_DIR="${NJRH_WAYPOINTS_DIR:-${OVERLAY_ROOT}/waypoints}"
 export NJRH_RUNTIME_LOG_DIR="${NJRH_RUNTIME_LOG_DIR:-${OVERLAY_ROOT}/web_dashboard/runtime_logs}"
 
 set +u
@@ -28,7 +32,12 @@ if [[ -f "${UPSTREAM_ROOT}/install/local_setup.bash" ]]; then
 fi
 set -u
 
-mkdir -p "${NJRH_RUNTIME_LOG_DIR}"
+mkdir -p \
+  "${NJRH_RUNTIME_LOG_DIR}" \
+  "${NJRH_MAPS_DIR}" \
+  "${NJRH_MAPS3D_DIR}" \
+  "${NJRH_RELEASE_ASSETS_DIR}" \
+  "${NJRH_WAYPOINTS_DIR}"
 
 require_upstream_script() {
   local script_name="$1"

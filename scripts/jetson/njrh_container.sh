@@ -11,11 +11,22 @@ UPSTREAM_WORKSPACE_ALIAS_CONTAINER="${NJRH_UPSTREAM_WORKSPACE_ALIAS_CONTAINER:-/
 CONTAINER_NAME="${NJRH_CONTAINER_NAME:-NJRH-car}"
 IMAGE_NAME="${NJRH_IMAGE_NAME:-njrh-car:latest}"
 BASE_IMAGE="${NJRH_BASE_IMAGE:-isaac_ros_dev-aarch64:latest}"
+RUNTIME_USER="${NJRH_RUNTIME_USER:-root}"
+RUNTIME_GROUP="${NJRH_RUNTIME_GROUP:-${RUNTIME_USER}}"
+RUNTIME_HOME="${NJRH_RUNTIME_HOME:-}"
+if [[ -z "${RUNTIME_HOME}" ]]; then
+  if [[ "${RUNTIME_USER}" == "root" ]]; then
+    RUNTIME_HOME="/root"
+  else
+    RUNTIME_HOME="/home/${RUNTIME_USER}"
+  fi
+fi
 ALLOW_BASE_IMAGE_FALLBACK="${NJRH_ALLOW_BASE_IMAGE_FALLBACK:-true}"
 DOCKER_BUILD_NETWORK="${NJRH_DOCKER_BUILD_NETWORK:-host}"
 DOCKERFILE_PATH="${NJRH_DOCKERFILE_PATH:-${WORKSPACE_HOST}/Dockerfile.car}"
 DASHBOARD_PORT="${NJRH_DASHBOARD_PORT:-2048}"
 DASHBOARD_HOST="${NJRH_DASHBOARD_HOST:-}"
+ROBOT_API_SERVER_PORT="${NJRH_ROBOT_API_SERVER_PORT:-8080}"
 DASHBOARD_RUNTIME_ROOT="${NJRH_DASHBOARD_RUNTIME_ROOT:-${WORKSPACE_CONTAINER}/scripts/jetson/runtime_overlay}"
 DASHBOARD_LOG_RELATIVE="${NJRH_DASHBOARD_LOG_RELATIVE:-web_dashboard/runtime_logs/njrh_dashboard.out.log}"
 DASHBOARD_TRACE_RELATIVE="${NJRH_DASHBOARD_TRACE_RELATIVE:-web_dashboard/runtime_logs/dashboard_trace.log}"
@@ -100,14 +111,15 @@ run_container() {
 
   docker_args+=("-v" "/tmp/.X11-unix:/tmp/.X11-unix")
   if [[ -f "$HOME/.Xauthority" ]]; then
-    docker_args+=("-v" "$HOME/.Xauthority:/home/admin/.Xauthority:rw")
+    docker_args+=("-v" "$HOME/.Xauthority:${RUNTIME_HOME}/.Xauthority:rw")
   fi
 
   docker_args+=("-e" "DISPLAY=${DISPLAY:-:0}")
   docker_args+=("-e" "NVIDIA_VISIBLE_DEVICES=all")
   docker_args+=("-e" "NVIDIA_DRIVER_CAPABILITIES=all")
   docker_args+=("-e" "ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}")
-  docker_args+=("-e" "USER=${USER:-nvidia}")
+  docker_args+=("-e" "USER=${RUNTIME_USER}")
+  docker_args+=("-e" "HOME=${RUNTIME_HOME}")
   docker_args+=("-e" "ISAAC_ROS_WS=$WORKSPACE_CONTAINER")
   docker_args+=("-e" "NJRH_UPSTREAM_ROOT=$UPSTREAM_WORKSPACE_CONTAINER")
   docker_args+=("-e" "NJRH_UPSTREAM_HOST_ROOT=$UPSTREAM_WORKSPACE_HOST")
@@ -139,7 +151,11 @@ run_container() {
     docker_args+=("-v" "/run/jtop.sock:/run/jtop.sock:ro")
   fi
 
-  mkdir -p "${WORKSPACE_HOST}/web_dashboard/runtime_logs" "${WORKSPACE_HOST}/maps" "${WORKSPACE_HOST}/maps3d"
+  mkdir -p \
+    "${WORKSPACE_HOST}/web_dashboard/runtime_logs" \
+    "${WORKSPACE_HOST}/maps" \
+    "${WORKSPACE_HOST}/maps3d" \
+    "${WORKSPACE_HOST}/maps_release"
 
   if [[ -d "${UPSTREAM_WORKSPACE_HOST}" && "${UPSTREAM_WORKSPACE_HOST}" != "${WORKSPACE_HOST}" ]]; then
     docker_args+=("-v" "${UPSTREAM_WORKSPACE_HOST}:${UPSTREAM_WORKSPACE_CONTAINER}:ro")
@@ -153,6 +169,7 @@ run_container() {
     --network host \
     --ipc host \
     --pid host \
+    --user "${RUNTIME_USER}" \
     --restart unless-stopped \
     "${docker_args[@]}" \
     -v "${WORKSPACE_HOST}:${WORKSPACE_CONTAINER}" \
@@ -171,6 +188,7 @@ start_container() {
     RUNTIME_IMAGE_NAME="$(docker inspect --format '{{.Config.Image}}' "$CONTAINER_NAME")"
     wait_for_container_ready
     prepare_nitros_tmp
+    ensure_gs2_device_in_container
     echo "[njrh-container] container already running: $CONTAINER_NAME"
     return
   fi
@@ -183,6 +201,7 @@ start_container() {
   run_container
   wait_for_container_ready
   prepare_nitros_tmp
+  ensure_gs2_device_in_container
   echo "[njrh-container] container started: $CONTAINER_NAME"
 }
 
@@ -195,12 +214,12 @@ stop_container() {
   fi
 }
 
-exec_admin() {
-  docker exec -u admin --workdir "$WORKSPACE_CONTAINER" "$CONTAINER_NAME" /bin/bash -lc "$1"
+exec_runtime() {
+  docker exec -u "${RUNTIME_USER}" --workdir "$WORKSPACE_CONTAINER" "$CONTAINER_NAME" /bin/bash -lc "$1"
 }
 
 dashboard_process_lines() {
-  docker exec -u admin "$CONTAINER_NAME" ps -eo pid,args | grep dashboard_server.py | grep -v grep || true
+  docker exec -u "${RUNTIME_USER}" "$CONTAINER_NAME" ps -eo pid,args | grep dashboard_server.py | grep -v grep || true
 }
 
 dashboard_running() {
@@ -215,13 +234,21 @@ dashboard_running_overlay() {
 
 dashboard_assets_ready() {
   container_running || return 1
-  docker exec -u admin "$CONTAINER_NAME" test -f "${DASHBOARD_RUNTIME_ROOT}/web_dashboard/dashboard_server.py" &&
-  docker exec -u admin "$CONTAINER_NAME" test -e "${DASHBOARD_RUNTIME_ROOT}/web_dashboard/index.html"
+  docker exec -u "${RUNTIME_USER}" "$CONTAINER_NAME" test -f "${DASHBOARD_RUNTIME_ROOT}/web_dashboard/dashboard_server.py" &&
+  docker exec -u "${RUNTIME_USER}" "$CONTAINER_NAME" test -e "${DASHBOARD_RUNTIME_ROOT}/web_dashboard/index.html"
 }
 
 dashboard_http_ready() {
   curl -fsS "http://127.0.0.1:${DASHBOARD_PORT}/api/status" >/dev/null 2>&1 &&
   curl -fsS "http://127.0.0.1:${DASHBOARD_PORT}/" >/dev/null 2>&1
+}
+
+robot_api_http_ready() {
+  local curl_args=(-fsS)
+  if [[ -n "${ROBOT_API_TOKEN:-}" ]]; then
+    curl_args+=("-H" "X-Robot-Token: ${ROBOT_API_TOKEN}")
+  fi
+  curl "${curl_args[@]}" "http://127.0.0.1:${ROBOT_API_SERVER_PORT}/api/v1/status" >/dev/null 2>&1
 }
 
 kill_dashboard_processes() {
@@ -232,22 +259,22 @@ kill_dashboard_processes() {
     "ps -eo pid=,args= | grep 'python3 .*dashboard_server.py' | grep -v grep | awk '{print \$1}' | xargs -r kill -9 2>/dev/null || true"
 }
 
-exec_admin_retry() {
+exec_runtime_retry() {
   local cmd="$1"
   local attempt
   for attempt in $(seq 1 12); do
-    if docker exec -u admin --workdir "$WORKSPACE_CONTAINER" "$CONTAINER_NAME" /bin/bash -lc "$cmd"; then
+    if docker exec -u "${RUNTIME_USER}" --workdir "$WORKSPACE_CONTAINER" "$CONTAINER_NAME" /bin/bash -lc "$cmd"; then
       return 0
     fi
     sleep 1
   done
-  die "admin exec did not succeed after retries: $cmd"
+  die "${RUNTIME_USER} exec did not succeed after retries: $cmd"
 }
 
 wait_for_container_ready() {
   local attempt
   for attempt in $(seq 1 20); do
-    if docker exec "$CONTAINER_NAME" id admin >/dev/null 2>&1; then
+    if docker exec "$CONTAINER_NAME" id "${RUNTIME_USER}" >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -263,9 +290,77 @@ prepare_nitros_tmp() {
       && chmod 1777 /tmp/isaac_ros_nitros /tmp/isaac_ros_nitros/graphs" >/dev/null
 }
 
+ensure_gs2_device_in_container() {
+  container_running || return 0
+  local host_gs2="${NJRH_GS2_HOST_DEVICE:-/dev/gs2}"
+  local host_target=""
+  if [[ -e "$host_gs2" ]]; then
+    host_target="$(readlink -f "$host_gs2")"
+  elif compgen -G "/dev/serial/by-id/*CP2102*" >/dev/null; then
+    host_target="$(readlink -f /dev/serial/by-id/*CP2102* | head -n 1)"
+  else
+    return 0
+  fi
+
+  [[ -n "$host_target" && -e "$host_target" ]] || return 0
+  local target_name major_hex minor_hex major_dec minor_dec
+  target_name="$(basename "$host_target")"
+  read -r major_hex minor_hex < <(stat -c '%t %T' "$host_target")
+  major_dec="$((16#$major_hex))"
+  minor_dec="$((16#$minor_hex))"
+
+  docker exec -u root "$CONTAINER_NAME" /bin/bash -lc \
+    "set -e
+      if [[ ! -e '/dev/${target_name}' ]]; then
+        mknod -m 666 '/dev/${target_name}' c ${major_dec} ${minor_dec}
+      fi
+      chmod 666 '/dev/${target_name}' || true
+      ln -sf '/dev/${target_name}' /dev/gs2
+      mkdir -p /dev/serial/by-id
+      ln -sf '../../${target_name}' '/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0'" >/dev/null 2>&1 || true
+}
+
+prepare_release_asset_permissions() {
+  container_running || return 0
+  docker exec -u root "$CONTAINER_NAME" /bin/bash -lc \
+    "mkdir -p '${WORKSPACE_CONTAINER}/maps_release' \
+      && chown -R '${RUNTIME_USER}:${RUNTIME_GROUP}' '${WORKSPACE_CONTAINER}/maps_release' \
+      && find '${WORKSPACE_CONTAINER}/maps_release' -type d -exec chmod 2775 {} + \
+      && find '${WORKSPACE_CONTAINER}/maps_release' -type f -exec chmod 664 {} +" >/dev/null
+}
+
+prepare_runtime_overlay_permissions() {
+  container_running || return 0
+  docker exec -u root "$CONTAINER_NAME" /bin/bash -lc \
+    "mkdir -p \
+        '${DASHBOARD_RUNTIME_ROOT}/web_dashboard/runtime_logs' \
+        '${DASHBOARD_RUNTIME_ROOT}/maps' \
+        '${DASHBOARD_RUNTIME_ROOT}/maps3d' \
+        '${DASHBOARD_RUNTIME_ROOT}/waypoints' \
+      && chown -R '${RUNTIME_USER}:${RUNTIME_GROUP}' \
+        '${DASHBOARD_RUNTIME_ROOT}/web_dashboard/runtime_logs' \
+        '${DASHBOARD_RUNTIME_ROOT}/maps' \
+        '${DASHBOARD_RUNTIME_ROOT}/maps3d' \
+        '${DASHBOARD_RUNTIME_ROOT}/waypoints' \
+      && find \
+        '${DASHBOARD_RUNTIME_ROOT}/web_dashboard/runtime_logs' \
+        '${DASHBOARD_RUNTIME_ROOT}/maps' \
+        '${DASHBOARD_RUNTIME_ROOT}/maps3d' \
+        '${DASHBOARD_RUNTIME_ROOT}/waypoints' \
+        -type d -exec chmod 2775 {} + \
+      && find \
+        '${DASHBOARD_RUNTIME_ROOT}/web_dashboard/runtime_logs' \
+        '${DASHBOARD_RUNTIME_ROOT}/maps' \
+        '${DASHBOARD_RUNTIME_ROOT}/maps3d' \
+        '${DASHBOARD_RUNTIME_ROOT}/waypoints' \
+        -type f -exec chmod 664 {} +" >/dev/null
+}
+
 start_dashboard() {
   container_running || start_container
   wait_for_container_ready
+  prepare_runtime_overlay_permissions
+  prepare_release_asset_permissions
   prepare_nitros_tmp
   if dashboard_running_overlay && dashboard_assets_ready && dashboard_http_ready; then
     echo "[njrh-container] dashboard already running: $(dashboard_url)"
@@ -277,10 +372,10 @@ start_dashboard() {
   fi
 
   if docker exec "$CONTAINER_NAME" test -f "${DASHBOARD_RUNTIME_ROOT}/scripts/run_web_dashboard.sh" >/dev/null 2>&1; then
-    docker exec -u admin --workdir "${DASHBOARD_RUNTIME_ROOT}" "$CONTAINER_NAME" \
+    docker exec -u "${RUNTIME_USER}" --workdir "${DASHBOARD_RUNTIME_ROOT}" "$CONTAINER_NAME" \
       /bin/bash -lc "mkdir -p '${DASHBOARD_RUNTIME_ROOT}/web_dashboard/runtime_logs'; cd '${DASHBOARD_RUNTIME_ROOT}'; nohup env NJRH_UPSTREAM_ROOT='${UPSTREAM_WORKSPACE_CONTAINER}' NJRH_UPSTREAM_HOST_ROOT='${UPSTREAM_WORKSPACE_HOST}' bash scripts/run_web_dashboard.sh > '${DASHBOARD_RUNTIME_ROOT}/${DASHBOARD_LOG_RELATIVE}' 2>&1 </dev/null &"
   else
-    docker exec -u admin --workdir "$WORKSPACE_CONTAINER" "$CONTAINER_NAME" \
+    docker exec -u "${RUNTIME_USER}" --workdir "$WORKSPACE_CONTAINER" "$CONTAINER_NAME" \
       /bin/bash -lc "mkdir -p '$WORKSPACE_CONTAINER/web_dashboard/runtime_logs'; cd '$WORKSPACE_CONTAINER'; nohup bash scripts/run_web_dashboard.sh > '$WORKSPACE_CONTAINER/$DASHBOARD_LOG_RELATIVE' 2>&1 </dev/null &"
   fi
   wait_for_dashboard
@@ -296,6 +391,48 @@ stop_dashboard() {
   echo "[njrh-container] dashboard stopped"
 }
 
+common_services_process_lines() {
+  docker exec -u "${RUNTIME_USER}" "$CONTAINER_NAME" ps -eo pid,args | grep run_common_services.sh | grep -v grep || true
+}
+
+common_services_running() {
+  container_running || return 1
+  [[ -n "$(common_services_process_lines)" ]]
+}
+
+start_common_services() {
+  container_running || start_container
+  wait_for_container_ready
+  prepare_runtime_overlay_permissions
+  prepare_release_asset_permissions
+  prepare_nitros_tmp
+  ensure_gs2_device_in_container
+  if common_services_running; then
+    wait_for_robot_api
+    echo "[njrh-container] common services already running"
+    return
+  fi
+  docker exec -u "${RUNTIME_USER}" --workdir "${DASHBOARD_RUNTIME_ROOT}" "$CONTAINER_NAME" \
+    /bin/bash -lc "mkdir -p '${DASHBOARD_RUNTIME_ROOT}/web_dashboard/runtime_logs'; cd '${DASHBOARD_RUNTIME_ROOT}'; nohup env ROBOT_API_TOKEN='${ROBOT_API_TOKEN:-}' ROBOT_API_SERVER_PORT='${ROBOT_API_SERVER_PORT}' bash scripts/run_common_services.sh > '${DASHBOARD_RUNTIME_ROOT}/web_dashboard/runtime_logs/common_services.out.log' 2>&1 </dev/null &"
+  sleep 2
+  if common_services_running; then
+    wait_for_robot_api
+    echo "[njrh-container] common services started"
+  else
+    die "common services did not stay running"
+  fi
+}
+
+stop_common_services() {
+  if ! container_running; then
+    echo "[njrh-container] container not running: $CONTAINER_NAME"
+    return
+  fi
+  docker exec "$CONTAINER_NAME" /bin/bash -lc \
+    "ps -eo pid=,args= | grep 'run_common_services.sh' | grep -v grep | awk '{print \$1}' | xargs -r kill -INT 2>/dev/null || true"
+  echo "[njrh-container] common services stop requested"
+}
+
 wait_for_dashboard() {
   local attempt
   for attempt in $(seq 1 25); do
@@ -305,6 +442,17 @@ wait_for_dashboard() {
     sleep 1
   done
   die "dashboard did not become ready on port ${DASHBOARD_PORT}"
+}
+
+wait_for_robot_api() {
+  local attempt
+  for attempt in $(seq 1 30); do
+    if robot_api_http_ready; then
+      return 0
+    fi
+    sleep 1
+  done
+  die "robot_api_server did not become ready on port ${ROBOT_API_SERVER_PORT}"
 }
 
 print_status() {
@@ -320,6 +468,16 @@ print_status() {
   echo "dashboard_url: $(dashboard_url)"
   if container_running; then
     echo "container_status: running"
+    if common_services_running; then
+      echo "common_services_status: running"
+    else
+      echo "common_services_status: stopped"
+    fi
+    if robot_api_http_ready; then
+      echo "robot_api_status: running"
+    else
+      echo "robot_api_status: stopped"
+    fi
     if dashboard_running; then
       echo "dashboard_status: running"
       if dashboard_running_overlay; then
@@ -332,21 +490,25 @@ print_status() {
     fi
   elif container_exists; then
     echo "container_status: stopped"
+    echo "common_services_status: stopped"
+    echo "robot_api_status: stopped"
     echo "dashboard_status: stopped"
   else
     echo "container_status: missing"
+    echo "common_services_status: stopped"
+    echo "robot_api_status: stopped"
     echo "dashboard_status: stopped"
   fi
 }
 
-show_logs() {
+  show_logs() {
   container_running || die "container is not running: $CONTAINER_NAME"
   if docker exec "$CONTAINER_NAME" test -f "${DASHBOARD_RUNTIME_ROOT}/${DASHBOARD_LOG_RELATIVE}" >/dev/null 2>&1; then
-    docker exec -u admin "$CONTAINER_NAME" /bin/bash -lc "tail -n 120 '${DASHBOARD_RUNTIME_ROOT}/${DASHBOARD_LOG_RELATIVE}'"
+    docker exec -u "${RUNTIME_USER}" "$CONTAINER_NAME" /bin/bash -lc "tail -n 120 '${DASHBOARD_RUNTIME_ROOT}/${DASHBOARD_LOG_RELATIVE}'"
   elif docker exec "$CONTAINER_NAME" test -f "${WORKSPACE_CONTAINER}/${DASHBOARD_LOG_RELATIVE}" >/dev/null 2>&1; then
-    docker exec -u admin "$CONTAINER_NAME" /bin/bash -lc "tail -n 120 '${WORKSPACE_CONTAINER}/${DASHBOARD_LOG_RELATIVE}'"
+    docker exec -u "${RUNTIME_USER}" "$CONTAINER_NAME" /bin/bash -lc "tail -n 120 '${WORKSPACE_CONTAINER}/${DASHBOARD_LOG_RELATIVE}'"
   elif docker exec "$CONTAINER_NAME" test -f "${WORKSPACE_CONTAINER}/${DASHBOARD_TRACE_RELATIVE}" >/dev/null 2>&1; then
-    docker exec -u admin "$CONTAINER_NAME" /bin/bash -lc "tail -n 120 '${WORKSPACE_CONTAINER}/${DASHBOARD_TRACE_RELATIVE}'"
+    docker exec -u "${RUNTIME_USER}" "$CONTAINER_NAME" /bin/bash -lc "tail -n 120 '${WORKSPACE_CONTAINER}/${DASHBOARD_TRACE_RELATIVE}'"
   else
     echo "dashboard log file not found"
   fi
@@ -354,7 +516,7 @@ show_logs() {
 
 open_shell() {
   container_running || start_container
-  exec docker exec -it -u admin --workdir "$WORKSPACE_CONTAINER" "$CONTAINER_NAME" /bin/bash
+  exec docker exec -it -u "${RUNTIME_USER}" --workdir "$WORKSPACE_CONTAINER" "$CONTAINER_NAME" /bin/bash
 }
 
 case "$ACTION" in
@@ -384,6 +546,13 @@ case "$ACTION" in
   stop-dashboard)
     stop_dashboard
     ;;
+  start-common)
+    start_common_services
+    print_status
+    ;;
+  stop-common)
+    stop_common_services
+    ;;
   dashboard-status)
     if dashboard_running; then
       echo "[njrh-container] dashboard running: $(dashboard_url)"
@@ -397,6 +566,12 @@ case "$ACTION" in
     ;;
   start-runtime)
     start_container
+    start_common_services
+    print_status
+    ;;
+  start-debug-runtime)
+    start_container
+    start_common_services
     start_dashboard
     print_status
     ;;

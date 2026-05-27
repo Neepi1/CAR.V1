@@ -16,6 +16,7 @@ namespace {
 
 enum class MotionMode : int {
   kDualAckermann = 0,
+  kCrab = 1,
   kSpin = 2,
   kPark = 3,
 };
@@ -38,6 +39,8 @@ std::string modeName(MotionMode mode) {
   switch (mode) {
     case MotionMode::kDualAckermann:
       return "dual_ackermann";
+    case MotionMode::kCrab:
+      return "crab";
     case MotionMode::kSpin:
       return "spin";
     case MotionMode::kPark:
@@ -125,6 +128,8 @@ class RangerMini3ModeController : public rclcpp::Node {
     declare_parameter<double>("max_linear_high_angle_mps", 0.75);
     declare_parameter<double>("max_ackermann_angle_rad", 0.698);
     declare_parameter<double>("max_spin_radps", 3.259);
+    declare_parameter<double>("max_lateral_mps", 0.08);
+    declare_parameter<double>("max_crab_yaw_radps", 0.15);
     declare_parameter<double>("publish_rate_hz", 50.0);
     declare_parameter<double>("cmd_timeout_s", 0.25);
     declare_parameter<std::string>("mode_policy", "auto");
@@ -132,6 +137,10 @@ class RangerMini3ModeController : public rclcpp::Node {
     declare_parameter<std::string>("lateral_policy", "reject");
     declare_parameter<std::string>("dual_ackermann_angle", "inner");
     declare_parameter<double>("spin_steering_threshold_rad", 0.698);
+    declare_parameter<double>("spin_enter_steering_threshold_rad", -1.0);
+    declare_parameter<double>("spin_exit_steering_threshold_rad", -1.0);
+    declare_parameter<double>("spin_enter_debounce_s", 0.4);
+    declare_parameter<double>("spin_min_hold_s", 1.0);
     declare_parameter<double>("linear_epsilon_mps", 0.02);
     declare_parameter<double>("lateral_epsilon_mps", 0.02);
     declare_parameter<double>("yaw_epsilon_radps", 0.02);
@@ -139,6 +148,8 @@ class RangerMini3ModeController : public rclcpp::Node {
     declare_parameter<std::string>("status_topic", "/ranger_mini3_mode_controller/status");
     declare_parameter<std::string>("desired_mode_topic", "/ranger_mini3/desired_motion_mode");
     declare_parameter<std::string>("forced_mode_topic", "/ranger_mini3/forced_mode");
+    declare_parameter<std::string>("reverse_enable_topic", "/ranger_mini3/allow_reverse");
+    declare_parameter<double>("reverse_enable_timeout_s", 0.75);
     declare_parameter<std::string>("park_topic", "/ranger_mini3/park");
 
     wheelbase_m_ = get_parameter("wheelbase_m").as_double();
@@ -147,12 +158,26 @@ class RangerMini3ModeController : public rclcpp::Node {
     max_linear_high_angle_mps_ = get_parameter("max_linear_high_angle_mps").as_double();
     max_ackermann_angle_rad_ = get_parameter("max_ackermann_angle_rad").as_double();
     max_spin_radps_ = get_parameter("max_spin_radps").as_double();
+    max_lateral_mps_ = get_parameter("max_lateral_mps").as_double();
+    max_crab_yaw_radps_ = get_parameter("max_crab_yaw_radps").as_double();
     cmd_timeout_s_ = get_parameter("cmd_timeout_s").as_double();
     mode_policy_ = get_parameter("mode_policy").as_string();
     allow_reverse_ = get_parameter("allow_reverse").as_bool();
     lateral_policy_ = get_parameter("lateral_policy").as_string();
     dual_ackermann_angle_ = get_parameter("dual_ackermann_angle").as_string();
-    spin_steering_threshold_rad_ = get_parameter("spin_steering_threshold_rad").as_double();
+    const double legacy_spin_threshold = get_parameter("spin_steering_threshold_rad").as_double();
+    const double enter_threshold = get_parameter("spin_enter_steering_threshold_rad").as_double();
+    const double exit_threshold = get_parameter("spin_exit_steering_threshold_rad").as_double();
+    spin_enter_steering_threshold_rad_ = enter_threshold > 0.0 ? enter_threshold : legacy_spin_threshold;
+    spin_exit_steering_threshold_rad_ =
+      exit_threshold > 0.0 ? exit_threshold : std::min(spin_enter_steering_threshold_rad_ * 0.65, spin_enter_steering_threshold_rad_ - 0.05);
+    if (spin_exit_steering_threshold_rad_ >= spin_enter_steering_threshold_rad_) {
+      warnThrottled("spin_thresholds", "spin_exit_steering_threshold_rad must be lower than spin_enter_steering_threshold_rad; using 65% of enter threshold.");
+      spin_exit_steering_threshold_rad_ = spin_enter_steering_threshold_rad_ * 0.65;
+    }
+    spin_enter_debounce_s_ = std::max(0.0, get_parameter("spin_enter_debounce_s").as_double());
+    spin_min_hold_s_ = std::max(0.0, get_parameter("spin_min_hold_s").as_double());
+    reverse_enable_timeout_s_ = get_parameter("reverse_enable_timeout_s").as_double();
     linear_eps_ = get_parameter("linear_epsilon_mps").as_double();
     lateral_eps_ = get_parameter("lateral_epsilon_mps").as_double();
     yaw_eps_ = get_parameter("yaw_epsilon_radps").as_double();
@@ -177,6 +202,14 @@ class RangerMini3ModeController : public rclcpp::Node {
       10,
       [this](const std_msgs::msg::String::SharedPtr msg) { onForcedMode(msg->data); });
 
+    reverse_enable_sub_ = create_subscription<std_msgs::msg::Bool>(
+      get_parameter("reverse_enable_topic").as_string(),
+      10,
+      [this](const std_msgs::msg::Bool::SharedPtr msg) {
+        reverse_override_enabled_ = msg->data;
+        reverse_override_time_ = std::chrono::steady_clock::now();
+      });
+
     park_sub_ = create_subscription<std_msgs::msg::Bool>(
       get_parameter("park_topic").as_string(),
       10,
@@ -193,12 +226,14 @@ class RangerMini3ModeController : public rclcpp::Node {
 
     RCLCPP_INFO(
       get_logger(),
-      "Ranger Mini 3 C++ mode controller started: %s -> %s, policy=%s, lateral_policy=%s, allow_reverse=%s",
+      "Ranger Mini 3 C++ mode controller started: %s -> %s, policy=%s, lateral_policy=%s, allow_reverse=%s, spin_enter=%.3f rad, spin_exit=%.3f rad",
       get_parameter("cmd_vel_in_topic").as_string().c_str(),
       get_parameter("cmd_vel_out_topic").as_string().c_str(),
       mode_policy_.c_str(),
       lateral_policy_.c_str(),
-      allow_reverse_ ? "true" : "false");
+      allow_reverse_ ? "true" : "false",
+      spin_enter_steering_threshold_rad_,
+      spin_exit_steering_threshold_rad_);
   }
 
  private:
@@ -208,12 +243,14 @@ class RangerMini3ModeController : public rclcpp::Node {
       forced_policy_.clear();
     } else if (mode == "dual_ackermann" || mode == "ackermann" || mode == "front_rear_ackermann") {
       forced_policy_ = "dual_ackermann";
+    } else if (mode == "crab" || mode == "lateral" || mode == "sideways" || mode == "parallel") {
+      forced_policy_ = "crab";
     } else if (mode == "spin" || mode == "park") {
       forced_policy_ = mode;
     } else {
       warnThrottled(
         "bad_mode",
-        "Unknown forced mode '" + input + "'. Use auto, dual_ackermann, spin, or park.");
+        "Unknown forced mode '" + input + "'. Use auto, dual_ackermann, crab, spin, or park.");
       return;
     }
     RCLCPP_INFO(get_logger(), "forced mode set to %s", forced_policy_.empty() ? "auto" : forced_policy_.c_str());
@@ -231,11 +268,13 @@ class RangerMini3ModeController : public rclcpp::Node {
 
   RangerCommand computeCommand(std::chrono::steady_clock::time_point now) {
     if (park_requested_ || forced_policy_ == "park") {
+      resetSpinHysteresis();
       return RangerCommand{MotionMode::kPark};
     }
 
     if (last_cmd_time_.time_since_epoch().count() == 0 ||
       std::chrono::duration<double>(now - last_cmd_time_).count() > cmd_timeout_s_) {
+      resetSpinHysteresis();
       return RangerCommand{MotionMode::kDualAckermann};
     }
 
@@ -252,17 +291,23 @@ class RangerMini3ModeController : public rclcpp::Node {
     if (std::abs(wz) < yaw_eps_) {
       wz = 0.0;
     }
-    if (!allow_reverse_ && vx < 0.0) {
+    const bool reverse_allowed = effectiveAllowReverse(now);
+    if (!reverse_allowed && vx < 0.0) {
       vx = 0.0;
     }
 
     std::string policy = forced_policy_.empty() ? mode_policy_ : forced_policy_;
     policy = lowercase(policy);
     if (policy == "dual_ackermann" || policy == "ackermann" || policy == "front_rear_ackermann") {
-      return makeDualAckermann(vx, wz);
+      return makeDualAckermann(vx, wz, reverse_allowed, now);
+    }
+    if (policy == "crab" || policy == "lateral" || policy == "sideways" || policy == "parallel") {
+      resetSpinHysteresis();
+      return makeCrab(vx, vy, wz, reverse_allowed);
     }
     if (policy == "spin") {
-      return makeSpin(wz);
+      resetSpinHysteresis();
+      return makeSpin(wz, "forced_spin");
     }
     if (policy != "auto") {
       warnThrottled("policy", "Unknown mode_policy '" + policy + "', falling back to auto.");
@@ -275,7 +320,11 @@ class RangerMini3ModeController : public rclcpp::Node {
       if (lateral_policy_ == "discard") {
         vy = 0.0;
         has_vy = false;
+      } else if (lateral_policy_ == "crab" || lateral_policy_ == "allow") {
+        resetSpinHysteresis();
+        return makeCrab(vx, vy, wz, reverse_allowed);
       } else {
+        resetSpinHysteresis();
         RangerCommand invalid;
         invalid.valid = false;
         invalid.reason =
@@ -284,29 +333,60 @@ class RangerMini3ModeController : public rclcpp::Node {
       }
     }
     if (!has_vx && !has_vy && !has_wz) {
+      resetSpinHysteresis();
       return RangerCommand{MotionMode::kDualAckermann};
     }
 
     if (has_wz && !has_vx && !has_vy) {
-      return makeSpin(wz);
+      resetSpinHysteresis();
+      return makeSpin(wz, "pure_yaw");
     }
-    return makeDualAckermann(vx, wz);
+    return makeDualAckermann(vx, wz, reverse_allowed, now);
   }
 
-  RangerCommand makeSpin(double wz) const {
+  RangerCommand makeSpin(double wz, const std::string & reason = "") const {
     RangerCommand command;
     command.mode = MotionMode::kSpin;
     command.yaw_radps = clamp(wz, -max_spin_radps_, max_spin_radps_);
+    command.reason = reason;
     return command;
   }
 
-  RangerCommand makeDualAckermann(double vx, double wz) const {
-    if (!allow_reverse_) {
+  RangerCommand makeCrab(double vx, double vy, double wz, bool reverse_allowed) const {
+    if (!reverse_allowed) {
+      vx = std::max(0.0, vx);
+    }
+
+    RangerCommand command;
+    command.mode = MotionMode::kCrab;
+    command.linear_mps = clamp(vx, -max_linear_high_angle_mps_, max_linear_high_angle_mps_);
+    command.lateral_mps = clamp(vy, -max_lateral_mps_, max_lateral_mps_);
+    command.yaw_radps = clamp(wz, -max_crab_yaw_radps_, max_crab_yaw_radps_);
+    return command;
+  }
+
+  bool effectiveAllowReverse(const std::chrono::steady_clock::time_point now) const {
+    if (allow_reverse_) {
+      return true;
+    }
+    if (!reverse_override_enabled_ || reverse_override_time_.time_since_epoch().count() == 0) {
+      return false;
+    }
+    return std::chrono::duration<double>(now - reverse_override_time_).count() <= reverse_enable_timeout_s_;
+  }
+
+  RangerCommand makeDualAckermann(
+    double vx,
+    double wz,
+    bool reverse_allowed,
+    const std::chrono::steady_clock::time_point now) {
+    if (!reverse_allowed) {
       vx = std::max(0.0, vx);
     }
     const double raw_angle = rawAckermannAngle(vx, wz);
-    if (std::abs(raw_angle) > spin_steering_threshold_rad_) {
-      return makeSpin(wz);
+    const std::string spin_reason = spinHysteresisReason(raw_angle, now);
+    if (!spin_reason.empty()) {
+      return makeSpin(wz, spin_reason);
     }
 
     double angle = 0.0;
@@ -334,6 +414,43 @@ class RangerMini3ModeController : public rclcpp::Node {
     return command;
   }
 
+  std::string spinHysteresisReason(
+    const double raw_angle,
+    const std::chrono::steady_clock::time_point now) {
+    const double abs_angle = std::abs(raw_angle);
+    if (spin_latched_) {
+      if (std::chrono::duration<double>(now - spin_enter_time_).count() < spin_min_hold_s_) {
+        return "spin_min_hold";
+      }
+      if (abs_angle > spin_exit_steering_threshold_rad_) {
+        return "spin_hysteresis";
+      }
+      resetSpinHysteresis();
+      return "";
+    }
+
+    if (abs_angle > spin_enter_steering_threshold_rad_) {
+      if (spin_candidate_since_.time_since_epoch().count() == 0) {
+        spin_candidate_since_ = now;
+      }
+      if (std::chrono::duration<double>(now - spin_candidate_since_).count() >= spin_enter_debounce_s_) {
+        spin_latched_ = true;
+        spin_enter_time_ = now;
+        return "spin_enter";
+      }
+      return "";
+    }
+
+    spin_candidate_since_ = {};
+    return "";
+  }
+
+  void resetSpinHysteresis() {
+    spin_latched_ = false;
+    spin_candidate_since_ = {};
+    spin_enter_time_ = {};
+  }
+
   double rawAckermannAngle(double vx, double wz) const {
     if (std::abs(vx) < 1.0e-6 || std::abs(wz) < 1.0e-6) {
       return 0.0;
@@ -349,6 +466,11 @@ class RangerMini3ModeController : public rclcpp::Node {
       case MotionMode::kPark:
         return msg;
       case MotionMode::kSpin:
+        msg.angular.z = command.yaw_radps;
+        return msg;
+      case MotionMode::kCrab:
+        msg.linear.x = command.linear_mps;
+        msg.linear.y = command.lateral_mps;
         msg.angular.z = command.yaw_radps;
         return msg;
       case MotionMode::kDualAckermann:
@@ -409,18 +531,29 @@ class RangerMini3ModeController : public rclcpp::Node {
   double max_linear_high_angle_mps_{0.75};
   double max_ackermann_angle_rad_{0.698};
   double max_spin_radps_{3.259};
+  double max_lateral_mps_{0.08};
+  double max_crab_yaw_radps_{0.15};
   double cmd_timeout_s_{0.25};
   std::string mode_policy_{"auto"};
   bool allow_reverse_{false};
   std::string lateral_policy_{"reject"};
   std::string dual_ackermann_angle_{"inner"};
-  double spin_steering_threshold_rad_{0.698};
+  double spin_enter_steering_threshold_rad_{0.785};
+  double spin_exit_steering_threshold_rad_{0.489};
+  double spin_enter_debounce_s_{0.4};
+  double spin_min_hold_s_{1.0};
+  double reverse_enable_timeout_s_{0.75};
   double linear_eps_{0.02};
   double lateral_eps_{0.02};
   double yaw_eps_{0.02};
   bool park_requested_{false};
+  bool reverse_override_enabled_{false};
+  std::chrono::steady_clock::time_point reverse_override_time_{};
   std::string forced_policy_;
   std::string last_status_;
+  bool spin_latched_{false};
+  std::chrono::steady_clock::time_point spin_candidate_since_{};
+  std::chrono::steady_clock::time_point spin_enter_time_{};
   geometry_msgs::msg::Twist last_cmd_;
   std::chrono::steady_clock::time_point last_cmd_time_{};
   std::map<std::string, std::chrono::steady_clock::time_point> last_warn_by_key_;
@@ -430,6 +563,7 @@ class RangerMini3ModeController : public rclcpp::Node {
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr mode_pub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr forced_mode_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr reverse_enable_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr park_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
 };

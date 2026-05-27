@@ -6,6 +6,40 @@ source "${SCRIPT_DIR}/common_env.sh"
 
 canonical_helper_pids=()
 
+reuse_common_services_enabled() {
+  [[ "${NJRH_REUSE_COMMON_SERVICES:-true}" == "true" ]]
+}
+
+force_restart_canonical_tf_enabled() {
+  [[ "${NJRH_FORCE_RESTART_CANONICAL_TF:-false}" == "true" ]]
+}
+
+canonical_helper_process_pattern() {
+  local helper_name="$1"
+  case "${helper_name}" in
+    ranger_chassis*)
+      printf '%s\n' "ranger_base_node.*port_name:=${CAN_IFACE:-can0}|ros2 run ranger_base ranger_base_node.*port_name:=${CAN_IFACE:-can0}"
+      ;;
+    robot_description*|robot_description_static_tf*)
+      printf '%s\n' "robot_description_static_tf_node"
+      ;;
+    local_state*|robot_local_state*)
+      printf '%s\n' "robot_localization/ekf_node|ekf_node --ros-args.*__node:=robot_local_state|robot_local_state/local_state_node|local_state_node --ros-args"
+      ;;
+    robot_localization_bridge*)
+      printf '%s\n' "robot_localization_bridge/localization_bridge_node|localization_bridge_node --ros-args"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+canonical_process_running() {
+  local pattern="$1"
+  pgrep -f "${pattern}" >/dev/null 2>&1
+}
+
 kill_canonical_pattern() {
   local pattern="$1"
   pkill -INT -f "$pattern" 2>/dev/null || true
@@ -14,10 +48,16 @@ kill_canonical_pattern() {
 }
 
 stop_existing_canonical_tf_publishers() {
+  if ! force_restart_canonical_tf_enabled; then
+    echo "[runtime-overlay] reusing canonical TF/local-state helpers; set NJRH_FORCE_RESTART_CANONICAL_TF=true to restart them" >&2
+    return 0
+  fi
   kill_canonical_pattern "hesai_lidar_state_publisher"
   kill_canonical_pattern "${NJRH_OVERLAY_ROOT}/scripts/run_robot_description.sh"
   kill_canonical_pattern "robot_description_static_tf_node"
   kill_canonical_pattern "${NJRH_OVERLAY_ROOT}/scripts/run_local_state.sh"
+  kill_canonical_pattern "robot_localization/ekf_node"
+  kill_canonical_pattern "ekf_node --ros-args.*__node:=robot_local_state"
   kill_canonical_pattern "robot_local_state/local_state_node"
   kill_canonical_pattern "local_state_node --ros-args"
   kill_canonical_pattern "${NJRH_OVERLAY_ROOT}/scripts/run_localization_bridge.sh"
@@ -30,6 +70,13 @@ start_canonical_helper() {
   local helper_name="$1"
   shift
   local helper_log="${NJRH_RUNTIME_LOG_DIR}/${helper_name}.log"
+  local helper_pattern=""
+  if helper_pattern="$(canonical_helper_process_pattern "${helper_name}")"; then
+    if reuse_common_services_enabled && canonical_process_running "${helper_pattern}"; then
+      echo "[runtime-overlay] reusing existing ${helper_name}; pattern=${helper_pattern}" >&2
+      return 0
+    fi
+  fi
   mkdir -p "${NJRH_RUNTIME_LOG_DIR}"
   if [[ -e "${helper_log}" && ! -w "${helper_log}" ]]; then
     rm -f "${helper_log}" 2>/dev/null || {

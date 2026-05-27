@@ -37,7 +37,7 @@ def main() -> int:
         "optimized_trajectory_csv": args.optimized_trajectory_csv,
         "output_root": args.output_root,
         "map_frame_id": args.map_frame_id,
-        "sensor_xyz": [0.25, 0.0, 1.05],
+        "sensor_xyz": [0.25, 0.0, 0.85],
         "sensor_rpy": [0.0, 0.0, 0.0],
         "resolution": args.resolution,
         "width_m": args.width_m,

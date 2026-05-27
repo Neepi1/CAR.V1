@@ -23,11 +23,12 @@ def generate_launch_description():
     localizer_params = LaunchConfiguration("localizer_params")
     use_sim_time = LaunchConfiguration("use_sim_time")
     publish_lidar_tf = LaunchConfiguration("publish_lidar_tf")
+    points_topic = LaunchConfiguration("points_topic")
 
     sensing = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(str(sensing_launch)),
         launch_arguments={
-            "points_topic": "/lidar_points",
+            "points_topic": points_topic,
             "scan_topic": "/scan",
             "flatscan_topic": "/flatscan",
         }.items(),
@@ -51,6 +52,7 @@ def generate_launch_description():
         DeclareLaunchArgument("localizer_params", default_value=str(localizer_params_default)),
         DeclareLaunchArgument("use_sim_time", default_value="false"),
         DeclareLaunchArgument("publish_lidar_tf", default_value="false"),
+        DeclareLaunchArgument("points_topic", default_value="/lidar_points"),
         sensing,
         localization,
     ])

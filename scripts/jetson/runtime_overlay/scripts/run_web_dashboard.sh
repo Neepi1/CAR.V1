@@ -2,18 +2,10 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${ROOT_DIR}/scripts/common_env.sh"
+
 UPSTREAM_ROOT="${NJRH_UPSTREAM_ROOT:-/workspaces/isaac_ros-dev}"
 UPSTREAM_WEB="${UPSTREAM_ROOT}/web_dashboard"
-
-set +u
-source /opt/ros/humble/setup.bash
-if [[ -f "${UPSTREAM_ROOT}/ros2_ws/install/local_setup.bash" ]]; then
-  source "${UPSTREAM_ROOT}/ros2_ws/install/local_setup.bash"
-fi
-if [[ -f "${UPSTREAM_ROOT}/install/local_setup.bash" ]]; then
-  source "${UPSTREAM_ROOT}/install/local_setup.bash"
-fi
-set -u
 
 export FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}"
 

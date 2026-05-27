@@ -132,12 +132,17 @@ private:
   {
     const auto stamp = now();
     const auto base_frame = require_string(config, "base_frame");
+    const auto ranger_base_frame =
+      config.count("ranger_base_frame") ? require_string(config, "ranger_base_frame") : "";
     const auto base_footprint_frame = require_string(config, "base_footprint_frame");
     const auto lidar_mount_frame = require_string(config, "lidar_mount_frame");
     const auto lidar_frame = require_string(config, "lidar_frame");
     const auto lidar_level_frame =
       config.count("lidar_level_frame") ? require_string(config, "lidar_level_frame") : "lidar_level_link";
     const auto imu_frame = require_string(config, "imu_frame");
+    const auto gs2_frame = config.count("gs2_frame") ? require_string(config, "gs2_frame") : "gs2_link";
+    const auto charge_contact_frame =
+      config.count("charge_contact_frame") ? require_string(config, "charge_contact_frame") : "charge_contact_link";
 
     const double lidar_x = require_double(config, "lidar_x");
     const double lidar_y = require_double(config, "lidar_y");
@@ -156,6 +161,9 @@ private:
     const double lidar_level_yaw = yaw_from_quaternion(final_q);
 
     std::vector<geometry_msgs::msg::TransformStamped> transforms;
+    if (!ranger_base_frame.empty() && ranger_base_frame != base_frame) {
+      transforms.push_back(make_transform(stamp, base_frame, ranger_base_frame, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0));
+    }
     transforms.push_back(make_transform(stamp, base_frame, base_footprint_frame, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0));
     transforms.push_back(
       make_transform(stamp, base_frame, lidar_mount_frame, lidar_x, lidar_y, lidar_z, lidar_roll, lidar_pitch, lidar_yaw));
@@ -173,6 +181,30 @@ private:
       require_double(config, "imu_roll"),
       require_double(config, "imu_pitch"),
       require_double(config, "imu_yaw")));
+    if (config.count("gs2_x") || config.count("gs2_y") || config.count("gs2_z")) {
+      transforms.push_back(make_transform(
+        stamp,
+        base_frame,
+        gs2_frame,
+        require_double(config, "gs2_x"),
+        require_double(config, "gs2_y"),
+        require_double(config, "gs2_z"),
+        require_double(config, "gs2_roll"),
+        require_double(config, "gs2_pitch"),
+        require_double(config, "gs2_yaw")));
+    }
+    if (config.count("charge_contact_x") || config.count("charge_contact_y") || config.count("charge_contact_z")) {
+      transforms.push_back(make_transform(
+        stamp,
+        base_frame,
+        charge_contact_frame,
+        require_double(config, "charge_contact_x"),
+        require_double(config, "charge_contact_y"),
+        require_double(config, "charge_contact_z"),
+        require_double(config, "charge_contact_roll"),
+        require_double(config, "charge_contact_pitch"),
+        require_double(config, "charge_contact_yaw")));
+    }
     return transforms;
   }
 

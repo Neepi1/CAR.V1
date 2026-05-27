@@ -1,23 +1,44 @@
 base_frame: base_link
+ranger_base_frame: ranger_base_link
 base_footprint_frame: base_footprint
 lidar_mount_frame: lidar_mount_link
 lidar_frame: lidar_link
 lidar_level_frame: lidar_level_link
 imu_frame: imu_link
+gs2_frame: gs2_link
+charge_contact_frame: charge_contact_link
 lidar_x: 0.25
 lidar_y: 0.0
-lidar_z: 1.05
-lidar_roll: -0.348
-lidar_pitch: -0.648
-lidar_yaw: -2.639
-# /lidar_points is already canonicalized by pointcloud_axis_remap, so the
-# static TF chain should not apply a second axis normalization here.
+lidar_z: 0.85
+# JT128 install extrinsic relative to base_link. Keep vehicle mounting here.
+lidar_roll: 0.0
+lidar_pitch: -0.3490658503988659
+lidar_yaw: 3.141592653589793
+# JT128 raw axis alignment is applied inside the canonical remap nodes before
+# publishing /lidar_points and /lidar_imu. Keep lidar_link as the canonical
+# sensor frame under the physical mount.
 lidar_axis_roll: 0.0
 lidar_axis_pitch: 0.0
 lidar_axis_yaw: 0.0
 imu_x: 0.25
 imu_y: 0.0
-imu_z: 1.05
-imu_roll: -0.348
-imu_pitch: -0.648
-imu_yaw: -2.639
+imu_z: 0.85
+imu_roll: 0.0
+imu_pitch: -0.3490658503988659
+imu_yaw: 3.141592653589793
+# GS2 near-field docking lidar: front centerline, flush with front body plane.
+# X follows the current Nav2 footprint front edge and should be refined after a
+# direct base_link-to-front-panel measurement.
+gs2_x: 0.36
+gs2_y: 0.0
+gs2_z: 0.290
+gs2_roll: 0.0
+gs2_pitch: 0.0
+gs2_yaw: 0.0
+# Charging contacts are on the same centerline as GS2 and 3.8 cm ahead of it.
+charge_contact_x: 0.398
+charge_contact_y: 0.0
+charge_contact_z: 0.255
+charge_contact_roll: 0.0
+charge_contact_pitch: 0.0
+charge_contact_yaw: 0.0

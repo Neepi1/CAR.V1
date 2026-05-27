@@ -26,7 +26,7 @@ class OccupancyBuilderReleaseNode(Node):
             "optimized_trajectory_csv": "mapping_result/optimized_trajectory.csv",
             "output_root": "maps/building_1/floor_1",
             "map_frame_id": "map",
-            "sensor_xyz": [0.25, 0.0, 1.05],
+            "sensor_xyz": [0.25, 0.0, 0.85],
             "sensor_rpy": [0.0, 0.0, 0.0],
             "resolution": 0.05,
             "width_m": 200.0,

@@ -46,20 +46,62 @@ resolve_floor_assets() {
   }
 
   local floor_root="${NJRH_RELEASE_ASSETS_DIR}/${building_id}/${floor_id}"
-  validate_floor_assets "${floor_root}"
+  local runtime_root="${floor_root}/current"
+  if [[ -f "${runtime_root}/nav/nav_map.yaml" ]]; then
+    validate_floor_assets "${runtime_root}"
+  else
+    runtime_root="${floor_root}"
+    validate_floor_assets "${runtime_root}"
+  fi
 
   export NJRH_BUILDING_ID="${building_id}"
   export NJRH_FLOOR_ID="${floor_id}"
-  export NJRH_CURRENT_FLOOR_ROOT="${floor_root}"
-  export NAV2_MAP_YAML="${floor_root}/nav/nav_map.yaml"
-  export NAV2_LOCALIZER_MAP_YAML="${floor_root}/localizer/localizer_params.yaml"
-  export NAV2_LOCALIZER_MAP_PNG="${floor_root}/localizer/localizer_map.png"
-  export NAV2_KEEP_OUT_MASK_YAML="${floor_root}/filters/keepout_mask.yaml"
-  export NAV2_SPEED_MASK_YAML="${floor_root}/filters/speed_mask.yaml"
-  export NAV2_BINARY_MASK_YAML="${floor_root}/filters/binary_mask.yaml"
-  export NJRH_FLOOR_POSES_YAML="${floor_root}/poses.yaml"
+  export NJRH_CURRENT_FLOOR_ROOT="${runtime_root}"
+  export NAV2_MAP_YAML="${runtime_root}/nav/nav_map.yaml"
+  export NAV2_LOCALIZER_MAP_YAML="${runtime_root}/localizer/localizer_params.yaml"
+  export NAV2_LOCALIZER_MAP_PNG="${runtime_root}/localizer/localizer_map.png"
+  export NAV2_KEEP_OUT_MASK_YAML="${runtime_root}/filters/keepout_mask.yaml"
+  export NAV2_SPEED_MASK_YAML="${runtime_root}/filters/speed_mask.yaml"
+  export NAV2_BINARY_MASK_YAML="${runtime_root}/filters/binary_mask.yaml"
+  export NJRH_FLOOR_POSES_YAML="${runtime_root}/poses.yaml"
+
+  local asset_report="${runtime_root}/reports/asset_report.json"
+  local nav_map_name=""
+  local nav_map_id=""
+  if [[ -f "${asset_report}" ]]; then
+    nav_map_name="$(python3 - "${asset_report}" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as stream:
+        data = json.load(stream)
+    print(str(data.get("map_name") or data.get("display_name") or ""))
+except Exception:
+    print("")
+PY
+)"
+    nav_map_id="$(python3 - "${asset_report}" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as stream:
+        data = json.load(stream)
+    print(str(data.get("map_id") or ""))
+except Exception:
+    print("")
+PY
+)"
+  fi
+  export NJRH_NAV_MAP_NAME="${nav_map_name}"
+  export NJRH_NAV_MAP_ID="${nav_map_id}"
 
   printf '[runtime-overlay] selected floor %s/%s\n' "${building_id}" "${floor_id}" >&2
+  printf '[runtime-overlay] selected floor asset root=%s\n' "${runtime_root}" >&2
+  if [[ -n "${NJRH_NAV_MAP_NAME}" ]]; then
+    printf '[runtime-overlay] selected navigation map=%s map_id=%s\n' "${NJRH_NAV_MAP_NAME}" "${NJRH_NAV_MAP_ID}" >&2
+  fi
   printf '[runtime-overlay] NAV2_MAP_YAML=%s\n' "${NAV2_MAP_YAML}" >&2
   printf '[runtime-overlay] NAV2_LOCALIZER_MAP_YAML=%s\n' "${NAV2_LOCALIZER_MAP_YAML}" >&2
 }

@@ -26,9 +26,19 @@ REQUIRED_RELATIVE_ASSETS = (
 )
 
 
-def save_pgm(path: Path, width: int, height: int, value: int) -> None:
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+NEUTRAL_FILTER_PIXEL = 254
+
+
+def save_pgm_from_grayscale(path: Path, width: int, height: int, pixels: bytes) -> None:
+    if len(pixels) != width * height:
+        raise RuntimeError(f"invalid grayscale payload size for {path}: {len(pixels)} != {width * height}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(f"P5\n{width} {height}\n255\n".encode("ascii") + bytes([value]) * width * height)
+    path.write_bytes(f"P5\n{width} {height}\n255\n".encode("ascii") + pixels)
+
+
+def save_pgm(path: Path, width: int, height: int, value: int) -> None:
+    save_pgm_from_grayscale(path, width, height, bytes([value]) * width * height)
 
 
 def _png_chunk(tag: bytes, payload: bytes) -> bytes:
@@ -40,18 +50,24 @@ def _png_chunk(tag: bytes, payload: bytes) -> bytes:
     )
 
 
-def save_png(path: Path, width: int, height: int, value: int) -> None:
+def save_png_from_grayscale(path: Path, width: int, height: int, pixels: bytes) -> None:
+    if len(pixels) != width * height:
+        raise RuntimeError(f"invalid grayscale payload size for {path}: {len(pixels)} != {width * height}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    raw = b"".join(b"\x00" + bytes([value]) * width for _ in range(height))
+    raw = b"".join(b"\x00" + pixels[row * width : (row + 1) * width] for row in range(height))
     payload = b"".join(
         [
-            b"\x89PNG\r\n\x1a\n",
+            PNG_SIGNATURE,
             _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0)),
             _png_chunk(b"IDAT", zlib.compress(raw)),
             _png_chunk(b"IEND", b""),
         ]
     )
     path.write_bytes(payload)
+
+
+def save_png(path: Path, width: int, height: int, value: int) -> None:
+    save_png_from_grayscale(path, width, height, bytes([value]) * width * height)
 
 
 def write_map_yaml(path: Path, image_name: str, resolution: float, origin_x: float, origin_y: float) -> None:
@@ -114,24 +130,70 @@ def resolve_yaml_image(source_yaml: Path, values: dict[str, str]) -> Path:
     return source_image
 
 
+def _parse_pgm_header(data: bytes, path: Path) -> tuple[int, int, int, int]:
+    tokens: list[bytes] = []
+    index = 0
+    while len(tokens) < 4:
+        while index < len(data) and data[index] in b" \t\r\n":
+            index += 1
+        if index < len(data) and data[index] == ord("#"):
+            while index < len(data) and data[index] not in b"\r\n":
+                index += 1
+            continue
+        start = index
+        while index < len(data) and data[index] not in b" \t\r\n":
+            index += 1
+        if start == index:
+            raise RuntimeError(f"invalid PGM header in {path}")
+        tokens.append(data[start:index])
+    if index < len(data) and data[index] in b" \t\r\n":
+        index += 1
+    if tokens[0] != b"P5":
+        raise RuntimeError(f"unsupported PGM format in {path}: {tokens[0]!r}")
+    return int(tokens[1]), int(tokens[2]), int(tokens[3]), index
+
+
 def read_pgm_size(path: Path) -> tuple[int, int]:
-    with path.open("rb") as handle:
-        magic = handle.readline().strip()
-        if magic != b"P5":
-            raise RuntimeError(f"unsupported PGM format in {path}: {magic!r}")
-        line = handle.readline().strip()
-        while line.startswith(b"#"):
-            line = handle.readline().strip()
-        width_text, height_text = line.split()[:2]
-        return int(width_text), int(height_text)
+    width, height, _max_value, _offset = _parse_pgm_header(path.read_bytes(), path)
+    return width, height
 
 
-def copy_map_yaml_with_local_image(source_yaml: Path, target_yaml: Path, target_image: Path) -> None:
-    values = read_map_yaml(source_yaml)
-    source_image = resolve_yaml_image(source_yaml, values)
+def load_pgm_grayscale(path: Path) -> tuple[int, int, bytes]:
+    data = path.read_bytes()
+    width, height, max_value, offset = _parse_pgm_header(data, path)
+    if max_value != 255:
+        raise RuntimeError(f"unsupported PGM max value in {path}: {max_value}")
+    pixels = data[offset : offset + width * height]
+    if len(pixels) != width * height:
+        raise RuntimeError(f"truncated PGM payload in {path}")
+    return width, height, pixels
 
+
+def copy_image_for_target(source_image: Path, target_image: Path) -> None:
+    signature = source_image.read_bytes()[:8]
     target_image.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source_image, target_image)
+    target_suffix = target_image.suffix.lower()
+    if target_suffix == ".pgm":
+        if signature.startswith(b"P5"):
+            shutil.copyfile(source_image, target_image)
+            return
+    if target_suffix == ".png":
+        if signature == PNG_SIGNATURE:
+            shutil.copyfile(source_image, target_image)
+            return
+    raise RuntimeError(f"unsupported source image for {target_image.suffix} asset: {source_image}")
+
+
+def copy_map_yaml_with_local_image(
+    source_yaml: Path,
+    target_yaml: Path,
+    target_image: Path,
+    source_image_override: Path | None = None,
+) -> None:
+    values = read_map_yaml(source_yaml)
+    source_image = source_image_override or resolve_yaml_image(source_yaml, values)
+
+    copy_image_for_target(source_image, target_image)
     write_map_yaml_from_values(target_yaml, target_image.name, values)
 
 
@@ -183,11 +245,25 @@ def promote_flat_map(
         raise RuntimeError(f"flat localizer map yaml does not exist: {localizer_source_yaml}")
 
     nav_values = read_map_yaml(nav_source_yaml)
-    nav_source_image = resolve_yaml_image(nav_source_yaml, nav_values)
+    expected_nav_image = f"{flat_map_name}.pgm"
+    actual_nav_image = nav_values.get("image", "").strip().strip('"').strip("'")
+    if actual_nav_image != expected_nav_image:
+        raise RuntimeError(
+            f"flat Nav2 map yaml must reference {expected_nav_image}, got {actual_nav_image or '<missing>'}: "
+            f"{nav_source_yaml}"
+        )
+    nav_source_image = flat_maps_dir / expected_nav_image
+    if not nav_source_image.exists():
+        raise RuntimeError(f"flat Nav2 map pgm does not exist: {nav_source_image}")
     mask_width, mask_height = read_pgm_size(nav_source_image)
     nav_resolution = float(nav_values.get("resolution", resolution))
 
-    copy_map_yaml_with_local_image(nav_source_yaml, floor_root / "nav" / "nav_map.yaml", floor_root / "nav" / "nav_map.pgm")
+    copy_map_yaml_with_local_image(
+        nav_source_yaml,
+        floor_root / "nav" / "nav_map.yaml",
+        floor_root / "nav" / "nav_map.pgm",
+        source_image_override=nav_source_image,
+    )
     copy_map_yaml_with_local_image(
         localizer_source_yaml,
         floor_root / "localizer" / "localizer_params.yaml",
@@ -197,7 +273,7 @@ def promote_flat_map(
     for stem in ("keepout_mask", "speed_mask", "binary_mask"):
         pgm = floor_root / "filters" / f"{stem}.pgm"
         if not pgm.exists():
-            save_pgm(pgm, mask_width, mask_height, 0)
+            save_pgm(pgm, mask_width, mask_height, NEUTRAL_FILTER_PIXEL)
         write_map_yaml_from_values(floor_root / "filters" / f"{stem}.yaml", f"{stem}.pgm", nav_values)
 
     poses = floor_root / "poses.yaml"
@@ -238,7 +314,7 @@ def ensure_floor_assets(
     for stem in ("keepout_mask", "speed_mask", "binary_mask"):
         pgm = floor_root / "filters" / f"{stem}.pgm"
         if not pgm.exists():
-            save_pgm(pgm, width, height, 0)
+            save_pgm(pgm, width, height, NEUTRAL_FILTER_PIXEL)
         write_map_yaml(floor_root / "filters" / f"{stem}.yaml", f"{stem}.pgm", resolution, origin_x, origin_y)
 
     poses = floor_root / "poses.yaml"

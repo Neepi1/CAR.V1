@@ -11,6 +11,7 @@ RUN if [[ -f /etc/apt/sources.list.d/yarn.list ]]; then mv /etc/apt/sources.list
     python3-tk \
     ros-humble-navigation2 \
     ros-humble-nav2-bringup \
+    ros-humble-robot-localization \
     ros-humble-gtsam \
     ros-humble-pcl-conversions \
     ros-humble-cartographer \

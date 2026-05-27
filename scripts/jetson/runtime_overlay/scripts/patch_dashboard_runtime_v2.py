@@ -115,13 +115,13 @@ FLOOR_TESTING_METHODS = """    @staticmethod
         return token
 
     def _floor_release_assets_dir(self) -> Path:
-        upstream_root = self.env.get('NJRH_UPSTREAM_ROOT') or os.environ.get(
-            'NJRH_UPSTREAM_ROOT',
-            '/workspaces/isaac_ros-dev',
+        project_root = self.env.get('NJRH_PROJECT_ROOT') or os.environ.get(
+            'NJRH_PROJECT_ROOT',
+            '/workspaces/njrh-v3/workspace1',
         )
         return Path(self.env.get('NJRH_RELEASE_ASSETS_DIR') or os.environ.get(
             'NJRH_RELEASE_ASSETS_DIR',
-            str(Path(upstream_root) / 'maps_release'),
+            str(Path(project_root) / 'maps_release'),
         ))
 
     def _floor_required_assets(self) -> List[str]:
@@ -309,7 +309,7 @@ FLOOR_TESTING_METHODS = """    @staticmethod
                     return select_result
                 actions.append(select_result.get('message', 'floor assets selected'))
                 actions.extend(self._ensure_floor_manager_ready())
-                payload = "{building_id: '" + safe_building + "', floor_id: '" + safe_floor + "', resume_navigation: true}"
+                payload = "{building_id: '" + safe_building + "', floor_id: '" + safe_floor + "', resume_navigation: false}"
                 ros_command = (
                     'PROJECT_ROOT="${NJRH_PROJECT_ROOT:-/workspaces/njrh-v3/workspace1}"; '
                     'cd "${PROJECT_ROOT}" && '
@@ -454,20 +454,6 @@ def patch_dashboard_server_floor_testing(path: Path) -> None:
             "    def start_nvblox(self) -> dict:\n",
             FLOOR_TESTING_METHODS + "    def start_nvblox(self) -> dict:\n",
             "floor testing manager methods",
-        )
-    if "            'run_floor_manager.sh',\n            'floor_manager_node',\n        ]\n        patterns.extend" not in text:
-        text = base.replace_once(
-            text,
-            "            'nav_cloud_preprocessor',\n        ]\n",
-            "            'nav_cloud_preprocessor',\n            'run_floor_manager.sh',\n            'floor_manager_node',\n        ]\n",
-            "floor manager stop_core kill patterns",
-        )
-    if "self._stop('floor_manager')" not in text:
-        text = base.replace_once(
-            text,
-            "        self._stop('map_align')\n        self._stop('pgo')\n",
-            "        self._stop('map_align')\n        self._stop('floor_manager')\n        self._stop('pgo')\n",
-            "floor manager stop_core managed process stop",
         )
     if "/api/floors/list" not in text:
         text = base.replace_once(

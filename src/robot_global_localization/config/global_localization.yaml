@@ -5,6 +5,9 @@ robot_global_localization:
     pose_topic: /global_localization/pose
     health_topic: /global_localization/health
     default_floor_id: floor_1
+    grid_search_trigger_service: /trigger_grid_search_localization
+    service_timeout_sec: 10.0
+    require_grid_search_trigger: true
     local_flatscan_config: D:/codespace/car/nav2_test/params/jt128_flatscan.yaml
     local_localizer_config: D:/codespace/car/nav2_test/params/jt128_occupancy_grid_localizer.yaml
     local_localizer_launch: D:/codespace/car/nav2_test/jt128_occupancy_localization.launch.py

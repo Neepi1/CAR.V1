@@ -6,12 +6,11 @@ pointcloud_to_laserscan:
     # horizontal even when the real lidar is pitched on the vehicle.
     target_frame: lidar_level_link
     transform_tolerance: 0.10
-    # Keep the slice above the floor while still broad enough to retain a
-    # useful first frame. With lidar_level_link at z ~= 1.05 m, this keeps
-    # roughly 0.20 m .. 0.85 m in base_link and avoids the strong near-ground
-    # ring that polluted the previous wider band.
-    min_height: -0.85
-    max_height: -0.20
+    # Keep mapping and relocalization on the same leveled structural band.
+    # This thicker slice is used to recover more long-range wall returns with
+    # the current tilted JT128 installation while staying in lidar_level_link.
+    min_height: -0.75
+    max_height: 0.35
     angle_min: -3.141592653589793
     angle_max: 3.141592653589793
     angle_increment: 0.004363323129985824

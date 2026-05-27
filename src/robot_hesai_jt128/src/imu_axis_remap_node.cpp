@@ -69,6 +69,31 @@ tf2::Quaternion normalize_quaternion(const tf2::Quaternion & input)
   return output;
 }
 
+std::array<double, 3> load_diagonal_parameter(
+  rclcpp::Node & node,
+  const std::string & name,
+  const std::array<double, 3> & default_value)
+{
+  node.declare_parameter<std::vector<double>>(
+    name,
+    std::vector<double>{default_value[0], default_value[1], default_value[2]});
+
+  const auto raw = node.get_parameter(name).as_double_array();
+  if (raw.size() != 3) {
+    throw std::runtime_error(name + " must contain exactly 3 values");
+  }
+  return {raw[0], raw[1], raw[2]};
+}
+
+std::array<double, 9> make_diagonal_covariance(const std::array<double, 3> & diagonal)
+{
+  return {
+    diagonal[0], 0.0, 0.0,
+    0.0, diagonal[1], 0.0,
+    0.0, 0.0, diagonal[2],
+  };
+}
+
 }  // namespace
 
 class ImuAxisRemapNode : public rclcpp::Node
@@ -80,6 +105,9 @@ public:
     declare_parameter<std::string>("input_topic", "/jt128/vendor/imu_raw");
     declare_parameter<std::string>("output_topic", "/lidar_imu");
     declare_parameter<std::string>("output_frame_id", "imu_link");
+    declare_parameter<bool>("override_angular_velocity_covariance", false);
+    declare_parameter<bool>("override_linear_acceleration_covariance", false);
+    declare_parameter<bool>("mark_orientation_unavailable", false);
     declare_parameter<std::vector<double>>(
       "rotation_matrix",
       std::vector<double>{
@@ -91,6 +119,15 @@ public:
     input_topic_ = get_parameter("input_topic").as_string();
     output_topic_ = get_parameter("output_topic").as_string();
     output_frame_id_ = get_parameter("output_frame_id").as_string();
+    override_angular_velocity_covariance_ =
+      get_parameter("override_angular_velocity_covariance").as_bool();
+    override_linear_acceleration_covariance_ =
+      get_parameter("override_linear_acceleration_covariance").as_bool();
+    mark_orientation_unavailable_ = get_parameter("mark_orientation_unavailable").as_bool();
+    angular_velocity_covariance_diagonal_ = load_diagonal_parameter(
+      *this, "angular_velocity_covariance_diagonal", {0.10, 0.10, 0.25});
+    linear_acceleration_covariance_diagonal_ = load_diagonal_parameter(
+      *this, "linear_acceleration_covariance_diagonal", {0.50, 0.50, 0.50});
     load_rotation_matrix();
 
     publisher_ = create_publisher<sensor_msgs::msg::Imu>(
@@ -128,7 +165,26 @@ private:
     output.linear_acceleration_covariance = rotate_covariance(
       msg->linear_acceleration_covariance, rotation_matrix_);
 
-    if (output.orientation_covariance[0] >= 0.0) {
+    if (override_angular_velocity_covariance_) {
+      output.angular_velocity_covariance =
+        make_diagonal_covariance(angular_velocity_covariance_diagonal_);
+    }
+    if (override_linear_acceleration_covariance_) {
+      output.linear_acceleration_covariance =
+        make_diagonal_covariance(linear_acceleration_covariance_diagonal_);
+    }
+
+    if (mark_orientation_unavailable_) {
+      output.orientation_covariance = {
+        -1.0, 0.0, 0.0,
+        0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0,
+      };
+      output.orientation.x = 0.0;
+      output.orientation.y = 0.0;
+      output.orientation.z = 0.0;
+      output.orientation.w = 1.0;
+    } else if (output.orientation_covariance[0] >= 0.0) {
       const tf2::Quaternion q_in = normalize_quaternion(
         tf2::Quaternion(
           msg->orientation.x,
@@ -148,10 +204,11 @@ private:
     if (!logged_ready_) {
       RCLCPP_INFO(
         get_logger(),
-        "compiled canonical imu remap ready: %s -> %s frame=%s",
+        "compiled canonical imu remap ready: %s -> %s frame=%s angular_cov_override=%s",
         input_topic_.c_str(),
         output_topic_.c_str(),
-        output_frame_id_.c_str());
+        output_frame_id_.c_str(),
+        override_angular_velocity_covariance_ ? "true" : "false");
       logged_ready_ = true;
     }
   }
@@ -159,7 +216,12 @@ private:
   std::string input_topic_;
   std::string output_topic_;
   std::string output_frame_id_;
+  bool override_angular_velocity_covariance_;
+  bool override_linear_acceleration_covariance_;
+  bool mark_orientation_unavailable_;
   bool logged_ready_;
+  std::array<double, 3> angular_velocity_covariance_diagonal_;
+  std::array<double, 3> linear_acceleration_covariance_diagonal_;
   tf2::Matrix3x3 rotation_matrix_;
   tf2::Quaternion rotation_quaternion_;
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr publisher_;

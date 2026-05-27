@@ -3,11 +3,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/canonical_tf_helpers.sh"
+source "${SCRIPT_DIR}/nav_runtime_helpers.sh"
 source "${SCRIPT_DIR}/map_server_helpers.sh"
 source "${SCRIPT_DIR}/floor_asset_helpers.sh"
 
 export PUBLISH_LIDAR_TF="${PUBLISH_LIDAR_TF:-false}"
 LAUNCH_FILE="${NJRH_OVERLAY_ROOT}/launch/occupancy_localization_stack.launch.py"
+NAV_LOCAL_STATE_MODE="${NJRH_NAV_LOCAL_STATE_MODE:-passthrough}"
+POINTS_TOPIC="${NJRH_LOCALIZATION_POINTS_TOPIC:-/lidar_points}"
 
 if [[ -n "${NJRH_FLOOR_ID:-}" || -n "${NAV2_FLOOR_ID:-}" ]]; then
   resolve_floor_assets "${NJRH_BUILDING_ID:-${NAV2_BUILDING_ID:-building_1}}" "${NJRH_FLOOR_ID:-${NAV2_FLOOR_ID:-}}"
@@ -62,7 +65,6 @@ fi
 patterns=(
   "laser_mapping"
   "fastlio_mapping"
-  "ros2 run fast_lio fastlio_mapping"
   "ros2 launch .*occupancy_localization_stack.launch.py"
   "occupancy_localization_stack.launch.py"
   "occupancy_localization.launch.py"
@@ -100,6 +102,7 @@ launch_args=(
   "localizer_map_yaml:=${LOCALIZER_MAP_YAML}"
   "use_sim_time:=false"
   "publish_lidar_tf:=${PUBLISH_LIDAR_TF}"
+  "points_topic:=${POINTS_TOPIC}"
 )
 
 if [[ -n "${NAV2_LOCALIZER_PARAMS}" ]]; then
@@ -112,6 +115,7 @@ cleanup() {
     kill -INT "${localization_pid}" 2>/dev/null || true
     wait "${localization_pid}" 2>/dev/null || true
   fi
+  cleanup_overlay_helpers
   cleanup_canonical_helpers
 }
 
@@ -125,8 +129,15 @@ trap on_signal INT TERM
 
 start_canonical_helper "ranger_chassis_localization" bash "${SCRIPT_DIR}/run_ranger_chassis.sh"
 start_canonical_helper "robot_description_static_tf_localization" bash "${SCRIPT_DIR}/run_robot_description.sh"
-start_canonical_helper "robot_local_state_localization" bash "${SCRIPT_DIR}/run_local_state.sh"
+if [[ "${NAV_LOCAL_STATE_MODE}" == "passthrough" || "${NAV_LOCAL_STATE_MODE}" == "legacy" ]]; then
+  kill_canonical_pattern "robot_localization/ekf_node"
+  kill_canonical_pattern "ekf_node --ros-args.*__node:=robot_local_state"
+fi
+start_canonical_helper \
+  "robot_local_state_localization" \
+  env LOCAL_STATE_MODE="${NAV_LOCAL_STATE_MODE}" bash "${SCRIPT_DIR}/run_local_state.sh"
 start_canonical_helper "robot_localization_bridge" bash "${SCRIPT_DIR}/run_localization_bridge.sh"
+start_overlay_helper "global_localization_localization" bash "${SCRIPT_DIR}/run_global_localization.sh"
 
 wait_for_tf_edge "base_link" "lidar_level_link" 10 || {
   echo "[runtime-overlay] base_link -> lidar_level_link TF did not become ready for occupancy localization" >&2
@@ -135,6 +146,12 @@ wait_for_tf_edge "base_link" "lidar_level_link" 10 || {
 
 wait_for_topic_message "/local_state/odometry" 12 || {
   echo "[runtime-overlay] /local_state/odometry did not become ready for occupancy localization" >&2
+  exit 1
+}
+
+wait_for_topic_message "${POINTS_TOPIC}" 20 || {
+  echo "[runtime-overlay] timed out waiting for localization pointcloud: ${POINTS_TOPIC}" >&2
+  echo "[runtime-overlay] check canonical /lidar_points input stream and JT128 driver/remap chain." >&2
   exit 1
 }
 

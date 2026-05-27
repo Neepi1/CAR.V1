@@ -1,0 +1,90 @@
+docking:
+  ros__parameters:
+    base_frame: base_link
+    gs2_frame: gs2_link
+    charge_contact_frame: charge_contact_link
+    dock_contact_frame: dock_contact_link
+    gs2_scan_topic: /dock/gs2_scan
+    cmd_vel_topic: /cmd_vel_collision_checked
+    status_topic: /docking/status
+    start_service: /docking/start
+    stop_service: /docking/stop
+    charging_state_topic: /battery_state
+
+    mode:
+      forced_mode_topic: /ranger_mini3/forced_mode
+      park_topic: /ranger_mini3/park
+      use_crab_mode: true
+      crab_forced_mode: crab
+      release_forced_mode: auto
+      park_on_docked: true
+
+    geometry:
+      gs2_x_m: 0.360
+      gs2_y_m: 0.000
+      gs2_z_m: 0.290
+      charge_contact_x_m: 0.398
+      charge_contact_y_m: 0.000
+      charge_contact_z_m: 0.255
+      gs2_to_contact_x_m: 0.038
+
+    charge_contact:
+      housing_lateral_length_m: 0.235
+      housing_vertical_width_m: 0.080
+      electrode_lateral_length_m: 0.185
+      electrode_vertical_width_m: 0.030
+      positive_electrode_position: upper
+      negative_electrode_position: lower
+
+    approach:
+      pre_dock_distance_m: 0.80
+      blind_approach_max_distance_m: 0.50
+      blind_approach_speed_mps: 0.06
+      gs2_acquire_distance_m: 0.28
+      final_target_distance_m: 0.05
+
+    tolerances:
+      lateral_soft_limit_m: 0.015
+      lateral_hard_limit_m: 0.050
+      yaw_soft_limit_deg: 2.0
+      yaw_hard_limit_deg: 4.0
+      contact_confirm_timeout_s: 3.0
+
+    safety:
+      max_linear_speed_mps: 0.08
+      max_angular_speed_radps: 0.12
+      max_retries: 3
+      command_timeout_ms: 300
+      control_rate_hz: 20.0
+
+    detector:
+      min_points: 8
+      min_lateral_span_m: 0.045
+      lateral_gate_m: 0.20
+      min_range_m: 0.025
+      max_range_m: 0.30
+      stable_frames_required: 3
+      filter_alpha: 0.25
+      use_yaw_fit: false
+
+    controller:
+      kx: 0.45
+      ky: 0.55
+      ky_lateral: 0.70
+      lateral_command_sign: -1.0
+      kyaw: 0.00
+      lateral_deadband_m: 0.005
+      yaw_deadband_deg: 1.0
+      min_align_speed_mps: 0.035
+      min_lateral_speed_mps: 0.025
+      max_lateral_speed_mps: 0.04
+      lateral_priority_threshold_m: 0.010
+      yaw_priority_threshold_deg: 2.0
+      max_forward_while_lateral_mps: 0.000
+      lock_lateral_during_final_insert: true
+      max_command_steering_rad: 0.35
+      ackermann_wheelbase_m: 0.494
+      contact_crawl_speed_mps: 0.025
+
+    charging:
+      min_current_a: 0.10

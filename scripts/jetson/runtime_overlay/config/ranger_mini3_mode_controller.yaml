@@ -9,6 +9,8 @@ ranger_mini3_mode_controller:
     max_linear_high_angle_mps: 0.75
     max_ackermann_angle_rad: 0.698
     max_spin_radps: 3.259
+    max_lateral_mps: 0.08
+    max_crab_yaw_radps: 0.15
 
     publish_rate_hz: 50.0
     cmd_timeout_s: 0.25
@@ -16,7 +18,13 @@ ranger_mini3_mode_controller:
     allow_reverse: false
     lateral_policy: reject
     dual_ackermann_angle: inner
-    spin_steering_threshold_rad: 0.698
+    spin_steering_threshold_rad: 0.785
+    spin_enter_steering_threshold_rad: 0.785
+    spin_exit_steering_threshold_rad: 0.489
+    spin_enter_debounce_s: 0.4
+    spin_min_hold_s: 1.0
+    reverse_enable_topic: /ranger_mini3/allow_reverse
+    reverse_enable_timeout_s: 0.75
     linear_epsilon_mps: 0.02
     lateral_epsilon_mps: 0.02
     yaw_epsilon_radps: 0.02

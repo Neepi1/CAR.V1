@@ -34,7 +34,7 @@ class OccupancyBuilderLiveNode(Node):
             "map_frame_id": "map",
             "base_frame": "base_link",
             "use_tf_for_sensor_extrinsics": True,
-            "sensor_xyz": [0.25, 0.0, 1.05],
+            "sensor_xyz": [0.25, 0.0, 0.85],
             "sensor_rpy": [0.0, 0.0, 0.0],
             "publish_period_sec": 0.5,
             "max_points_per_scan": 9000,

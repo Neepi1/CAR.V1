@@ -45,7 +45,7 @@ def main() -> int:
     parser.add_argument("--origin-x", type=float, default=-100.0)
     parser.add_argument("--origin-y", type=float, default=-100.0)
     parser.add_argument("--pose-match-tolerance-ms", type=float, default=100.0)
-    parser.add_argument("--sensor-xyz", type=parse_triplet, default=[0.25, 0.0, 1.05])
+    parser.add_argument("--sensor-xyz", type=parse_triplet, default=[0.25, 0.0, 0.85])
     parser.add_argument("--sensor-rpy", type=parse_triplet, default=[0.0, 0.0, 0.0])
     args = parser.parse_args()
 

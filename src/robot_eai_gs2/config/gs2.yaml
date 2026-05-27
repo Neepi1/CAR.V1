@@ -1,0 +1,31 @@
+gs2_driver_node:
+  ros__parameters:
+    serial_port: "/dev/gs2"
+    serial_baudrate: 921600
+    frame_id: "gs2_link"
+    scan_topic: "/dock/gs2_scan"
+    point_cloud_topic: "/dock/gs2_points"
+    publish_point_cloud: true
+    auto_start: true
+    fail_on_initialize_error: true
+    use_ros_time_stamp: true
+
+    # GS2 SDK distances are reported in millimeters. Keep ROS LaserScan in meters.
+    sdk_range_scale: 0.001
+    range_min_m: 0.025
+    range_max_m: 0.30
+
+    # Use this for a horizontally mounted docking GS2. Widen only after live validation.
+    angle_min_deg: -50.0
+    angle_max_deg: 50.0
+    scan_frequency_hz: 8.0
+
+    fixed_resolution: false
+    reversion: false
+    inverted: false
+    auto_reconnect: true
+    single_channel: false
+    intensity: true
+    tof_lidar: false
+    invalid_range_is_inf: false
+    point_cloud_preservative: false

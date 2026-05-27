@@ -1,7 +1,10 @@
 param(
   [ValidateSet(
     'start-runtime',
+    'start-debug-runtime',
     'start-container',
+    'start-common',
+    'stop-common',
     'restart-container',
     'stop-container',
     'shell',
@@ -98,7 +101,10 @@ Publish-RemoteTool -HostSpec $JetsonHost -RemoteDir $RemoteToolDir
 
 $remoteAction = switch ($Action) {
   'start-runtime' { 'start-runtime' }
+  'start-debug-runtime' { 'start-debug-runtime' }
   'start-container' { 'start' }
+  'start-common' { 'start-common' }
+  'stop-common' { 'stop-common' }
   'restart-container' { 'restart' }
   'stop-container' { 'stop' }
   'shell' { 'shell' }

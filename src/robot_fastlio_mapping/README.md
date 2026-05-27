@@ -16,5 +16,6 @@ Wrapper-only package for FAST-LIO2 frontend integration.
 
 - Emits `mapping_result/frontend_result/frontend_result.json`
 - Exposes the repository-owned live draft pose contract on `/mapping/frontend_pose`
+- Provides `/cloud_registered_body` as the default deskewed current-frame point cloud for live `slam_toolbox` 2D mapping; Isaac occupancy-grid relocalization now defaults to canonical raw `/lidar_points` because it is triggered while the robot is stationary
 - Must remain upstream-config driven; wrapper does not modify FAST-LIO2 core source
 - Frontend metadata now records the canonical Fast-LIO input contract and does not expose a legacy remap fallback in the repository-owned runtime

@@ -10,12 +10,18 @@ CONFIG_FILE="${ROBOT_DESCRIPTION_CONFIG_FILE:-${NJRH_OVERLAY_ROOT}/config/sensor
   exit 1
 }
 
-# Keep static TF publication single-sourced even when this helper is started
-# manually during debugging. The canonical stack also kills old publishers, but
-# this makes the helper itself safe to re-run.
-pkill -INT -f "robot_description_static_tf_node" 2>/dev/null || true
-sleep 1
-pkill -9 -f "robot_description_static_tf_node" 2>/dev/null || true
+if pgrep -f "robot_description_static_tf_node" >/dev/null 2>&1; then
+  if [[ "${NJRH_FORCE_RESTART_CANONICAL_TF:-false}" != "true" ]]; then
+    echo "[runtime-overlay] robot_description_static_tf_node already running; reusing existing static TF publisher" >&2
+    while pgrep -f "robot_description_static_tf_node" >/dev/null 2>&1; do
+      sleep 2
+    done
+    exit 0
+  fi
+  pkill -INT -f "robot_description_static_tf_node" 2>/dev/null || true
+  sleep 1
+  pkill -9 -f "robot_description_static_tf_node" 2>/dev/null || true
+fi
 
 read_config_value() {
   local key="$1"

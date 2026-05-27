@@ -1,37 +1,61 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="multi_floor_delivery_robot">
   <xacro:arg name="base_frame" default="base_link"/>
+  <xacro:arg name="ranger_base_frame" default="ranger_base_link"/>
   <xacro:arg name="base_footprint_frame" default="base_footprint"/>
   <xacro:arg name="lidar_mount_frame" default="lidar_mount_link"/>
   <xacro:arg name="lidar_frame" default="lidar_link"/>
   <xacro:arg name="lidar_level_frame" default="lidar_level_link"/>
   <xacro:arg name="imu_frame" default="imu_link"/>
+  <xacro:arg name="gs2_frame" default="gs2_link"/>
+  <xacro:arg name="charge_contact_frame" default="charge_contact_link"/>
   <xacro:arg name="lidar_x" default="0.25"/>
   <xacro:arg name="lidar_y" default="0.0"/>
-  <xacro:arg name="lidar_z" default="1.05"/>
-  <xacro:arg name="lidar_roll" default="-0.682"/>
-  <xacro:arg name="lidar_pitch" default="0.273"/>
-  <xacro:arg name="lidar_yaw" default="-1.278"/>
+  <xacro:arg name="lidar_z" default="0.85"/>
+  <xacro:arg name="lidar_roll" default="0.0"/>
+  <xacro:arg name="lidar_pitch" default="-0.3490658503988659"/>
+  <xacro:arg name="lidar_yaw" default="3.141592653589793"/>
   <xacro:arg name="lidar_axis_roll" default="0.0"/>
   <xacro:arg name="lidar_axis_pitch" default="0.0"/>
-  <xacro:arg name="lidar_axis_yaw" default="-1.5707963267948966"/>
+  <xacro:arg name="lidar_axis_yaw" default="0.0"/>
   <xacro:arg name="lidar_level_x" default="0.25"/>
   <xacro:arg name="lidar_level_y" default="0.0"/>
-  <xacro:arg name="lidar_level_z" default="1.05"/>
-  <xacro:arg name="lidar_level_yaw" default="-1.5707963267948966"/>
+  <xacro:arg name="lidar_level_z" default="0.85"/>
+  <xacro:arg name="lidar_level_yaw" default="3.141592653589793"/>
   <xacro:arg name="imu_x" default="0.25"/>
   <xacro:arg name="imu_y" default="0.0"/>
-  <xacro:arg name="imu_z" default="1.05"/>
-  <xacro:arg name="imu_roll" default="-0.682"/>
-  <xacro:arg name="imu_pitch" default="0.273"/>
-  <xacro:arg name="imu_yaw" default="-1.278"/>
+  <xacro:arg name="imu_z" default="0.85"/>
+  <xacro:arg name="imu_roll" default="0.0"/>
+  <xacro:arg name="imu_pitch" default="-0.3490658503988659"/>
+  <xacro:arg name="imu_yaw" default="3.141592653589793"/>
+  <xacro:arg name="gs2_x" default="0.36"/>
+  <xacro:arg name="gs2_y" default="0.0"/>
+  <xacro:arg name="gs2_z" default="0.290"/>
+  <xacro:arg name="gs2_roll" default="0.0"/>
+  <xacro:arg name="gs2_pitch" default="0.0"/>
+  <xacro:arg name="gs2_yaw" default="0.0"/>
+  <xacro:arg name="charge_contact_x" default="0.398"/>
+  <xacro:arg name="charge_contact_y" default="0.0"/>
+  <xacro:arg name="charge_contact_z" default="0.255"/>
+  <xacro:arg name="charge_contact_roll" default="0.0"/>
+  <xacro:arg name="charge_contact_pitch" default="0.0"/>
+  <xacro:arg name="charge_contact_yaw" default="0.0"/>
 
   <link name="$(arg base_frame)"/>
+  <link name="$(arg ranger_base_frame)"/>
   <link name="$(arg base_footprint_frame)"/>
   <link name="$(arg lidar_mount_frame)"/>
   <link name="$(arg lidar_frame)"/>
   <link name="$(arg lidar_level_frame)"/>
   <link name="$(arg imu_frame)"/>
+  <link name="$(arg gs2_frame)"/>
+  <link name="$(arg charge_contact_frame)"/>
+
+  <joint name="$(arg base_frame)_to_$(arg ranger_base_frame)" type="fixed">
+    <parent link="$(arg base_frame)"/>
+    <child link="$(arg ranger_base_frame)"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
 
   <joint name="$(arg base_frame)_to_$(arg base_footprint_frame)" type="fixed">
     <parent link="$(arg base_frame)"/>
@@ -61,5 +85,17 @@
     <parent link="$(arg base_frame)"/>
     <child link="$(arg imu_frame)"/>
     <origin xyz="$(arg imu_x) $(arg imu_y) $(arg imu_z)" rpy="$(arg imu_roll) $(arg imu_pitch) $(arg imu_yaw)"/>
+  </joint>
+
+  <joint name="$(arg base_frame)_to_$(arg gs2_frame)" type="fixed">
+    <parent link="$(arg base_frame)"/>
+    <child link="$(arg gs2_frame)"/>
+    <origin xyz="$(arg gs2_x) $(arg gs2_y) $(arg gs2_z)" rpy="$(arg gs2_roll) $(arg gs2_pitch) $(arg gs2_yaw)"/>
+  </joint>
+
+  <joint name="$(arg base_frame)_to_$(arg charge_contact_frame)" type="fixed">
+    <parent link="$(arg base_frame)"/>
+    <child link="$(arg charge_contact_frame)"/>
+    <origin xyz="$(arg charge_contact_x) $(arg charge_contact_y) $(arg charge_contact_z)" rpy="$(arg charge_contact_roll) $(arg charge_contact_pitch) $(arg charge_contact_yaw)"/>
   </joint>
 </robot>

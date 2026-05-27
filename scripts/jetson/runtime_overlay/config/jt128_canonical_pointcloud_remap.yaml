@@ -3,6 +3,12 @@ pointcloud_axis_remap:
     input_topic: /jt128/vendor/points_raw
     output_topic: /lidar_points
     output_frame_id: lidar_link
+    input_qos_depth: 1
+    output_qos_depth: 1
+    output_reliable: false
+    # JT128 raw planar axes: +Y_raw is the 0 degree beam and +X_raw is the
+    # 90 degree beam. Publish canonical lidar_link points as:
+    # x = raw_y, y = -raw_x, z = raw_z.
     rotation_matrix:
       - 0.0
       - 1.0

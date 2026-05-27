@@ -19,6 +19,7 @@ fi
 }
 
 stop_existing_overlay_nav_helpers
+stop_existing_standard_nav_stack
 
 ensure_map_server_active "${NAV2_MAP_YAML:-}" 30 || {
   echo "[runtime-overlay] map_server is not active. Start localization and load a Nav2 map before navigation." >&2
@@ -27,6 +28,35 @@ ensure_map_server_active "${NAV2_MAP_YAML:-}" 30 || {
 
 wait_for_occupancy_grid "/map" 30 || {
   echo "[runtime-overlay] /map is not available. Navigation cannot build the global costmap." >&2
+  exit 1
+}
+
+ensure_costmap_filter_masks() {
+  local keepout="${NAV2_KEEP_OUT_MASK_YAML:-}"
+  local speed="${NAV2_SPEED_MASK_YAML:-}"
+  if [[ -n "${keepout}" && -f "${keepout}" && -n "${speed}" && -f "${speed}" ]]; then
+    export NAV2_KEEP_OUT_MASK_YAML="${keepout}"
+    export NAV2_SPEED_MASK_YAML="${speed}"
+    return 0
+  fi
+
+  local neutral_dir="${NJRH_OVERLAY_ROOT}/filters/runtime_neutral"
+  local generator="${SCRIPT_DIR}/ensure_costmap_filter_masks.py"
+  [[ -f "${generator}" ]] || {
+    echo "[runtime-overlay] missing costmap filter mask generator: ${generator}" >&2
+    return 1
+  }
+
+  if [[ -n "${NAV2_MAP_YAML:-}" && -f "${NAV2_MAP_YAML}" ]]; then
+    eval "$(python3 "${generator}" --nav-yaml "${NAV2_MAP_YAML}" --output-dir "${neutral_dir}")"
+  else
+    eval "$(python3 "${generator}" --output-dir "${neutral_dir}")"
+  fi
+  export NAV2_KEEP_OUT_MASK_YAML NAV2_SPEED_MASK_YAML NAV2_BINARY_MASK_YAML
+}
+
+ensure_costmap_filter_masks || {
+  echo "[runtime-overlay] failed to prepare costmap filter masks" >&2
   exit 1
 }
 
@@ -63,7 +93,9 @@ start_overlay_helper "ranger_mini3_mode_controller" bash "${SCRIPT_DIR}/run_rang
 ros2 launch "${LAUNCH_FILE}" \
   use_sim_time:=false \
   autostart:=true \
-  params_file:="${NAV2_PARAMS_FILE}" &
+  params_file:="${NAV2_PARAMS_FILE}" \
+  keepout_mask_yaml:="${NAV2_KEEP_OUT_MASK_YAML}" \
+  speed_mask_yaml:="${NAV2_SPEED_MASK_YAML}" &
 nav_pid=$!
 
 wait_for_global_costmap_static 45 || {

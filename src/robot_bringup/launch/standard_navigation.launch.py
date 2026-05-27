@@ -12,6 +12,8 @@ def generate_launch_description():
     use_sim_time = LaunchConfiguration("use_sim_time")
     autostart = LaunchConfiguration("autostart")
     params_file = LaunchConfiguration("params_file")
+    keepout_mask_yaml = LaunchConfiguration("keepout_mask_yaml")
+    speed_mask_yaml = LaunchConfiguration("speed_mask_yaml")
     use_respawn = LaunchConfiguration("use_respawn")
     use_composition = LaunchConfiguration("use_composition")
     log_level = LaunchConfiguration("log_level")
@@ -19,8 +21,18 @@ def generate_launch_description():
     default_params_file = PathJoinSubstitution(
         [FindPackageShare("robot_nav_config"), "config", "nav2.yaml"]
     )
+    default_keepout_mask_yaml = PathJoinSubstitution(
+        [FindPackageShare("robot_nav_config"), "config", "neutral_keepout_mask.yaml"]
+    )
+    default_speed_mask_yaml = PathJoinSubstitution(
+        [FindPackageShare("robot_nav_config"), "config", "neutral_speed_mask.yaml"]
+    )
 
     lifecycle_nodes = [
+        "keepout_filter_mask_server",
+        "keepout_costmap_filter_info_server",
+        "speed_filter_mask_server",
+        "speed_costmap_filter_info_server",
         "controller_server",
         "smoother_server",
         "planner_server",
@@ -64,9 +76,75 @@ def generate_launch_description():
             DeclareLaunchArgument("use_sim_time", default_value="false"),
             DeclareLaunchArgument("autostart", default_value="true"),
             DeclareLaunchArgument("params_file", default_value=default_params_file),
+            DeclareLaunchArgument("keepout_mask_yaml", default_value=default_keepout_mask_yaml),
+            DeclareLaunchArgument("speed_mask_yaml", default_value=default_speed_mask_yaml),
             DeclareLaunchArgument("use_respawn", default_value="False"),
             DeclareLaunchArgument("use_composition", default_value="False"),
             DeclareLaunchArgument("log_level", default_value="info"),
+            Node(
+                package="nav2_map_server",
+                executable="map_server",
+                name="keepout_filter_mask_server",
+                output="screen",
+                respawn=use_respawn,
+                respawn_delay=2.0,
+                parameters=[
+                    {"use_sim_time": use_sim_time},
+                    {"yaml_filename": keepout_mask_yaml},
+                    {"topic_name": "/keepout_filter_mask"},
+                    {"frame_id": "map"},
+                ],
+                arguments=["--ros-args", "--log-level", log_level],
+            ),
+            Node(
+                package="nav2_map_server",
+                executable="costmap_filter_info_server",
+                name="keepout_costmap_filter_info_server",
+                output="screen",
+                respawn=use_respawn,
+                respawn_delay=2.0,
+                parameters=[
+                    {"use_sim_time": use_sim_time},
+                    {"type": 0},
+                    {"filter_info_topic": "/costmap_filter_info/keepout"},
+                    {"mask_topic": "/keepout_filter_mask"},
+                    {"base": 0.0},
+                    {"multiplier": 1.0},
+                ],
+                arguments=["--ros-args", "--log-level", log_level],
+            ),
+            Node(
+                package="nav2_map_server",
+                executable="map_server",
+                name="speed_filter_mask_server",
+                output="screen",
+                respawn=use_respawn,
+                respawn_delay=2.0,
+                parameters=[
+                    {"use_sim_time": use_sim_time},
+                    {"yaml_filename": speed_mask_yaml},
+                    {"topic_name": "/speed_filter_mask"},
+                    {"frame_id": "map"},
+                ],
+                arguments=["--ros-args", "--log-level", log_level],
+            ),
+            Node(
+                package="nav2_map_server",
+                executable="costmap_filter_info_server",
+                name="speed_costmap_filter_info_server",
+                output="screen",
+                respawn=use_respawn,
+                respawn_delay=2.0,
+                parameters=[
+                    {"use_sim_time": use_sim_time},
+                    {"type": 1},
+                    {"filter_info_topic": "/costmap_filter_info/speed"},
+                    {"mask_topic": "/speed_filter_mask"},
+                    {"base": 0.0},
+                    {"multiplier": 1.0},
+                ],
+                arguments=["--ros-args", "--log-level", log_level],
+            ),
             # This runtime path stays non-composed intentionally so the field overlay
             # can keep deterministic process ownership for crash / restart handling.
             Node(

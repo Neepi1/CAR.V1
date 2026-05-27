@@ -61,11 +61,14 @@ def load_xacro_arguments() -> list[str]:
 
     return [
         _xacro_arg("base_frame", params["base_frame"]),
+        _xacro_arg("ranger_base_frame", params.get("ranger_base_frame", "ranger_base_link")),
         _xacro_arg("base_footprint_frame", params["base_footprint_frame"]),
         _xacro_arg("lidar_mount_frame", params["lidar_mount_frame"]),
         _xacro_arg("lidar_frame", params["lidar_frame"]),
         _xacro_arg("lidar_level_frame", params.get("lidar_level_frame", "lidar_level_link")),
         _xacro_arg("imu_frame", params["imu_frame"]),
+        _xacro_arg("gs2_frame", params.get("gs2_frame", "gs2_link")),
+        _xacro_arg("charge_contact_frame", params.get("charge_contact_frame", "charge_contact_link")),
         _xacro_arg("lidar_x", lidar_xyz[0]),
         _xacro_arg("lidar_y", lidar_xyz[1]),
         _xacro_arg("lidar_z", lidar_xyz[2]),
@@ -85,6 +88,18 @@ def load_xacro_arguments() -> list[str]:
         _xacro_arg("imu_roll", float(params["imu_rpy"][0])),
         _xacro_arg("imu_pitch", float(params["imu_rpy"][1])),
         _xacro_arg("imu_yaw", float(params["imu_rpy"][2])),
+        _xacro_arg("gs2_x", float(params.get("gs2_xyz", [0.36, 0.0, 0.290])[0])),
+        _xacro_arg("gs2_y", float(params.get("gs2_xyz", [0.36, 0.0, 0.290])[1])),
+        _xacro_arg("gs2_z", float(params.get("gs2_xyz", [0.36, 0.0, 0.290])[2])),
+        _xacro_arg("gs2_roll", float(params.get("gs2_rpy", [0.0, 0.0, 0.0])[0])),
+        _xacro_arg("gs2_pitch", float(params.get("gs2_rpy", [0.0, 0.0, 0.0])[1])),
+        _xacro_arg("gs2_yaw", float(params.get("gs2_rpy", [0.0, 0.0, 0.0])[2])),
+        _xacro_arg("charge_contact_x", float(params.get("charge_contact_xyz", [0.398, 0.0, 0.255])[0])),
+        _xacro_arg("charge_contact_y", float(params.get("charge_contact_xyz", [0.398, 0.0, 0.255])[1])),
+        _xacro_arg("charge_contact_z", float(params.get("charge_contact_xyz", [0.398, 0.0, 0.255])[2])),
+        _xacro_arg("charge_contact_roll", float(params.get("charge_contact_rpy", [0.0, 0.0, 0.0])[0])),
+        _xacro_arg("charge_contact_pitch", float(params.get("charge_contact_rpy", [0.0, 0.0, 0.0])[1])),
+        _xacro_arg("charge_contact_yaw", float(params.get("charge_contact_rpy", [0.0, 0.0, 0.0])[2])),
     ]
 
 

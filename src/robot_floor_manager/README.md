@@ -9,10 +9,11 @@
 The switch sequence is:
 
 1. Validate `maps_root/<building_id>/<floor_id>` assets.
-2. Load `nav/nav_map.yaml` into `/map_server`.
-3. Apply `localizer/localizer_map.png` and `localizer/localizer_params.yaml` through `/global_localization/apply_floor_assets`.
-4. Trigger global localization through `/global_localization/trigger`.
-5. Clear global and local costmaps.
+2. With `resume_navigation=false`, record the selected floor assets for the next navigation start without requiring `/map_server`, Isaac localization, or Nav2 to be running.
+3. With `resume_navigation=true`, load `nav/nav_map.yaml` into `/map_server`.
+4. Apply `localizer/localizer_map.png` and `localizer/localizer_params.yaml` through `/global_localization/apply_floor_assets`.
+5. Trigger global localization through `/global_localization/trigger`.
+6. Clear global and local costmaps when the live navigation stack is active.
 
 ## Required Assets
 
