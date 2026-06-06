@@ -1,6 +1,6 @@
 robot_global_localization:
   ros__parameters:
-    mock_mode: true
+    mock_mode: false
     publish_tf: false
     pose_topic: /global_localization/pose
     health_topic: /global_localization/health

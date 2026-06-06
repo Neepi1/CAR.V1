@@ -2,7 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/common_env.sh"
+source "${SCRIPT_DIR}/nav_runtime_helpers.sh"
+source "${SCRIPT_DIR}/cpu_affinity.sh"
 REPO_ROOT="$(cd "${NJRH_OVERLAY_ROOT}/../../.." && pwd)"
 
 PARAMS_FILE="${LOCAL_PERCEPTION_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/local_perception.yaml}"
@@ -18,4 +19,6 @@ NODE_BIN="${REPO_ROOT}/install/robot_local_perception/lib/robot_local_perception
   exit 1
 }
 
-exec "${NODE_BIN}" --ros-args --params-file "${PARAMS_FILE}"
+echo "[runtime-overlay] starting local perception without startup topic/TF probes" >&2
+
+njrh_exec_affined robot_local_perception "${NODE_BIN}" --ros-args --params-file "${PARAMS_FILE}"

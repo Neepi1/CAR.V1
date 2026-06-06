@@ -3,17 +3,38 @@ robot_local_perception:
     mock_mode: true
     mode: NORMAL
     mode_topic: /robot_mode
-    input_topic: /lidar_points
+    input_topic: /_internal/lidar_points_local
+    input_reliable: false
+    input_qos_depth: 1
+    input_frame_id_override: lidar_link
+    input_transform_use_latest: true
+    input_rotation_matrix:
+      - 1.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
     output_topic: /perception/obstacle_points
     clearing_output_topic: /perception/clearing_points
     output_frame_id: base_link
-    restamp_to_now: true
-    restamp_to_latest_tf: true
-    require_output_stamp_tf: true
+    restamp_to_now: false
+    restamp_to_latest_tf: false
+    require_output_stamp_tf: false
     output_stamp_tf_target_frame: odom
+    output_stamp_odom_topic: /local_state/odometry
     lookup_timeout_sec: 0.1
-    processing_rate_hz: 8.0
-    point_sample_stride: 4
+    max_output_tf_stamp_age_sec: 0.25
+    output_stamp_tf_backoff_sec: 0.0
+    output_stamp_forward_sec: 0.0
+    require_startup_tf_ready: true
+    startup_tf_warmup_sec: 1.0
+    processing_rate_hz: 20.0
+    process_on_callback: true
+    point_sample_stride: 1
     max_filtered_points: 12000
     clearing.enabled: true
     clearing.range_filter.min: 0.10
@@ -30,6 +51,7 @@ robot_local_perception:
     publish_debug_log: false
     local_nav_preprocessor_reference: D:/codespace/car/nav2_test/params/jt128_nav_cloud_preprocessor.yaml
     supported_modes: [NORMAL, RAMP, ELEVATOR_WAIT, DOORWAY]
+    clearing.publish_every_n: 3
 
     profiles.NORMAL.range_filter.min: 0.5
     profiles.NORMAL.range_filter.max: 5.50

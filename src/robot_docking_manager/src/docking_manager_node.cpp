@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "geometry_msgs/msg/twist.hpp"
+#include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/battery_state.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
@@ -46,6 +47,27 @@ double median(std::vector<double> values)
   }
   return result;
 }
+
+struct BatteryContactEvaluation
+{
+  bool contact{false};
+  std::string reason{"no_contact"};
+};
+
+double normalized_soc_percent(const float percentage)
+{
+  if (!std::isfinite(percentage)) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  const double raw = static_cast<double>(percentage);
+  return std::clamp(raw <= 1.0 ? raw * 100.0 : raw, 0.0, 100.0);
+}
+
+bool voltage_in_contact_range(const float voltage, const double min_v, const double max_v)
+{
+  const double v = static_cast<double>(voltage);
+  return std::isfinite(v) && v >= min_v && v <= max_v;
+}
 }  // namespace
 
 class DockingManagerNode : public rclcpp::Node
@@ -68,9 +90,17 @@ public:
       [this](const sensor_msgs::msg::BatteryState::SharedPtr msg) {
         latest_battery_ = msg;
         charging_detected_ = battery_indicates_charging(*msg);
+        charging_contact_detected_ = battery_indicates_charging_contact(*msg);
         if (charging_detected_ && docking_is_active()) {
           docked_stop("docked_charging_detected");
         }
+      });
+
+    odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+      undock_odom_topic_, rclcpp::QoS(20),
+      [this](nav_msgs::msg::Odometry::SharedPtr msg) {
+        latest_odom_ = std::move(msg);
+        last_odom_time_ = now();
       });
 
     cmd_pub_ = create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, rclcpp::QoS(10));
@@ -147,7 +177,7 @@ private:
   void load_parameters()
   {
     gs2_scan_topic_ = declare_parameter<std::string>("gs2_scan_topic", "/dock/gs2_scan");
-    cmd_vel_topic_ = declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel_collision_checked");
+    cmd_vel_topic_ = declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel_docking");
     status_topic_ = declare_parameter<std::string>("status_topic", "/docking/status");
     start_service_ = declare_parameter<std::string>("start_service", "/docking/start");
     stop_service_ = declare_parameter<std::string>("stop_service", "/docking/stop");
@@ -156,7 +186,7 @@ private:
     forced_mode_topic_ = declare_parameter<std::string>("mode.forced_mode_topic", "/ranger_mini3/forced_mode");
     park_topic_ = declare_parameter<std::string>("mode.park_topic", "/ranger_mini3/park");
     reverse_enable_topic_ =
-      declare_parameter<std::string>("mode.reverse_enable_topic", "/ranger_mini3/allow_reverse");
+      declare_parameter<std::string>("mode.reverse_enable_topic", "/ranger_mini3/docking_allow_reverse");
     use_crab_mode_ = declare_parameter<bool>("mode.use_crab_mode", true);
     crab_forced_mode_ = declare_parameter<std::string>("mode.crab_forced_mode", "crab");
     release_forced_mode_ = declare_parameter<std::string>("mode.release_forced_mode", "auto");
@@ -174,6 +204,11 @@ private:
     undock_speed_mps_ = declare_parameter<double>("undock.speed_mps", 0.06);
     undock_min_clear_distance_m_ = declare_parameter<double>("undock.min_clear_distance_m", 0.45);
     undock_timeout_s_ = declare_parameter<double>("undock.timeout_s", 12.0);
+    undock_odom_topic_ = declare_parameter<std::string>("undock.odom_topic", "/local_state/odometry");
+    undock_odom_timeout_s_ = declare_parameter<double>("undock.odom_timeout_s", 0.50);
+    undock_odom_start_timeout_s_ = declare_parameter<double>("undock.odom_start_timeout_s", 2.0);
+    undock_no_progress_timeout_s_ = declare_parameter<double>("undock.no_progress_timeout_s", 2.0);
+    undock_progress_epsilon_m_ = declare_parameter<double>("undock.progress_epsilon_m", 0.005);
 
     lateral_soft_limit_m_ = declare_parameter<double>("tolerances.lateral_soft_limit_m", 0.030);
     lateral_hard_limit_m_ = declare_parameter<double>("tolerances.lateral_hard_limit_m", 0.050);
@@ -215,14 +250,24 @@ private:
     ackermann_wheelbase_m_ = declare_parameter<double>("controller.ackermann_wheelbase_m", 0.494);
     contact_crawl_speed_mps_ = declare_parameter<double>("controller.contact_crawl_speed_mps", 0.025);
     min_charging_current_a_ = declare_parameter<double>("charging.min_current_a", 0.10);
+    charging_contact_voltage_min_v_ =
+      std::max(0.0, declare_parameter<double>("charging.contact_voltage_min_v", 40.0));
+    charging_contact_voltage_max_v_ =
+      std::max(charging_contact_voltage_min_v_, declare_parameter<double>("charging.contact_voltage_max_v", 1000.0));
+    charging_full_soc_threshold_pct_ =
+      std::clamp(declare_parameter<double>("charging.full_soc_threshold_pct", 99.0), 0.0, 100.0);
+    charging_full_soc_voltage_contact_enable_ =
+      declare_parameter<bool>("charging.full_soc_voltage_contact_enable", true);
 
     control_rate_hz_ = std::max(1.0, control_rate_hz_);
   }
 
   void start_docking()
   {
+    reset_undock_tracking();
     retries_ = 0;
     charging_detected_ = latest_battery_ && battery_indicates_charging(*latest_battery_);
+    charging_contact_detected_ = latest_battery_ && battery_indicates_charging_contact(*latest_battery_);
     valid_detection_streak_ = 0;
     has_filtered_detection_ = false;
     if (charging_detected_) {
@@ -239,6 +284,7 @@ private:
 
   void stop_docking(const std::string & reason)
   {
+    reset_undock_tracking();
     state_ = State::Idle;
     publish_zero();
     publish_reverse_enable(false);
@@ -248,6 +294,7 @@ private:
 
   void fail(const std::string & reason)
   {
+    reset_undock_tracking();
     state_ = State::Failed;
     publish_zero();
     publish_reverse_enable(false);
@@ -258,11 +305,12 @@ private:
   bool start_undocking(std::string & message)
   {
     charging_detected_ = latest_battery_ && battery_indicates_charging(*latest_battery_);
+    charging_contact_detected_ = latest_battery_ && battery_indicates_charging_contact(*latest_battery_);
     if (state_ == State::Undocking) {
       message = "undocking already active";
       return true;
     }
-    if (state_ != State::Docked && !charging_detected_) {
+    if (state_ != State::Docked && !charging_contact_detected_) {
       message = "undock rejected: robot is not docked and no charging contact is detected";
       publish_status("undock_rejected_not_docked");
       return false;
@@ -271,8 +319,10 @@ private:
     publish_park(false);
     publish_forced_mode(release_forced_mode_);
     publish_reverse_enable(true);
+    reset_undock_tracking();
     state_ = State::Undocking;
     state_entered_time_ = now();
+    last_undock_progress_time_ = state_entered_time_;
     message = "undocking started";
     publish_status("undocking");
     return true;
@@ -558,27 +608,62 @@ private:
 
   void handle_undocking()
   {
+    const auto stamp = now();
     const double speed = clamp(undock_speed_mps_, 0.0, max_linear_speed_mps_);
     if (speed <= 1.0e-3) {
       fail("undock_failed_invalid_speed");
       return;
     }
 
-    const double elapsed = (now() - state_entered_time_).seconds();
+    const double elapsed = (stamp - state_entered_time_).seconds();
     const double distance = std::max(0.0, undock_distance_m_);
-    const double traveled = elapsed * speed;
+    if (!have_undock_start_odom_) {
+      if (capture_undock_start_odom()) {
+        publish_status("undocking odom_reference_captured");
+      } else {
+        publish_zero();
+        if (elapsed > undock_odom_start_timeout_s_) {
+          fail("undock_failed_no_fresh_odom");
+          return;
+        }
+        publish_status("undocking waiting_for_fresh_odom");
+        return;
+      }
+    }
+
+    if (!odom_fresh()) {
+      fail("undock_failed_stale_odom");
+      return;
+    }
+
+    const double traveled = undock_traveled_m();
+    if (traveled > undock_max_progress_m_ + undock_progress_epsilon_m_) {
+      undock_max_progress_m_ = traveled;
+      last_undock_progress_time_ = stamp;
+    }
+
     if (traveled >= distance) {
+      const double final_distance = traveled;
+      reset_undock_tracking();
       state_ = State::Idle;
       publish_zero();
       publish_reverse_enable(false);
       release_docking_motion_mode(false);
       std::ostringstream status;
-      status << "undocked distance=" << std::fixed << std::setprecision(3) << distance;
+      status << "undocked distance=" << std::fixed << std::setprecision(3) << final_distance;
       publish_status(status.str());
       return;
     }
     if (elapsed > undock_timeout_s_) {
-      fail("undock_failed_timeout");
+      std::ostringstream status;
+      status << "undock_failed_timeout distance=" << std::fixed << std::setprecision(3) << traveled;
+      fail(status.str());
+      return;
+    }
+    if ((stamp - last_undock_progress_time_).seconds() > undock_no_progress_timeout_s_) {
+      std::ostringstream status;
+      status << "undock_failed_no_motion distance=" << std::fixed << std::setprecision(3) << traveled;
+      fail(status.str());
       return;
     }
 
@@ -594,6 +679,46 @@ private:
     publish_status(status.str());
   }
 
+  bool odom_fresh() const
+  {
+    if (!latest_odom_) {
+      return false;
+    }
+    return (now() - last_odom_time_).seconds() <= undock_odom_timeout_s_;
+  }
+
+  bool capture_undock_start_odom()
+  {
+    if (!odom_fresh()) {
+      return false;
+    }
+    const auto & position = latest_odom_->pose.pose.position;
+    undock_start_x_ = position.x;
+    undock_start_y_ = position.y;
+    undock_max_progress_m_ = 0.0;
+    last_undock_progress_time_ = now();
+    have_undock_start_odom_ = true;
+    return true;
+  }
+
+  double undock_traveled_m() const
+  {
+    if (!have_undock_start_odom_ || !latest_odom_) {
+      return 0.0;
+    }
+    const auto & position = latest_odom_->pose.pose.position;
+    return std::hypot(position.x - undock_start_x_, position.y - undock_start_y_);
+  }
+
+  void reset_undock_tracking()
+  {
+    have_undock_start_odom_ = false;
+    undock_start_x_ = 0.0;
+    undock_start_y_ = 0.0;
+    undock_max_progress_m_ = 0.0;
+    last_undock_progress_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+  }
+
   double apply_deadband(double value, double deadband) const
   {
     if (std::abs(value) <= deadband) {
@@ -606,7 +731,38 @@ private:
   {
     return msg.power_supply_status == sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_CHARGING ||
       msg.power_supply_status == sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_FULL ||
-      (std::isfinite(msg.current) && msg.current > min_charging_current_a_);
+      (std::isfinite(msg.current) && static_cast<double>(msg.current) > min_charging_current_a_) ||
+      (msg.present && voltage_in_contact_range(
+        msg.voltage, charging_contact_voltage_min_v_, charging_contact_voltage_max_v_));
+  }
+
+  bool battery_indicates_charging_contact(const sensor_msgs::msg::BatteryState & msg) const
+  {
+    return battery_charging_contact(msg).contact;
+  }
+
+  BatteryContactEvaluation battery_charging_contact(const sensor_msgs::msg::BatteryState & msg) const
+  {
+    if (msg.power_supply_status == sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_CHARGING) {
+      return {true, "power_supply_status=CHARGING"};
+    }
+    if (msg.power_supply_status == sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_FULL) {
+      return {true, "power_supply_status=FULL"};
+    }
+    if (std::isfinite(msg.current) && static_cast<double>(msg.current) > min_charging_current_a_) {
+      return {true, "current_above_threshold"};
+    }
+    if (msg.present && voltage_in_contact_range(
+      msg.voltage, charging_contact_voltage_min_v_, charging_contact_voltage_max_v_)) {
+      return {true, "present_voltage_valid"};
+    }
+    const double soc = normalized_soc_percent(msg.percentage);
+    if (charging_full_soc_voltage_contact_enable_ && msg.present && std::isfinite(soc) &&
+      soc >= charging_full_soc_threshold_pct_ &&
+      voltage_in_contact_range(msg.voltage, charging_contact_voltage_min_v_, charging_contact_voltage_max_v_)) {
+      return {true, "full_soc_present_voltage_valid"};
+    }
+    return {false, "no_contact"};
   }
 
   bool docking_is_active() const
@@ -715,6 +871,7 @@ private:
   std::string stop_service_;
   std::string undock_service_;
   std::string charging_state_topic_;
+  std::string undock_odom_topic_{"/local_state/odometry"};
   std::string forced_mode_topic_;
   std::string park_topic_;
   std::string reverse_enable_topic_;
@@ -734,6 +891,10 @@ private:
   double undock_speed_mps_{0.06};
   double undock_min_clear_distance_m_{0.45};
   double undock_timeout_s_{12.0};
+  double undock_odom_timeout_s_{0.50};
+  double undock_odom_start_timeout_s_{2.0};
+  double undock_no_progress_timeout_s_{2.0};
+  double undock_progress_epsilon_m_{0.005};
   double lateral_soft_limit_m_{0.030};
   double lateral_hard_limit_m_{0.050};
   double yaw_soft_limit_rad_{deg_to_rad(2.0)};
@@ -770,20 +931,33 @@ private:
   double ackermann_wheelbase_m_{0.494};
   double contact_crawl_speed_mps_{0.025};
   double min_charging_current_a_{0.10};
+  double charging_contact_voltage_min_v_{40.0};
+  double charging_contact_voltage_max_v_{1000.0};
+  double charging_full_soc_threshold_pct_{99.0};
+  bool charging_full_soc_voltage_contact_enable_{true};
 
   State state_{State::Idle};
   int retries_{0};
   int valid_detection_streak_{0};
   bool charging_detected_{false};
+  bool charging_contact_detected_{false};
   bool has_filtered_detection_{false};
+  bool have_undock_start_odom_{false};
+  double undock_start_x_{0.0};
+  double undock_start_y_{0.0};
+  double undock_max_progress_m_{0.0};
   Detection filtered_detection_;
   rclcpp::Time state_entered_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_scan_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_odom_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_undock_progress_time_{0, 0, RCL_ROS_TIME};
   sensor_msgs::msg::LaserScan::SharedPtr latest_scan_;
   sensor_msgs::msg::BatteryState::SharedPtr latest_battery_;
+  nav_msgs::msg::Odometry::SharedPtr latest_odom_;
 
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::Subscription<sensor_msgs::msg::BatteryState>::SharedPtr battery_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr forced_mode_pub_;

@@ -5,9 +5,13 @@ robot_localization_bridge:
     odom_frame: odom
     base_frame: base_link
     jump_threshold_m: 1.0
+    forced_jump_threshold_m: 20.0
     timeout_sec: 1.0
+    publish_rate_hz: 20.0
+    tf_future_stamp_offset_sec: 0.05
     localization_topic: /global_localization/pose
     local_odom_topic: /local_state/odometry
     health_topic: /localization/health
+    force_accept_service: /robot_localization_bridge/force_accept_next_localization
     two_d_mode: true
     local_reference_bridge_config: D:/codespace/car/nav2_test/params/jt128_map_to_odom_tf_bridge.yaml

@@ -2,11 +2,8 @@ lifecycle_manager_navigation:
   ros__parameters:
     use_sim_time: false
     autostart: true
+    bond_timeout: 0.0
     node_names:
-      - keepout_filter_mask_server
-      - keepout_costmap_filter_info_server
-      - speed_filter_mask_server
-      - speed_costmap_filter_info_server
       - controller_server
       - smoother_server
       - planner_server
@@ -15,6 +12,17 @@ lifecycle_manager_navigation:
       - waypoint_follower
       - velocity_smoother
       - collision_monitor
+
+lifecycle_manager_costmap_filters:
+  ros__parameters:
+    use_sim_time: false
+    autostart: true
+    bond_timeout: 0.0
+    node_names:
+      - keepout_filter_mask_server
+      - keepout_costmap_filter_info_server
+      - speed_filter_mask_server
+      - speed_costmap_filter_info_server
 
 planner_server:
   ros__parameters:
@@ -48,11 +56,11 @@ controller_server:
       plugin: "nav2_controller::SimpleGoalChecker"
       stateful: false
       xy_goal_tolerance: 0.20
-      yaw_goal_tolerance: 0.35
+      yaw_goal_tolerance: 0.15
     FollowPath:
       plugin: "nav2_rotation_shim_controller::RotationShimController"
       primary_controller: "nav2_mppi_controller::MPPIController"
-      angular_dist_threshold: 0.85
+      angular_dist_threshold: 1.20
       forward_sampling_distance: 0.55
       rotate_to_heading_angular_vel: 0.85
       max_angular_accel: 2.4
@@ -63,7 +71,7 @@ controller_server:
       batch_size: 1200
       iteration_count: 1
       prune_distance: 4.5
-      transform_tolerance: 0.30
+      transform_tolerance: 0.10
       temperature: 0.30
       gamma: 0.03
       motion_model: "Ackermann"
@@ -73,10 +81,10 @@ controller_server:
       regenerate_noises: false
       retry_attempt_limit: 3
       reset_period: 1.0
-      vx_std: 0.28
+      vx_std: 0.45
       vy_std: 0.0
       wz_std: 0.45
-      vx_max: 0.55
+      vx_max: 1.20
       vx_min: 0.0
       vy_max: 0.0
       wz_max: 0.70
@@ -139,13 +147,13 @@ controller_server:
         twirling_cost_weight: 1.0
     FollowPathFallback:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
-      desired_linear_vel: 0.45
+      desired_linear_vel: 0.80
       lookahead_dist: 0.75
       min_lookahead_dist: 0.40
       max_lookahead_dist: 1.10
       lookahead_time: 1.5
       rotate_to_heading_angular_vel: 1.00
-      transform_tolerance: 0.35
+      transform_tolerance: 0.10
       use_velocity_scaled_lookahead_dist: true
       use_rotate_to_heading: false
       min_approach_linear_velocity: 0.05
@@ -168,7 +176,7 @@ behavior_server:
       plugin: "nav2_behaviors/Wait"
     global_frame: "odom"
     robot_base_frame: "base_link"
-    transform_tolerance: 0.25
+    transform_tolerance: 0.10
     simulate_ahead_time: 1.5
     max_rotational_vel: 1.0
     min_rotational_vel: 0.2
@@ -180,9 +188,10 @@ bt_navigator:
     global_frame: map
     robot_base_frame: base_link
     odom_topic: /local_state/odometry
-    bt_loop_duration: 10
-    default_server_timeout: 20
-    transform_tolerance: 0.25
+    bt_loop_duration: 50
+    default_server_timeout: 1000
+    wait_for_service_timeout: 2000
+    transform_tolerance: 0.10
     default_nav_to_pose_bt_xml: /opt/ros/humble/share/nav2_bt_navigator/behavior_trees/navigate_to_pose_w_replanning_and_recovery.xml
     default_nav_through_poses_bt_xml: /opt/ros/humble/share/nav2_bt_navigator/behavior_trees/navigate_through_poses_w_replanning_and_recovery.xml
 
@@ -210,7 +219,7 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: false
     feedback: "OPEN_LOOP"
-    max_velocity: [0.60, 0.0, 1.00]
+    max_velocity: [1.20, 0.0, 1.00]
     min_velocity: [0.0, 0.0, -1.00]
     max_accel: [1.2, 0.0, 2.0]
     max_decel: [-1.2, 0.0, -2.0]
@@ -230,7 +239,7 @@ global_costmap:
       rolling_window: false
       track_unknown_space: true
       resolution: 0.05
-      transform_tolerance: 0.5
+      transform_tolerance: 0.10
       footprint: "[[0.36, 0.25], [0.36, -0.25], [-0.36, -0.25], [-0.36, 0.25]]"
       footprint_padding: 0.03
       plugins: ["static_layer", "global_inflation_layer"]
@@ -263,13 +272,13 @@ local_costmap:
       use_sim_time: false
       update_frequency: 12.0
       publish_frequency: 8.0
-      global_frame: odom
+      global_frame: base_link
       robot_base_frame: base_link
       rolling_window: true
       width: 10
       height: 10
       resolution: 0.05
-      transform_tolerance: 0.3
+      transform_tolerance: 0.15
       footprint: "[[0.36, 0.25], [0.36, -0.25], [-0.36, -0.25], [-0.36, 0.25]]"
       footprint_padding: 0.03
       plugins: ["voxel_layer", "local_inflation_layer"]
@@ -286,10 +295,10 @@ local_costmap:
         observation_sources: obstacle_points clearing_points
         obstacle_points:
           topic: /perception/obstacle_points
-          sensor_frame: lidar_link
+          sensor_frame: base_link
           data_type: PointCloud2
           marking: true
-          clearing: true
+          clearing: false
           observation_persistence: 0.0
           min_obstacle_height: -0.20
           max_obstacle_height: 1.40
@@ -299,7 +308,7 @@ local_costmap:
           raytrace_max_range: 8.00
         clearing_points:
           topic: /perception/clearing_points
-          sensor_frame: lidar_link
+          sensor_frame: base_link
           data_type: PointCloud2
           marking: false
           clearing: true
@@ -324,8 +333,8 @@ collision_monitor:
     odom_frame_id: "odom"
     cmd_vel_in_topic: "/cmd_vel_nav"
     cmd_vel_out_topic: "/cmd_vel_collision_checked"
-    transform_tolerance: 0.25
-    source_timeout: 0.6
+    transform_tolerance: 0.10
+    source_timeout: 1.5
     base_shift_correction: true
     stop_pub_timeout: 0.3
     polygons: ["StopZone", "SlowZone"]

@@ -4,13 +4,13 @@ robot_local_state:
     publish_tf: true
     output_topic: /local_state/odometry
     input_odom_topic: /wheel/odom
-    input_base_frame: ranger_base_link
+    input_base_frame: base_link
     input_imu_topic: /sensors/lidar/imu
     odom_frame: odom
     base_frame: base_link
-    # Ranger native ranger_base_link heading is opposite to the project
-    # canonical base_link heading on the current Mini 3 installation.
-    # Correct only the child-frame yaw; the odom position is the same origin.
+    # Passthrough diagnostics preserve the same canonical child frame as EKF.
     odom_yaw_offset_rad: 0.0
     rotate_odom_position_with_yaw_offset: false
-    publish_rate_hz: 20.0
+    publish_rate_hz: 30.0
+    republish_latest: true
+    republish_latest_max_age_sec: 0.50

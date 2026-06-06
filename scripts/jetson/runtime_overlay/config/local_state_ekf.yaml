@@ -15,9 +15,12 @@ robot_local_state:
     base_link_frame: base_link
     world_frame: odom
 
-    odom0: /wheel/odom
-    odom0_config: [false, false, false,
-                   false, false, false,
+    odom0: /wheel/odom_ekf
+    # Wheel odometry anchors x/y/yaw pose as well as forward/yaw velocity.
+    # Nav2 needs a low-latency heading in odom; the JT128 IMU contributes
+    # yaw-rate only and cannot provide an absolute yaw anchor by itself.
+    odom0_config: [true, true, false,
+                   false, false, true,
                    true, false, false,
                    false, false, true,
                    false, false, false]
@@ -28,7 +31,7 @@ robot_local_state:
     odom0_pose_rejection_threshold: 5.0
     odom0_twist_rejection_threshold: 1.5
 
-    imu0: /lidar_imu
+    imu0: /lidar_imu_bias_corrected
     imu0_config: [false, false, false,
                   false, false, false,
                   false, false, false,

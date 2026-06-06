@@ -1,15 +1,17 @@
 /**:
   ros__parameters:
     feature_extract_enable: false
-    point_filter_num: 4
-    # Keep the online deskew/mapping frontend responsive on Orin NX while the
-    # driver, 2D slicing, local perception and Nav2 are running concurrently.
-    max_iteration: 3
+    # Keep FAST-LIO2 on full JT128 input density. Runtime load is handled by
+    # process uniqueness, QoS isolation and CPU affinity, not source sampling.
+    point_filter_num: 1
+    max_iteration: 4
     filter_size_surf: 0.5
     filter_size_map: 0.5
     cube_side_length: 1000.0
     runtime_pos_log_enable: false
     map_file_path: "./jt128_map.pcd"
+    lidar_input_reliable: false
+    lidar_input_qos_depth: 1
 
     common:
       lid_topic: /lidar_points

@@ -4,12 +4,14 @@ robot_local_state:
     publish_tf: true
     output_topic: /local_state/odometry
     input_odom_topic: /wheel/odom
-    input_base_frame: ranger_base_link
+    input_base_frame: base_link
     input_imu_topic: /lidar_imu
     odom_frame: odom
     base_frame: base_link
-    # Ranger SDK /wheel/odom is treated as the chassis odometry truth.
-    # robot_local_state only republishes it as the canonical base_link frame.
+    # Ranger SDK /wheel/odom already uses the canonical base_link child frame
+    # by default; passthrough only republishes the same boundary topic.
     odom_yaw_offset_rad: 0.0
     rotate_odom_position_with_yaw_offset: false
-    publish_rate_hz: 20.0
+    publish_rate_hz: 30.0
+    republish_latest: true
+    republish_latest_max_age_sec: 0.50

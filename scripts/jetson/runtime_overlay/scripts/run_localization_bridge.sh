@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common_env.sh"
+source "${SCRIPT_DIR}/cpu_affinity.sh"
 
 PARAMS_FILE="${LOCALIZATION_BRIDGE_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/localization_bridge.yaml}"
 [[ -f "${PARAMS_FILE}" ]] || {
@@ -17,4 +18,4 @@ NODE_BIN="${NJRH_PROJECT_ROOT}/install/robot_localization_bridge/lib/robot_local
   exit 1
 }
 
-exec "${NODE_BIN}" --ros-args --params-file "${PARAMS_FILE}"
+njrh_exec_affined robot_localization_bridge "${NODE_BIN}" --ros-args --params-file "${PARAMS_FILE}"

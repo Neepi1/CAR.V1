@@ -33,7 +33,11 @@ on_signal() {
 trap cleanup EXIT
 trap on_signal INT TERM
 
-start_overlay_helper "local_perception_rapid" bash "${SCRIPT_DIR}/run_local_perception.sh"
+if [[ "${NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER:-true}" == "true" ]]; then
+  echo "[runtime-overlay] local_perception is owned by pointcloud_perception_pipeline; skipping standalone rapid local_perception" >&2
+else
+  start_overlay_helper "local_perception_rapid" bash "${SCRIPT_DIR}/run_local_perception.sh"
+fi
 start_overlay_helper "robot_safety_rapid" bash "${SCRIPT_DIR}/run_robot_safety.sh"
 start_overlay_helper "ranger_mini3_mode_controller_rapid" bash "${SCRIPT_DIR}/run_ranger_mini3_mode_controller.sh"
 

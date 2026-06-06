@@ -27,6 +27,8 @@ DOCKERFILE_PATH="${NJRH_DOCKERFILE_PATH:-${WORKSPACE_HOST}/Dockerfile.car}"
 DASHBOARD_PORT="${NJRH_DASHBOARD_PORT:-2048}"
 DASHBOARD_HOST="${NJRH_DASHBOARD_HOST:-}"
 ROBOT_API_SERVER_PORT="${NJRH_ROBOT_API_SERVER_PORT:-8080}"
+ROBOT_API_READY_TIMEOUT_SEC="${NJRH_ROBOT_API_READY_TIMEOUT_SEC:-120}"
+ROBOT_API_READY_POLL_SEC="${NJRH_ROBOT_API_READY_POLL_SEC:-1}"
 DASHBOARD_RUNTIME_ROOT="${NJRH_DASHBOARD_RUNTIME_ROOT:-${WORKSPACE_CONTAINER}/scripts/jetson/runtime_overlay}"
 DASHBOARD_LOG_RELATIVE="${NJRH_DASHBOARD_LOG_RELATIVE:-web_dashboard/runtime_logs/njrh_dashboard.out.log}"
 DASHBOARD_TRACE_RELATIVE="${NJRH_DASHBOARD_TRACE_RELATIVE:-web_dashboard/runtime_logs/dashboard_trace.log}"
@@ -429,8 +431,52 @@ stop_common_services() {
     return
   fi
   docker exec "$CONTAINER_NAME" /bin/bash -lc \
-    "ps -eo pid=,args= | grep 'run_common_services.sh' | grep -v grep | awk '{print \$1}' | xargs -r kill -INT 2>/dev/null || true"
-  echo "[njrh-container] common services stop requested"
+    '
+set -e
+common_pids="$(ps -eo pid=,args= | awk '"'"'/run_common_services.sh/ && !/awk/ {print $1}'"'"')"
+if [[ -z "${common_pids}" ]]; then
+  exit 0
+fi
+
+for pid in ${common_pids}; do
+  kill -INT "${pid}" 2>/dev/null || true
+done
+
+deadline=$((SECONDS + ${NJRH_COMMON_STOP_INT_WAIT_SEC:-8}))
+while (( SECONDS < deadline )); do
+  alive=""
+  for pid in ${common_pids}; do
+    if kill -0 "${pid}" 2>/dev/null; then
+      alive=1
+      break
+    fi
+  done
+  [[ -n "${alive}" ]] || exit 0
+  sleep 0.5
+done
+
+for pid in ${common_pids}; do
+  kill -TERM "${pid}" 2>/dev/null || true
+done
+
+deadline=$((SECONDS + ${NJRH_COMMON_STOP_TERM_WAIT_SEC:-5}))
+while (( SECONDS < deadline )); do
+  alive=""
+  for pid in ${common_pids}; do
+    if kill -0 "${pid}" 2>/dev/null; then
+      alive=1
+      break
+    fi
+  done
+  [[ -n "${alive}" ]] || exit 0
+  sleep 0.5
+done
+
+for pid in ${common_pids}; do
+  kill -KILL "${pid}" 2>/dev/null || true
+done
+'
+  echo "[njrh-container] common services stopped"
 }
 
 wait_for_dashboard() {
@@ -445,14 +491,18 @@ wait_for_dashboard() {
 }
 
 wait_for_robot_api() {
-  local attempt
-  for attempt in $(seq 1 30); do
+  local deadline
+  deadline=$((SECONDS + ROBOT_API_READY_TIMEOUT_SEC))
+  while (( SECONDS < deadline )); do
     if robot_api_http_ready; then
       return 0
     fi
-    sleep 1
+    sleep "${ROBOT_API_READY_POLL_SEC}"
   done
-  die "robot_api_server did not become ready on port ${ROBOT_API_SERVER_PORT}"
+  if robot_api_http_ready; then
+    return 0
+  fi
+  die "robot_api_server did not become ready on port ${ROBOT_API_SERVER_PORT} within ${ROBOT_API_READY_TIMEOUT_SEC}s"
 }
 
 print_status() {

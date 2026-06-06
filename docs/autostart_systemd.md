@@ -41,7 +41,7 @@ Edit it to set `ROBOT_API_TOKEN` for the Android app API.
 
 ## Autostart Node Set
 
-The boot service starts only common infrastructure:
+The boot service starts common infrastructure first:
 
 - `hesai_ros_driver_node`
 - `pointcloud_axis_remap_node`
@@ -56,15 +56,21 @@ The boot service starts only common infrastructure:
 - `mode_controller_node` from `ranger_mini3_mode_controller`
 - `robot_api_server_node`
 
+By default `run_common_services.sh` then runs
+`NJRH_RESIDENT_NAVIGATION_AUTOSTART=auto`: if
+`maps_release/last_navigation_map.json` matches a valid `current/manifest.json`,
+it starts the resident localization/Nav2 runtime for that last manually selected
+map. If no valid last map exists, the robot remains in `NO_MAP` with common
+services alive.
+
 It does not start:
 
 - Web dashboard
-- FAST-LIO2
 - PGO
 - slam_toolbox
-- Isaac localization stack
-- `robot_localization_bridge`
-- Nav2
+- Isaac localization stack, `robot_localization_bridge`, or Nav2 unless a valid
+  last navigation map is found or `NJRH_RESIDENT_NAVIGATION_AUTOSTART=true` is
+  explicitly configured
 
 GS2 autostart can be disabled for bench tests by setting this in `/etc/njrh/runtime.env`:
 

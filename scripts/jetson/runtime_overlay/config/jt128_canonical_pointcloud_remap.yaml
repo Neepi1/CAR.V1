@@ -3,7 +3,20 @@ pointcloud_axis_remap:
     input_topic: /jt128/vendor/points_raw
     output_topic: /lidar_points
     output_frame_id: lidar_link
+    # /lidar_points is the full-density high-priority trunk for FAST-LIO2.
+    # Navigation scan/localizer preprocessing still uses a public branch.
+    # Local obstacle filtering is normally loaded in the same component
+    # container and consumes the hidden /_internal/lidar_points_local branch
+    # through intra-process transport, so it does not become another public
+    # full-size DDS pointcloud stream during production navigation.
+    nav_output_topic: /lidar_points_nav
+    nav_output_stride: 1
+    nav_output_qos_depth: 1
+    local_output_topic: /_internal/lidar_points_local
+    local_output_stride: 1
+    local_output_qos_depth: 1
     input_qos_depth: 1
+    input_reliable: false
     output_qos_depth: 1
     output_reliable: false
     # JT128 raw planar axes: +Y_raw is the 0 degree beam and +X_raw is the

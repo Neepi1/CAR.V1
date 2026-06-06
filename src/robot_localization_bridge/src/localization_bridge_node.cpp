@@ -1,5 +1,7 @@
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -9,6 +11,7 @@
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/bool.hpp"
+#include "std_srvs/srv/trigger.hpp"
 #include "tf2_ros/transform_broadcaster.h"
 
 namespace
@@ -55,11 +58,41 @@ public:
     odom_frame_ = declare_parameter<std::string>("odom_frame", "odom");
     base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
     jump_threshold_m_ = declare_parameter<double>("jump_threshold_m", 1.0);
+    forced_jump_threshold_m_ = declare_parameter<double>("forced_jump_threshold_m", 20.0);
     timeout_sec_ = declare_parameter<double>("timeout_sec", 1.0);
+    publish_rate_hz_ = declare_parameter<double>("publish_rate_hz", 10.0);
+    tf_future_stamp_offset_sec_ = declare_parameter<double>("tf_future_stamp_offset_sec", 0.0);
     localization_topic_ = declare_parameter<std::string>("localization_topic", "/localization_result");
     local_odom_topic_ = declare_parameter<std::string>("local_odom_topic", "/local_state/odometry");
     health_topic_ = declare_parameter<std::string>("health_topic", "/localization/health");
+    force_accept_service_ = declare_parameter<std::string>(
+      "force_accept_service", "/robot_localization_bridge/force_accept_next_localization");
     two_d_mode_ = declare_parameter<bool>("two_d_mode", true);
+    if (forced_jump_threshold_m_ < jump_threshold_m_) {
+      RCLCPP_WARN(
+        get_logger(),
+        "forced_jump_threshold_m %.3f is below jump_threshold_m %.3f; clamping to normal threshold",
+        forced_jump_threshold_m_,
+        jump_threshold_m_);
+      forced_jump_threshold_m_ = jump_threshold_m_;
+    }
+    if (publish_rate_hz_ < 1.0) {
+      RCLCPP_WARN(
+        get_logger(), "publish_rate_hz %.3f is too low; clamping to 1.0 Hz", publish_rate_hz_);
+      publish_rate_hz_ = 1.0;
+    }
+    if (tf_future_stamp_offset_sec_ < 0.0) {
+      RCLCPP_WARN(
+        get_logger(), "tf_future_stamp_offset_sec %.3f is negative; clamping to 0.0",
+        tf_future_stamp_offset_sec_);
+      tf_future_stamp_offset_sec_ = 0.0;
+    } else if (tf_future_stamp_offset_sec_ > 0.20) {
+      RCLCPP_WARN(
+        get_logger(),
+        "tf_future_stamp_offset_sec %.3f is too large for Nav2; clamping to 0.20",
+        tf_future_stamp_offset_sec_);
+      tf_future_stamp_offset_sec_ = 0.20;
+    }
 
     pose_sub_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
       localization_topic_,
@@ -70,8 +103,17 @@ public:
       rclcpp::QoS(20),
       std::bind(&LocalizationBridgeNode::on_odom, this, std::placeholders::_1));
     health_pub_ = create_publisher<std_msgs::msg::Bool>(health_topic_, rclcpp::QoS(10));
+    force_accept_srv_ = create_service<std_srvs::srv::Trigger>(
+      force_accept_service_,
+      std::bind(
+        &LocalizationBridgeNode::on_force_accept_request,
+        this,
+        std::placeholders::_1,
+        std::placeholders::_2));
+    const auto period_ms = std::max<std::int64_t>(
+      1, static_cast<std::int64_t>(std::llround(1000.0 / publish_rate_hz_)));
     timer_ = create_wall_timer(
-      std::chrono::milliseconds(100),
+      std::chrono::milliseconds(period_ms),
       std::bind(&LocalizationBridgeNode::on_timer, this));
   }
 
@@ -114,6 +156,19 @@ private:
     } else {
       RCLCPP_WARN(get_logger(), "%s", reason.c_str());
     }
+  }
+
+  void on_force_accept_request(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+    const std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+  {
+    force_accept_next_pose_ = true;
+    response->success = true;
+    response->message = "next localization_result may update map->odom across normal jump threshold";
+    RCLCPP_WARN(
+      get_logger(),
+      "force accepting next localization_result up to %.3f m map->odom jump",
+      forced_jump_threshold_m_);
   }
 
   bool is_new_pose_stamp() const
@@ -175,10 +230,25 @@ private:
         const double dy = map_to_odom_y - map_to_odom_.y;
         const double jump = std::hypot(dx, dy);
         if (jump > jump_threshold_m_) {
-          publish_health(false, "bridge map->odom jump rejected: " + std::to_string(jump) + " m (" + source + ")");
-          return;
+          if (!force_accept_next_pose_) {
+            publish_health(false, "bridge map->odom jump rejected: " + std::to_string(jump) + " m (" + source + ")");
+            return;
+          }
+          force_accept_next_pose_ = false;
+          if (jump > forced_jump_threshold_m_) {
+            publish_health(
+              false,
+              "bridge forced map->odom jump rejected: " + std::to_string(jump) + " m (" + source + ")");
+            return;
+          }
+          RCLCPP_WARN(
+            get_logger(),
+            "forced map->odom jump accepted: %.3f m from %s",
+            jump,
+            source);
         }
       }
+      force_accept_next_pose_ = false;
 
       map_to_odom_.x = map_to_odom_x;
       map_to_odom_.y = map_to_odom_y;
@@ -199,7 +269,11 @@ private:
     }
 
     geometry_msgs::msg::TransformStamped tf;
-    tf.header.stamp = now();
+    auto tf_stamp = now();
+    if (tf_future_stamp_offset_sec_ > 0.0) {
+      tf_stamp = tf_stamp + rclcpp::Duration::from_seconds(tf_future_stamp_offset_sec_);
+    }
+    tf.header.stamp = tf_stamp;
     tf.header.frame_id = map_frame_;
     tf.child_frame_id = odom_frame_;
     tf.transform.translation.x = map_to_odom_.x;
@@ -214,13 +288,17 @@ private:
   bool publish_tf_{true};
   bool two_d_mode_{true};
   double jump_threshold_m_{1.0};
+  double forced_jump_threshold_m_{20.0};
   double timeout_sec_{1.0};
+  double publish_rate_hz_{10.0};
+  double tf_future_stamp_offset_sec_{0.0};
   std::string map_frame_;
   std::string odom_frame_;
   std::string base_frame_;
   std::string localization_topic_;
   std::string local_odom_topic_;
   std::string health_topic_;
+  std::string force_accept_service_;
 
   bool has_pose_{false};
   bool has_odom_{false};
@@ -228,6 +306,7 @@ private:
   bool has_last_pose_stamp_used_{false};
   bool has_last_health_{false};
   bool last_health_state_{false};
+  bool force_accept_next_pose_{false};
   double latest_pose_received_sec_{0.0};
   std::string last_health_reason_;
   builtin_interfaces::msg::Time last_pose_stamp_used_;
@@ -238,6 +317,7 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr health_pub_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr force_accept_srv_;
   rclcpp::TimerBase::SharedPtr timer_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 };

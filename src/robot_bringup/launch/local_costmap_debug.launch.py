@@ -1,3 +1,5 @@
+import os
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
@@ -5,6 +7,17 @@ from launch_ros.actions import Node
 from launch_ros.descriptions import ParameterFile
 from launch_ros.substitutions import FindPackageShare
 from nav2_common.launch import RewrittenYaml
+
+
+def cpu_affinity_prefix(service_name):
+    enabled = os.environ.get("NJRH_CPU_AFFINITY_ENABLED", "true").lower()
+    if enabled not in ("1", "true", "yes", "on"):
+        return None
+    key = service_name.upper().replace("-", "_").replace(".", "_").replace("/", "_")
+    cpuset = os.environ.get(f"NJRH_CPUSET_{key}", "")
+    if not cpuset:
+        return None
+    return f"taskset -c {cpuset}"
 
 
 def generate_launch_description():
@@ -56,6 +69,7 @@ def generate_launch_description():
                 parameters=[configured_params],
                 remappings=remappings + [("cmd_vel", "cmd_vel_local_costmap_debug")],
                 arguments=["--ros-args", "--log-level", log_level],
+                prefix=cpu_affinity_prefix("controller_server"),
             ),
             Node(
                 package="nav2_lifecycle_manager",
@@ -63,6 +77,7 @@ def generate_launch_description():
                 name="lifecycle_manager_local_costmap_debug",
                 output="screen",
                 arguments=["--ros-args", "--log-level", log_level],
+                prefix=cpu_affinity_prefix("nav2_lifecycle_manager"),
                 parameters=[
                     {"use_sim_time": use_sim_time},
                     {"autostart": autostart},

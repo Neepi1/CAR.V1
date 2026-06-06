@@ -57,10 +57,14 @@ public:
     watchdog_timeout_sec_ = declare_parameter<double>("watchdog_timeout_sec", 1.0);
     const double publish_rate_hz = std::max(1.0, declare_parameter<double>("publish_rate_hz", 10.0));
     cmd_vel_in_topic_ = declare_parameter<std::string>("cmd_vel_in_topic", "/cmd_vel_collision_checked");
+    docking_cmd_vel_in_topic_ = declare_parameter<std::string>("docking_cmd_vel_in_topic", "/cmd_vel_docking");
     cmd_vel_out_topic_ = declare_parameter<std::string>("cmd_vel_out_topic", "/cmd_vel_safe");
     estop_topic_ = declare_parameter<std::string>("estop_topic", "/safety/estop");
     localization_ok_topic_ = declare_parameter<std::string>("localization_ok_topic", "/localization/health");
     require_localization_health_ = declare_parameter<bool>("require_localization_health", false);
+    enable_docking_cmd_priority_ = declare_parameter<bool>("enable_docking_cmd_priority", true);
+    docking_cmd_priority_timeout_sec_ =
+      std::max(0.05, declare_parameter<double>("docking_cmd_priority_timeout_sec", 0.25));
     status_topic_ = declare_parameter<std::string>("status_topic", "/safety/status");
     motion_allowed_topic_ = declare_parameter<std::string>("motion_allowed_topic", "/safety/motion_allowed");
     const bool publish_zero_on_startup = declare_parameter<bool>("publish_zero_on_startup", true);
@@ -69,13 +73,20 @@ public:
     last_cmd_time_ = now();
 
     cmd_pub_ = create_publisher<geometry_msgs::msg::Twist>(cmd_vel_out_topic_, rclcpp::QoS(10));
-    status_pub_ = create_publisher<std_msgs::msg::String>(status_topic_, rclcpp::QoS(10));
-    motion_allowed_pub_ = create_publisher<std_msgs::msg::Bool>(motion_allowed_topic_, rclcpp::QoS(10));
+    const auto state_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
+    status_pub_ = create_publisher<std_msgs::msg::String>(status_topic_, state_qos);
+    motion_allowed_pub_ = create_publisher<std_msgs::msg::Bool>(motion_allowed_topic_, state_qos);
 
     cmd_sub_ = create_subscription<geometry_msgs::msg::Twist>(
       cmd_vel_in_topic_,
       rclcpp::QoS(10),
-      std::bind(&RobotSafetyNode::on_cmd, this, std::placeholders::_1));
+      std::bind(&RobotSafetyNode::on_normal_cmd, this, std::placeholders::_1));
+    if (!docking_cmd_vel_in_topic_.empty()) {
+      docking_cmd_sub_ = create_subscription<geometry_msgs::msg::Twist>(
+        docking_cmd_vel_in_topic_,
+        rclcpp::QoS(10),
+        std::bind(&RobotSafetyNode::on_docking_cmd, this, std::placeholders::_1));
+    }
     estop_sub_ = create_subscription<std_msgs::msg::Bool>(
       estop_topic_,
       rclcpp::QoS(10),
@@ -134,11 +145,34 @@ private:
     publish_snapshot(snapshot);
   }
 
-  void on_cmd(const geometry_msgs::msg::Twist::SharedPtr msg)
+  bool docking_command_fresh() const
+  {
+    if (!enable_docking_cmd_priority_ || last_docking_cmd_time_.nanoseconds() <= 0) {
+      return false;
+    }
+    return (now() - last_docking_cmd_time_).seconds() <= docking_cmd_priority_timeout_sec_;
+  }
+
+  void publish_checked_command(const geometry_msgs::msg::Twist & cmd)
   {
     last_cmd_time_ = now();
     const auto snapshot = current_snapshot();
-    publish_command(snapshot.motion_allowed ? *msg : geometry_msgs::msg::Twist{}, snapshot);
+    publish_command(snapshot.motion_allowed ? cmd : geometry_msgs::msg::Twist{}, snapshot);
+  }
+
+  void on_normal_cmd(const geometry_msgs::msg::Twist::SharedPtr msg)
+  {
+    last_normal_cmd_time_ = now();
+    if (docking_command_fresh()) {
+      return;
+    }
+    publish_checked_command(*msg);
+  }
+
+  void on_docking_cmd(const geometry_msgs::msg::Twist::SharedPtr msg)
+  {
+    last_docking_cmd_time_ = now();
+    publish_checked_command(*msg);
   }
 
   void on_estop(const std_msgs::msg::Bool::SharedPtr msg)
@@ -178,19 +212,25 @@ private:
   bool require_localization_health_{false};
   bool has_last_snapshot_{false};
   double watchdog_timeout_sec_{1.0};
+  double docking_cmd_priority_timeout_sec_{0.25};
+  bool enable_docking_cmd_priority_{true};
   std::string cmd_vel_in_topic_;
+  std::string docking_cmd_vel_in_topic_;
   std::string cmd_vel_out_topic_;
   std::string estop_topic_;
   std::string localization_ok_topic_;
   std::string status_topic_;
   std::string motion_allowed_topic_;
   rclcpp::Time last_cmd_time_;
+  rclcpp::Time last_normal_cmd_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_docking_cmd_time_{0, 0, RCL_ROS_TIME};
   SafetySnapshot last_snapshot_;
 
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr motion_allowed_pub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr docking_cmd_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr estop_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr localization_sub_;
   rclcpp::TimerBase::SharedPtr timer_;

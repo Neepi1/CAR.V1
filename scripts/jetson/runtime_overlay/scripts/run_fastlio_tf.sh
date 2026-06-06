@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/canonical_tf_helpers.sh"
+source "${SCRIPT_DIR}/cpu_affinity.sh"
 
 export CONFIG_FILE="${NJRH_FASTLIO_CONFIG_FILE:-${NJRH_OVERLAY_ROOT}/config/fastlio.yaml}"
 export FASTLIO_RVIZ="${FASTLIO_RVIZ:-false}"
@@ -21,11 +22,11 @@ fi
 
 require_can_interface_up
 
-for pattern in "laser_mapping" "ros2 launch fast_lio" "hesai_lidar_state_publisher"; do
+for pattern in "fastlio_mapping" "laser_mapping" "ros2 launch fast_lio" "hesai_lidar_state_publisher"; do
   pkill -INT -f "$pattern" 2>/dev/null || true
 done
 sleep 1
-for pattern in "laser_mapping" "ros2 launch fast_lio" "hesai_lidar_state_publisher"; do
+for pattern in "fastlio_mapping" "laser_mapping" "ros2 launch fast_lio" "hesai_lidar_state_publisher"; do
   pkill -9 -f "$pattern" 2>/dev/null || true
 done
 
@@ -77,9 +78,11 @@ trap on_signal INT TERM
 
 start_canonical_helper "ranger_chassis" bash "${SCRIPT_DIR}/run_ranger_chassis.sh"
 start_canonical_helper "robot_description_static_tf" bash "${SCRIPT_DIR}/run_robot_description.sh"
-start_canonical_helper "robot_local_state" bash "${SCRIPT_DIR}/run_local_state.sh"
+start_canonical_helper \
+  "robot_local_state" \
+  env LOCAL_STATE_MODE="${NJRH_NAV_LOCAL_STATE_MODE:-ekf}" bash "${SCRIPT_DIR}/run_local_state.sh"
 
-ros2 run fast_lio fastlio_mapping \
+njrh_run_affined fastlio_mapping ros2 run fast_lio fastlio_mapping \
   --ros-args \
   --params-file "${CONFIG_FILE}" \
   -p use_sim_time:=false \

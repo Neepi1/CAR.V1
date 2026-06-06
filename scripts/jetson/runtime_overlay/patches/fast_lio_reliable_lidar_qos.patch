@@ -1,0 +1,32 @@
+--- a/src/fast_lio/src/laserMapping.cpp
++++ b/src/fast_lio/src/laserMapping.cpp
+@@ -1012,15 +1012,27 @@
+         /*** ROS subscribe initialization ***/
++        bool lidar_input_reliable = true;
++        int lidar_input_qos_depth = 5;
++        this->declare_parameter<bool>("lidar_input_reliable", lidar_input_reliable);
++        this->declare_parameter<int>("lidar_input_qos_depth", lidar_input_qos_depth);
++        this->get_parameter("lidar_input_reliable", lidar_input_reliable);
++        this->get_parameter("lidar_input_qos_depth", lidar_input_qos_depth);
++        if (lidar_input_qos_depth < 1) lidar_input_qos_depth = 1;
++        auto lidar_input_qos = rclcpp::QoS(rclcpp::KeepLast(lidar_input_qos_depth));
++        lidar_input_qos.durability_volatile();
++        if (lidar_input_reliable) lidar_input_qos.reliable();
++        else lidar_input_qos.best_effort();
++        RCLCPP_INFO(this->get_logger(), "FAST-LIO lidar input QoS: reliable=%s depth=%d", lidar_input_reliable ? "true" : "false", lidar_input_qos_depth);
++
+         if (p_pre->lidar_type == AVIA)
+         {
+ #if FAST_LIO_USE_LIVOX
+             sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk);
+ #else
+             RCLCPP_ERROR(this->get_logger(), "FAST_LIO_USE_LIVOX=0, but lidar_type=1 (Livox).");
+ #endif
+         }
+         else
+         {
+-            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
++            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, lidar_input_qos, standard_pcl_cbk);
+         }
+         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);

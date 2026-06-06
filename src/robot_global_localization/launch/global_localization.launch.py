@@ -9,7 +9,7 @@ def generate_launch_description():
         [
             Node(
                 package="robot_global_localization",
-                executable="global_localization_node.py",
+                executable="global_localization_node",
                 name="robot_global_localization",
                 output="screen",
                 parameters=[

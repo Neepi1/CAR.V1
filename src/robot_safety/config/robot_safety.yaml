@@ -4,6 +4,9 @@ robot_safety:
     watchdog_timeout_sec: 1.0
     publish_rate_hz: 10.0
     cmd_vel_in_topic: /cmd_vel_collision_checked
+    docking_cmd_vel_in_topic: /cmd_vel_docking
+    enable_docking_cmd_priority: true
+    docking_cmd_priority_timeout_sec: 0.25
     cmd_vel_out_topic: /cmd_vel_safe
     estop_topic: /safety/estop
     localization_ok_topic: /localization/health

@@ -18,5 +18,8 @@ occupancy_grid_localizer:
     batch_size: 1024
     out_of_range_threshold: 41.0
     invalid_range_threshold: 0.0
-    min_scan_fov_degrees: 120.0
+    # Isaac rejects scans below this effective FOV as likely covered. Field
+    # startup at the dock can report ~119 deg after invalid-range filtering, so
+    # keep a small margin instead of failing navigation resume on a 1 deg edge.
+    min_scan_fov_degrees: 115.0
     use_closest_beam: true

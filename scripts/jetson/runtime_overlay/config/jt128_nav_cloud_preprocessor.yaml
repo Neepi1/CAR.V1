@@ -1,9 +1,13 @@
 nav_cloud_preprocessor:
   ros__parameters:
-    input_topic: /lidar_points
+    input_topic: /lidar_points_nav
     output_topic: /points_nav
     output_frame_id: lidar_level_link
-    lookup_timeout_sec: 0.1
+    input_reliable: false
+    input_qos_depth: 1
+    output_reliable: false
+    output_qos_depth: 1
+    lookup_timeout_sec: 0.03
     publish_debug_log: false
 
     # Transform the raw lidar_link cloud into the leveled slice frame first, and

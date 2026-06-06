@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/nav_runtime_helpers.sh"
 source "${SCRIPT_DIR}/canonical_tf_helpers.sh"
+source "${SCRIPT_DIR}/cpu_affinity.sh"
 
 export NAV2_PARAMS_FILE="${NAV2_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/nav2.yaml}"
 LAUNCH_FILE="${NJRH_PROJECT_ROOT}/src/robot_bringup/launch/local_costmap_debug.launch.py"
@@ -47,7 +48,11 @@ trap on_signal INT TERM
 
 start_canonical_helper "robot_description" bash "${SCRIPT_DIR}/run_robot_description.sh"
 start_canonical_helper "local_state" bash "${SCRIPT_DIR}/run_local_state.sh"
-start_overlay_helper "local_perception" bash "${SCRIPT_DIR}/run_local_perception.sh"
+if [[ "${NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER:-true}" == "true" ]]; then
+  echo "[runtime-overlay] local_perception is owned by pointcloud_perception_pipeline; skipping standalone debug local_perception" >&2
+else
+  start_overlay_helper "local_perception" bash "${SCRIPT_DIR}/run_local_perception.sh"
+fi
 
 ros2 launch "${LAUNCH_FILE}" \
   use_sim_time:=false \

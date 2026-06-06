@@ -1,0 +1,25 @@
+pointcloud_downsample:
+  ros__parameters:
+    input_topic: /lidar_points
+    input_qos_depth: 1
+    # Diagnostic-only mirror. Production navigation consumes /lidar_points
+    # directly; if this helper is enabled, keep it best-effort/depth=1 and feed
+    # it from /lidar_points so it never adds another raw pointcloud subscriber.
+    input_reliable: false
+    output_frame_id: lidar_link
+    nav_output_topic: /lidar_points_nav
+    nav_output_stride: 1
+    nav_output_qos_depth: 1
+    local_output_topic: ""
+    local_output_stride: 1
+    local_output_qos_depth: 1
+    rotation_matrix:
+      - 1.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 1.0

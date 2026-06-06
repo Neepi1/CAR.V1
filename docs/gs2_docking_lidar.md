@@ -28,7 +28,7 @@ Control-chain rule:
 
 ```text
 robot_docking_manager
-  -> /cmd_vel_collision_checked
+  -> /cmd_vel_docking
   -> robot_safety
   -> /cmd_vel_safe
   -> ranger_mini3_mode_controller
@@ -38,7 +38,7 @@ robot_docking_manager
 
 Do not publish docking control directly to `/cmd_vel_safe` or `/cmd_vel`; that would bypass the final safety arbiter.
 
-The current field profile prioritizes stable contact over aggressive correction: `use_yaw_fit=false`, `filter_alpha=0.25`, `lateral_deadband_m=0.005`, `lateral_command_sign=-1.0`, `min_lateral_speed_mps=0.025`, `max_lateral_speed_mps=0.04`, `max_forward_while_lateral_mps=0.000`, and `lock_lateral_during_final_insert=true`. The negative lateral sign matches the current GS2 mounting where the detected charger `y` sign is opposite the vehicle correction direction. This makes docking three-stage: correct lateral/yaw first, lock lateral velocity to zero, then crawl straight forward. The minimum lateral speed is intentional because the downstream Ranger mode controller drops lateral commands below its deadband. If the robot visibly oscillates sideways, reduce `controller.ky_lateral` first; do not increase `max_lateral_speed_mps` until the GS2 scan is stable.
+The current field profile prioritizes stable contact over aggressive correction: `use_yaw_fit=true`, `filter_alpha=0.25`, `lateral_deadband_m=0.005`, `lateral_command_sign=-1.0`, `kyaw=-0.70`, `min_lateral_speed_mps=0.025`, `max_lateral_speed_mps=0.04`, `max_forward_while_lateral_mps=0.000`, and `lock_lateral_during_final_insert=true`. The negative lateral sign matches the current GS2 mounting where the detected charger `y` sign is opposite the vehicle correction direction. The negative yaw gain matches the fitted dock-face slope sign from the current GS2 mount, so a negative fitted `yaw_deg` commands a positive body yaw correction. This makes docking three-stage: correct lateral/yaw first, lock lateral velocity to zero, then crawl straight forward. The minimum lateral speed is intentional because the downstream Ranger mode controller drops lateral commands below its deadband. If the robot visibly oscillates sideways, reduce `controller.ky_lateral` first; if it rotates away from the dock angle instead of squaring up, flip the sign of `controller.kyaw` before changing the magnitude.
 
 Mounting rule:
 
@@ -93,9 +93,9 @@ ros2 service call /docking/start std_srvs/srv/Trigger {}
 ros2 topic echo /docking/status
 ```
 
-For App-triggered undocking, call `POST /api/v1/docking/undock`; the API forwards the intent to `/docking/undock`. Do not publish reverse `/cmd_vel` directly, because reverse permission and final motion arbitration must remain inside `robot_docking_manager`, `robot_safety`, and the Ranger mode controller.
+For App-triggered undocking, call `POST /api/v1/docking/undock`; the API forwards the intent to `/docking/undock`. Do not publish reverse `/cmd_vel` directly, because reverse permission and final motion arbitration must remain inside `robot_docking_manager`, `robot_safety`, and the Ranger mode controller. During undock the docking manager owns `/ranger_mini3/docking_allow_reverse`; App teleop uses a separate `/ranger_mini3/teleop_allow_reverse` permit so idle teleop stop messages cannot cancel a live undock. Undocking completion is odometry-confirmed on `/local_state/odometry`; stale odometry, no physical progress, or timeout must report a failed undock instead of `undocked`. After odometry-confirmed undock, `robot_api_server` triggers Isaac relocalization and verifies that the new localization is reflected in `map -> base_link`; manual undock records the result for diagnostics, while auto-undock before a navigation goal requires the relocalization to succeed before Nav2 is commanded.
 
-Normal execution does not require `rosbag`. Use `rosbag2` for tuning and regression captures of `/dock/gs2_scan`, `/battery_state`, `/tf`, `/cmd_vel_collision_checked`, `/cmd_vel_safe`, `/ranger_mini3/forced_mode`, and `/ranger_mini3_mode_controller/status`.
+Normal execution does not require `rosbag`. Use `rosbag2` for tuning and regression captures of `/dock/gs2_scan`, `/battery_state`, `/local_state/odometry`, `/tf`, `/cmd_vel_docking`, `/cmd_vel_collision_checked`, `/cmd_vel_safe`, `/ranger_mini3/forced_mode`, and `/ranger_mini3_mode_controller/status`.
 
 On the current Jetson, the GS2 CP2102 adapter appears as `10c4:ea60` and should be aliased to `/dev/gs2`.
 When the runtime is started through `njrh-runtime.service`, the host runner resolves `/dev/gs2` to the real tty device and passes it into the container as `NJRH_GS2_SERIAL_PORT`. This avoids falling back to an unrelated USB serial port after USB re-enumeration.

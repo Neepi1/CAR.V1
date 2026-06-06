@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+
+
+def cpu_affinity_prefix(service_name: str) -> str | None:
+    enabled = os.environ.get("NJRH_CPU_AFFINITY_ENABLED", "true").lower()
+    if enabled not in ("1", "true", "yes", "on"):
+        return None
+    key = service_name.upper().replace("-", "_").replace(".", "_").replace("/", "_")
+    cpuset = os.environ.get(f"NJRH_CPUSET_{key}", "")
+    if not cpuset:
+        return None
+    return f"taskset -c {cpuset}"
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -29,6 +41,7 @@ def generate_launch_description() -> LaunchDescription:
         executable="nav_cloud_preprocessor",
         name="nav_cloud_preprocessor",
         output="screen",
+        prefix=cpu_affinity_prefix("nav_cloud_preprocessor"),
         parameters=[
             str(preprocessor_params_default),
             preprocessor_params,
@@ -45,6 +58,7 @@ def generate_launch_description() -> LaunchDescription:
         executable="pointcloud_to_laserscan_node",
         name="pointcloud_to_laserscan",
         output="screen",
+        prefix=cpu_affinity_prefix("pointcloud_to_laserscan"),
         parameters=[str(scan_params_default), scan_params],
         remappings=[
             ("cloud_in", nav_points_topic),
@@ -57,6 +71,7 @@ def generate_launch_description() -> LaunchDescription:
         executable="scan_republisher_node",
         name="scan_republisher",
         output="screen",
+        prefix=cpu_affinity_prefix("scan_republisher"),
         parameters=[
             {
                 "input_topic": "/scan_raw",
@@ -71,6 +86,7 @@ def generate_launch_description() -> LaunchDescription:
         executable="laser_scan_to_flatscan",
         name="laser_scan_to_flatscan",
         output="screen",
+        prefix=cpu_affinity_prefix("laser_scan_to_flatscan"),
         parameters=[str(flatscan_params_default), flatscan_params],
         remappings=[
             ("scan", scan_topic),
@@ -83,7 +99,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("preprocessor_params", default_value=str(preprocessor_params_default)),
             DeclareLaunchArgument("scan_params", default_value=str(scan_params_default)),
             DeclareLaunchArgument("flatscan_params", default_value=str(flatscan_params_default)),
-            DeclareLaunchArgument("points_topic", default_value="/lidar_points"),
+            DeclareLaunchArgument("points_topic", default_value="/lidar_points_nav"),
             DeclareLaunchArgument("nav_points_topic", default_value="/points_nav"),
             DeclareLaunchArgument("scan_topic", default_value="/scan"),
             DeclareLaunchArgument("flatscan_topic", default_value="/flatscan"),

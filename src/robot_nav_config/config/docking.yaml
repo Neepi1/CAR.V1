@@ -5,7 +5,7 @@ docking:
     charge_contact_frame: charge_contact_link
     dock_contact_frame: dock_contact_link
     gs2_scan_topic: /dock/gs2_scan
-    cmd_vel_topic: /cmd_vel_collision_checked
+    cmd_vel_topic: /cmd_vel_docking
     status_topic: /docking/status
     start_service: /docking/start
     stop_service: /docking/stop
@@ -15,7 +15,7 @@ docking:
     mode:
       forced_mode_topic: /ranger_mini3/forced_mode
       park_topic: /ranger_mini3/park
-      reverse_enable_topic: /ranger_mini3/allow_reverse
+      reverse_enable_topic: /ranger_mini3/docking_allow_reverse
       use_crab_mode: true
       crab_forced_mode: crab
       release_forced_mode: auto
@@ -50,6 +50,11 @@ docking:
       speed_mps: 0.06
       min_clear_distance_m: 0.45
       timeout_s: 12.0
+      odom_topic: /local_state/odometry
+      odom_timeout_s: 0.50
+      odom_start_timeout_s: 2.0
+      no_progress_timeout_s: 2.0
+      progress_epsilon_m: 0.005
 
     tolerances:
       lateral_soft_limit_m: 0.015
@@ -73,14 +78,14 @@ docking:
       max_range_m: 0.30
       stable_frames_required: 3
       filter_alpha: 0.25
-      use_yaw_fit: false
+      use_yaw_fit: true
 
     controller:
       kx: 0.45
       ky: 0.55
       ky_lateral: 0.70
       lateral_command_sign: -1.0
-      kyaw: 0.00
+      kyaw: -0.70
       lateral_deadband_m: 0.005
       yaw_deadband_deg: 1.0
       min_align_speed_mps: 0.035
@@ -96,3 +101,7 @@ docking:
 
     charging:
       min_current_a: 0.10
+      contact_voltage_min_v: 40.0
+      contact_voltage_max_v: 1000.0
+      full_soc_threshold_pct: 99.0
+      full_soc_voltage_contact_enable: true

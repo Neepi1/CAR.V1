@@ -1,10 +1,31 @@
+import os
+
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
+from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable, TimerAction
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.descriptions import ParameterFile
 from launch_ros.substitutions import FindPackageShare
 from nav2_common.launch import RewrittenYaml
+
+
+def cpu_affinity_prefix(service_name):
+    enabled = os.environ.get("NJRH_CPU_AFFINITY_ENABLED", "true").lower()
+    if enabled not in ("1", "true", "yes", "on"):
+        return None
+    key = service_name.upper().replace("-", "_").replace(".", "_").replace("/", "_")
+    cpuset = os.environ.get(f"NJRH_CPUSET_{key}", "")
+    if not cpuset:
+        return None
+    return f"taskset -c {cpuset}"
+
+
+def with_cpu_affinity(service_name, kwargs):
+    result = dict(kwargs)
+    prefix = cpu_affinity_prefix(service_name)
+    if prefix:
+        result["prefix"] = prefix
+    return result
 
 
 def generate_launch_description():
@@ -17,6 +38,7 @@ def generate_launch_description():
     use_respawn = LaunchConfiguration("use_respawn")
     use_composition = LaunchConfiguration("use_composition")
     log_level = LaunchConfiguration("log_level")
+    nav_lifecycle_start_delay = LaunchConfiguration("nav_lifecycle_start_delay")
 
     default_params_file = PathJoinSubstitution(
         [FindPackageShare("robot_nav_config"), "config", "nav2.yaml"]
@@ -28,11 +50,14 @@ def generate_launch_description():
         [FindPackageShare("robot_nav_config"), "config", "neutral_speed_mask.yaml"]
     )
 
-    lifecycle_nodes = [
+    filter_lifecycle_nodes = [
         "keepout_filter_mask_server",
         "keepout_costmap_filter_info_server",
         "speed_filter_mask_server",
         "speed_costmap_filter_info_server",
+    ]
+
+    navigation_lifecycle_nodes = [
         "controller_server",
         "smoother_server",
         "planner_server",
@@ -80,6 +105,10 @@ def generate_launch_description():
             DeclareLaunchArgument("speed_mask_yaml", default_value=default_speed_mask_yaml),
             DeclareLaunchArgument("use_respawn", default_value="False"),
             DeclareLaunchArgument("use_composition", default_value="False"),
+            DeclareLaunchArgument(
+                "nav_lifecycle_start_delay",
+                default_value=os.environ.get("NJRH_NAV_LIFECYCLE_START_DELAY_SEC", "3.0"),
+            ),
             DeclareLaunchArgument("log_level", default_value="info"),
             Node(
                 package="nav2_map_server",
@@ -95,6 +124,7 @@ def generate_launch_description():
                     {"frame_id": "map"},
                 ],
                 arguments=["--ros-args", "--log-level", log_level],
+                prefix=cpu_affinity_prefix("nav2_map_server"),
             ),
             Node(
                 package="nav2_map_server",
@@ -112,6 +142,7 @@ def generate_launch_description():
                     {"multiplier": 1.0},
                 ],
                 arguments=["--ros-args", "--log-level", log_level],
+                prefix=cpu_affinity_prefix("nav2_map_server"),
             ),
             Node(
                 package="nav2_map_server",
@@ -127,6 +158,7 @@ def generate_launch_description():
                     {"frame_id": "map"},
                 ],
                 arguments=["--ros-args", "--log-level", log_level],
+                prefix=cpu_affinity_prefix("nav2_map_server"),
             ),
             Node(
                 package="nav2_map_server",
@@ -144,6 +176,7 @@ def generate_launch_description():
                     {"multiplier": 1.0},
                 ],
                 arguments=["--ros-args", "--log-level", log_level],
+                prefix=cpu_affinity_prefix("nav2_map_server"),
             ),
             # This runtime path stays non-composed intentionally so the field overlay
             # can keep deterministic process ownership for crash / restart handling.
@@ -152,67 +185,88 @@ def generate_launch_description():
                 executable="controller_server",
                 name="controller_server",
                 remappings=remappings + [("cmd_vel", "cmd_vel_nav_raw")],
-                **node_kwargs,
+                **with_cpu_affinity("controller_server", node_kwargs),
             ),
             Node(
                 package="nav2_smoother",
                 executable="smoother_server",
                 name="smoother_server",
                 remappings=remappings,
-                **node_kwargs,
+                **with_cpu_affinity("smoother_server", node_kwargs),
             ),
             Node(
                 package="nav2_planner",
                 executable="planner_server",
                 name="planner_server",
                 remappings=remappings,
-                **node_kwargs,
+                **with_cpu_affinity("planner_server", node_kwargs),
             ),
             Node(
                 package="nav2_behaviors",
                 executable="behavior_server",
                 name="behavior_server",
                 remappings=remappings + [("cmd_vel", "cmd_vel_nav")],
-                **node_kwargs,
+                **with_cpu_affinity("behavior_server", node_kwargs),
             ),
             Node(
                 package="nav2_bt_navigator",
                 executable="bt_navigator",
                 name="bt_navigator",
                 remappings=remappings,
-                **node_kwargs,
+                **with_cpu_affinity("bt_navigator", node_kwargs),
             ),
             Node(
                 package="nav2_waypoint_follower",
                 executable="waypoint_follower",
                 name="waypoint_follower",
                 remappings=remappings,
-                **node_kwargs,
+                **with_cpu_affinity("waypoint_follower", node_kwargs),
             ),
             Node(
                 package="nav2_velocity_smoother",
                 executable="velocity_smoother",
                 name="velocity_smoother",
                 remappings=remappings + [("cmd_vel", "cmd_vel_nav_raw"), ("cmd_vel_smoothed", "cmd_vel_nav")],
-                **node_kwargs,
+                **with_cpu_affinity("velocity_smoother", node_kwargs),
             ),
             Node(
                 package="nav2_collision_monitor",
                 executable="collision_monitor",
                 name="collision_monitor",
                 remappings=remappings,
-                **node_kwargs,
+                **with_cpu_affinity("collision_monitor", node_kwargs),
             ),
             Node(
                 package="nav2_lifecycle_manager",
                 executable="lifecycle_manager",
-                name="lifecycle_manager_navigation",
+                name="lifecycle_manager_costmap_filters",
                 output="screen",
                 arguments=["--ros-args", "--log-level", log_level],
+                prefix=cpu_affinity_prefix("nav2_lifecycle_manager"),
                 parameters=[
                     {"use_sim_time": use_sim_time},
                     {"autostart": autostart},
-                    {"node_names": lifecycle_nodes},
+                    {"bond_timeout": 0.0},
+                    {"node_names": filter_lifecycle_nodes},
+                ],
+            ),
+            TimerAction(
+                period=nav_lifecycle_start_delay,
+                actions=[
+                    Node(
+                        package="nav2_lifecycle_manager",
+                        executable="lifecycle_manager",
+                        name="lifecycle_manager_navigation",
+                        output="screen",
+                        arguments=["--ros-args", "--log-level", log_level],
+                        prefix=cpu_affinity_prefix("nav2_lifecycle_manager"),
+                        parameters=[
+                            {"use_sim_time": use_sim_time},
+                            {"autostart": autostart},
+                            {"bond_timeout": 0.0},
+                            {"node_names": navigation_lifecycle_nodes},
+                        ],
+                    ),
                 ],
             ),
         ]

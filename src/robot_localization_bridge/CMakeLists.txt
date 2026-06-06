@@ -6,6 +6,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(tf2_ros REQUIRED)
 
 add_executable(localization_bridge_node src/localization_bridge_node.cpp)
@@ -15,6 +16,7 @@ ament_target_dependencies(
   nav_msgs
   rclcpp
   std_msgs
+  std_srvs
   tf2_ros
 )
 

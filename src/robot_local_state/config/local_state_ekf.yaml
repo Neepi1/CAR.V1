@@ -15,10 +15,12 @@ robot_local_state:
     base_link_frame: base_link
     world_frame: odom
 
-    # Wheel odometry owns planar speed; this avoids double-integrating noisy IMU acceleration.
-    odom0: /wheel/odom
-    odom0_config: [false, false, false,
-                   false, false, false,
+    # Sanitized Ranger odometry anchors x/y/yaw pose and owns forward speed
+    # plus low-frequency yaw-rate. Nav2 control needs this low-latency yaw
+    # anchor; the JT128 IMU contributes yaw-rate only.
+    odom0: /wheel/odom_ekf
+    odom0_config: [true, true, false,
+                   false, false, true,
                    true, false, false,
                    false, false, true,
                    false, false, false]
@@ -29,8 +31,8 @@ robot_local_state:
     odom0_pose_rejection_threshold: 5.0
     odom0_twist_rejection_threshold: 1.5
 
-    # First production profile fuses the JT128 IMU gyro yaw-rate only.
-    imu0: /lidar_imu
+    # Bias-corrected JT128 IMU gyro yaw-rate stabilizes in-place rotation.
+    imu0: /lidar_imu_bias_corrected
     imu0_config: [false, false, false,
                   false, false, false,
                   false, false, false,

@@ -6,6 +6,7 @@ export AMENT_TRACE_SETUP_FILES="${AMENT_TRACE_SETUP_FILES:-}"
 export AMENT_PYTHON_EXECUTABLE="${AMENT_PYTHON_EXECUTABLE:-/usr/bin/python3}"
 # shellcheck source=common_env.sh
 source "${SCRIPT_DIR}/common_env.sh"
+source "${SCRIPT_DIR}/cpu_affinity.sh"
 
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
 export FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}"
@@ -26,12 +27,12 @@ source "${PROJECT_ROOT}/install/setup.bash"
 set -u
 
 if [[ -n "${ROBOT_API_TOKEN:-}" ]]; then
-  exec ros2 run robot_api_server robot_api_server_node --ros-args \
+  njrh_exec_affined robot_api_server ros2 run robot_api_server robot_api_server_node --ros-args \
     --params-file "${CONFIG_FILE}" \
     -p port:="${PORT}" \
     -p api_token:="${ROBOT_API_TOKEN}"
 fi
 
-exec ros2 run robot_api_server robot_api_server_node --ros-args \
+njrh_exec_affined robot_api_server ros2 run robot_api_server robot_api_server_node --ros-args \
   --params-file "${CONFIG_FILE}" \
   -p port:="${PORT}"

@@ -1,15 +1,24 @@
-pointcloud_axis_remap:
+pointcloud_fastlio_remap:
   ros__parameters:
+    # Diagnostic-only identity remap. Production FAST-LIO consumes /lidar_points
+    # directly. Keep this helper latest-only if it is enabled for field testing
+    # so it cannot build a reliable backlog on full-size pointclouds.
     input_topic: /lidar_points
     output_topic: /lidar_points_fastlio
-    output_frame_id: hesai_lidar_fastlio
+    output_frame_id: lidar_link
+    nav_output_topic: ""
+    local_output_topic: ""
+    input_qos_depth: 1
+    input_reliable: false
+    output_qos_depth: 1
+    output_reliable: false
     rotation_matrix:
-      - -0.2567402
-      - -0.687
-      - 0.6797907
-      - 0.9271735
-      - -0.3736277
-      - -0.02741957
-      - 0.2728259
-      - 0.6232442
-      - 0.7328933
+      - 1.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 1.0

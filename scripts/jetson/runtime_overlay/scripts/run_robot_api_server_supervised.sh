@@ -7,6 +7,25 @@ RESTART_DELAY_SEC="${ROBOT_API_SERVER_RESTART_DELAY_SEC:-2}"
 child_pid=""
 stopping=0
 
+cleanup_stale_api_processes() {
+  local pattern
+  for pattern in \
+    "/install/robot_api_server/lib/robot_api_server/robot_api_server_node" \
+    "robot_api_server_node --ros-args" \
+    "ros2 run robot_api_server robot_api_server_node"
+  do
+    pkill -TERM -f "${pattern}" 2>/dev/null || true
+  done
+  sleep 1
+  for pattern in \
+    "/install/robot_api_server/lib/robot_api_server/robot_api_server_node" \
+    "robot_api_server_node --ros-args" \
+    "ros2 run robot_api_server robot_api_server_node"
+  do
+    pkill -KILL -f "${pattern}" 2>/dev/null || true
+  done
+}
+
 stop_child() {
   stopping=1
   if [[ -n "${child_pid}" ]] && kill -0 "${child_pid}" 2>/dev/null; then
@@ -25,6 +44,7 @@ trap 'stop_child; exit 130' INT TERM
 echo "[runtime-overlay] robot_api_server supervisor starting" >&2
 while true; do
   child_pid=""
+  cleanup_stale_api_processes
   bash "${SCRIPT_DIR}/run_robot_api_server.sh" &
   child_pid=$!
   set +e

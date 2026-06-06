@@ -23,7 +23,11 @@ ranger_mini3_mode_controller:
     spin_exit_steering_threshold_rad: 0.489
     spin_enter_debounce_s: 0.4
     spin_min_hold_s: 1.0
+    auto_spin_max_linear_mps: 0.08
+    spin_on_high_curvature_while_moving: false
     reverse_enable_topic: /ranger_mini3/allow_reverse
+    docking_reverse_enable_topic: /ranger_mini3/docking_allow_reverse
+    teleop_reverse_enable_topic: /ranger_mini3/teleop_allow_reverse
     reverse_enable_timeout_s: 0.75
     linear_epsilon_mps: 0.02
     lateral_epsilon_mps: 0.02

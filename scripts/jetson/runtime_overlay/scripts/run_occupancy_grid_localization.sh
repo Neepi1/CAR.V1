@@ -6,11 +6,25 @@ source "${SCRIPT_DIR}/canonical_tf_helpers.sh"
 source "${SCRIPT_DIR}/nav_runtime_helpers.sh"
 source "${SCRIPT_DIR}/map_server_helpers.sh"
 source "${SCRIPT_DIR}/floor_asset_helpers.sh"
+source "${SCRIPT_DIR}/cpu_affinity.sh"
 
 export PUBLISH_LIDAR_TF="${PUBLISH_LIDAR_TF:-false}"
 LAUNCH_FILE="${NJRH_OVERLAY_ROOT}/launch/occupancy_localization_stack.launch.py"
-NAV_LOCAL_STATE_MODE="${NJRH_NAV_LOCAL_STATE_MODE:-passthrough}"
-POINTS_TOPIC="${NJRH_LOCALIZATION_POINTS_TOPIC:-/lidar_points}"
+NAV_LOCAL_STATE_MODE="${NJRH_NAV_LOCAL_STATE_MODE:-ekf}"
+POINTS_TOPIC="${NJRH_LOCALIZATION_POINTS_TOPIC:-/lidar_points_nav}"
+FASTLIO_POINTS_TOPIC="${NJRH_FASTLIO_POINTS_TOPIC:-/cloud_registered_body}"
+FASTLIO_ODOM_TOPIC="${NJRH_FASTLIO_ODOM_TOPIC:-/Odometry}"
+FASTLIO_POINTS_READY_TIMEOUT="${NJRH_FASTLIO_POINTS_READY_TIMEOUT:-30}"
+FASTLIO_ODOM_READY_TIMEOUT="${NJRH_FASTLIO_ODOM_READY_TIMEOUT:-30}"
+FASTLIO_TOPIC_FRESH_TIMEOUT="${NJRH_FASTLIO_TOPIC_FRESH_TIMEOUT:-8}"
+FASTLIO_TOPIC_MAX_AGE_SEC="${NJRH_FASTLIO_TOPIC_MAX_AGE_SEC:-1.0}"
+FASTLIO_TOPIC_MAX_FUTURE_SEC="${NJRH_FASTLIO_TOPIC_MAX_FUTURE_SEC:-0.25}"
+LOCALIZATION_POINTS_INITIAL_WAIT_SEC="${NJRH_LOCALIZATION_POINTS_INITIAL_WAIT_SEC:-20}"
+LOCALIZATION_POINTS_RETRY_WAIT_SEC="${NJRH_LOCALIZATION_POINTS_RETRY_WAIT_SEC:-20}"
+LOCALIZATION_POINTS_REPAIR_WAIT_SEC="${NJRH_LOCALIZATION_POINTS_REPAIR_WAIT_SEC:-60}"
+LOCALIZATION_POINTS_DRIVER_REPAIR="${NJRH_LOCALIZATION_POINTS_DRIVER_REPAIR:-true}"
+MAP_SERVER_READY_TIMEOUT="${NJRH_LOCALIZATION_MAP_SERVER_READY_TIMEOUT:-75}"
+LOCALIZATION_REUSE_READY_STACK="${NJRH_LOCALIZATION_REUSE_READY_STACK:-false}"
 
 if [[ -n "${NJRH_FLOOR_ID:-}" || -n "${NAV2_FLOOR_ID:-}" ]]; then
   resolve_floor_assets "${NJRH_BUILDING_ID:-${NAV2_BUILDING_ID:-building_1}}" "${NJRH_FLOOR_ID:-${NAV2_FLOOR_ID:-}}"
@@ -62,9 +76,18 @@ fi
   exit 1
 }
 
+localization_stack_ready_for_current_floor() {
+  pgrep -f "occupancy_localization_stack.launch.py|occupancy_grid_localizer_container|occupancy_grid_localizer" >/dev/null 2>&1
+}
+
+if [[ "${LOCALIZATION_REUSE_READY_STACK}" == "true" ]] && localization_stack_ready_for_current_floor; then
+  echo "[runtime-overlay] occupancy localization stack already ready for ${NAV2_MAP_YAML}; reusing existing stack" >&2
+  while true; do
+    sleep 3600
+  done
+fi
+
 patterns=(
-  "laser_mapping"
-  "fastlio_mapping"
   "ros2 launch .*occupancy_localization_stack.launch.py"
   "occupancy_localization_stack.launch.py"
   "occupancy_localization.launch.py"
@@ -93,6 +116,22 @@ for pattern in "${patterns[@]}"; do
   pkill -9 -f "$pattern" 2>/dev/null || true
 done
 
+kill_localization_stack_patterns() {
+  local signal="$1"
+  local pattern
+  for pattern in "${patterns[@]}"; do
+    pkill "-${signal}" -f "$pattern" 2>/dev/null || true
+  done
+}
+
+cleanup_localization_stack_patterns() {
+  kill_localization_stack_patterns INT
+  sleep "${NJRH_LOCALIZATION_PATTERN_STOP_INT_WAIT_SEC:-1}"
+  kill_localization_stack_patterns TERM
+  sleep "${NJRH_LOCALIZATION_PATTERN_STOP_TERM_WAIT_SEC:-1}"
+  kill_localization_stack_patterns KILL
+}
+
 stop_existing_canonical_tf_publishers
 
 localization_pid=""
@@ -105,18 +144,73 @@ launch_args=(
   "points_topic:=${POINTS_TOPIC}"
 )
 
+wait_for_child_exit() {
+  local pid="$1"
+  local attempts="${2:-20}"
+  local i
+  for ((i = 0; i < attempts; i += 1)); do
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+terminate_child() {
+  local pid="$1"
+  local label="$2"
+  [[ -n "${pid}" ]] || return 0
+  if ! kill -0 "${pid}" 2>/dev/null; then
+    wait "${pid}" 2>/dev/null || true
+    return 0
+  fi
+  echo "[runtime-overlay] stopping ${label} pid=${pid}" >&2
+  kill -INT "${pid}" 2>/dev/null || true
+  wait_for_child_exit "${pid}" "${NJRH_LOCALIZATION_STOP_INT_ATTEMPTS:-20}" || {
+    kill -TERM "${pid}" 2>/dev/null || true
+    wait_for_child_exit "${pid}" "${NJRH_LOCALIZATION_STOP_TERM_ATTEMPTS:-20}" || {
+      kill -KILL "${pid}" 2>/dev/null || true
+    }
+  }
+  wait "${pid}" 2>/dev/null || true
+}
+
+repair_jt128_navigation_points() {
+  if [[ "${LOCALIZATION_POINTS_DRIVER_REPAIR}" != "true" ]]; then
+    return 1
+  fi
+  if [[ "${POINTS_TOPIC}" != "/lidar_points_nav" && "${POINTS_TOPIC}" != "/lidar_points" ]]; then
+    return 1
+  fi
+
+  mkdir -p "${NJRH_RUNTIME_LOG_DIR}"
+  echo "[runtime-overlay] attempting JT128 driver/remap repair for localization pointcloud: ${POINTS_TOPIC}" >&2
+  nohup env \
+    DRIVER_PROFILE="${NJRH_LOCALIZATION_DRIVER_PROFILE:-navigation}" \
+    NJRH_FORCE_RESTART_DRIVER="${NJRH_LOCALIZATION_REPAIR_FORCE_RESTART_DRIVER:-true}" \
+    bash "${SCRIPT_DIR}/run_driver.sh" \
+    >>"${NJRH_RUNTIME_LOG_DIR}/driver_repair_for_localization.log" 2>&1 &
+  sleep "${NJRH_LOCALIZATION_DRIVER_REPAIR_SETTLE_SEC:-3}"
+}
+
+ensure_localization_pointcloud_ready() {
+  echo "[runtime-overlay] localization pointcloud startup probe disabled: ${POINTS_TOPIC}" >&2
+  return 0
+}
+
 if [[ -n "${NAV2_LOCALIZER_PARAMS}" ]]; then
   launch_args+=("localizer_params:=${NAV2_LOCALIZER_PARAMS}")
 fi
 
 cleanup() {
   trap - EXIT INT TERM
-  if [[ -n "${localization_pid}" ]]; then
-    kill -INT "${localization_pid}" 2>/dev/null || true
-    wait "${localization_pid}" 2>/dev/null || true
-  fi
+  terminate_child "${localization_pid}" "occupancy localization launch"
+  cleanup_localization_stack_patterns
   cleanup_overlay_helpers
-  cleanup_canonical_helpers
+  # Canonical TF/local-state is a common-service dependency, not owned by the
+  # occupancy localization mode. Killing it here can leave Nav2 active with no
+  # /local_state/odometry or odom->base_link publisher during stop/restart.
 }
 
 on_signal() {
@@ -127,46 +221,38 @@ on_signal() {
 trap cleanup EXIT
 trap on_signal INT TERM
 
+resident_fastlio_runtime_running() {
+  pgrep -f "fast_lio[[:space:]]+fastlio_mapping|fastlio_mapping --ros-args|laser_mapping" >/dev/null 2>&1
+}
+
+ensure_resident_fastlio_for_local_state() {
+  resident_fastlio_runtime_running || {
+    echo "[runtime-overlay] managed FAST-LIO runtime is not running; explicit fastlio local-state mode must start it before occupancy localization" >&2
+    return 1
+  }
+  echo "[runtime-overlay] managed FAST-LIO process exists for explicit fastlio local-state mode; startup topic probes are disabled" >&2
+}
+
+ensure_resident_local_state_for_localization() {
+  LOCAL_STATE_MODE="${NAV_LOCAL_STATE_MODE}" local_state_required_processes_running || {
+    echo "[runtime-overlay] resident local_state ${NAV_LOCAL_STATE_MODE} process is not running; common services must start it before occupancy localization" >&2
+    return 1
+  }
+  echo "[runtime-overlay] resident local_state ${NAV_LOCAL_STATE_MODE} process exists for occupancy localization; startup odom/TF probes are disabled" >&2
+}
+
 start_canonical_helper "ranger_chassis_localization" bash "${SCRIPT_DIR}/run_ranger_chassis.sh"
 start_canonical_helper "robot_description_static_tf_localization" bash "${SCRIPT_DIR}/run_robot_description.sh"
-if [[ "${NAV_LOCAL_STATE_MODE}" == "passthrough" || "${NAV_LOCAL_STATE_MODE}" == "legacy" ]]; then
-  kill_canonical_pattern "robot_localization/ekf_node"
-  kill_canonical_pattern "ekf_node --ros-args.*__node:=robot_local_state"
+ensure_localization_pointcloud_ready
+if [[ "${NAV_LOCAL_STATE_MODE}" == "fastlio" ]]; then
+  ensure_resident_fastlio_for_local_state || exit 1
 fi
-start_canonical_helper \
-  "robot_local_state_localization" \
-  env LOCAL_STATE_MODE="${NAV_LOCAL_STATE_MODE}" bash "${SCRIPT_DIR}/run_local_state.sh"
+ensure_resident_local_state_for_localization || exit 1
 start_canonical_helper "robot_localization_bridge" bash "${SCRIPT_DIR}/run_localization_bridge.sh"
 start_overlay_helper "global_localization_localization" bash "${SCRIPT_DIR}/run_global_localization.sh"
 
-wait_for_tf_edge "base_link" "lidar_level_link" 10 || {
-  echo "[runtime-overlay] base_link -> lidar_level_link TF did not become ready for occupancy localization" >&2
-  exit 1
-}
-
-wait_for_topic_message "/local_state/odometry" 12 || {
-  echo "[runtime-overlay] /local_state/odometry did not become ready for occupancy localization" >&2
-  exit 1
-}
-
-wait_for_topic_message "${POINTS_TOPIC}" 20 || {
-  echo "[runtime-overlay] timed out waiting for localization pointcloud: ${POINTS_TOPIC}" >&2
-  echo "[runtime-overlay] check canonical /lidar_points input stream and JT128 driver/remap chain." >&2
-  exit 1
-}
-
 ros2 launch "${LAUNCH_FILE}" "${launch_args[@]}" &
 localization_pid=$!
-
-ensure_map_server_active "${NAV2_MAP_YAML}" 30 || {
-  echo "[runtime-overlay] map_server did not become active for occupancy localization" >&2
-  exit 1
-}
-
-wait_for_occupancy_grid "/map" 30 || {
-  echo "[runtime-overlay] /map did not become available for occupancy localization" >&2
-  exit 1
-}
 
 wait "${localization_pid}" || localization_exit_code=$?
 exit "${localization_exit_code}"

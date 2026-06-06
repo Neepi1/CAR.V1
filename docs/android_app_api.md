@@ -53,6 +53,8 @@ POST /api/v1/localization/trigger
 GET  /api/v1/navigation/state
 POST /api/v1/navigation/goal
 POST /api/v1/navigation/cancel
+POST /api/v1/navigation/stop
+POST /api/v1/navigation/stop_runtime
 GET  /api/v1/docking/state
 POST /api/v1/docking/start
 POST /api/v1/docking/cancel
@@ -72,9 +74,11 @@ Example floor switch body:
 
 Reserved navigation start and 3D mapping endpoints return `501` until `robot_mode_manager` or `robot_mission_manager` exposes formal ROS-native services/actions. 2D mapping is wired to the repository-owned `slam_toolbox` runtime chain, not to the test Web dashboard. Navigation goals are wired to Nav2 `NavigateToPose`; the App should send saved `pose_id` targets instead of publishing velocity commands.
 
-When `POST /api/v1/floors/switch` uses `"resume_navigation": true`, the car starts the floor navigation runtime for that `building_id` and `floor_id`: load the released `nav/nav_map.yaml`, start the occupancy localization stack, start the `robot_global_localization` wrapper, wait for `/global_localization/apply_floor_assets`, `/global_localization/trigger`, Isaac `/trigger_grid_search_localization`, `/map`, and `/flatscan`, call `/floor_manager/switch_floor` to apply localizer assets and trigger Isaac localization, then starts standard Nav2 with the active floor filter masks. The backend treats `map -> odom` as the authoritative localization-ready signal. `/localization_result` is observed when available, but the backend does not fail solely because that one-shot result was already published before the runtime subscribed. The App still only requests the mode transition; it must not launch Nav2 or send task-navigation velocity commands.
+When `POST /api/v1/floors/switch` uses `"resume_navigation": true`, the car starts the floor navigation runtime for that `building_id` and `floor_id`: resolve the released `nav/nav_map.yaml`, start the occupancy localization stack, start the `robot_global_localization` wrapper, call `/floor_manager/switch_floor` best-effort with `resume_navigation=false`, wait for the localizer services/map/flatscan inputs, and send one bounded `/global_localization/trigger` request. The startup waits for the initial localization_result and map -> odom before starting standard Nav2 with the active floor filter masks. Local-costmap and safety-topic shell probes remain diagnostics and API goal-admission inputs after the runtime is up; they are not restored as high-frequency startup loops. The backend records that manual navigation selection in `maps_release/last_navigation_map.json`; the next boot uses only that recorded map plus the matching `current/manifest.json` to auto-resume navigation. If no valid last map exists, common services stay alive and Nav2 is not started. If the navigation resume child process exits during startup, `/api/v1/status` and `/api/v1/navigation/state` report navigation `failed` instead of staying in `starting`. The App still only requests the mode transition; it must not launch Nav2 or send task-navigation velocity commands.
 
-When the request includes `map_id` or `map_name`, the backend activates that saved map into `maps_release/<building_id>/<floor_id>/current/` before floor switch or navigation resume. `current/` is a backend-owned runtime mirror; the App should edit saved map records through map APIs and must not write files under `current/` directly.
+Repeated `resume_navigation=true` for the same ready `map_id/building_id/floor_id` returns `state: "navigation_runtime_reused"` and keeps the existing runtime process alive. The API must not stop a healthy Nav2/localization stack just because the App page refreshed or sent the same floor request again.
+
+When the request includes `map_id` or `map_name`, the backend activates that saved map into `maps_release/<building_id>/<floor_id>/current/` before floor switch or navigation resume. `current/` is a backend-owned runtime mirror; the App should edit saved map records through map APIs and must not write files under `current/` directly. Saving a new 2D map does not activate it; the App must explicitly select the saved `map_id` before navigation starts.
 
 ## Status / Battery
 
@@ -99,7 +103,11 @@ Relevant response fields:
     "active": true,
     "state": "running",
     "map_topic": "/map",
-    "map_endpoint": "/api/v1/mapping/2d/map"
+    "map_endpoint": "/api/v1/mapping/2d/map",
+    "live_map_available": true,
+    "live_map_age_sec": 0.2,
+    "live_map_width": 1024,
+    "live_map_height": 1024
   },
   "navigation": {
     "active": false,
@@ -136,9 +144,9 @@ The App should use these lightweight business fields instead of inferring state 
 - Idle: `mode == "IDLE"`.
 - Error: `mode == "ERROR" || healthy == false`.
 
-The backend intentionally keeps this status lightweight. It is driven by official API transitions such as `/mapping/2d/start`, `/mapping/2d/stop`, `/mapping/2d/save`, `/floors/switch?resume_navigation=true`, `/navigation/goal`, and `/navigation/cancel`. Deep ROS checks remain backend diagnostics and should not be duplicated in the App.
+The backend intentionally keeps this status lightweight. It is driven by official API transitions such as `/mapping/2d/start`, `/mapping/2d/stop`, `/mapping/2d/save`, `/floors/switch?resume_navigation=true`, `/navigation/goal`, and `/navigation/cancel`. Deep ROS checks remain backend diagnostics and should not be duplicated in the App. The API has a fixed worker pool instead of one thread per request, so the App should poll with a modest interval, for example `500ms..1000ms` while a task is active and slower while idle. Treat HTTP `503 {"error":"server busy"}` as a transient backend overload and retry with backoff instead of launching more parallel requests.
 
-`bms.soc` is the value the App should display as real battery percentage. The data path is Ranger CAN BMS frame decoded by `ranger_base_node` into `/battery_state`, then subscribed by `robot_api_server`; the App must not read CAN or ROS 2 DDS directly. Treat `soc_valid=false` as stale or unavailable power data.
+`bms.soc` is the value the App should display as real battery percentage. The data path is Ranger CAN BMS frame decoded by `ranger_base_node` into `/battery_state`, then subscribed by `robot_api_server`; the App must not read CAN or ROS 2 DDS directly. Treat `soc_valid=false` as stale or unavailable power data. Use `bms.charging_contact` and `bms.charging_contact_reason` for dock-contact diagnostics; full batteries may report `current=0`, so App logic must not use current alone to decide whether undocking is allowed.
 
 ## Page-Scoped Subscriptions
 
@@ -178,8 +186,8 @@ POST http://<robot-ip>:8080/api/v1/subscriptions/release
 
 Resource mapping:
 
-- Home / robot detail: acquire `status`.
-- Mapping page: acquire `live_map`, `tf`, and `teleop`, then open `WS /ws/v1/teleop`.
+- Home / robot detail: `status` may still be acquired for compatibility, but safety state is now a backend-resident cache. Releasing the page lease must not be treated as clearing `/safety/status` or `/safety/motion_allowed`.
+- Mapping page: acquire `live_map`, `tf`, and `teleop`, then open `WS /ws/v1/teleop`. The API keeps an internal `/map` cache during active 2D mapping for status and save, but the page should still acquire `live_map` before polling the PNG endpoint.
 - Map editing page: usually does not acquire ROS resources; read saved map assets and semantic layers only.
 
 If the App crashes or network drops, the server expires the lease after `ttl_ms`. WebSocket disconnect immediately releases the internal `teleop` lease and publishes one zero velocity command.
@@ -191,6 +199,8 @@ Start live `slam_toolbox` mapping before requesting live map images:
 ```text
 POST http://<robot-ip>:8080/api/v1/mapping/2d/start
 ```
+
+If a navigation task is active, the backend cancels the task and publishes zero velocity before entering mapping mode. The App should not call `/api/v1/navigation/stop_runtime` before mapping; that endpoint is reserved for engineering recovery.
 
 Successful response:
 
@@ -224,7 +234,7 @@ Successful response:
 }
 ```
 
-The stop endpoint terminates the complete 2D mapping-side chain: `run_projected_map.sh`, the `slam_toolbox` launch/processes, scan preprocessing and republishing nodes, and the FAST-LIO2 deskew source used for live mapping (`fastlio_mapping` / `laser_mapping`). It does not stop canonical chassis, TF, local state, safety, or API services.
+The stop endpoint terminates the complete 2D mapping-side chain: `run_projected_map.sh`, the `slam_toolbox` launch/processes, scan preprocessing and republishing nodes, the C++ mapping odom bridge, and the mapping-owned FAST-LIO2 process marked with `NJRH_SLAM2D_PRIVATE_FASTLIO=1`. It does not stop canonical chassis, TF, local state, safety, or API services.
 
 Save the current live or just-stopped `slam_toolbox` map into flat runtime preview files plus a business map bundle. A successful save also runs the same mapping-chain stop logic as `/mapping/2d/stop`, so the App does not need to call stop again after saving:
 
@@ -277,7 +287,7 @@ Successful response includes:
 }
 ```
 
-The Nav2 `PGM` and Isaac localizer `PNG` are generated from the same cached occupancy grid. The endpoint also creates neutral filter masks, `asset_report.json`, `poses.yaml`, and `manifest.json`. Runtime consumers do not use the business filename directly; activation copies fixed role files into `maps_release/<building_id>/<floor_id>/current/nav/nav_map.yaml` and `current/localizer/localizer_map.png`.
+The Nav2 `PGM` and Isaac localizer `PNG` are generated from the same cached occupancy grid. The endpoint also creates neutral filter masks, `asset_report.json`, `poses.yaml`, and `manifest.json`. Runtime consumers do not use the business filename directly; activation copies fixed role files into `maps_release/<building_id>/<floor_id>/current/nav/nav_map.yaml` and `current/localizer/localizer_map.png`. The save response includes `requires_manual_navigation_selection:true`; call `/api/v1/floors/switch` with the returned `map_id` and `resume_navigation:true` to start navigation on that map.
 
 List maps:
 
@@ -540,7 +550,7 @@ Content-Type: application/json
 }
 ```
 
-Successful response returns `202 Accepted`. The server resolves the pose from `maps_release/<building_id>/<floor_id>/poses.yaml` and sends a Nav2 `NavigateToPose` goal on `/navigate_to_pose`. If the car is already docked or the backend sees live charging contact, this endpoint automatically performs controlled undocking first, waits for `docking.state == "undocked"`, and only then sends the Nav2 goal. If undocking fails or times out, the response is an error and no navigation goal is sent. The App must not send `/cmd_vel` for task navigation, and it should not call `/api/v1/docking/undock` separately before every normal point navigation.
+Successful response returns `202 Accepted` with `navigation_goal_id`. The server resolves the pose from `maps_release/<building_id>/<floor_id>/poses.yaml`, sends a Nav2 `NavigateToPose` goal on `/navigate_to_pose`, and tracks the result in the background. If the car is already docked or the backend sees live charging contact, this endpoint automatically performs controlled undocking first, waits for odometry-confirmed `undocked`, arms the bridge one-shot correction service, triggers post-undock relocalization, waits until the result is reflected in `map -> base_link`, and only then sends the Nav2 goal. If undocking, post-undock relocalization, bridge acceptance, or the wait times out, the response is an error and no navigation goal is sent. The App must not send `/cmd_vel` for task navigation, and it should not call `/api/v1/docking/undock` separately before every normal point navigation.
 
 Cancel active navigation goals:
 
@@ -557,13 +567,17 @@ POST http://<robot-ip>:8080/api/v1/navigation/cancel
 }
 ```
 
-By default this endpoint exits navigation mode, not just the current goal. The car-side server publishes a zero burst into `/cmd_vel_collision_checked`, accepts a background cancel job, and returns `202 Accepted` quickly. The background job cancels the cached API-started `NavigateToPose` goal handle when `/navigate_to_pose` is available, sends cancel-all to `/navigate_to_pose`, publishes another zero burst, and stops the Nav2 plus 2D localization runtime. It keeps common services alive: driver, chassis, `robot_safety`, local odom, robot description, local perception, floor manager, and the API server.
+By default this endpoint cancels the current navigation task and keeps the resident navigation runtime alive. The car-side server publishes a zero burst into `/cmd_vel_collision_checked`, accepts a background cancel job, and returns `202 Accepted` quickly. The background job uses a short `/navigate_to_pose` action-server probe so a partly degraded Nav2 stack does not block cancellation for the generic service timeout; when `/navigate_to_pose` is available it cancels the cached API-started `NavigateToPose` goal handle, sends cancel-all to `/navigate_to_pose`, publishes another zero burst, and leaves Nav2 plus localization resident.
 
-The endpoint is idempotent for mode exit: if Nav2 is already partly down, it still publishes zero velocity and stops any remaining navigation/localization processes.
+The endpoint is idempotent for task exit: if Nav2 is already partly down, it still publishes zero velocity and records the cancel job failure reason without tearing down localization.
 
-If an engineering tool only wants to cancel the current goal but keep Nav2 and localization running, it may send `"stop_stack": false`. The App normal cancel button should not set this field.
+If an engineering tool needs to tear down Nav2/localization for recovery, call `POST /api/v1/navigation/stop` or `POST /api/v1/navigation/stop_runtime`. These force `stop_stack=true`, cancel any Nav2 goal, publish zero velocity, terminate Nav2/localizer/`robot_localization_bridge`, and clear the runtime map context. The App normal cancel button should not call these endpoints. For the user-facing "return to charger" button, do not call `/api/v1/navigation/cancel` first; call `/api/v1/docking/start` directly so the backend can cancel the current API navigation goal without stopping the Nav2/localization stack.
 
-The App may poll the latest cancel job:
+Before accepting a normal `POST /api/v1/navigation/goal`, the backend now checks that the critical Nav2 lifecycle nodes are active and refreshes Isaac localization through `/global_localization/trigger`. If localization cannot produce a fresh result accepted by `robot_localization_bridge`, the request fails before any Nav2 goal is sent. Successful responses include `pre_navigation_relocalization_requested`, `pre_navigation_relocalization_succeeded`, and `pre_navigation_relocalization_detail` for App diagnostics.
+
+The backend treats delivery-point success as reaching the saved position first. A Nav2 action result of `succeeded` is not accepted by itself: after Nav2 returns, the API re-reads the current `map -> base_link` pose and requires the final distance to be within `navigation_goal_position_success_tolerance_m`. Nav2's goal checker uses `yaw_goal_tolerance: 0.15`, but if only the final heading remains and the direct final yaw alignment through `/cmd_vel_collision_checked -> robot_safety -> /cmd_vel_safe` is blocked by the safety layer, the navigation goal job still reports `state: "succeeded"` with `phase: "position_reached_yaw_warning"` and `final_yaw_align_blocked: true`. This is a user-visible heading warning, not a failed delivery. If the position itself is not reached, the job remains failed even if Nav2 reported success.
+
+The App may poll the latest cancel job and goal job:
 
 ```text
 GET http://<robot-ip>:8080/api/v1/navigation/state
@@ -611,7 +625,7 @@ Content-Type: application/json
 }
 ```
 
-The backend activates the requested map, starts or waits for the standard navigation runtime, sends Nav2 to the computed pre-dock pose, starts `robot_docking_manager` if needed, then calls `/docking/start`. GS2 fine docking owns the final low-speed alignment and charging-contact confirmation.
+The backend activates the requested map, starts or waits for the standard navigation runtime, cancels any cached API navigation goal without stopping the Nav2/localization stack, triggers `/global_localization/trigger`, waits for a fresh `/localization_result` or a very recent existing result, sends Nav2 to the pre-dock pose, triggers localization again after Nav2 reports the pre-dock goal succeeded, and verifies the refreshed `map -> base_link` pose is still close to the approach pose before starting `robot_docking_manager`. The App may keep the existing body unchanged. If the map contains a manual pre-dock pose named `dock_id_predock`, `dock_id_pre_dock`, `dock_id_approach`, `predock_dock_id`, `pre_dock_dock_id`, or `approach_dock_id`, the backend uses it after checking yaw sanity only by default. Engineering tools may also pass `"predock_pose_id": "dock_main_predock"` or `"approach_pose_id": "dock_main_predock"`. A manual pre-dock point should normally be saved with the robot centered in front of the charger, about `0.6m..0.9m` away, but `docking_manual_predock_distance_check_enable` defaults to `false`, so short points such as `0.356m` are not rejected only because of distance. If no manual point exists, the backend falls back to the geometric offset from the saved dock contact pose. `/api/v1/docking/state` exposes `predock_pose_id` and `approach_source`. If localization does not refresh, is stale, is rejected by `robot_localization_bridge`, or shows the car is outside the configured approach-pose tolerance, the request fails before the robot continues into GS2 fine docking. GS2 fine docking owns the final low-speed alignment and charging-contact confirmation. After GS2 fine docking returns a terminal status such as `docked`, `dock_feature_not_found`, or `contact_verify_timeout`, the backend briefly reports `relocalize_after_fine_docking`, triggers `/global_localization/trigger`, then reports the final docking state so later Nav2 actions do not inherit uncorrected fine-docking odometry drift.
 
 Cancel docking:
 
@@ -642,7 +656,7 @@ Content-Type: application/json
 {"dock_id":"dock_main","reason":"app_manual_undock"}
 ```
 
-The undock endpoint is accepted only when the car is already docked or the backend sees live charging contact. It calls the car-side `/docking/undock` service; the App must not send reverse velocity directly. The car backs out through `/cmd_vel_collision_checked`, `robot_safety`, and the Ranger mode controller. Poll `/api/v1/docking/state` until `state` becomes `undocked` or `failed`.
+The undock endpoint is accepted only when the car is already docked or the backend sees live charging contact. Contact can come from `power_supply_status=CHARGING/FULL`, charge current, `present=true` with valid voltage, or `present=true` with full-SOC/valid-voltage inference until the dedicated contact signal is wired. Full SOC plus pack voltage alone is not treated as dock contact because a full battery away from the charger can report the same values. It calls the car-side `/docking/undock` service; the App must not send reverse velocity directly. The car backs out through `/cmd_vel_docking`, `robot_safety`, and the Ranger mode controller, with reverse permitted by `/ranger_mini3/docking_allow_reverse`. After `/local_state/odometry` confirms departure, the backend state briefly becomes `relocalize_after_undock` while it triggers `/global_localization/trigger`; the API requires the new localization result to be reflected in `map -> base_link` so a rejected `map -> odom` jump is not reported as success. The docking job exposes `post_undock_relocalization_requested`, `post_undock_relocalization_succeeded`, `post_undock_relocalization_required`, and `post_undock_relocalization_detail`. Poll `/api/v1/docking/state` until `state` becomes `undocked` or `failed`; use `charging_contact`, `charging_contact_reason`, and `inferred_docked` to explain why undock is available while `docking.state` is not `docked`.
 
 The App must not use mapping teleop or direct velocity commands for docking. Docking motion is owned by Nav2 plus `robot_docking_manager`.
 
@@ -655,7 +669,7 @@ GET http://<robot-ip>:8080/api/v1/mapping/2d/map
 Content-Type: image/png
 ```
 
-This endpoint is live-only by default. If no App-started 2D mapping session is active, or if live `/map` data has not arrived yet, it returns JSON `409`/`404` instead of falling back to map_server or an existing saved map.
+This endpoint is live-only by default. If no App-started 2D mapping session is active, or if live `/map` data has not arrived yet, it returns JSON `409`/`404` instead of falling back to map_server or an existing saved map. `GET /api/v1/status` and save use the API's internal `/map` cache while mapping is active, so they do not depend on the App acquiring this page resource first.
 
 The App must acquire `live_map` before polling this endpoint:
 
@@ -700,7 +714,7 @@ Server-side safety contract:
 - Published topic: `/cmd_vel_collision_checked`
 - Final chain: `/cmd_vel_collision_checked -> robot_safety -> /cmd_vel_safe -> ranger_mini3_mode_controller -> /cmd_vel -> ranger_base_node`
 - Default limits: `linear_x <= 0.30 m/s`, `abs(angular_z) <= 0.55 rad/s`
-- Mapping teleop allows low-speed reverse. The API server enables `/ranger_mini3/allow_reverse` only during an active WebSocket mapping teleop session.
+- Mapping teleop allows low-speed reverse. The API server enables `/ranger_mini3/teleop_allow_reverse` only during an active WebSocket mapping teleop session.
 - Navigation still cannot reverse by default because `ranger_mini3_mode_controller.allow_reverse` remains `false`; reverse permission expires if the App stops sending commands.
 - Teleop is accepted only while 2D mapping is active by default. If mapping is not active, the WebSocket upgrade returns `409`.
 - Teleop stops automatically if the robot reports charging/full or charge current on `/battery_state`.

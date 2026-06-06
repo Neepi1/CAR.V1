@@ -3,6 +3,7 @@ robot_api_server:
     host: "0.0.0.0"
     port: 8080
     api_token: ""
+    max_http_connections: 16
 
     maps_root: "/workspaces/njrh-v3/workspace1/maps_release"
     runtime_maps_dir: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/maps"
@@ -15,15 +16,22 @@ robot_api_server:
     bms_state_max_age_sec: 3.0
     teleop_stop_on_charging: true
     teleop_charging_current_min_a: 0.10
+    bms_charging_contact_voltage_min_v: 40.0
+    bms_charging_contact_voltage_max_v: 1000.0
+    bms_full_soc_threshold_pct: 99.0
+    bms_full_soc_voltage_contact_enable: true
     floor_switch_service: "/floor_manager/switch_floor"
     localization_trigger_service: "/global_localization/trigger"
+    localization_bridge_force_accept_service: "/robot_localization_bridge/force_accept_next_localization"
+    localization_result_topic: "/localization_result"
     navigate_to_pose_action: "/navigate_to_pose"
 
     mapping_2d_start_command: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/run_projected_map.sh"
     mapping_2d_log_file: "/tmp/njrh_mapping2d_slam_toolbox.log"
-    navigation_resume_command: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/run_floor_navigation.sh"
+    navigation_resume_command: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/run_navigation_runtime_services.sh"
     navigation_resume_log_file: "/tmp/njrh_navigation_resume.log"
     runtime_map_context_file: "/tmp/njrh_runtime_map_context.json"
+    last_navigation_map_file: "/workspaces/njrh-v3/workspace1/maps_release/last_navigation_map.json"
     navigation_stop_command: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/stop_floor_navigation.sh"
     navigation_stop_log_file: "/tmp/njrh_navigation_stop.log"
     docking_manager_start_command: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/run_docking_manager.sh"
@@ -35,6 +43,23 @@ robot_api_server:
     docking_pre_dock_distance_m: 0.60
     docking_navigation_start_wait_sec: 45.0
     docking_predock_nav_timeout_sec: 180.0
+    docking_relocalize_before_predock: true
+    docking_relocalize_after_predock: true
+    docking_relocalize_after_predock_required: true
+    docking_relocalize_after_fine_docking: true
+    docking_relocalize_after_fine_docking_required: false
+    docking_validate_predock_pose_after_relocalization: true
+    docking_predock_pose_max_distance_m: 0.35
+    docking_predock_pose_max_yaw_rad: 0.35
+    docking_manual_predock_distance_check_enable: false
+    docking_manual_predock_min_distance_m: 0.50
+    docking_manual_predock_max_distance_m: 1.20
+    docking_manual_predock_max_yaw_error_rad: 0.80
+    docking_relocalize_wait_sec: 8.0
+    docking_relocalize_recent_result_max_age_sec: 5.0
+    undock_relocalize_after_success: true
+    undock_relocalize_wait_sec: 8.0
+    docking_cancel_active_goal_before_predock: true
     navigation_auto_undock_timeout_sec: 18.0
     docking_undock_charging_retry_sec: 3.0
     mapping_2d_live_map_topic: "/map"
@@ -49,7 +74,7 @@ robot_api_server:
     robot_pose_freshness_sec: 0.5
 
     teleop_cmd_topic: "/cmd_vel_collision_checked"
-    teleop_reverse_enable_topic: "/ranger_mini3/allow_reverse"
+    teleop_reverse_enable_topic: "/ranger_mini3/teleop_allow_reverse"
     teleop_pose_topic: "/local_state/odometry"
     teleop_max_linear_x_mps: 0.30
     teleop_max_angular_z_radps: 0.55
@@ -62,3 +87,18 @@ robot_api_server:
     subscription_max_ttl_ms: 60000
 
     service_timeout_sec: 8.0
+    navigation_cancel_action_wait_sec: 0.75
+    localization_trigger_service_timeout_sec: 15.0
+    localization_bridge_acceptance_timeout_sec: 3.0
+    localization_bridge_acceptance_max_distance_m: 1.0
+    localization_bridge_acceptance_max_yaw_rad: 0.35
+    navigation_relocalize_before_goal: true
+    navigation_relocalize_before_goal_required: true
+    navigation_relocalize_wait_sec: 8.0
+    navigation_goal_result_timeout_sec: 600.0
+    navigation_goal_position_success_tolerance_m: 0.30
+    navigation_final_yaw_align_enable: true
+    navigation_final_yaw_tolerance_rad: 0.15
+    navigation_final_yaw_align_speed_radps: 0.25
+    navigation_final_yaw_align_timeout_sec: 4.0
+    navigation_lifecycle_check_timeout_sec: 0.35

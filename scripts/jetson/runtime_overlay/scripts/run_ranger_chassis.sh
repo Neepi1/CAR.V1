@@ -3,12 +3,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common_env.sh"
+source "${SCRIPT_DIR}/cpu_affinity.sh"
 
 CAN_IFACE="${CAN_IFACE:-can0}"
 export PUBLISH_ODOM_TF="${PUBLISH_ODOM_TF:-false}"
 export ODOM_TOPIC="${ODOM_TOPIC:-/wheel/odom}"
 export ODOM_FRAME="${ODOM_FRAME:-odom}"
-export BASE_FRAME="${BASE_FRAME:-ranger_base_link}"
+export BASE_FRAME="${BASE_FRAME:-base_link}"
 ROBOT_MODEL="${ROBOT_MODEL:-ranger_mini_v3}"
 LOCK_DIR="/tmp/njrh_ranger_chassis_${CAN_IFACE}.lock"
 REAL_NODE_PATTERN="/ranger_base/lib/ranger_base/ranger_base_node.*port_name:=${CAN_IFACE}"
@@ -57,7 +58,7 @@ on_signal() {
 trap cleanup EXIT
 trap on_signal INT TERM
 
-ros2 run ranger_base ranger_base_node \
+njrh_run_affined ranger_base_node ros2 run ranger_base ranger_base_node \
   --ros-args \
   -p use_sim_time:=false \
   -p "port_name:=${CAN_IFACE}" \

@@ -11,6 +11,24 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
+def cpu_affinity_prefix(service_name: str) -> str | None:
+    enabled = os.environ.get("NJRH_CPU_AFFINITY_ENABLED", "true").lower()
+    if enabled not in ("1", "true", "yes", "on"):
+        return None
+    key = service_name.upper().replace("-", "_").replace(".", "_").replace("/", "_")
+    cpuset = os.environ.get(f"NJRH_CPUSET_{key}", "")
+    if not cpuset:
+        return None
+    return f"taskset -c {cpuset}"
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
 def generate_launch_description() -> LaunchDescription:
     overlay_root = Path(__file__).resolve().parents[1]
     upstream_root = Path(os.environ.get("NJRH_UPSTREAM_ROOT", "/workspaces/isaac_ros-dev"))
@@ -30,12 +48,15 @@ def generate_launch_description() -> LaunchDescription:
     points_topic = LaunchConfiguration("points_topic")
     nav_points_topic = LaunchConfiguration("nav_points_topic")
     scan_topic = LaunchConfiguration("scan_topic")
+    tf_topic = LaunchConfiguration("tf_topic")
+    restamp_scan_to_now = env_bool("NJRH_SLAM2D_RESTAMP_SCAN_TO_NOW", False)
 
     nav_cloud_preprocessor = Node(
         package="jt128_nav_tools",
         executable="nav_cloud_preprocessor",
         name="nav_cloud_preprocessor",
         output="screen",
+        prefix=cpu_affinity_prefix("nav_cloud_preprocessor"),
         parameters=[
             str(preprocessor_params_default),
             preprocessor_params,
@@ -52,6 +73,7 @@ def generate_launch_description() -> LaunchDescription:
         executable="pointcloud_to_laserscan_node",
         name="pointcloud_to_laserscan",
         output="screen",
+        prefix=cpu_affinity_prefix("pointcloud_to_laserscan"),
         parameters=[str(scan_params_default), scan_params],
         remappings=[
             ("cloud_in", nav_points_topic),
@@ -64,11 +86,12 @@ def generate_launch_description() -> LaunchDescription:
         executable="scan_republisher_node",
         name="scan_republisher",
         output="screen",
+        prefix=cpu_affinity_prefix("scan_republisher"),
         parameters=[
             {
                 "input_topic": "/scan_raw",
                 "output_topic": scan_topic,
-                "restamp_to_now": True,
+                "restamp_to_now": restamp_scan_to_now,
             }
         ],
     )
@@ -78,6 +101,10 @@ def generate_launch_description() -> LaunchDescription:
         executable="async_slam_toolbox_node",
         name="slam_toolbox",
         output="screen",
+        prefix=cpu_affinity_prefix("slam_toolbox_mapping"),
+        remappings=[
+            ("/tf", tf_topic),
+        ],
         parameters=[
             str(upstream_slam_params),
             slam_params,
@@ -101,6 +128,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("points_topic", default_value="/cloud_registered_body"),
             DeclareLaunchArgument("nav_points_topic", default_value="/points_nav"),
             DeclareLaunchArgument("scan_topic", default_value="/scan"),
+            DeclareLaunchArgument("tf_topic", default_value="/tf"),
             nav_cloud_preprocessor,
             pointcloud_to_scan,
             restamp_scan,

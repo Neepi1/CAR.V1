@@ -10,6 +10,17 @@ from launch_ros.actions import ComposableNodeContainer, Node
 from launch_ros.descriptions import ComposableNode
 
 
+def cpu_affinity_prefix(service_name):
+    enabled = os.environ.get("NJRH_CPU_AFFINITY_ENABLED", "true").lower()
+    if enabled not in ("1", "true", "yes", "on"):
+        return None
+    key = service_name.upper().replace("-", "_").replace(".", "_").replace("/", "_")
+    cpuset = os.environ.get(f"NJRH_CPUSET_{key}", "")
+    if not cpuset:
+        return None
+    return f"taskset -c {cpuset}"
+
+
 def generate_launch_description():
     upstream_root = Path(os.environ.get("NJRH_UPSTREAM_ROOT", "/workspaces/isaac_ros-dev"))
     overlay_root = Path(__file__).resolve().parents[1]
@@ -31,6 +42,7 @@ def generate_launch_description():
         executable="map_server",
         name="map_server",
         output="screen",
+        prefix=cpu_affinity_prefix("nav2_map_server"),
         parameters=[{
             "use_sim_time": use_sim_time,
             "yaml_filename": map_yaml,
@@ -43,6 +55,7 @@ def generate_launch_description():
         executable="lifecycle_manager",
         name="lifecycle_manager_map",
         output="screen",
+        prefix=cpu_affinity_prefix("nav2_lifecycle_manager"),
         parameters=[{
             "use_sim_time": use_sim_time,
             "autostart": True,
@@ -76,6 +89,7 @@ def generate_launch_description():
         namespace="",
         composable_node_descriptions=[occupancy_grid_localizer],
         output="screen",
+        prefix=cpu_affinity_prefix("occupancy_grid_localizer"),
     )
 
     return LaunchDescription([

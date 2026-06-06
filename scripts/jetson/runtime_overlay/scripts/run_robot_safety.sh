@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common_env.sh"
+source "${SCRIPT_DIR}/cpu_affinity.sh"
 REPO_ROOT="$(cd "${NJRH_OVERLAY_ROOT}/../../.." && pwd)"
 
 PARAMS_FILE="${ROBOT_SAFETY_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/robot_safety.yaml}"
@@ -18,4 +19,4 @@ NODE_BIN="${REPO_ROOT}/install/robot_safety/lib/robot_safety/robot_safety_node"
   exit 1
 }
 
-exec "${NODE_BIN}" --ros-args --params-file "${PARAMS_FILE}"
+njrh_exec_affined robot_safety "${NODE_BIN}" --ros-args --params-file "${PARAMS_FILE}"
