@@ -15,7 +15,7 @@ robot_hesai_jt128:
     imu_port: 10110
     points_topic: /lidar_points
     nav_points_topic: /lidar_points_nav
-    local_perception_points_topic: /_internal/lidar_points_local
+    local_perception_points_topic: ""
     imu_topic: /lidar_imu
     vendor_points_topic: /jt128/vendor/points_raw
     vendor_imu_topic: /jt128/vendor/imu_raw

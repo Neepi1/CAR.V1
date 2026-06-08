@@ -3,7 +3,7 @@ robot_local_perception:
     mock_mode: false
     mode: NORMAL
     mode_topic: /robot_mode
-    input_topic: /_internal/lidar_points_local
+    input_topic: /lidar_points
     input_reliable: false
     input_qos_depth: 1
     input_frame_id_override: lidar_link
@@ -26,14 +26,14 @@ robot_local_perception:
     require_output_stamp_tf: false
     output_stamp_tf_target_frame: odom
     output_stamp_odom_topic: /local_state/odometry
-    lookup_timeout_sec: 0.1
+    lookup_timeout_sec: 0.03
     max_output_tf_stamp_age_sec: 0.25
     output_stamp_tf_backoff_sec: 0.0
     output_stamp_forward_sec: 0.0
     require_startup_tf_ready: true
     startup_tf_warmup_sec: 1.0
-    processing_rate_hz: 20.0
-    process_on_callback: true
+    processing_rate_hz: 15.0
+    process_on_callback: false
     point_sample_stride: 1
     max_filtered_points: 12000
     clearing.enabled: true
@@ -41,17 +41,19 @@ robot_local_perception:
     clearing.range_filter.max: 8.00
     clearing.height_filter.min_z: -0.30
     clearing.height_filter.max_z: 1.40
-    clearing.point_sample_stride: 1
-    clearing.max_points: 30000
+    clearing.point_sample_stride: 2
+    clearing.max_points: 15000
     clearing.virtual_rays.enabled: true
-    clearing.virtual_rays.angular_resolution_deg: 0.75
+    clearing.virtual_rays.angular_resolution_deg: 1.0
     clearing.virtual_rays.range: 8.00
     clearing.virtual_rays.range_steps: [0.50, 1.00, 2.00, 3.50, 5.50, 8.00]
     clearing.virtual_rays.endpoint_z_values: [-0.10, 0.05, 0.20, 0.40, 0.60, 0.85, 1.10, 1.30]
+    status_topic: /perception/local_perception_status
+    status_publish_period_sec: 2.0
     publish_debug_log: false
     local_nav_preprocessor_reference: /workspaces/isaac_ros-dev/nav2_test/params/jt128_nav_cloud_preprocessor.yaml
     supported_modes: [NORMAL, RAMP, ELEVATOR_WAIT, DOORWAY]
-    clearing.publish_every_n: 3
+    clearing.publish_every_n: 4
 
     profiles.NORMAL.range_filter.min: 0.5
     profiles.NORMAL.range_filter.max: 5.50

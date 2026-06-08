@@ -1,9 +1,12 @@
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <iomanip>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -14,6 +17,7 @@
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "sensor_msgs/msg/point_field.hpp"
 #include "sensor_msgs/point_cloud2_iterator.hpp"
+#include "std_msgs/msg/string.hpp"
 
 namespace
 {
@@ -65,6 +69,11 @@ bool find_float32_field_offset(
   return false;
 }
 
+double stamp_to_sec(const builtin_interfaces::msg::Time & stamp)
+{
+  return static_cast<double>(stamp.sec) + static_cast<double>(stamp.nanosec) * 1.0e-9;
+}
+
 }  // namespace
 
 class PointCloudAxisRemapNode : public rclcpp::Node
@@ -86,6 +95,8 @@ public:
     declare_parameter<bool>("input_reliable", false);
     declare_parameter<int>("output_qos_depth", 1);
     declare_parameter<bool>("output_reliable", false);
+    declare_parameter<std::string>("status_topic", "/lidar/axis_remap_status");
+    declare_parameter<double>("status_publish_period_sec", 1.0);
     declare_parameter<std::vector<double>>(
       "rotation_matrix",
       std::vector<double>{
@@ -107,6 +118,8 @@ public:
     const auto local_output_qos_depth_param = get_parameter("local_output_qos_depth").as_int();
     const auto input_qos_depth_param = get_parameter("input_qos_depth").as_int();
     const auto output_qos_depth_param = get_parameter("output_qos_depth").as_int();
+    status_topic_ = get_parameter("status_topic").as_string();
+    status_publish_period_sec_ = std::max(get_parameter("status_publish_period_sec").as_double(), 0.0);
     nav_output_qos_depth_ = static_cast<std::size_t>(
       nav_output_qos_depth_param > 0 ? nav_output_qos_depth_param : 1);
     local_output_qos_depth_ = static_cast<std::size_t>(
@@ -133,6 +146,13 @@ public:
         local_output_topic_,
         make_qos(local_output_qos_depth_, RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT));
     }
+    if (!status_topic_.empty() && status_publish_period_sec_ > 0.0) {
+      status_publisher_ = create_publisher<std_msgs::msg::String>(status_topic_, 10);
+      status_timer_ = create_wall_timer(
+        std::chrono::duration<double>(status_publish_period_sec_),
+        std::bind(&PointCloudAxisRemapNode::publish_status, this));
+      previous_status_time_ = std::chrono::steady_clock::now();
+    }
     subscription_ = create_subscription<sensor_msgs::msg::PointCloud2>(
       input_topic_,
       make_qos(input_qos_depth_, input_reliability),
@@ -152,18 +172,6 @@ private:
       rotation[i] = static_cast<float>(raw[i]);
     }
     return rotation;
-  }
-
-  std::unique_ptr<sensor_msgs::msg::PointCloud2> make_output_message(
-    const sensor_msgs::msg::PointCloud2::SharedPtr & msg) const
-  {
-    auto output = std::make_unique<sensor_msgs::msg::PointCloud2>();
-    if (msg.use_count() == 1) {
-      *output = std::move(*msg);
-    } else {
-      *output = *msg;
-    }
-    return output;
   }
 
   void publish_downsample(
@@ -228,9 +236,19 @@ private:
 
   void publish_outputs(std::unique_ptr<sensor_msgs::msg::PointCloud2> output)
   {
+    const auto publish_start = std::chrono::steady_clock::now();
+    publisher_->publish(*output);
+    ++lidar_points_publish_count_;
+    last_cloud_points_ = static_cast<std::size_t>(output->width) * output->height;
+    last_cloud_bytes_ = output->data.size();
+    last_output_stamp_sec_ = stamp_to_sec(output->header.stamp);
+    last_output_subscription_count_ = publisher_->get_subscription_count();
     publish_downsample(local_publisher_, local_output_stride_, *output);
     publish_downsample(nav_publisher_, nav_output_stride_, *output);
-    publisher_->publish(std::move(output));
+    const auto publish_end = std::chrono::steady_clock::now();
+    last_publish_time_ = publish_end;
+    last_publish_duration_ms_ =
+      std::chrono::duration<double, std::milli>(publish_end - publish_start).count();
 
     if (!logged_ready_) {
       RCLCPP_INFO(
@@ -247,9 +265,12 @@ private:
     }
   }
 
-  void on_cloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
+  void on_cloud(sensor_msgs::msg::PointCloud2::UniquePtr msg)
   {
-    auto output = make_output_message(msg);
+    ++raw_input_count_;
+    last_raw_callback_time_ = std::chrono::steady_clock::now();
+    last_raw_stamp_sec_ = stamp_to_sec(msg->header.stamp);
+    auto output = std::move(msg);
     output->header.frame_id = output_frame_id_;
 
     if (output->data.empty() || output->width == 0U || output->height == 0U) {
@@ -263,6 +284,7 @@ private:
           get_logger(), "cloud on %s does not expose x/y/z fields", input_topic_.c_str());
         warned_missing_xyz_ = true;
       }
+      ++dropped_or_skipped_count_;
       return;
     }
 
@@ -326,6 +348,58 @@ private:
     publish_outputs(std::move(output));
   }
 
+  void publish_status()
+  {
+    if (!status_publisher_) {
+      return;
+    }
+
+    const auto now_steady = std::chrono::steady_clock::now();
+    const double elapsed_sec = std::max(
+      std::chrono::duration<double>(now_steady - previous_status_time_).count(), 1.0e-3);
+    const auto raw_delta = raw_input_count_ - previous_raw_input_count_;
+    const auto publish_delta = lidar_points_publish_count_ - previous_lidar_points_publish_count_;
+    const double raw_age_ms = last_raw_callback_time_ == std::chrono::steady_clock::time_point{} ?
+      -1.0 :
+      std::chrono::duration<double, std::milli>(now_steady - last_raw_callback_time_).count();
+    const double publish_age_ms = last_publish_time_ == std::chrono::steady_clock::time_point{} ?
+      -1.0 :
+      std::chrono::duration<double, std::milli>(now_steady - last_publish_time_).count();
+    const double raw_stamp_age_ms = last_raw_stamp_sec_ <= 0.0 ?
+      -1.0 :
+      (now().seconds() - last_raw_stamp_sec_) * 1000.0;
+    const double publish_stamp_age_ms = last_output_stamp_sec_ <= 0.0 ?
+      -1.0 :
+      (now().seconds() - last_output_stamp_sec_) * 1000.0;
+    const double uptime_sec = std::chrono::duration<double>(now_steady - start_time_).count();
+
+    std_msgs::msg::String msg;
+    std::ostringstream stream;
+    stream << std::fixed << std::setprecision(3)
+           << "input_topic=" << input_topic_
+           << " output_topic=" << output_topic_
+           << " raw_input_hz=" << static_cast<double>(raw_delta) / elapsed_sec
+           << " lidar_points_publish_hz=" << static_cast<double>(publish_delta) / elapsed_sec
+           << " last_raw_age_ms=" << raw_age_ms
+           << " last_raw_stamp_age_ms=" << raw_stamp_age_ms
+           << " last_publish_age_ms=" << publish_age_ms
+           << " last_publish_stamp_age_ms=" << publish_stamp_age_ms
+           << " last_publish_duration_ms=" << last_publish_duration_ms_
+           << " last_cloud_points=" << last_cloud_points_
+           << " last_cloud_bytes=" << last_cloud_bytes_
+           << " output_subscription_count=" << last_output_subscription_count_
+           << " nav_branch_enabled=" << (nav_publisher_ ? "true" : "false")
+           << " local_branch_enabled=" << (local_publisher_ ? "true" : "false")
+           << " dropped_or_skipped_count=" << dropped_or_skipped_count_
+           << " node_uptime_sec=" << uptime_sec;
+    msg.data = stream.str();
+    status_publisher_->publish(msg);
+
+    previous_status_time_ = now_steady;
+    previous_raw_input_count_ = raw_input_count_;
+    previous_lidar_points_publish_count_ = lidar_points_publish_count_;
+  }
+
   std::string input_topic_;
   std::string output_topic_;
   std::string output_frame_id_;
@@ -337,13 +411,32 @@ private:
   std::size_t local_output_qos_depth_;
   std::size_t input_qos_depth_;
   std::size_t output_qos_depth_;
+  std::string status_topic_;
+  double status_publish_period_sec_{1.0};
   std::array<float, 9> rotation_{};
   bool logged_ready_;
   bool warned_missing_xyz_;
+  std::chrono::steady_clock::time_point start_time_{std::chrono::steady_clock::now()};
+  std::chrono::steady_clock::time_point previous_status_time_{std::chrono::steady_clock::now()};
+  std::chrono::steady_clock::time_point last_raw_callback_time_{};
+  std::chrono::steady_clock::time_point last_publish_time_{};
+  std::uint64_t raw_input_count_{0};
+  std::uint64_t lidar_points_publish_count_{0};
+  std::uint64_t previous_raw_input_count_{0};
+  std::uint64_t previous_lidar_points_publish_count_{0};
+  std::uint64_t dropped_or_skipped_count_{0};
+  std::size_t last_cloud_points_{0};
+  std::size_t last_cloud_bytes_{0};
+  std::size_t last_output_subscription_count_{0};
+  double last_raw_stamp_sec_{0.0};
+  double last_output_stamp_sec_{0.0};
+  double last_publish_duration_ms_{0.0};
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr nav_publisher_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr local_publisher_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_publisher_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subscription_;
+  rclcpp::TimerBase::SharedPtr status_timer_;
 };
 
 #ifndef ROBOT_HESAI_JT128_COMPONENT_ONLY

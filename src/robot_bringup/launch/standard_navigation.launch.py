@@ -59,13 +59,13 @@ def generate_launch_description():
 
     navigation_lifecycle_nodes = [
         "controller_server",
+        "velocity_smoother",
+        "collision_monitor",
         "smoother_server",
         "planner_server",
         "behavior_server",
         "bt_navigator",
         "waypoint_follower",
-        "velocity_smoother",
-        "collision_monitor",
     ]
 
     remappings = [

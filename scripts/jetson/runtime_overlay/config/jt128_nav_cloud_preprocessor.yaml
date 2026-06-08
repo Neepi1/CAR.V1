@@ -7,6 +7,8 @@ nav_cloud_preprocessor:
     input_qos_depth: 1
     output_reliable: false
     output_qos_depth: 1
+    status_topic: /lidar/nav_cloud_preprocessor_status
+    status_publish_period_sec: 1.0
     lookup_timeout_sec: 0.03
     publish_debug_log: false
 

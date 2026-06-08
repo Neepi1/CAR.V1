@@ -1,14 +1,33 @@
-﻿--- a/ros2_ws/src/jt128_nav_tools/src/nav_cloud_preprocessor_node.cpp
+diff --git a/ros2_ws/src/jt128_nav_tools/CMakeLists.txt b/ros2_ws/src/jt128_nav_tools/CMakeLists.txt
+index 50fa410..477e935 100644
+--- a/ros2_ws/src/jt128_nav_tools/CMakeLists.txt
++++ b/ros2_ws/src/jt128_nav_tools/CMakeLists.txt
+@@ -15,0 +16 @@ find_package(sensor_msgs REQUIRED)
++find_package(std_msgs REQUIRED)
+@@ -29,0 +31 @@ ament_target_dependencies(
++  std_msgs
+diff --git a/ros2_ws/src/jt128_nav_tools/package.xml b/ros2_ws/src/jt128_nav_tools/package.xml
+index 21b0673..ad5d9c7 100644
+--- a/ros2_ws/src/jt128_nav_tools/package.xml
++++ b/ros2_ws/src/jt128_nav_tools/package.xml
+@@ -18,0 +19 @@
++  <depend>std_msgs</depend>
+diff --git a/ros2_ws/src/jt128_nav_tools/src/nav_cloud_preprocessor_node.cpp b/ros2_ws/src/jt128_nav_tools/src/nav_cloud_preprocessor_node.cpp
+index 4dd7f5e..fc51965 100644
+--- a/ros2_ws/src/jt128_nav_tools/src/nav_cloud_preprocessor_node.cpp
 +++ b/ros2_ws/src/jt128_nav_tools/src/nav_cloud_preprocessor_node.cpp
-@@ -1,3 +1,4 @@
+@@ -0,0 +1,2 @@
 +#include <algorithm>
- #include <cmath>
- #include <functional>
- #include <limits>
-@@ -25,6 +26,18 @@
- {
- using PointT = pcl::PointXYZI;
-
++#include <chrono>
+@@ -1,0 +4 @@
++#include <cstdint>
+@@ -2,0 +6 @@
++#include <iomanip>
+@@ -4,0 +9 @@
++#include <sstream>
+@@ -19,0 +25 @@
++#include "std_msgs/msg/string.hpp"
+@@ -28,0 +35,17 @@ using PointT = pcl::PointXYZI;
 +rclcpp::QoS makePointCloudQos(const int depth, const bool reliable)
 +{
 +  const auto safe_depth = static_cast<size_t>(std::max(1, depth));
@@ -21,54 +40,109 @@
 +  return qos;
 +}
 +
- struct CropBox
- {
-   bool enabled{false};
-@@ -80,6 +95,10 @@
-     input_topic_ = declare_parameter<std::string>("input_topic", "/lidar_points");
-     output_topic_ = declare_parameter<std::string>("output_topic", "/points_nav");
-     output_frame_id_ = declare_parameter<std::string>("output_frame_id", "");
++double stampToSec(const builtin_interfaces::msg::Time & stamp)
++{
++  return static_cast<double>(stamp.sec) + static_cast<double>(stamp.nanosec) * 1.0e-9;
++}
++
+@@ -82,0 +106,6 @@ public:
 +    input_reliable_ = declare_parameter<bool>("input_reliable", false);
 +    input_qos_depth_ = declare_parameter<int>("input_qos_depth", 1);
 +    output_reliable_ = declare_parameter<bool>("output_reliable", false);
 +    output_qos_depth_ = declare_parameter<int>("output_qos_depth", 1);
-     lookup_timeout_sec_ = declare_parameter<double>("lookup_timeout_sec", 0.1);
-     publish_debug_log_ = declare_parameter<bool>("publish_debug_log", false);
-
-@@ -97,17 +116,21 @@
-     outlier_filter_mean_k_ = declare_parameter<int>("outlier_filter.mean_k", 16);
-     outlier_filter_stddev_mul_thresh_ =
-       declare_parameter<double>("outlier_filter.stddev_mul_thresh", 1.0);
-
++    status_topic_ = declare_parameter<std::string>("status_topic", "/lidar/nav_cloud_preprocessor_status");
++    status_publish_period_sec_ = std::max(declare_parameter<double>("status_publish_period_sec", 1.0), 0.0);
+@@ -100 +129,9 @@ public:
 -    publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>(output_topic_, 10);
 +    publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>(
 +      output_topic_, makePointCloudQos(output_qos_depth_, output_reliable_));
-     subscription_ = create_subscription<sensor_msgs::msg::PointCloud2>(
++    if (!status_topic_.empty() && status_publish_period_sec_ > 0.0) {
++      status_publisher_ = create_publisher<std_msgs::msg::String>(status_topic_, 10);
++      status_timer_ = create_wall_timer(
++        std::chrono::duration<double>(status_publish_period_sec_),
++        std::bind(&NavCloudPreprocessorNode::publishStatus, this));
++      previous_status_time_ = std::chrono::steady_clock::now();
++    }
+@@ -102 +139 @@ public:
 -      input_topic_, rclcpp::SensorDataQoS(),
 +      input_topic_, makePointCloudQos(input_qos_depth_, input_reliable_),
-       std::bind(&NavCloudPreprocessorNode::pointCloudCallback, this, std::placeholders::_1));
-
-     RCLCPP_INFO(
-       get_logger(),
+@@ -107 +144,2 @@ public:
 -      "JT128 nav cloud preprocessor ready. input=%s output=%s frame_override=%s",
 +      "JT128 nav cloud preprocessor ready. input=%s output=%s frame_override=%s "
 +      "input_reliable=%s input_depth=%d output_reliable=%s output_depth=%d",
-       input_topic_.c_str(), output_topic_.c_str(),
+@@ -109 +147,3 @@ public:
 -      output_frame_id_.empty() ? "<keep_input>" : output_frame_id_.c_str());
 +      output_frame_id_.empty() ? "<keep_input>" : output_frame_id_.c_str(),
 +      input_reliable_ ? "true" : "false", input_qos_depth_,
 +      output_reliable_ ? "true" : "false", output_qos_depth_);
-   }
-
- private:
-@@ -299,6 +323,10 @@
-   std::string input_topic_;
-   std::string output_topic_;
-   std::string output_frame_id_;
+@@ -234,0 +275 @@ private:
++    ++output_publish_count_;
+@@ -238,0 +280,5 @@ private:
++    const auto callback_start = std::chrono::steady_clock::now();
++    ++input_callback_count_;
++    input_cloud_points_ = static_cast<size_t>(msg->width) * msg->height;
++    input_cloud_bytes_ = msg->data.size();
++    input_last_stamp_age_ms_ = (now().seconds() - stampToSec(msg->header.stamp)) * 1000.0;
+@@ -261,0 +308 @@ private:
++        ++skipped_transform_count_;
+@@ -296,0 +344,38 @@ private:
++    ++output_publish_count_;
++    output_cloud_points_ = final_cloud->size();
++    last_processing_ms_ =
++      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - callback_start).count();
++  }
++
++  void publishStatus()
++  {
++    if (!status_publisher_) {
++      return;
++    }
++    const auto now_steady = std::chrono::steady_clock::now();
++    const double elapsed_sec = std::max(
++      std::chrono::duration<double>(now_steady - previous_status_time_).count(), 1.0e-3);
++    const auto input_delta = input_callback_count_ - previous_input_callback_count_;
++    const auto output_delta = output_publish_count_ - previous_output_publish_count_;
++
++    std_msgs::msg::String msg;
++    std::ostringstream stream;
++    stream << std::fixed << std::setprecision(3)
++           << "input_topic=" << input_topic_
++           << " output_topic=" << output_topic_
++           << " input_callback_hz=" << static_cast<double>(input_delta) / elapsed_sec
++           << " output_points_nav_hz=" << static_cast<double>(output_delta) / elapsed_sec
++           << " last_processing_ms=" << last_processing_ms_
++           << " skipped_transform=" << skipped_transform_count_
++           << " input_cloud_points=" << input_cloud_points_
++           << " input_cloud_bytes=" << input_cloud_bytes_
++           << " input_last_stamp_age_ms=" << input_last_stamp_age_ms_
++           << " output_cloud_points=" << output_cloud_points_
++           << " subscription_qos_depth=" << input_qos_depth_
++           << " subscription_qos_reliable=" << (input_reliable_ ? "true" : "false");
++    msg.data = stream.str();
++    status_publisher_->publish(msg);
++
++    previous_status_time_ = now_steady;
++    previous_input_callback_count_ = input_callback_count_;
++    previous_output_publish_count_ = output_publish_count_;
+@@ -301,0 +387,6 @@ private:
 +  bool input_reliable_{false};
 +  int input_qos_depth_{1};
 +  bool output_reliable_{false};
 +  int output_qos_depth_{1};
-   double lookup_timeout_sec_{0.1};
-   bool publish_debug_log_{false};
-   double range_min_{1.0};
++  std::string status_topic_;
++  double status_publish_period_sec_{1.0};
+@@ -316,0 +408 @@ private:
++  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_publisher_;
+@@ -317,0 +410,12 @@ private:
++  rclcpp::TimerBase::SharedPtr status_timer_;
++  std::chrono::steady_clock::time_point previous_status_time_{std::chrono::steady_clock::now()};
++  std::uint64_t input_callback_count_{0};
++  mutable std::uint64_t output_publish_count_{0};
++  std::uint64_t previous_input_callback_count_{0};
++  std::uint64_t previous_output_publish_count_{0};
++  std::uint64_t skipped_transform_count_{0};
++  size_t input_cloud_points_{0};
++  size_t input_cloud_bytes_{0};
++  size_t output_cloud_points_{0};
++  double input_last_stamp_age_ms_{0.0};
++  double last_processing_ms_{0.0};

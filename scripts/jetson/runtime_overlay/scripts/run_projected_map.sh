@@ -41,10 +41,6 @@ for pattern in \
   "slam_toolbox" \
   "jt128_2d_mapping.launch.py" \
   "jt128_slam_toolbox_mapping.launch.py" \
-  "nav_cloud_preprocessor" \
-  "pointcloud_to_laserscan_node" \
-  "robot_hesai_jt128/scan_republisher_node" \
-  "scan_republisher_node" \
   "fastlio_mapping_odom_bridge.py" \
   "fastlio_odom_bridge_node.*mapping/fastlio_odometry"
 do
@@ -60,10 +56,6 @@ for pattern in \
   "slam_toolbox" \
   "jt128_2d_mapping.launch.py" \
   "jt128_slam_toolbox_mapping.launch.py" \
-  "nav_cloud_preprocessor" \
-  "pointcloud_to_laserscan_node" \
-  "robot_hesai_jt128/scan_republisher_node" \
-  "scan_republisher_node" \
   "fastlio_mapping_odom_bridge.py" \
   "fastlio_odom_bridge_node.*mapping/fastlio_odometry"
 do

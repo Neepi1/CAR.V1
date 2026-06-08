@@ -25,7 +25,7 @@ export LOCAL_PERCEPTION_CONFIG="${LOCAL_PERCEPTION_PARAMS_FILE:-${NJRH_OVERLAY_R
 export POINTCLOUD_REMAP_CPP_BIN="${NJRH_POINTCLOUD_REMAP_CPP_BIN:-${NJRH_PROJECT_ROOT}/install/robot_hesai_jt128/lib/robot_hesai_jt128/pointcloud_axis_remap_node}"
 export POINTCLOUD_DOWNSAMPLE_CPP_BIN="${NJRH_POINTCLOUD_DOWNSAMPLE_CPP_BIN:-${NJRH_PROJECT_ROOT}/install/robot_hesai_jt128/lib/robot_hesai_jt128/pointcloud_downsample_node}"
 export IMU_REMAP_CPP_BIN="${NJRH_IMU_REMAP_CPP_BIN:-${NJRH_PROJECT_ROOT}/install/robot_hesai_jt128/lib/robot_hesai_jt128/imu_axis_remap_node}"
-export NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER="${NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER:-true}"
+export NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER="${NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER:-false}"
 export NJRH_JT128_ENABLE_POINTCLOUD_DOWNSAMPLE="${NJRH_JT128_ENABLE_POINTCLOUD_DOWNSAMPLE:-false}"
 UPSTREAM_DRIVER_PROFILE="${NJRH_HESAI_UPSTREAM_DRIVER_PROFILE}"
 
@@ -124,7 +124,7 @@ stop_jt128_ingress_processes() {
 }
 
 if [[ "${NJRH_JT128_ENABLE_POINTCLOUD_DOWNSAMPLE}" != "true" ]] && jt128_pointcloud_downsample_running; then
-  echo "[runtime-overlay] stopping diagnostic pointcloud_downsample; /lidar_points_nav is produced by pointcloud_axis_remap" >&2
+  echo "[runtime-overlay] stopping diagnostic pointcloud_downsample; production /lidar_points is produced by pointcloud_axis_remap" >&2
   pkill -INT -f "pointcloud_downsample" 2>/dev/null || true
   sleep 1
   pkill -9 -f "pointcloud_downsample" 2>/dev/null || true
@@ -199,7 +199,7 @@ if [[ "${NJRH_JT128_ENABLE_POINTCLOUD_DOWNSAMPLE}" == "true" ]]; then
     "${POINTCLOUD_DOWNSAMPLE_CPP_BIN}" --ros-args --params-file "${POINTCLOUD_DOWNSAMPLE_CONFIG}" &
   pointcloud_downsample_pid=$!
 else
-  echo "[runtime-overlay] diagnostic pointcloud_downsample disabled; pointcloud ingress owns /lidar_points_nav and hidden /_internal/lidar_points_local" >&2
+  echo "[runtime-overlay] diagnostic pointcloud_downsample disabled; pointcloud ingress publishes only canonical /lidar_points" >&2
 fi
 
 [[ -x "${IMU_REMAP_CPP_BIN}" ]] || {

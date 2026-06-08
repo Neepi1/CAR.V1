@@ -82,7 +82,7 @@ function Publish-RemoteTool {
   if (-not (Test-Path $overlayRoot)) {
     throw "Missing runtime overlay: $overlayRoot"
   }
-  Invoke-Remote -HostSpec $HostSpec -Command "rm -rf '$RemoteDir/runtime_overlay' && mkdir -p '$RemoteDir'"
+  Invoke-Remote -HostSpec $HostSpec -Command "if ! rm -rf '$RemoteDir/runtime_overlay' 2>/dev/null; then mv '$RemoteDir/runtime_overlay' '$RemoteDir/runtime_overlay.stale.'`$(date +%s) 2>/dev/null || true; fi; mkdir -p '$RemoteDir'"
   & scp -r $overlayRoot "${HostSpec}:${RemoteDir}/runtime_overlay"
   if ($LASTEXITCODE -ne 0) {
     throw "scp overlay failed with exit code $LASTEXITCODE"

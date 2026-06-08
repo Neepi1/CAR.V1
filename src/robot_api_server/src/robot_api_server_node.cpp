@@ -154,6 +154,7 @@ using robot_api_server::read_binary_file;
 using robot_api_server::read_nav_map_info;
 using robot_api_server::read_optional_text_file;
 using robot_api_server::read_proc_cmdline;
+using robot_api_server::read_proc_environ;
 using robot_api_server::read_runtime_map_context_file;
 using robot_api_server::read_text_file;
 using robot_api_server::reason_phrase;
@@ -2959,20 +2960,34 @@ private:
       });
   }
 
-  bool is_mapping_2d_residual_process_command(const std::string & cmdline) const
+  bool is_private_slam2d_fastlio_process(const std::string & cmdline, const std::string & environ) const
   {
-    static constexpr std::array<const char *, 10> kMapping2dResidualProcessPatterns{
-      "slam_toolbox",
-      "nav_cloud_preprocessor",
-      "pointcloud_to_laserscan_node",
-      "scan_republisher_node",
-      "fastlio_mapping_odom_bridge.py",
-      "/mapping/fastlio_odometry",
-      "/tf_slam2d",
+    static constexpr std::array<const char *, 3> kFastlioProcessPatterns{
       "ros2 run fast_lio fastlio_mapping",
       "fast_lio/lib/fast_lio/fastlio_mapping",
       "fastlio_mapping --ros-args"
     };
+    const bool is_fastlio_process = std::any_of(
+      kFastlioProcessPatterns.begin(), kFastlioProcessPatterns.end(),
+      [&cmdline](const char * pattern) {
+        return cmdline.find(pattern) != std::string::npos;
+      });
+    return is_fastlio_process &&
+           environ.find("NJRH_SLAM2D_PRIVATE_FASTLIO=1") != std::string::npos;
+  }
+
+  bool is_mapping_2d_residual_process_command(
+    const std::string & cmdline, const std::string & environ) const
+  {
+    static constexpr std::array<const char *, 4> kMapping2dResidualProcessPatterns{
+      "slam_toolbox",
+      "fastlio_mapping_odom_bridge.py",
+      "/mapping/fastlio_odometry",
+      "/tf_slam2d"
+    };
+    if (is_private_slam2d_fastlio_process(cmdline, environ)) {
+      return true;
+    }
     return std::any_of(
       kMapping2dResidualProcessPatterns.begin(), kMapping2dResidualProcessPatterns.end(),
       [&cmdline](const char * pattern) {
@@ -3021,7 +3036,8 @@ private:
         continue;
       }
       const auto cmdline = read_proc_cmdline(pid);
-      if (is_mapping_2d_residual_process_command(cmdline)) {
+      const auto environ = read_proc_environ(pid);
+      if (is_mapping_2d_residual_process_command(cmdline, environ)) {
         pids.insert(pid);
       }
     }
@@ -3109,13 +3125,11 @@ private:
       return {409, "application/json", error_json("cannot start 2D mapping while docking is active")};
     }
     if (runtime.navigation_active) {
-      set_navigation_runtime_state(true, "canceling_for_mapping", "canceling active navigation task before 2D mapping");
-      std::string cancel_detail;
-      if (!cancel_navigation_task_for_mode_switch("start_mapping_2d", cancel_detail)) {
-        set_navigation_runtime_state(true, "failed", cancel_detail, false);
-        return {503, "application/json", error_json(cancel_detail)};
-      }
-      set_navigation_runtime_state(true, "paused_for_mapping", cancel_detail);
+      return {
+        409,
+        "application/json",
+        error_json("cannot start 2D mapping while navigation runtime is active; stop navigation runtime first")
+      };
     }
     clear_runtime_map_context();
 
@@ -3165,7 +3179,6 @@ private:
 
   HttpResponse handle_stop_mapping_2d()
   {
-    set_mapping_runtime_state(true, "stopping", "stopping 2D mapping chain");
     std::size_t requested_groups = 0U;
     {
       std::lock_guard<std::mutex> process_lock(mapping_process_mutex_);

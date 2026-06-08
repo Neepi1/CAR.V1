@@ -73,6 +73,17 @@ std::string read_proc_cmdline(const pid_t pid)
   return trim(cmdline);
 }
 
+std::string read_proc_environ(const pid_t pid)
+{
+  std::ifstream file(fs::path("/proc") / std::to_string(pid) / "environ", std::ios::binary);
+  if (!file) {
+    return {};
+  }
+  std::string environ((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+  std::replace(environ.begin(), environ.end(), '\0', '\n');
+  return environ;
+}
+
 bool process_group_has_live_process(const pid_t pgid)
 {
   if (pgid <= 0 || !fs::exists("/proc")) {

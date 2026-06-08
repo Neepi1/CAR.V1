@@ -282,7 +282,7 @@ if [[ "${NJRH_RUNTIME_HEALTH_GUARD_AUTOSTART:-false}" == "true" ]]; then
 else
   echo "[runtime-overlay] runtime_health_guard autostart disabled; startup readiness probes are disabled" >&2
 fi
-if [[ "${NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER:-true}" == "true" ]]; then
+if [[ "${NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER:-false}" == "true" ]]; then
   echo "[runtime-overlay] local_perception is owned by pointcloud_perception_pipeline; skipping standalone local_perception_common" >&2
 else
   start_overlay_helper "local_perception_common" bash "${SCRIPT_DIR}/run_local_perception.sh"

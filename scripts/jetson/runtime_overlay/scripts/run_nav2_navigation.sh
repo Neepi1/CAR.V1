@@ -124,7 +124,7 @@ ensure_resident_overlay_helper_process() {
 ensure_resident_overlay_helper_process "floor_manager" "floor_manager" bash "${SCRIPT_DIR}/run_floor_manager.sh"
 ensure_resident_overlay_helper_process "robot_safety" "robot_safety" bash "${SCRIPT_DIR}/run_robot_safety.sh"
 ensure_resident_overlay_helper_process "ranger_mini3_mode_controller" "ranger_mini3_mode_controller" bash "${SCRIPT_DIR}/run_ranger_mini3_mode_controller.sh"
-if [[ "${NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER:-true}" == "true" ]]; then
+if [[ "${NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER:-false}" == "true" ]]; then
   echo "[runtime-overlay] local_perception is owned by pointcloud_perception_pipeline; skipping standalone local_perception helper" >&2
 else
   ensure_resident_overlay_helper_process "local_perception" "local_perception" bash "${SCRIPT_DIR}/run_local_perception.sh"

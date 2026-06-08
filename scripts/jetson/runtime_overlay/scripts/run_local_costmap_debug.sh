@@ -48,7 +48,7 @@ trap on_signal INT TERM
 
 start_canonical_helper "robot_description" bash "${SCRIPT_DIR}/run_robot_description.sh"
 start_canonical_helper "local_state" bash "${SCRIPT_DIR}/run_local_state.sh"
-if [[ "${NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER:-true}" == "true" ]]; then
+if [[ "${NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER:-false}" == "true" ]]; then
   echo "[runtime-overlay] local_perception is owned by pointcloud_perception_pipeline; skipping standalone debug local_perception" >&2
 else
   start_overlay_helper "local_perception" bash "${SCRIPT_DIR}/run_local_perception.sh"

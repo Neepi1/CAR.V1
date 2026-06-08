@@ -115,20 +115,24 @@ def test_nav_defaults_are_fixed():
     overlay_local_perception = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "local_perception.yaml"
     ).read_text(encoding="utf-8")
-    assert "input_topic: /_internal/lidar_points_local" in local_perception
-    assert "input_topic: /lidar_points\n" not in local_perception
+    assert "input_topic: /lidar_points\n" in local_perception
+    assert "input_topic: /_internal/lidar_points_local" not in local_perception
     assert "input_topic: /jt128/vendor/points_raw" not in local_perception
     assert "input_reliable: false" in local_perception
     assert "input_qos_depth: 1" in local_perception
     assert "input_transform_use_latest: true" in local_perception
-    assert "clearing.publish_every_n: 3" in local_perception
+    assert "clearing.publish_every_n: 4" in local_perception
+    assert "status_topic: /perception/local_perception_status" in local_perception
+    assert "status_publish_period_sec: 2.0" in local_perception
     assert "input_reliable: false" in overlay_local_perception
     assert "input_qos_depth: 1" in overlay_local_perception
-    assert "input_topic: /_internal/lidar_points_local" in overlay_local_perception
-    assert "input_topic: /lidar_points\n" not in overlay_local_perception
+    assert "input_topic: /lidar_points\n" in overlay_local_perception
+    assert "input_topic: /_internal/lidar_points_local" not in overlay_local_perception
     assert "input_topic: /jt128/vendor/points_raw" not in overlay_local_perception
     assert "input_transform_use_latest: true" in overlay_local_perception
-    assert "clearing.publish_every_n: 3" in overlay_local_perception
+    assert "clearing.publish_every_n: 4" in overlay_local_perception
+    assert "status_topic: /perception/local_perception_status" in overlay_local_perception
+    assert "status_publish_period_sec: 2.0" in overlay_local_perception
 
 
 def test_tf_policy_is_canonical():
@@ -908,6 +912,7 @@ def test_runtime_overlay_lidar_view_defaults_to_base_link():
 def test_project_runtime_helpers_are_wired():
     local_perception = (ROOT / "src" / "robot_local_perception" / "config" / "local_perception.yaml").read_text(encoding="utf-8")
     robot_safety = (ROOT / "src" / "robot_safety" / "config" / "robot_safety.yaml").read_text(encoding="utf-8")
+    nav2_yaml = (ROOT / "src" / "robot_nav_config" / "config" / "nav2.yaml").read_text(encoding="utf-8")
     overlay_nav = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_nav2_navigation.sh").read_text(encoding="utf-8")
     standard_navigation_launch = (
         ROOT / "src" / "robot_bringup" / "launch" / "standard_navigation.launch.py"
@@ -943,8 +948,8 @@ def test_project_runtime_helpers_are_wired():
     autostart_doc = (ROOT / "docs" / "autostart_systemd.md").read_text(encoding="utf-8")
     powershell_helper = (ROOT / "scripts" / "jetson" / "Invoke-NJRHJetson.ps1").read_text(encoding="utf-8")
     assert "mode_topic" in local_perception
-    assert "input_topic: /_internal/lidar_points_local" in local_perception
-    assert "input_topic: /lidar_points\n" not in local_perception
+    assert "input_topic: /lidar_points\n" in local_perception
+    assert "input_topic: /_internal/lidar_points_local" not in local_perception
     assert "input_topic: /jt128/vendor/points_raw" not in local_perception
     assert "input_reliable: false" in local_perception
     assert "input_qos_depth: 1" in local_perception
@@ -953,8 +958,8 @@ def test_project_runtime_helpers_are_wired():
     assert "input_rotation_matrix:" in local_perception
     assert "output_topic: /perception/obstacle_points" in local_perception
     assert "clearing_output_topic: /perception/clearing_points" in local_perception
-    assert "processing_rate_hz: 20.0" in local_perception
-    assert "process_on_callback: true" in local_perception
+    assert "processing_rate_hz: 15.0" in local_perception
+    assert "process_on_callback: false" in local_perception
     assert "point_sample_stride: 1" in local_perception
     assert "restamp_to_now: false" in local_perception
     assert "restamp_to_latest_tf: false" in local_perception
@@ -967,10 +972,12 @@ def test_project_runtime_helpers_are_wired():
     assert "startup_tf_warmup_sec: 1.0" in local_perception
     assert "clearing.enabled: true" in local_perception
     assert "clearing.virtual_rays.enabled: true" in local_perception
-    assert "clearing.virtual_rays.angular_resolution_deg: 0.75" in local_perception
+    assert "clearing.virtual_rays.angular_resolution_deg: 1.0" in local_perception
     assert "clearing.virtual_rays.range: 8.00" in local_perception
     assert "clearing.virtual_rays.range_steps: [0.50, 1.00, 2.00, 3.50, 5.50, 8.00]" in local_perception
-    assert "clearing.max_points: 30000" in local_perception
+    assert "clearing.max_points: 15000" in local_perception
+    assert "status_topic: /perception/local_perception_status" in local_perception
+    assert "status_publish_period_sec: 2.0" in local_perception
     assert "-0.10, 0.05, 0.20, 0.40, 0.60, 0.85, 1.10, 1.30" in local_perception
     assert "profiles.NORMAL.range_filter.max: 5.50" in local_perception
     assert "profiles.NORMAL.height_filter.min_z: 0.40" in local_perception
@@ -1088,6 +1095,10 @@ def test_project_runtime_helpers_are_wired():
     assert 'with_cpu_affinity("controller_server", node_kwargs)' in standard_navigation_launch
     assert 'with_cpu_affinity("velocity_smoother", node_kwargs)' in standard_navigation_launch
     assert 'with_cpu_affinity("collision_monitor", node_kwargs)' in standard_navigation_launch
+    assert standard_navigation_launch.index('"velocity_smoother",') < standard_navigation_launch.index('"bt_navigator",')
+    assert standard_navigation_launch.index('"collision_monitor",') < standard_navigation_launch.index('"bt_navigator",')
+    assert nav2_yaml.index("- velocity_smoother") < nav2_yaml.index("- bt_navigator")
+    assert nav2_yaml.index("- collision_monitor") < nav2_yaml.index("- bt_navigator")
     assert "keepout_filter_mask_server" in standard_navigation_launch
     assert "speed_filter_mask_server" in standard_navigation_launch
     assert '"/costmap_filter_info/keepout"' in standard_navigation_launch
@@ -2052,10 +2063,11 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
         node_cpp.index("HttpResponse handle_start_mapping_2d()"):
         node_cpp.index("HttpResponse handle_stop_mapping_2d()")
     ]
-    assert "cancel_navigation_task_for_mode_switch" in start_mapping_section
+    assert "cancel_navigation_task_for_mode_switch" not in start_mapping_section
     assert "stop_navigation_runtime_stack" not in start_mapping_section
-    assert "canceling active navigation task before 2D mapping" in start_mapping_section
-    assert "paused_for_mapping" in start_mapping_section
+    assert "canceling active navigation task before 2D mapping" not in start_mapping_section
+    assert "paused_for_mapping" not in start_mapping_section
+    assert "cannot start 2D mapping while navigation runtime is active; stop navigation runtime first" in start_mapping_section
     assert "cancel_navigation_task_for_mode_switch" in node_cpp
     assert 'if (!runtime_mode_snapshot().navigation_active)' in node_cpp
     assert "requires_manual_navigation_selection" in node_cpp
@@ -2091,6 +2103,11 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "discover_mapping_2d_residual_processes" in node_cpp
     assert "mapping_was_active" in node_cpp
     assert "stopped_groups" in node_cpp
+    stop_mapping_section = node_cpp[
+        node_cpp.index("HttpResponse handle_stop_mapping_2d()"):
+        node_cpp.index("bool navigation_resume_process_running_locked()")
+    ]
+    assert 'set_mapping_runtime_state(true, "stopping"' not in stop_mapping_section
     mapping_residual_section = node_cpp[
         node_cpp.index("bool is_mapping_2d_residual_process_command"):
         node_cpp.index("std::set<pid_t> discover_mapping_2d_process_groups")
@@ -2101,10 +2118,19 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert '"fastlio_mapping_odom_bridge.py"' in mapping_residual_section
     assert '"/mapping/fastlio_odometry"' in mapping_residual_section
     assert '"/tf_slam2d"' in mapping_residual_section
-    assert '"ros2 run fast_lio fastlio_mapping"' in mapping_residual_section
+    assert '"ros2 run fast_lio fastlio_mapping"' not in mapping_residual_section
+    private_fastlio_section = node_cpp[
+        node_cpp.index("bool is_private_slam2d_fastlio_process"):
+        node_cpp.index("bool is_mapping_2d_residual_process_command")
+    ]
+    assert '"ros2 run fast_lio fastlio_mapping"' in private_fastlio_section
+    assert '"fast_lio/lib/fast_lio/fastlio_mapping"' in private_fastlio_section
+    assert '"fastlio_mapping --ros-args"' in private_fastlio_section
+    assert "NJRH_SLAM2D_PRIVATE_FASTLIO=1" in private_fastlio_section
     assert '"fastlio_odom_bridge_node"' not in mapping_residual_section
-    assert '"nav_cloud_preprocessor"' in node_cpp
-    assert '"scan_republisher_node"' in node_cpp
+    assert '"nav_cloud_preprocessor"' not in mapping_residual_section
+    assert '"pointcloud_to_laserscan_node"' not in mapping_residual_section
+    assert '"scan_republisher_node"' not in mapping_residual_section
     assert "mapping_2d_start_command" in node_cpp
     assert "navigation_resume_command" in node_cpp
     assert "handle_resume_floor_navigation" in node_cpp
@@ -2671,6 +2697,15 @@ def test_local_perception_node_ports_validated_base_link_filter_contract():
     assert "clearingWorkerLoop" in node_script
     assert "enqueueClearingJob" in node_script
     assert "pending_clearing_job_ = std::move(job)" in node_script
+    assert 'declare_parameter<std::string>("status_topic", "/perception/local_perception_status")' in node_script
+    assert 'declare_parameter<double>("status_publish_period_sec", 2.0)' in node_script
+    assert "publishStatus" in node_script
+    assert "input_callback_hz" in node_script
+    assert "input_cloud_accept_hz" in node_script
+    assert "input_interarrival_ms_avg" in node_script
+    assert "input_subscription_qos_reliable" in node_script
+    assert "processed_cloud_hz" in node_script
+    assert "published_obstacle_hz" in node_script
     assert "pcl::toROSMsg" not in node_script
     assert "std::map<std::tuple" not in node_script
     assert "outputStampForCostmap" in node_script
@@ -2713,7 +2748,12 @@ def test_local_perception_node_ports_validated_base_link_filter_contract():
     assert "output_stamp_tf_backoff_sec: 0.0" in overlay_cfg
     assert "output_stamp_forward_sec: 0.0" in local_cfg
     assert "output_stamp_forward_sec: 0.0" in overlay_cfg
+    assert "status_topic: /perception/local_perception_status" in local_cfg
+    assert "status_topic: /perception/local_perception_status" in overlay_cfg
+    assert "status_publish_period_sec: 2.0" in local_cfg
+    assert "status_publish_period_sec: 2.0" in overlay_cfg
     assert "preserve the original pointcloud acquisition stamp" in readme
+    assert "/perception/local_perception_status" in readme
     assert "cold TF listener" in readme
 
 
@@ -2970,7 +3010,7 @@ def test_runtime_overlay_live_2d_mapping_uses_slam_toolbox():
     assert "nav_cloud_preprocessor" in slam_launch
     assert "pointcloud_to_laserscan_node" in slam_launch
     assert "scan_republisher_node" in slam_launch
-    assert "scan_republisher_node" in run_projected_map
+    assert "scan_republisher_node" not in run_projected_map
     assert 'restamp_scan_to_now = env_bool("NJRH_SLAM2D_RESTAMP_SCAN_TO_NOW", False)' in slam_launch
     assert '"restamp_to_now": restamp_scan_to_now' in slam_launch
     assert "motion_gate_enabled" not in slam_launch
@@ -3328,6 +3368,12 @@ def test_jt128_driver_normalizes_vendor_raw_to_canonical_topics():
     pointcloud_pipeline_launch = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "launch" / "pointcloud_perception_pipeline.launch.py"
     ).read_text(encoding="utf-8")
+    verify_pointcloud_rates = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "verify_pointcloud_rates.sh"
+    ).read_text(encoding="utf-8")
+    verify_pointcloud_matrix = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "verify_pointcloud_delivery_matrix.sh"
+    ).read_text(encoding="utf-8")
     assert 'export LIDAR_FRAME="${LIDAR_FRAME:-lidar_link}"' in driver_script
     assert 'export IMU_FRAME="${IMU_FRAME:-imu_link}"' in driver_script
     assert 'export POINTS_TOPIC="${NJRH_JT128_POINTS_TOPIC:-/lidar_points}"' in driver_script
@@ -3335,7 +3381,7 @@ def test_jt128_driver_normalizes_vendor_raw_to_canonical_topics():
     assert 'export VENDOR_POINTS_TOPIC="${NJRH_JT128_VENDOR_POINTS_TOPIC:-/jt128/vendor/points_raw}"' in driver_script
     assert 'export VENDOR_IMU_TOPIC="${NJRH_JT128_VENDOR_IMU_TOPIC:-/jt128/vendor/imu_raw}"' in driver_script
     assert 'export POINTCLOUD_PIPELINE_LAUNCH="${NJRH_POINTCLOUD_PIPELINE_LAUNCH:-${NJRH_OVERLAY_ROOT}/launch/pointcloud_perception_pipeline.launch.py}"' in driver_script
-    assert 'export NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER="${NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER:-true}"' in driver_script
+    assert 'export NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER="${NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER:-false}"' in driver_script
     assert 'export POINTCLOUD_REMAP_CPP_BIN="${NJRH_POINTCLOUD_REMAP_CPP_BIN:-${NJRH_PROJECT_ROOT}/install/robot_hesai_jt128/lib/robot_hesai_jt128/pointcloud_axis_remap_node}"' in driver_script
     assert 'export NJRH_JT128_ENABLE_POINTCLOUD_DOWNSAMPLE="${NJRH_JT128_ENABLE_POINTCLOUD_DOWNSAMPLE:-false}"' in driver_script
     assert "POINTCLOUD_FASTLIO_REMAP_CONFIG" not in driver_script
@@ -3347,7 +3393,7 @@ def test_jt128_driver_normalizes_vendor_raw_to_canonical_topics():
     assert '[[ -x "${POINTCLOUD_REMAP_CPP_BIN}" ]]' in driver_script
     assert '"${POINTCLOUD_REMAP_CPP_BIN}" --ros-args --params-file "${POINTCLOUD_REMAP_CONFIG}" &' in driver_script
     assert "ros2 launch \"${POINTCLOUD_PIPELINE_LAUNCH}\"" in driver_script
-    assert "pointcloud ingress owns /lidar_points_nav and hidden /_internal/lidar_points_local" in driver_script
+    assert "pointcloud ingress publishes only canonical /lidar_points" in driver_script
     assert "pointcloud_fastlio_remap" in driver_script
     assert '--params-file "${POINTCLOUD_FASTLIO_REMAP_CONFIG}" -r __node:=pointcloud_fastlio_remap &' not in driver_script
     assert '[[ -x "${IMU_REMAP_CPP_BIN}" ]]' in driver_script
@@ -3360,7 +3406,7 @@ def test_jt128_driver_normalizes_vendor_raw_to_canonical_topics():
     assert "Python remap fallback has been removed" in driver_script
     assert "points_topic: /lidar_points" in jt128_cfg
     assert "nav_points_topic: /lidar_points_nav" in jt128_cfg
-    assert "local_perception_points_topic: /_internal/lidar_points_local" in jt128_cfg
+    assert 'local_perception_points_topic: ""' in jt128_cfg
     assert "imu_topic: /lidar_imu" in jt128_cfg
     assert "vendor_points_topic: /jt128/vendor/points_raw" in jt128_cfg
     assert "vendor_imu_topic: /jt128/vendor/imu_raw" in jt128_cfg
@@ -3396,7 +3442,11 @@ def test_jt128_driver_normalizes_vendor_raw_to_canonical_topics():
     assert raw_to_canonical in pointcloud_remap_cfg
     assert raw_to_canonical in imu_remap_cfg
     assert "fast_path_neg_raw_y_neg_raw_x" in pointcloud_remap_cpp
+    assert "void on_cloud(sensor_msgs::msg::PointCloud2::UniquePtr msg)" in pointcloud_remap_cpp
+    assert "auto output = std::move(msg);" in pointcloud_remap_cpp
     assert "pointcloud_axis_remap_component" in hesai_cmake
+    assert "find_package(std_msgs REQUIRED)" in hesai_cmake
+    assert "std_msgs" in hesai_cmake
     assert 'rclcpp_components_register_nodes(pointcloud_axis_remap_component "PointCloudAxisRemapNode")' in hesai_cmake
     assert "local_perception_component" in local_perception_cmake
     assert 'rclcpp_components_register_nodes(local_perception_component "LocalPerceptionNode")' in local_perception_cmake
@@ -3405,11 +3455,31 @@ def test_jt128_driver_normalizes_vendor_raw_to_canonical_topics():
     assert 'plugin="LocalPerceptionNode"' in pointcloud_pipeline_launch
     assert '"use_intra_process_comms": True' in pointcloud_pipeline_launch
     assert "nav_output_topic: /lidar_points_nav" in pointcloud_remap_cfg
-    assert "nav_output_stride: 1" in pointcloud_remap_cfg
-    assert "local_output_topic: /_internal/lidar_points_local" in pointcloud_remap_cfg
+    assert "nav_output_stride: 4" in pointcloud_remap_cfg
+    assert 'local_output_topic: ""' in pointcloud_remap_cfg
     assert "local_output_stride: 1" in pointcloud_remap_cfg
     assert "output_qos_depth: 1" in pointcloud_remap_cfg
     assert "output_reliable: false" in pointcloud_remap_cfg
+    assert "status_topic: /lidar/axis_remap_status" in pointcloud_remap_cfg
+    assert "status_publish_period_sec: 1.0" in pointcloud_remap_cfg
+    assert 'declare_parameter<std::string>("status_topic", "/lidar/axis_remap_status")' in pointcloud_remap_cpp
+    assert "raw_input_hz" in pointcloud_remap_cpp
+    assert "lidar_points_publish_hz" in pointcloud_remap_cpp
+    assert "output_subscription_count" in pointcloud_remap_cpp
+    assert "dropped_or_skipped_count" in pointcloud_remap_cpp
+    assert "/jt128/vendor/points_raw" in verify_pointcloud_rates
+    assert "/lidar_points" in verify_pointcloud_rates
+    assert "/lidar_points_nav" in verify_pointcloud_rates
+    assert "MIN_LIDAR_HZ" in verify_pointcloud_rates
+    assert "for topic in ${OPTIONAL_TOPICS}" in verify_pointcloud_rates
+    assert "/lidar/axis_remap_status" in verify_pointcloud_matrix
+    assert "/perception/local_perception_status" in verify_pointcloud_matrix
+    assert "/lidar/nav_cloud_preprocessor_status" in verify_pointcloud_matrix
+    assert "CASE_A_MAIN_TRUNK_LOW" in verify_pointcloud_matrix
+    assert "CASE_B_LOCAL_DDS_DELIVERY_LOW" in verify_pointcloud_matrix
+    assert "CASE_C_LOCAL_PROCESS_OR_PUBLISH_GATING" in verify_pointcloud_matrix
+    assert "CASE_D_FANOUT_PRESSURE" in verify_pointcloud_matrix
+    assert "does not start/stop Nav2" in verify_pointcloud_matrix
     assert "input_topic: /lidar_points" in pointcloud_downsample_cfg
     assert "input_qos_depth: 1" in pointcloud_downsample_cfg
     assert "input_reliable: false" in pointcloud_downsample_cfg
@@ -3428,10 +3498,14 @@ def test_jt128_driver_normalizes_vendor_raw_to_canonical_topics():
     assert "publisher->get_subscription_count() == 0U" in pointcloud_remap_cpp
     assert "stride <= 1U" in pointcloud_remap_cpp
     assert "std::make_unique<sensor_msgs::msg::PointCloud2>(cloud)" in pointcloud_remap_cpp
+    assert "publisher_->publish(*output)" in pointcloud_remap_cpp
+    assert pointcloud_remap_cpp.index("publisher_->publish(*output)") < pointcloud_remap_cpp.index(
+        "publish_downsample(local_publisher_"
+    )
     assert pointcloud_remap_cpp.index("publish_downsample(local_publisher_") < pointcloud_remap_cpp.index(
         "publish_downsample(nav_publisher_"
     )
-    assert "*output = std::move(*msg)" in pointcloud_remap_cpp
+    assert "*output = std::move(*msg)" not in pointcloud_remap_cpp
     assert "pointcloud_downsample_node src/pointcloud_downsample_node.cpp" in hesai_cmake
     assert 'declare_parameter<std::string>("input_topic", "/jt128/vendor/points_raw")' in pointcloud_downsample_cpp
     assert 'declare_parameter<std::string>("nav_output_topic", "/lidar_points_nav")' in pointcloud_downsample_cpp
@@ -3469,6 +3543,45 @@ def test_robot_api_server_keeps_tf_subscription_resident():
     assert "set_tf_subscription_active(true);" in wait_function
     assert "set_tf_subscription_active(false)" not in wait_function
     assert "was_active" not in wait_function
+
+
+def test_mapping_stop_only_cleans_private_fastlio_residuals():
+    api_code = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    runtime_utils = (ROOT / "src" / "robot_api_server" / "src" / "runtime_process_utils.cpp").read_text(
+        encoding="utf-8"
+    )
+    mapping_script = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_projected_map.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "read_proc_environ(pid)" in api_code
+    assert "is_private_slam2d_fastlio_process" in api_code
+    assert "NJRH_SLAM2D_PRIVATE_FASTLIO=1" in api_code
+    assert "read_proc_environ" in runtime_utils
+    assert "cannot start 2D mapping while navigation runtime is active; stop navigation runtime first" in api_code
+
+    residual_fn = api_code[
+        api_code.index("bool is_mapping_2d_residual_process_command"):
+        api_code.index("std::set<pid_t> discover_mapping_2d_process_groups")
+    ]
+    fastlio_fn = api_code[
+        api_code.index("bool is_private_slam2d_fastlio_process"):
+        api_code.index("bool is_mapping_2d_residual_process_command")
+    ]
+
+    assert "ros2 run fast_lio fastlio_mapping" not in residual_fn
+    assert "fast_lio/lib/fast_lio/fastlio_mapping" not in residual_fn
+    assert "fastlio_mapping --ros-args" not in residual_fn
+    assert "nav_cloud_preprocessor" not in residual_fn
+    assert "pointcloud_to_laserscan_node" not in residual_fn
+    assert "scan_republisher_node" not in residual_fn
+    assert "ros2 run fast_lio fastlio_mapping" in fastlio_fn
+    assert "environ.find(\"NJRH_SLAM2D_PRIVATE_FASTLIO=1\")" in fastlio_fn
+    assert "nav_cloud_preprocessor" not in mapping_script
+    assert "pointcloud_to_laserscan_node" not in mapping_script
+    assert "scan_republisher_node" not in mapping_script
 
 
 def test_localization_bridge_latches_one_shot_localizer_pose():
@@ -3557,18 +3670,25 @@ def test_localization_sensing_reuses_slam2d_scan_contract():
     assert "nav_points_topic" in localization_sensing
     assert 'DeclareLaunchArgument("points_topic", default_value="/lidar_points_nav")' in localization_sensing
     assert '"output_frame_id": "lidar_level_link"' in localization_sensing
-    assert "input_topic: /lidar_points_nav" in preprocessor_cfg
-    assert "input_topic: /lidar_points\n" not in preprocessor_cfg
+    assert "input_topic: /lidar_points_nav\n" in preprocessor_cfg
     assert "output_frame_id: lidar_level_link" in preprocessor_cfg
     assert "input_reliable: false" in preprocessor_cfg
     assert "input_qos_depth: 1" in preprocessor_cfg
     assert "output_reliable: false" in preprocessor_cfg
     assert "output_qos_depth: 1" in preprocessor_cfg
+    assert "status_topic: /lidar/nav_cloud_preprocessor_status" in preprocessor_cfg
+    assert "status_publish_period_sec: 1.0" in preprocessor_cfg
     assert "makePointCloudQos" in preprocessor_qos_patch
+    assert "find_package(std_msgs REQUIRED)" in preprocessor_qos_patch
+    assert "<depend>std_msgs</depend>" in preprocessor_qos_patch
     assert 'declare_parameter<bool>("input_reliable", false)' in preprocessor_qos_patch
     assert 'declare_parameter<bool>("output_reliable", false)' in preprocessor_qos_patch
-    assert "create_subscription<sensor_msgs::msg::PointCloud2>" in preprocessor_qos_patch
-    assert "create_publisher<sensor_msgs::msg::PointCloud2>" in preprocessor_qos_patch
+    assert 'declare_parameter<std::string>("status_topic", "/lidar/nav_cloud_preprocessor_status")' in preprocessor_qos_patch
+    assert "input_callback_hz" in preprocessor_qos_patch
+    assert "output_points_nav_hz" in preprocessor_qos_patch
+    assert "skipped_transform" in preprocessor_qos_patch
+    assert "input_topic_, makePointCloudQos(input_qos_depth_, input_reliable_)" in preprocessor_qos_patch
+    assert "output_topic_, makePointCloudQos(output_qos_depth_, output_reliable_)" in preprocessor_qos_patch
     assert "lookup_timeout_sec: 0.03" in preprocessor_cfg
     assert '("cloud_in", nav_points_topic)' in localization_sensing
     assert '("scan", "/scan_raw")' in localization_sensing
