@@ -27,6 +27,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -264,6 +265,9 @@ public:
       "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/run_projected_map.sh");
     mapping_2d_log_file_ =
       declare_parameter<std::string>("mapping_2d_log_file", "/tmp/njrh_mapping2d_slam_toolbox.log");
+    mapping_lidar_rps_xps_state_dir_ = declare_parameter<std::string>(
+      "mapping_lidar_rps_xps_state_dir",
+      "/tmp/njrh_slam2d_lidar_rps_xps");
     navigation_resume_command_ = declare_parameter<std::string>(
       "navigation_resume_command",
       "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/run_navigation_runtime_services.sh");
@@ -498,10 +502,37 @@ private:
   struct BmsChargingContactSnapshot
   {
     bool have_state{false};
+    bool have_soc{false};
     bool fresh{false};
     bool contact{false};
     std::string reason{"no_bms_state"};
     double age_sec{-1.0};
+    double soc{0.0};
+    double voltage{0.0};
+    double current{0.0};
+    double temperature{0.0};
+    int power_supply_status{sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_UNKNOWN};
+    int power_supply_health{sensor_msgs::msg::BatteryState::POWER_SUPPLY_HEALTH_UNKNOWN};
+    int power_supply_technology{sensor_msgs::msg::BatteryState::POWER_SUPPLY_TECHNOLOGY_UNKNOWN};
+    bool present{false};
+  };
+
+  struct PreNavigationDockCheck
+  {
+    RuntimeModeSnapshot runtime;
+    BmsChargingContactSnapshot bms;
+    bool runtime_state_docked{false};
+    bool runtime_state_charging{false};
+    bool runtime_state_undocking{false};
+    bool docking_status_indicates_docked{false};
+    bool docking_status_indicates_charging{false};
+    bool docking_status_indicates_undocking{false};
+    bool inferred_docked{false};
+    bool final_is_docked_or_charging{false};
+    bool final_auto_undock_required{false};
+    bool docking_active_not_docked_block{false};
+    bool can_auto_undock{false};
+    std::string auto_undock_reason{"not_docked"};
   };
 
   struct NavigationLifecycleSnapshot
@@ -1740,6 +1771,9 @@ private:
     if (request.method == "GET" && request.path == "/api/v1/navigation/state") {
       return handle_navigation_state();
     }
+    if (request.method == "GET" && request.path == "/api/v1/navigation/pre_goal_check") {
+      return handle_navigation_pre_goal_check(request);
+    }
     if (request.method == "POST" && request.path == "/api/v1/navigation/goal") {
       return handle_navigation_goal(request.body);
     }
@@ -1825,6 +1859,15 @@ private:
     const bool bms_valid = have_bms_state && have_bms_soc && bms_age_sec <= bms_state_max_age_sec_;
     const auto runtime = runtime_mode_snapshot();
     const bool inferred_docked = runtime.docking_state != "docked" && bms_charging_contact;
+    const auto status_dock_check = pre_navigation_dock_check_snapshot();
+    const auto status_dock_check_json = pre_navigation_dock_check_json(
+      status_dock_check,
+      "status",
+      "",
+      "",
+      "",
+      "map",
+      false);
     const auto localization = localization_result_snapshot();
     bool live_mapping_map_available = false;
     double live_mapping_map_age_sec = 0.0;
@@ -1877,6 +1920,7 @@ private:
     body << "\"active\":" << (runtime.navigation_active ? "true" : "false") << ",";
     body << "\"state\":" << json_string(runtime.navigation_state) << ",";
     body << "\"action\":" << json_string(navigate_to_pose_action_) << ",";
+    body << "\"pre_goal_check_endpoint\":\"/api/v1/navigation/pre_goal_check\",";
     body << "\"goal\":" << navigation_goal_json;
     body << "},";
     body << "\"docking_active\":" << (runtime.docking_active ? "true" : "false") << ",";
@@ -1887,7 +1931,10 @@ private:
     body << "\"inferred_docked\":" << (inferred_docked ? "true" : "false") << ",";
     body << "\"dock_id\":" << json_string(runtime.docking_dock_id) << ",";
     body << "\"status_topic\":" << json_string(docking_status_topic_) << ",";
-    body << "\"last_status\":" << json_string(runtime.docking_status);
+    body << "\"last_status\":" << json_string(runtime.docking_status) << ",";
+    body << "\"can_auto_undock\":" << (status_dock_check.can_auto_undock ? "true" : "false") << ",";
+    body << "\"auto_undock_reason\":" << json_string(status_dock_check.auto_undock_reason) << ",";
+    body << "\"pre_navigation_dock_check\":" << status_dock_check_json;
     body << "},";
     body << "\"safety_status\":" << json_string(safety_status) << ",";
     body << "\"motion_allowed\":" << (motion_allowed ? "true" : "false") << ",";
@@ -1922,6 +1969,7 @@ private:
     body << "\"present\":" << (bms_present ? "true" : "false") << ",";
     body << "\"charging_contact\":" << (bms_charging_contact ? "true" : "false") << ",";
     body << "\"charging_contact_reason\":" << json_string(bms_charging_contact_reason) << ",";
+    body << "\"contact_snapshot\":{" << bms_charging_contact_snapshot_json(status_dock_check.bms) << "},";
     body << "\"voltage\":";
     if (have_bms_state && std::isfinite(bms_voltage)) {
       body << bms_voltage;
@@ -2018,6 +2066,7 @@ private:
       "\"POST /api/v1/floors/switch\","
       "\"POST /api/v1/localization/trigger\","
       "\"GET /api/v1/navigation/state\","
+      "\"GET /api/v1/navigation/pre_goal_check\","
       "\"POST /api/v1/navigation/goal\","
       "\"POST /api/v1/navigation/cancel\","
       "\"POST /api/v1/navigation/stop\","
@@ -3070,6 +3119,107 @@ private:
     return requested_pids;
   }
 
+  bool is_safe_mapping_lidar_rps_xps_path(const std::string & path) const
+  {
+    const bool is_rps = path.size() >= 9U && path.compare(path.size() - 9U, 9U, "/rps_cpus") == 0;
+    const bool is_xps = path.size() >= 9U && path.compare(path.size() - 9U, 9U, "/xps_cpus") == 0;
+    return starts_with(path, "/sys/class/net/") &&
+           path.find("/queues/") != std::string::npos &&
+           path.find("..") == std::string::npos &&
+           (is_rps || is_xps);
+  }
+
+  bool is_safe_mapping_lidar_rps_xps_value(const std::string & value) const
+  {
+    return !value.empty() &&
+           std::all_of(value.begin(), value.end(), [](const unsigned char ch) {
+             return std::isxdigit(ch) || ch == ',';
+           });
+  }
+
+  std::size_t restore_mapping_lidar_rps_xps_state() const
+  {
+    if (mapping_lidar_rps_xps_state_dir_.empty()) {
+      return 0U;
+    }
+    const fs::path state_dir(mapping_lidar_rps_xps_state_dir_);
+    const fs::path table_path = state_dir / "rps_xps.tsv";
+    if (!fs::exists(table_path) || !fs::is_regular_file(table_path)) {
+      return 0U;
+    }
+
+    std::size_t restored = 0U;
+    std::size_t failures = 0U;
+    std::string table_text;
+    try {
+      table_text = read_text_file(table_path);
+    } catch (const std::exception & exc) {
+      RCLCPP_WARN(
+        get_logger(),
+        "failed to read mapping LiDAR RPS/XPS state table %s: %s",
+        table_path.string().c_str(),
+        exc.what());
+      return 0U;
+    }
+    std::istringstream input(table_text);
+    std::string line;
+    while (std::getline(input, line)) {
+      const auto tab = line.find('\t');
+      if (tab == std::string::npos) {
+        continue;
+      }
+      const std::string path = trim(line.substr(0, tab));
+      const std::string value = trim(line.substr(tab + 1));
+      if (!is_safe_mapping_lidar_rps_xps_path(path) || !is_safe_mapping_lidar_rps_xps_value(value)) {
+        ++failures;
+        RCLCPP_WARN(
+          get_logger(),
+          "skipping unsafe mapping LiDAR RPS/XPS restore entry: %s",
+          path.c_str());
+        continue;
+      }
+
+      std::ofstream file(path);
+      if (!file) {
+        ++failures;
+        RCLCPP_WARN(
+          get_logger(),
+          "failed to open mapping LiDAR RPS/XPS restore target: %s",
+          path.c_str());
+        continue;
+      }
+      file << value << '\n';
+      if (!file) {
+        ++failures;
+        RCLCPP_WARN(
+          get_logger(),
+          "failed to write mapping LiDAR RPS/XPS restore target: %s",
+          path.c_str());
+        continue;
+      }
+      ++restored;
+    }
+
+    if (failures == 0U) {
+      std::error_code ec;
+      fs::remove_all(state_dir, ec);
+      if (ec) {
+        RCLCPP_WARN(
+          get_logger(),
+          "failed to remove mapping LiDAR RPS/XPS state dir %s: %s",
+          state_dir.string().c_str(),
+          ec.message().c_str());
+      }
+    }
+    if (restored > 0U) {
+      RCLCPP_INFO(
+        get_logger(),
+        "restored %zu mapping LiDAR RPS/XPS queue settings",
+        restored);
+    }
+    return restored;
+  }
+
   std::size_t terminate_mapping_2d_process_groups_locked()
   {
     std::set<pid_t> groups = discover_mapping_2d_process_groups();
@@ -3107,7 +3257,9 @@ private:
     mapping_2d_pid_ = -1;
     mapping_2d_active_ = false;
     set_mapping_runtime_state(false, "stopped", "2D mapping runtime stopped");
-    return requested_groups + terminate_mapping_2d_residual_processes();
+    const std::size_t requested_residuals = terminate_mapping_2d_residual_processes();
+    restore_mapping_lidar_rps_xps_state();
+    return requested_groups + requested_residuals;
   }
 
   HttpResponse handle_start_mapping_2d()
@@ -4112,6 +4264,194 @@ private:
     }
   }
 
+  static std::string query_string_value(
+    const HttpRequest & request,
+    const std::string & key,
+    const std::string & default_value = "")
+  {
+    const auto it = request.query.find(key);
+    if (it == request.query.end()) {
+      return default_value;
+    }
+    return it->second;
+  }
+
+  static std::optional<double> query_number_value(const HttpRequest & request, const std::string & key)
+  {
+    const auto it = request.query.find(key);
+    if (it == request.query.end() || it->second.empty()) {
+      return std::nullopt;
+    }
+    try {
+      std::size_t parsed = 0U;
+      const double value = std::stod(it->second, &parsed);
+      if (parsed != it->second.size()) {
+        return std::nullopt;
+      }
+      return value;
+    } catch (...) {
+      return std::nullopt;
+    }
+  }
+
+  HttpResponse handle_navigation_pre_goal_check(const HttpRequest & request)
+  {
+    const auto pose_id = query_string_value(
+      request,
+      "pose_id",
+      query_string_value(request, "id", ""));
+    auto building_id = query_string_value(request, "building_id", "");
+    auto floor_id = query_string_value(request, "floor_id", "");
+    const auto map_id = query_string_value(request, "map_id", "");
+    const auto frame_id = normalized_frame_id(query_string_value(request, "frame_id", "map"));
+    const bool by_pose_id = !pose_id.empty();
+    const bool has_direct_pose_query =
+      request.query.find("x") != request.query.end() ||
+      request.query.find("y") != request.query.end() ||
+      request.query.find("yaw") != request.query.end() ||
+      request.query.find("theta") != request.query.end();
+
+    const auto dock_check = pre_navigation_dock_check_snapshot();
+    const auto lifecycle = navigation_lifecycle_snapshot();
+
+    bool pose_requested = by_pose_id;
+    bool pose_ok = false;
+    std::string pose_status = by_pose_id ? "unresolved" : "not_requested";
+    std::string pose_detail;
+    std::string target_source;
+    StoredPose target;
+
+    if (by_pose_id) {
+      pose_requested = true;
+      if (!safe_pose_id(pose_id)) {
+        pose_status = "invalid_pose_id";
+        pose_detail = "valid pose_id is required";
+      } else {
+        std::optional<MapManifest> manifest;
+        try {
+          if (!map_id.empty()) {
+            manifest = map_catalog_->find_map_by_id(map_id);
+            if (!manifest) {
+              pose_status = "map_not_found";
+              pose_detail = "map_id not found: " + map_id;
+            } else {
+              building_id = manifest->building_id;
+              floor_id = manifest->floor_id;
+            }
+          } else if (!safe_map_name(building_id) || !safe_map_name(floor_id)) {
+            pose_status = "invalid_floor";
+            pose_detail = "valid building_id and floor_id are required for pose_id navigation";
+          } else {
+            manifest = map_catalog_->active_floor_map(building_id, floor_id);
+            if (!manifest) {
+              pose_status = "active_map_not_found";
+              pose_detail = "active map not found for floor: " + building_id + "/" + floor_id;
+            }
+          }
+
+          if (manifest) {
+            const auto pose = find_floor_catalog_pose(*map_catalog_, building_id, floor_id, pose_id);
+            if (!pose) {
+              pose_status = "pose_not_found";
+              pose_detail = "pose_id not found in poses.yaml: " + pose_id;
+            } else {
+              target = *pose;
+              pose_ok = true;
+              pose_status = "resolved";
+              pose_detail = "pose_id resolved from poses.yaml";
+              target_source = "poses_yaml";
+            }
+          }
+        } catch (const std::exception & exc) {
+          pose_status = "resolve_exception";
+          pose_detail = exc.what();
+        }
+      }
+    } else {
+      const auto x = query_number_value(request, "x");
+      const auto y = query_number_value(request, "y");
+      auto yaw = query_number_value(request, "yaw");
+      if (!yaw) {
+        yaw = query_number_value(request, "theta");
+      }
+      if (x || y || yaw) {
+        pose_requested = true;
+        if (frame_id != "map") {
+          pose_status = "invalid_frame";
+          pose_detail = "navigation goals must be in map frame";
+        } else if (!x || !y || !yaw || !std::isfinite(*x) || !std::isfinite(*y) || !std::isfinite(*yaw)) {
+          pose_status = "invalid_direct_pose";
+          pose_detail = "finite x, y, and yaw query parameters are required for direct pose precheck";
+        } else {
+          target.id = "direct";
+          target.name = "direct";
+          target.type = "direct_goal";
+          target.x = *x;
+          target.y = *y;
+          target.yaw = normalize_angle(*yaw);
+          pose_ok = true;
+          pose_status = "resolved";
+          pose_detail = "direct map-frame pose is valid";
+          target_source = "direct_pose";
+        }
+      }
+    }
+
+    std::ostringstream response;
+    response << std::fixed << std::setprecision(6)
+             << "{\"ok\":true,"
+             << "\"read_only\":true,"
+             << "\"endpoint\":\"GET /api/v1/navigation/pre_goal_check\","
+             << "\"would_auto_undock\":"
+             << (dock_check.final_auto_undock_required ? "true" : "false") << ","
+             << "\"can_auto_undock\":" << (dock_check.can_auto_undock ? "true" : "false") << ","
+             << "\"pre_navigation_dock_check\":" << pre_navigation_dock_check_json(
+               dock_check,
+               "navigation_pre_goal_check",
+               pose_id,
+               building_id,
+               floor_id,
+               frame_id,
+               has_direct_pose_query) << ","
+             << "\"navigation_lifecycle\":{"
+             << "\"active\":" << (lifecycle.active ? "true" : "false") << ","
+             << "\"detail\":" << json_string(lifecycle.detail) << "},"
+             << "\"pose_resolution\":{"
+             << "\"requested\":" << (pose_requested ? "true" : "false") << ","
+             << "\"ok\":" << (pose_ok ? "true" : "false") << ","
+             << "\"status\":" << json_string(pose_status) << ","
+             << "\"detail\":" << json_string(pose_detail) << ","
+             << "\"source\":" << json_string(target_source) << ","
+             << "\"pose_id\":" << json_string(pose_id) << ","
+             << "\"building_id\":" << json_string(building_id) << ","
+             << "\"floor_id\":" << json_string(floor_id) << ","
+             << "\"map_id\":" << json_string(map_id) << ","
+             << "\"frame_id\":" << json_string(frame_id);
+    if (pose_ok) {
+      response << ",\"goal\":{\"x\":" << target.x << ",\"y\":" << target.y << ",\"yaw\":" << target.yaw << "}";
+    }
+    response << "}}";
+    return {200, "application/json", response.str()};
+  }
+
+  HttpResponse navigation_goal_error_response(
+    const int status,
+    const std::string & error,
+    const bool pre_navigation_undock,
+    const std::string & pre_navigation_undock_detail,
+    const std::string & pre_navigation_dock_check_json) const
+  {
+    std::ostringstream response;
+    response << "{\"ok\":false,"
+             << "\"accepted\":false,"
+             << "\"error\":" << json_string(error) << ","
+             << "\"pre_navigation_undock\":" << (pre_navigation_undock ? "true" : "false") << ","
+             << "\"pre_navigation_undock_detail\":"
+             << json_string(pre_navigation_undock_detail) << ","
+             << "\"pre_navigation_dock_check\":" << pre_navigation_dock_check_json << "}";
+    return {status, "application/json", response.str()};
+  }
+
   HttpResponse handle_navigation_goal(const std::string & body)
   {
     const auto pose_id = json_string_value(body, "pose_id").value_or(json_string_value(body, "id").value_or(""));
@@ -4122,25 +4462,48 @@ private:
     StoredPose target;
     std::string target_source = "direct_pose";
     std::string frame_id = normalized_frame_id(json_string_value(body, "frame_id").value_or("map"));
+    const auto pre_navigation_dock_check = pre_navigation_dock_check_snapshot();
+    auto pre_navigation_dock_check_payload = [&]() {
+        return pre_navigation_dock_check_json(
+          pre_navigation_dock_check,
+          "navigation_goal",
+          pose_id,
+          building_id.value_or(""),
+          floor_id.value_or(""),
+          frame_id,
+          !by_pose_id);
+      };
+    auto navigation_goal_error = [&](
+        const int status,
+        const std::string & error,
+        const bool pre_navigation_undock = false,
+        const std::string & pre_navigation_undock_detail = std::string()) {
+        return navigation_goal_error_response(
+          status,
+          error,
+          pre_navigation_undock,
+          pre_navigation_undock_detail,
+          pre_navigation_dock_check_payload());
+      };
 
     if (by_pose_id) {
       if (!building_id || !safe_map_name(*building_id)) {
-        return {400, "application/json", error_json("valid building_id is required for pose_id navigation")};
+        return navigation_goal_error(400, "valid building_id is required for pose_id navigation");
       }
       if (!floor_id || !safe_map_name(*floor_id)) {
-        return {400, "application/json", error_json("valid floor_id is required for pose_id navigation")};
+        return navigation_goal_error(400, "valid floor_id is required for pose_id navigation");
       }
       if (!safe_pose_id(pose_id)) {
-        return {400, "application/json", error_json("valid pose_id is required")};
+        return navigation_goal_error(400, "valid pose_id is required");
       }
       std::optional<StoredPose> pose;
       try {
         pose = find_floor_catalog_pose(*map_catalog_, *building_id, *floor_id, pose_id);
       } catch (const std::exception & ex) {
-        return {500, "application/json", error_json(ex.what())};
+        return navigation_goal_error(500, ex.what());
       }
       if (!pose) {
-        return {404, "application/json", error_json("pose_id not found in poses.yaml: " + pose_id)};
+        return navigation_goal_error(404, "pose_id not found in poses.yaml: " + pose_id);
       }
       target = *pose;
       target_source = "poses_yaml";
@@ -4154,7 +4517,7 @@ private:
         json_number_value(body, "theta").value_or(
           json_nested_number_value(body, "pose", "yaw").value_or(std::numeric_limits<double>::quiet_NaN())));
       if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(yaw)) {
-        return {400, "application/json", error_json("pose_id or finite x, y, and yaw are required")};
+        return navigation_goal_error(400, "pose_id or finite x, y, and yaw are required");
       }
       target.id = "direct";
       target.name = "direct";
@@ -4165,28 +4528,37 @@ private:
     }
 
     if (frame_id != "map") {
-      return {400, "application/json", error_json("navigation goals must be in map frame")};
+      return navigation_goal_error(400, "navigation goals must be in map frame");
     }
 
     std::lock_guard<std::mutex> navigation_goal_start_lock(navigation_goal_start_mutex_);
     if (navigation_goal_job_running()) {
-      return {409, "application/json", error_json("navigation goal is already running; cancel it before starting a new goal")};
+      return navigation_goal_error(409, "navigation goal is already running; cancel it before starting a new goal");
     }
     join_navigation_goal_worker();
 
     bool pre_navigation_undock = false;
     std::string pre_navigation_undock_detail;
-    if (!undock_before_navigation_if_needed(pre_navigation_undock_detail, pre_navigation_undock)) {
-      return {
+    if (!undock_before_navigation_if_needed(
+        pre_navigation_dock_check,
+        pre_navigation_undock_detail,
+        pre_navigation_undock))
+    {
+      return navigation_goal_error(
         409,
-        "application/json",
-        error_json("navigation requires successful undock first: " + pre_navigation_undock_detail)};
+        "navigation requires successful undock first: " + pre_navigation_undock_detail,
+        pre_navigation_undock,
+        pre_navigation_undock_detail);
     }
 
     const auto lifecycle = navigation_lifecycle_snapshot();
     if (!lifecycle.active) {
       set_navigation_runtime_state(true, "degraded", lifecycle.detail, false);
-      return {503, "application/json", error_json(lifecycle.detail)};
+      return navigation_goal_error(
+        503,
+        lifecycle.detail,
+        pre_navigation_undock,
+        pre_navigation_undock_detail);
     }
 
     bool pre_navigation_relocalization_requested = false;
@@ -4204,7 +4576,7 @@ private:
         const auto detail =
           "navigation requires fresh localization before goal: " + pre_navigation_relocalization_detail;
         set_navigation_runtime_state(true, "localization_failed", detail, false);
-        return {409, "application/json", error_json(detail)};
+        return navigation_goal_error(409, detail, pre_navigation_undock, pre_navigation_undock_detail);
       }
     } else if (pre_navigation_undock) {
       pre_navigation_relocalization_detail = "covered by pre-navigation undock relocalization";
@@ -4227,24 +4599,41 @@ private:
     try {
       std::lock_guard<std::mutex> action_lock(navigate_action_mutex_);
       if (!navigate_to_pose_client_->wait_for_action_server(service_timeout())) {
-        return {503, "application/json", error_json("action unavailable: " + navigate_to_pose_action_)};
+        return navigation_goal_error(
+          503,
+          "action unavailable: " + navigate_to_pose_action_,
+          pre_navigation_undock,
+          pre_navigation_undock_detail);
       }
       auto future = navigate_to_pose_client_->async_send_goal(goal);
       if (future.wait_for(service_timeout()) != std::future_status::ready) {
-        return {503, "application/json", error_json("timed out sending navigation goal")};
+        return navigation_goal_error(
+          503,
+          "timed out sending navigation goal",
+          pre_navigation_undock,
+          pre_navigation_undock_detail);
       }
       goal_handle = future.get();
     } catch (const std::exception & exc) {
-      return {
+      return navigation_goal_error(
         503,
-        "application/json",
-        error_json(std::string("exception sending navigation goal: ") + exc.what())};
+        std::string("exception sending navigation goal: ") + exc.what(),
+        pre_navigation_undock,
+        pre_navigation_undock_detail);
     } catch (...) {
-      return {503, "application/json", error_json("unknown exception sending navigation goal")};
+      return navigation_goal_error(
+        503,
+        "unknown exception sending navigation goal",
+        pre_navigation_undock,
+        pre_navigation_undock_detail);
     }
 
     if (!goal_handle) {
-      return {500, "application/json", error_json("navigation goal was rejected by Nav2")};
+      return navigation_goal_error(
+        500,
+        "navigation goal was rejected by Nav2",
+        pre_navigation_undock,
+        pre_navigation_undock_detail);
     }
 
     {
@@ -4292,10 +4681,11 @@ private:
         false,
         false,
         false);
-      return {
+      return navigation_goal_error(
         500,
-        "application/json",
-        error_json(std::string("failed to start navigation goal worker: ") + exc.what())};
+        std::string("failed to start navigation goal worker: ") + exc.what(),
+        pre_navigation_undock,
+        pre_navigation_undock_detail);
     }
 
     set_navigation_runtime_state(true, "navigating", "navigation goal accepted");
@@ -4317,6 +4707,7 @@ private:
     }
     response << "\"pre_navigation_undock\":" << (pre_navigation_undock ? "true" : "false") << ","
              << "\"pre_navigation_undock_detail\":" << json_string(pre_navigation_undock_detail) << ","
+             << "\"pre_navigation_dock_check\":" << pre_navigation_dock_check_payload() << ","
              << "\"pre_navigation_relocalization_requested\":"
              << (pre_navigation_relocalization_requested ? "true" : "false") << ","
              << "\"pre_navigation_relocalization_succeeded\":"
@@ -4327,33 +4718,31 @@ private:
     return {202, "application/json", response.str()};
   }
 
-  bool undock_before_navigation_if_needed(std::string & detail, bool & undock_performed)
+  bool undock_before_navigation_if_needed(
+    const PreNavigationDockCheck & dock_check,
+    std::string & detail,
+    bool & undock_performed)
   {
     undock_performed = false;
-    const auto runtime = runtime_mode_snapshot();
-    const bool charging_contact = bms_charging_contact_active();
-    const bool docked_state = runtime.docking_state == "docked" ||
-      docking_status_is_success(runtime.docking_status);
-    const bool undocking_state = runtime.docking_state == "undocking" ||
-      docking_status_is_undocking(runtime.docking_status);
-
-    if (!docked_state && !charging_contact && !undocking_state) {
-      if (runtime.docking_active) {
-        detail = "docking is active but not docked: " + runtime.docking_state;
+    if (!dock_check.final_auto_undock_required) {
+      if (dock_check.docking_active_not_docked_block) {
+        detail = "docking is active but not docked: " + dock_check.runtime.docking_state;
         return false;
       }
-      detail = "not docked";
+      detail = dock_check.auto_undock_reason;
       return true;
     }
 
     undock_performed = true;
-    if (!undocking_state && !start_pre_navigation_undock(detail)) {
+    if (!dock_check.runtime_state_undocking && !dock_check.docking_status_indicates_undocking &&
+      !start_pre_navigation_undock(detail, dock_check.bms.contact))
+    {
       return false;
     }
     return wait_for_pre_navigation_undock(detail);
   }
 
-  bool start_pre_navigation_undock(std::string & detail)
+  bool start_pre_navigation_undock(std::string & detail, const bool charging_contact_at_gate)
   {
     clear_teleop_command();
     publish_teleop_zero_burst();
@@ -4404,7 +4793,7 @@ private:
     }
 
     std::string service_detail;
-    if (!call_undock_service_with_charging_retry(service_detail, bms_charging_contact_active())) {
+    if (!call_undock_service_with_charging_retry(service_detail, charging_contact_at_gate)) {
       finish_docking_job(job_id, false, "failed", service_detail);
       detail = service_detail;
       return false;
@@ -6332,6 +6721,15 @@ private:
   {
     const auto runtime = runtime_mode_snapshot();
     const auto charging_contact = bms_charging_contact_snapshot();
+    const auto dock_check = pre_navigation_dock_check_snapshot();
+    const auto dock_check_json = pre_navigation_dock_check_json(
+      dock_check,
+      "docking_state",
+      "",
+      "",
+      "",
+      "map",
+      false);
     const bool inferred_docked = runtime.docking_state != "docked" && charging_contact.contact;
     std::lock_guard<std::mutex> lock(docking_job_mutex_);
     std::ostringstream response;
@@ -6342,7 +6740,11 @@ private:
              << "\"charging_contact\":" << (charging_contact.contact ? "true" : "false") << ","
              << "\"charging_contact_reason\":" << json_string(charging_contact.reason) << ","
              << "\"inferred_docked\":" << (inferred_docked ? "true" : "false") << ","
+             << "\"can_undock\":" << (dock_check.final_is_docked_or_charging ? "true" : "false") << ","
+             << "\"can_auto_undock\":" << (dock_check.can_auto_undock ? "true" : "false") << ","
+             << "\"auto_undock_reason\":" << json_string(dock_check.auto_undock_reason) << ","
              << "\"last_status\":" << json_string(runtime.docking_status) << ","
+             << "\"pre_navigation_dock_check\":" << dock_check_json << ","
              << "\"docking\":" << docking_job_json_locked() << "}";
     return {200, "application/json", response.str()};
   }
@@ -6553,6 +6955,16 @@ private:
       bms_full_soc_threshold_pct_);
   }
 
+  static std::string json_nullable_number(const bool valid, const double value)
+  {
+    if (!valid || !std::isfinite(value)) {
+      return "null";
+    }
+    std::ostringstream out;
+    out << value;
+    return out.str();
+  }
+
   BmsChargingContactSnapshot bms_charging_contact_snapshot()
   {
     BmsChargingContactSnapshot snapshot;
@@ -6562,6 +6974,15 @@ private:
       snapshot.reason = "no_bms_state";
       return snapshot;
     }
+    snapshot.have_soc = have_bms_soc_;
+    snapshot.soc = latest_bms_soc_;
+    snapshot.voltage = latest_bms_voltage_;
+    snapshot.current = latest_bms_current_;
+    snapshot.temperature = latest_bms_temperature_;
+    snapshot.power_supply_status = latest_bms_power_supply_status_;
+    snapshot.power_supply_health = latest_bms_power_supply_health_;
+    snapshot.power_supply_technology = latest_bms_power_supply_technology_;
+    snapshot.present = latest_bms_present_;
     snapshot.age_sec = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - latest_bms_received_at_).count();
     snapshot.fresh = snapshot.age_sec <= bms_state_max_age_sec_;
@@ -6572,6 +6993,126 @@ private:
     snapshot.contact = latest_bms_charging_contact_;
     snapshot.reason = latest_bms_charging_contact_reason_;
     return snapshot;
+  }
+
+  PreNavigationDockCheck pre_navigation_dock_check_snapshot()
+  {
+    PreNavigationDockCheck check;
+    check.runtime = runtime_mode_snapshot();
+    check.bms = bms_charging_contact_snapshot();
+
+    const auto docking_state = lower_copy(check.runtime.docking_state);
+    const auto docking_status = lower_copy(check.runtime.docking_status);
+    check.runtime_state_docked = docking_state == "docked";
+    check.runtime_state_charging = docking_state == "charging";
+    check.runtime_state_undocking = docking_state == "undocking";
+    check.docking_status_indicates_docked = starts_with(docking_status, "docked");
+    check.docking_status_indicates_charging = starts_with(docking_status, "charging");
+    check.docking_status_indicates_undocking = docking_status_is_undocking(docking_status);
+    check.inferred_docked = !check.runtime_state_docked && check.bms.contact;
+    check.final_is_docked_or_charging =
+      check.runtime_state_docked ||
+      check.runtime_state_charging ||
+      check.docking_status_indicates_docked ||
+      check.docking_status_indicates_charging ||
+      check.bms.contact;
+    check.final_auto_undock_required =
+      check.final_is_docked_or_charging ||
+      check.runtime_state_undocking ||
+      check.docking_status_indicates_undocking;
+    check.docking_active_not_docked_block =
+      check.runtime.docking_active &&
+      !check.final_is_docked_or_charging &&
+      !check.runtime_state_undocking &&
+      !check.docking_status_indicates_undocking;
+    check.can_auto_undock = check.final_auto_undock_required && !check.docking_active_not_docked_block;
+
+    if (check.runtime_state_undocking || check.docking_status_indicates_undocking) {
+      check.auto_undock_reason = "undocking_already_active";
+    } else if (check.runtime_state_docked) {
+      check.auto_undock_reason = "runtime_docking_state_docked";
+    } else if (check.runtime_state_charging) {
+      check.auto_undock_reason = "runtime_docking_state_charging";
+    } else if (check.docking_status_indicates_charging) {
+      check.auto_undock_reason = "docking_status_charging";
+    } else if (check.docking_status_indicates_docked) {
+      check.auto_undock_reason = "docking_status_docked";
+    } else if (check.bms.contact) {
+      check.auto_undock_reason = "bms_charging_contact:" + check.bms.reason;
+    } else if (check.docking_active_not_docked_block) {
+      check.auto_undock_reason = "docking_active_not_docked:" + check.runtime.docking_state;
+    } else {
+      check.auto_undock_reason = "not_docked";
+    }
+    return check;
+  }
+
+  std::string bms_charging_contact_snapshot_json(const BmsChargingContactSnapshot & bms) const
+  {
+    std::ostringstream body;
+    body << "\"have_state\":" << (bms.have_state ? "true" : "false") << ","
+         << "\"fresh\":" << (bms.fresh ? "true" : "false") << ","
+         << "\"age_sec\":" << json_nullable_number(bms.have_state, bms.age_sec) << ","
+         << "\"contact\":" << (bms.contact ? "true" : "false") << ","
+         << "\"reason\":" << json_string(bms.reason) << ","
+         << "\"soc\":" << json_nullable_number(bms.have_soc, bms.soc) << ","
+         << "\"soc_valid\":" << (bms.have_soc && bms.fresh ? "true" : "false") << ","
+         << "\"voltage\":" << json_nullable_number(bms.have_state, bms.voltage) << ","
+         << "\"current\":" << json_nullable_number(bms.have_state, bms.current) << ","
+         << "\"temperature\":" << json_nullable_number(bms.have_state, bms.temperature) << ","
+         << "\"present\":" << (bms.present ? "true" : "false") << ","
+         << "\"power_supply_status\":" << bms.power_supply_status << ","
+         << "\"power_supply_health\":" << bms.power_supply_health << ","
+         << "\"power_supply_technology\":" << bms.power_supply_technology;
+    return body.str();
+  }
+
+  std::string pre_navigation_dock_check_json(
+    const PreNavigationDockCheck & check,
+    const std::string & request_source,
+    const std::string & pose_id,
+    const std::string & building_id,
+    const std::string & floor_id,
+    const std::string & frame_id,
+    const bool direct_pose) const
+  {
+    std::ostringstream body;
+    body << "{"
+         << "\"schema\":\"njrh.pre_navigation_dock_check.v1\","
+         << "\"request_source\":" << json_string(request_source) << ","
+         << "\"pose_id\":" << json_string(pose_id) << ","
+         << "\"building_id\":" << json_string(building_id) << ","
+         << "\"floor_id\":" << json_string(floor_id) << ","
+         << "\"frame_id\":" << json_string(frame_id) << ","
+         << "\"direct_pose\":" << (direct_pose ? "true" : "false") << ","
+         << "\"api_bms_charging_contact\":" << (check.bms.contact ? "true" : "false") << ","
+         << "\"api_bms_charging_contact_reason\":" << json_string(check.bms.reason) << ","
+         << "\"bms\":{" << bms_charging_contact_snapshot_json(check.bms) << "},"
+         << "\"docking\":{"
+         << "\"state\":" << json_string(check.runtime.docking_state) << ","
+         << "\"active\":" << (check.runtime.docking_active ? "true" : "false") << ","
+         << "\"dock_id\":" << json_string(check.runtime.docking_dock_id) << ","
+         << "\"last_status\":" << json_string(check.runtime.docking_status) << ","
+         << "\"status_topic\":" << json_string(docking_status_topic_) << ","
+         << "\"runtime_state_docked\":" << (check.runtime_state_docked ? "true" : "false") << ","
+         << "\"runtime_state_charging\":" << (check.runtime_state_charging ? "true" : "false") << ","
+         << "\"runtime_state_undocking\":" << (check.runtime_state_undocking ? "true" : "false") << ","
+         << "\"status_indicates_docked\":" << (check.docking_status_indicates_docked ? "true" : "false") << ","
+         << "\"status_indicates_charging\":"
+         << (check.docking_status_indicates_charging ? "true" : "false") << ","
+         << "\"status_indicates_undocking\":"
+         << (check.docking_status_indicates_undocking ? "true" : "false") << "},"
+         << "\"inferred_docked\":" << (check.inferred_docked ? "true" : "false") << ","
+         << "\"final_is_docked_or_charging\":"
+         << (check.final_is_docked_or_charging ? "true" : "false") << ","
+         << "\"final_auto_undock_required\":"
+         << (check.final_auto_undock_required ? "true" : "false") << ","
+         << "\"can_auto_undock\":" << (check.can_auto_undock ? "true" : "false") << ","
+         << "\"docking_active_not_docked_block\":"
+         << (check.docking_active_not_docked_block ? "true" : "false") << ","
+         << "\"auto_undock_reason\":" << json_string(check.auto_undock_reason)
+         << "}";
+    return body.str();
   }
 
   bool bms_charging_contact_active()
@@ -6937,6 +7478,7 @@ private:
   std::string navigate_to_pose_action_;
   std::string mapping_2d_start_command_;
   std::string mapping_2d_log_file_;
+  std::string mapping_lidar_rps_xps_state_dir_;
   std::string navigation_resume_command_;
   std::string navigation_resume_log_file_;
   std::string runtime_map_context_file_;

@@ -2,32 +2,43 @@ diff --git a/ros2_ws/src/jt128_nav_tools/CMakeLists.txt b/ros2_ws/src/jt128_nav_
 index 50fa410..477e935 100644
 --- a/ros2_ws/src/jt128_nav_tools/CMakeLists.txt
 +++ b/ros2_ws/src/jt128_nav_tools/CMakeLists.txt
-@@ -15,0 +16 @@ find_package(sensor_msgs REQUIRED)
+@@ -15,2 +15,3 @@ find_package(rclcpp REQUIRED)
+ find_package(sensor_msgs REQUIRED)
 +find_package(std_msgs REQUIRED)
-@@ -29,0 +31 @@ ament_target_dependencies(
+ find_package(geometry_msgs REQUIRED)
+@@ -29,2 +30,3 @@ ament_target_dependencies(
+   sensor_msgs
 +  std_msgs
+   pcl_conversions
 diff --git a/ros2_ws/src/jt128_nav_tools/package.xml b/ros2_ws/src/jt128_nav_tools/package.xml
 index 21b0673..ad5d9c7 100644
 --- a/ros2_ws/src/jt128_nav_tools/package.xml
 +++ b/ros2_ws/src/jt128_nav_tools/package.xml
-@@ -18,0 +19 @@
+@@ -18,2 +18,3 @@
+   <depend>sensor_msgs</depend>
 +  <depend>std_msgs</depend>
+   <depend>tf2</depend>
 diff --git a/ros2_ws/src/jt128_nav_tools/src/nav_cloud_preprocessor_node.cpp b/ros2_ws/src/jt128_nav_tools/src/nav_cloud_preprocessor_node.cpp
-index 4dd7f5e..fc51965 100644
+index 4dd7f5e..8f54eb9 100644
 --- a/ros2_ws/src/jt128_nav_tools/src/nav_cloud_preprocessor_node.cpp
 +++ b/ros2_ws/src/jt128_nav_tools/src/nav_cloud_preprocessor_node.cpp
-@@ -0,0 +1,2 @@
+@@ -1,2 +1,5 @@
 +#include <algorithm>
 +#include <chrono>
-@@ -1,0 +4 @@
+ #include <cmath>
 +#include <cstdint>
-@@ -2,0 +6 @@
+ #include <functional>
+@@ -4,2 +7,4 @@
+ #include <memory>
 +#include <iomanip>
-@@ -4,0 +9 @@
 +#include <sstream>
-@@ -19,0 +25 @@
+ #include <string>
+@@ -19,2 +24,3 @@
+ #include "sensor_msgs/msg/point_cloud2.hpp"
 +#include "std_msgs/msg/string.hpp"
-@@ -28,0 +35,17 @@ using PointT = pcl::PointXYZI;
+ #include "tf2/exceptions.h"
+@@ -28,2 +34,19 @@ using PointT = pcl::PointXYZI;
+ 
 +rclcpp::QoS makePointCloudQos(const int depth, const bool reliable)
 +{
 +  const auto safe_depth = static_cast<size_t>(std::max(1, depth));
@@ -45,14 +56,18 @@ index 4dd7f5e..fc51965 100644
 +  return static_cast<double>(stamp.sec) + static_cast<double>(stamp.nanosec) * 1.0e-9;
 +}
 +
-@@ -82,0 +106,6 @@ public:
+ struct CropBox
+@@ -84,2 +107,8 @@ public:
+     publish_debug_log_ = declare_parameter<bool>("publish_debug_log", false);
 +    input_reliable_ = declare_parameter<bool>("input_reliable", false);
 +    input_qos_depth_ = declare_parameter<int>("input_qos_depth", 1);
 +    output_reliable_ = declare_parameter<bool>("output_reliable", false);
 +    output_qos_depth_ = declare_parameter<int>("output_qos_depth", 1);
 +    status_topic_ = declare_parameter<std::string>("status_topic", "/lidar/nav_cloud_preprocessor_status");
 +    status_publish_period_sec_ = std::max(declare_parameter<double>("status_publish_period_sec", 1.0), 0.0);
-@@ -100 +129,9 @@ public:
+ 
+@@ -99,5 +128,13 @@ public:
+ 
 -    publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>(output_topic_, 10);
 +    publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>(
 +      output_topic_, makePointCloudQos(output_qos_depth_, output_reliable_));
@@ -63,33 +78,84 @@ index 4dd7f5e..fc51965 100644
 +        std::bind(&NavCloudPreprocessorNode::publishStatus, this));
 +      previous_status_time_ = std::chrono::steady_clock::now();
 +    }
-@@ -102 +139 @@ public:
+     subscription_ = create_subscription<sensor_msgs::msg::PointCloud2>(
 -      input_topic_, rclcpp::SensorDataQoS(),
 +      input_topic_, makePointCloudQos(input_qos_depth_, input_reliable_),
-@@ -107 +144,2 @@ public:
+       std::bind(&NavCloudPreprocessorNode::pointCloudCallback, this, std::placeholders::_1));
+@@ -106,5 +143,8 @@ public:
+       get_logger(),
 -      "JT128 nav cloud preprocessor ready. input=%s output=%s frame_override=%s",
 +      "JT128 nav cloud preprocessor ready. input=%s output=%s frame_override=%s "
 +      "input_reliable=%s input_depth=%d output_reliable=%s output_depth=%d",
-@@ -109 +147,3 @@ public:
+       input_topic_.c_str(), output_topic_.c_str(),
 -      output_frame_id_.empty() ? "<keep_input>" : output_frame_id_.c_str());
 +      output_frame_id_.empty() ? "<keep_input>" : output_frame_id_.c_str(),
 +      input_reliable_ ? "true" : "false", input_qos_depth_,
 +      output_reliable_ ? "true" : "false", output_qos_depth_);
-@@ -234,0 +275 @@ private:
+   }
+@@ -234,2 +274,17 @@ private:
+     publisher_->publish(output_msg);
 +    ++output_publish_count_;
-@@ -238,0 +280,5 @@ private:
-+    const auto callback_start = std::chrono::steady_clock::now();
++  }
++
++  void recordProcessingMs(const double processing_ms)
++  {
++    last_processing_ms_ = processing_ms;
++    processing_ms_sum_ += processing_ms;
++    processing_ms_max_ = std::max(processing_ms_max_, processing_ms);
++    ++processing_ms_count_;
++  }
++
++  void recordProcessingMsSince(const std::chrono::steady_clock::time_point & start)
++  {
++    recordProcessingMs(
++      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+   }
+@@ -238,2 +293,18 @@ private:
+   {
++    const auto callback_time = std::chrono::steady_clock::now();
++    if (last_input_callback_time_ != std::chrono::steady_clock::time_point{}) {
++      const double interarrival_ms =
++        std::chrono::duration<double, std::milli>(callback_time - last_input_callback_time_).count();
++      input_interarrival_ms_sum_ += interarrival_ms;
++      input_interarrival_ms_max_ = std::max(input_interarrival_ms_max_, interarrival_ms);
++      ++input_interarrival_count_;
++    }
++    last_input_callback_time_ = callback_time;
 +    ++input_callback_count_;
 +    input_cloud_points_ = static_cast<size_t>(msg->width) * msg->height;
 +    input_cloud_bytes_ = msg->data.size();
 +    input_last_stamp_age_ms_ = (now().seconds() - stampToSec(msg->header.stamp)) * 1000.0;
-@@ -261,0 +308 @@ private:
++    last_source_frame_ = msg->header.frame_id;
++    last_target_frame_ = output_frame_id_.empty() ? msg->header.frame_id : output_frame_id_;
++
+     pcl::PointCloud<PointT>::Ptr raw_cloud(new pcl::PointCloud<PointT>());
+@@ -245,5 +316,9 @@ private:
+     if (raw_cloud->empty()) {
++      ++skipped_empty_count_;
++      output_cloud_points_ = 0U;
+       publishEmptyCloud(*msg);
++      recordProcessingMsSince(callback_time);
+       return;
+     }
++    ++input_accept_count_;
+ 
+@@ -261,2 +336,4 @@ private:
+           output_frame_id_.c_str(), msg->header.frame_id.c_str(), ex.what());
 +        ++skipped_transform_count_;
-@@ -296,0 +344,38 @@ private:
++        recordProcessingMsSince(callback_time);
+         return;
+@@ -277,2 +354,5 @@ private:
+     auto final_cloud = maybeApplyOutlierFilter(cropped_cloud);
++    if (final_cloud->empty()) {
++      ++skipped_filter_empty_count_;
++    }
+     final_cloud->width = static_cast<uint32_t>(final_cloud->size());
+@@ -296,2 +376,83 @@ private:
+     publisher_->publish(output_msg);
 +    ++output_publish_count_;
 +    output_cloud_points_ = final_cloud->size();
-+    last_processing_ms_ =
-+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - callback_start).count();
++    recordProcessingMsSince(callback_time);
 +  }
 +
 +  void publishStatus()
@@ -97,11 +163,29 @@ index 4dd7f5e..fc51965 100644
 +    if (!status_publisher_) {
 +      return;
 +    }
++
 +    const auto now_steady = std::chrono::steady_clock::now();
 +    const double elapsed_sec = std::max(
 +      std::chrono::duration<double>(now_steady - previous_status_time_).count(), 1.0e-3);
 +    const auto input_delta = input_callback_count_ - previous_input_callback_count_;
++    const auto accept_delta = input_accept_count_ - previous_input_accept_count_;
 +    const auto output_delta = output_publish_count_ - previous_output_publish_count_;
++    const std::uint64_t interarrival_delta_count =
++      input_interarrival_count_ - previous_input_interarrival_count_;
++    const double interarrival_delta_sum =
++      input_interarrival_ms_sum_ - previous_input_interarrival_ms_sum_;
++    const double input_interarrival_ms_avg = interarrival_delta_count == 0U ?
++      -1.0 :
++      interarrival_delta_sum / static_cast<double>(interarrival_delta_count);
++    const double input_last_msg_age_ms = last_input_callback_time_ == std::chrono::steady_clock::time_point{} ?
++      -1.0 :
++      std::chrono::duration<double, std::milli>(now_steady - last_input_callback_time_).count();
++    const double processing_ms_avg = processing_ms_count_ == 0U ?
++      -1.0 :
++      processing_ms_sum_ / static_cast<double>(processing_ms_count_);
++    const double processing_ms_max = processing_ms_max_;
++    const auto input_publisher_count = subscription_ ? subscription_->get_publisher_count() : 0U;
++    const auto output_subscription_count = publisher_ ? publisher_->get_subscription_count() : 0U;
 +
 +    std_msgs::msg::String msg;
 +    std::ostringstream stream;
@@ -109,40 +193,86 @@ index 4dd7f5e..fc51965 100644
 +           << "input_topic=" << input_topic_
 +           << " output_topic=" << output_topic_
 +           << " input_callback_hz=" << static_cast<double>(input_delta) / elapsed_sec
++           << " input_accept_hz=" << static_cast<double>(accept_delta) / elapsed_sec
 +           << " output_points_nav_hz=" << static_cast<double>(output_delta) / elapsed_sec
-+           << " last_processing_ms=" << last_processing_ms_
 +           << " skipped_transform=" << skipped_transform_count_
-+           << " input_cloud_points=" << input_cloud_points_
-+           << " input_cloud_bytes=" << input_cloud_bytes_
++           << " skipped_empty=" << skipped_empty_count_
++           << " skipped_filter_empty=" << skipped_filter_empty_count_
++           << " input_interarrival_ms_avg=" << input_interarrival_ms_avg
++           << " input_interarrival_ms_max=" << input_interarrival_ms_max_
++           << " input_last_msg_age_ms=" << input_last_msg_age_ms
 +           << " input_last_stamp_age_ms=" << input_last_stamp_age_ms_
-+           << " output_cloud_points=" << output_cloud_points_
++           << " last_processing_ms=" << last_processing_ms_
++           << " processing_ms_avg=" << processing_ms_avg
++           << " processing_ms_max=" << processing_ms_max
++           << " last_input_points=" << input_cloud_points_
++           << " last_input_bytes=" << input_cloud_bytes_
++           << " last_output_points=" << output_cloud_points_
++           << " lookup_timeout_sec=" << lookup_timeout_sec_
++           << " target_frame=" << last_target_frame_
++           << " source_frame=" << last_source_frame_
++           << " height_filter_min=" << min_z_
++           << " height_filter_max=" << max_z_
++           << " range_min=" << range_min_
++           << " range_max=" << range_max_
++           << " subscriber_count=" << input_publisher_count
++           << " publisher_subscription_count=" << output_subscription_count
 +           << " subscription_qos_depth=" << input_qos_depth_
-+           << " subscription_qos_reliable=" << (input_reliable_ ? "true" : "false");
++           << " subscription_qos_reliable=" << (input_reliable_ ? "true" : "false")
++           << " output_qos_depth=" << output_qos_depth_
++           << " output_qos_reliable=" << (output_reliable_ ? "true" : "false");
 +    msg.data = stream.str();
 +    status_publisher_->publish(msg);
 +
 +    previous_status_time_ = now_steady;
 +    previous_input_callback_count_ = input_callback_count_;
++    previous_input_accept_count_ = input_accept_count_;
 +    previous_output_publish_count_ = output_publish_count_;
-@@ -301,0 +387,6 @@ private:
++    previous_input_interarrival_count_ = input_interarrival_count_;
++    previous_input_interarrival_ms_sum_ = input_interarrival_ms_sum_;
++    input_interarrival_ms_max_ = 0.0;
++    processing_ms_sum_ = 0.0;
++    processing_ms_max_ = 0.0;
++    processing_ms_count_ = 0U;
+   }
+@@ -303,2 +464,8 @@ private:
+   bool publish_debug_log_{false};
 +  bool input_reliable_{false};
 +  int input_qos_depth_{1};
 +  bool output_reliable_{false};
 +  int output_qos_depth_{1};
 +  std::string status_topic_;
 +  double status_publish_period_sec_{1.0};
-@@ -316,0 +408 @@ private:
+   double range_min_{1.0};
+@@ -316,3 +483,31 @@ private:
+   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher_;
 +  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_publisher_;
-@@ -317,0 +410,12 @@ private:
+   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subscription_;
 +  rclcpp::TimerBase::SharedPtr status_timer_;
 +  std::chrono::steady_clock::time_point previous_status_time_{std::chrono::steady_clock::now()};
++  std::chrono::steady_clock::time_point last_input_callback_time_{};
 +  std::uint64_t input_callback_count_{0};
++  std::uint64_t input_accept_count_{0};
 +  mutable std::uint64_t output_publish_count_{0};
 +  std::uint64_t previous_input_callback_count_{0};
++  std::uint64_t previous_input_accept_count_{0};
 +  std::uint64_t previous_output_publish_count_{0};
 +  std::uint64_t skipped_transform_count_{0};
++  std::uint64_t skipped_empty_count_{0};
++  std::uint64_t skipped_filter_empty_count_{0};
++  std::uint64_t input_interarrival_count_{0};
++  std::uint64_t previous_input_interarrival_count_{0};
++  double input_interarrival_ms_sum_{0.0};
++  double previous_input_interarrival_ms_sum_{0.0};
++  double input_interarrival_ms_max_{0.0};
 +  size_t input_cloud_points_{0};
 +  size_t input_cloud_bytes_{0};
 +  size_t output_cloud_points_{0};
 +  double input_last_stamp_age_ms_{0.0};
 +  double last_processing_ms_{0.0};
++  double processing_ms_sum_{0.0};
++  double processing_ms_max_{0.0};
++  std::uint64_t processing_ms_count_{0};
++  std::string last_source_frame_;
++  std::string last_target_frame_;
+ };

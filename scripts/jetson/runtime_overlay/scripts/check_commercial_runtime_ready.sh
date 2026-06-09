@@ -15,6 +15,17 @@ check_process() {
   return 1
 }
 
+check_process_absent() {
+  local label="$1"
+  local pattern="$2"
+  if pgrep -f "${pattern}" >/dev/null 2>&1; then
+    printf 'MISS process %-34s unexpected: %s\n' "${label}" "${pattern}"
+    return 1
+  fi
+  printf 'OK   process %-34s absent as expected\n' "${label}"
+  return 0
+}
+
 check_node() {
   local node_name="$1"
   if timeout 3 ros2 node info "${node_name}" >/dev/null 2>&1 ||
@@ -49,6 +60,17 @@ check_topic() {
   return 1
 }
 
+check_topic_once() {
+  local topic="$1"
+  local timeout_sec="${2:-2}"
+  if timeout "${timeout_sec}" ros2 topic echo "${topic}" --once >/dev/null 2>&1; then
+    printf 'OK   topic   %s\n' "${topic}"
+    return 0
+  fi
+  printf 'MISS topic   %s\n' "${topic}"
+  return 1
+}
+
 check_tf() {
   local target="$1"
   local source="$2"
@@ -69,7 +91,11 @@ run_check() {
 printf '[runtime-overlay] commercial runtime readiness check\n'
 
 run_check check_process "jt128_driver" "hesai_ros_driver_node"
-run_check check_process "fastlio_mapping" "fast_lio fastlio_mapping|laser_mapping"
+if [[ "${NJRH_NAV_LOCAL_STATE_MODE:-ekf}" == "fastlio" || "${NJRH_FASTLIO_AUTOSTART:-false}" == "true" ]]; then
+  run_check check_process "fastlio_mapping" "fast_lio fastlio_mapping|laser_mapping"
+else
+  run_check check_process_absent "fastlio_mapping" "fast_lio fastlio_mapping|laser_mapping"
+fi
 run_check check_process "robot_local_state" "ekf_node --ros-args.*__node:=robot_local_state|robot_localization/ekf_node|robot_local_state/local_state_node|local_state_node --ros-args"
 run_check check_process "localization_bridge" "robot_localization_bridge/localization_bridge_node|localization_bridge_node --ros-args"
 run_check check_process "robot_safety" "robot_safety/robot_safety_node|robot_safety_node --ros-args"
@@ -94,7 +120,7 @@ run_check check_lifecycle_active "/collision_monitor" 12
 
 run_check check_topic "/local_state/odometry" 10
 run_check check_topic "/perception/obstacle_points" 10
-run_check check_topic "/safety/status" 10
+run_check check_topic_once "/safety/status" 10
 run_check check_tf "odom" "base_link" 10
 run_check check_tf "map" "odom" 10
 

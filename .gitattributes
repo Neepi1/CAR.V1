@@ -19,6 +19,7 @@
 *.md text eol=lf
 *.toml text eol=lf
 *.repos text eol=lf
+*.patch text eol=lf whitespace=-blank-at-eol
 
 *.ps1 text eol=crlf
 *.bat text eol=crlf

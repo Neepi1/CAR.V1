@@ -28,6 +28,7 @@ robot_api_server:
 
     mapping_2d_start_command: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/run_projected_map.sh"
     mapping_2d_log_file: "/tmp/njrh_mapping2d_slam_toolbox.log"
+    mapping_lidar_rps_xps_state_dir: "/tmp/njrh_slam2d_lidar_rps_xps"
     navigation_resume_command: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/run_navigation_runtime_services.sh"
     navigation_resume_log_file: "/tmp/njrh_navigation_resume.log"
     runtime_map_context_file: "/tmp/njrh_runtime_map_context.json"

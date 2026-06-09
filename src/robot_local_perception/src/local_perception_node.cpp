@@ -50,6 +50,11 @@ double stamp_to_sec(const builtin_interfaces::msg::Time & stamp)
   return static_cast<double>(stamp.sec) + static_cast<double>(stamp.nanosec) * 1.0e-9;
 }
 
+double rad_to_deg(const double radians)
+{
+  return radians * 180.0 / M_PI;
+}
+
 struct CropBox
 {
   bool enabled{false};
@@ -926,6 +931,7 @@ private:
       auto clearing_output_msg = makePointCloud2FromPoints(clearing_points, job.header);
       clearing_publisher_->publish(clearing_output_msg);
       ++published_clearing_count_;
+      last_clearing_point_count_.store(clearing_points.size());
       if (publish_debug_log_) {
         const auto elapsed_ms = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - t_start).count();
@@ -1067,6 +1073,20 @@ private:
     ++published_empty_obstacle_count_;
   }
 
+  void recordProcessingMs(const double processing_ms)
+  {
+    last_processing_ms_ = processing_ms;
+    processing_ms_sum_ += processing_ms;
+    processing_ms_max_ = std::max(processing_ms_max_, processing_ms);
+    ++processing_ms_count_;
+  }
+
+  void recordProcessingMsSince(const std::chrono::steady_clock::time_point & start)
+  {
+    recordProcessingMs(
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+  }
+
   bool shouldPublishClearingThisFrame() const
   {
     if (!clearing_enabled_) {
@@ -1097,6 +1117,7 @@ private:
       input_frame_id_override_.empty() ? msg->header.frame_id : input_frame_id_override_;
     if (!startupTfGateReady(source_frame)) {
       ++skipped_transform_count_;
+      recordProcessingMsSince(t_start);
       return;
     }
 
@@ -1104,8 +1125,15 @@ private:
     last_input_point_count_ = point_count;
     last_input_stamp_age_sec_ = now().seconds() - stamp_to_sec(msg->header.stamp);
     if (point_count == 0U || msg->point_step == 0U || msg->data.empty()) {
+      ++skipped_empty_input_count_;
+      last_filtered_point_count_ = 0U;
+      last_output_point_count_ = 0U;
+      last_obstacle_point_count_ = 0U;
+      last_clearing_candidate_count_ = 0U;
+      last_clearing_point_count_.store(0U);
       publishEmptyCloud(*msg);
       ++processed_cloud_count_;
+      recordProcessingMsSince(t_start);
       return;
     }
 
@@ -1132,6 +1160,7 @@ private:
         input_topic_.c_str());
       ++skipped_field_count_;
       publishEmptyCloud(*msg);
+      recordProcessingMsSince(t_start);
       return;
     }
     const auto t_from_ros = std::chrono::steady_clock::now();
@@ -1154,6 +1183,7 @@ private:
           "Skipping cloud because transform %s <- %s is unavailable: %s",
           output_frame_id_.c_str(), source_frame.c_str(), ex.what());
         ++skipped_transform_count_;
+        recordProcessingMsSince(t_start);
         return;
       }
     }
@@ -1206,17 +1236,24 @@ private:
     }
     filtered_points = applyVoxelOutlierFilter(std::move(filtered_points), profile);
     filtered_points = limitPointCount(std::move(filtered_points), max_filtered_points_);
+    if (filtered_points.empty()) {
+      ++skipped_empty_obstacle_count_;
+    }
     const auto t_filter = std::chrono::steady_clock::now();
 
     sensor_msgs::msg::PointCloud2 output_msg = makePointCloud2FromPoints(filtered_points, msg->header);
     output_msg.header.frame_id = output_frame_id_;
+    last_filtered_point_count_ = filtered_points.size();
     last_output_point_count_ = filtered_points.size();
+    last_obstacle_point_count_ = filtered_points.size();
     last_clearing_candidate_count_ = clearing_points.size();
     const auto t_to_ros_obstacle = std::chrono::steady_clock::now();
     if (restamp_to_now_) {
       const auto output_stamp = outputStampForCostmap();
       if (!output_stamp) {
         ++skipped_stamp_count_;
+        ++skipped_publish_gating_count_;
+        recordProcessingMsSince(t_start);
         return;
       }
       output_msg.header.stamp = *output_stamp;
@@ -1228,7 +1265,7 @@ private:
     ++published_obstacle_count_;
     ++processed_cloud_count_;
     const auto t_publish_obstacle = std::chrono::steady_clock::now();
-    last_processing_ms_ = std::chrono::duration<double, std::milli>(t_publish_obstacle - t_start).count();
+    recordProcessingMs(std::chrono::duration<double, std::milli>(t_publish_obstacle - t_start).count());
     t_publish_clearing = t_publish_obstacle;
     auto t_clearing = t_publish_obstacle;
     if (publish_clearing_this_frame) {
@@ -1308,6 +1345,12 @@ private:
     const auto obstacle_delta = published_obstacle_count_ - previous_published_obstacle_count_;
     const auto clearing_delta = published_clearing_count - previous_published_clearing_count_;
     const auto timer_delta = process_timer_count_ - previous_process_timer_count_;
+    const auto no_new_delta = no_new_cloud_count_ - previous_no_new_cloud_count_;
+    const double processing_ms_avg = processing_ms_count_ == 0U ?
+      -1.0 :
+      processing_ms_sum_ / static_cast<double>(processing_ms_count_);
+    const double processing_ms_max = processing_ms_max_;
+    const auto & profile = activeProfile();
     const double input_last_msg_age_ms = last_input_callback_time_ == std::chrono::steady_clock::time_point{} ?
       -1.0 :
       std::chrono::duration<double, std::milli>(now_steady - last_input_callback_time_).count();
@@ -1325,6 +1368,7 @@ private:
            << "mode=" << current_mode_
            << " input_topic=" << input_topic_
            << " output_topic=" << output_topic_
+           << " clearing_output_topic=" << clearing_output_topic_
            << " received=" << received_cloud_count_
            << " received_hz=" << static_cast<double>(received_delta) / elapsed_sec
            << " input_callback_hz=" << static_cast<double>(received_delta) / elapsed_sec
@@ -1340,6 +1384,7 @@ private:
            << " input_subscription_qos_depth=" << input_qos_depth_
            << " process_timer=" << process_timer_count_
            << " process_timer_hz=" << static_cast<double>(timer_delta) / elapsed_sec
+           << " timer_tick_hz=" << static_cast<double>(timer_delta) / elapsed_sec
            << " processed_cloud=" << processed_cloud_count_
            << " processed_cloud_hz=" << static_cast<double>(processed_delta) / elapsed_sec
            << " published_obstacle=" << published_obstacle_count_
@@ -1350,13 +1395,35 @@ private:
            << " no_latest=" << no_latest_cloud_count_
            << " no_new=" << no_new_cloud_count_
            << " no_new_count=" << no_new_cloud_count_
+           << " no_new_hz=" << static_cast<double>(no_new_delta) / elapsed_sec
            << " skipped_field=" << skipped_field_count_
            << " skipped_transform=" << skipped_transform_count_
            << " skipped_stamp=" << skipped_stamp_count_
+           << " skipped_empty_input=" << skipped_empty_input_count_
+           << " skipped_empty_obstacle=" << skipped_empty_obstacle_count_
+           << " skipped_mode_gating=" << skipped_mode_gating_count_
+           << " skipped_publish_gating=" << skipped_publish_gating_count_
            << " last_input_points=" << last_input_point_count_
+           << " last_filtered_points=" << last_filtered_point_count_
+           << " last_obstacle_points=" << last_obstacle_point_count_
+           << " last_clearing_points=" << last_clearing_point_count_.load()
            << " last_output_points=" << last_output_point_count_
            << " last_clearing_candidates=" << last_clearing_candidate_count_
+           << " last_mode=" << current_mode_
+           << " active_profile_name=" << current_mode_
+           << " range_min=" << profile.range_min
+           << " range_max=" << profile.range_max
+           << " height_min=" << profile.min_z
+           << " height_max=" << profile.max_z
+           << " azimuth_min=" << rad_to_deg(profile.azimuth_filter.min_angle_rad)
+           << " azimuth_max=" << rad_to_deg(profile.azimuth_filter.max_angle_rad)
+           << " point_sample_stride=" << point_sample_stride_
+           << " clearing_publish_every_n=" << clearing_publish_every_n_
+           << " clearing_point_sample_stride=" << clearing_point_sample_stride_
+           << " clearing_virtual_rays_enabled=" << (clearing_virtual_rays_enabled_ ? "true" : "false")
            << " last_processing_ms=" << last_processing_ms_
+           << " processing_ms_avg=" << processing_ms_avg
+           << " processing_ms_max=" << processing_ms_max
            << " last_input_stamp_age_sec=" << last_input_stamp_age_sec_;
     status_msg.data = stream.str();
     status_publisher_->publish(status_msg);
@@ -1368,9 +1435,13 @@ private:
     previous_published_obstacle_count_ = published_obstacle_count_;
     previous_published_clearing_count_ = published_clearing_count;
     previous_process_timer_count_ = process_timer_count_;
+    previous_no_new_cloud_count_ = no_new_cloud_count_;
     previous_input_interarrival_count_ = input_interarrival_count_;
     previous_input_interarrival_ms_sum_ = input_interarrival_ms_sum_;
     input_interarrival_ms_max_ = 0.0;
+    processing_ms_sum_ = 0.0;
+    processing_ms_max_ = 0.0;
+    processing_ms_count_ = 0U;
   }
 
   std::string mode_topic_;
@@ -1457,12 +1528,17 @@ private:
   std::uint64_t skipped_field_count_{0};
   std::uint64_t skipped_transform_count_{0};
   std::uint64_t skipped_stamp_count_{0};
+  std::uint64_t skipped_empty_input_count_{0};
+  std::uint64_t skipped_empty_obstacle_count_{0};
+  std::uint64_t skipped_mode_gating_count_{0};
+  std::uint64_t skipped_publish_gating_count_{0};
   std::uint64_t previous_received_count_{0};
   std::uint64_t previous_accepted_count_{0};
   std::uint64_t previous_processed_count_{0};
   std::uint64_t previous_published_obstacle_count_{0};
   std::uint64_t previous_published_clearing_count_{0};
   std::uint64_t previous_process_timer_count_{0};
+  std::uint64_t previous_no_new_cloud_count_{0};
   std::uint64_t input_interarrival_count_{0};
   std::uint64_t previous_input_interarrival_count_{0};
   double input_interarrival_ms_sum_{0.0};
@@ -1470,9 +1546,15 @@ private:
   double input_interarrival_ms_max_{0.0};
   std::size_t last_input_point_count_{0};
   std::size_t last_input_cloud_bytes_{0};
+  std::size_t last_filtered_point_count_{0};
+  std::size_t last_obstacle_point_count_{0};
   std::size_t last_output_point_count_{0};
   std::size_t last_clearing_candidate_count_{0};
+  std::atomic<std::size_t> last_clearing_point_count_{0};
   double last_processing_ms_{0.0};
+  double processing_ms_sum_{0.0};
+  double processing_ms_max_{0.0};
+  std::uint64_t processing_ms_count_{0};
   double last_input_stamp_age_sec_{0.0};
   double last_input_stamp_age_ms_{0.0};
 };

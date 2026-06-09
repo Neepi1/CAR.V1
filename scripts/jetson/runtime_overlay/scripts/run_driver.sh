@@ -7,6 +7,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 unset NJRH_COMMON_ENV_SETUP_DONE
 source "${SCRIPT_DIR}/common_env.sh"
 source "${SCRIPT_DIR}/cpu_affinity.sh"
+source "${SCRIPT_DIR}/local_perception_profile.sh"
+njrh_load_local_perception_input_profile
 
 CONFIG_FILE="${NJRH_HESAI_CONFIG_FILE:-${UPSTREAM_WS}/src/hesai_lidar_ros2/config/config.yaml}"
 export DRIVER_PROFILE="${DRIVER_PROFILE:-mapping}"
@@ -28,6 +30,8 @@ export IMU_REMAP_CPP_BIN="${NJRH_IMU_REMAP_CPP_BIN:-${NJRH_PROJECT_ROOT}/install
 export NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER="${NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER:-false}"
 export NJRH_JT128_ENABLE_POINTCLOUD_DOWNSAMPLE="${NJRH_JT128_ENABLE_POINTCLOUD_DOWNSAMPLE:-false}"
 UPSTREAM_DRIVER_PROFILE="${NJRH_HESAI_UPSTREAM_DRIVER_PROFILE}"
+
+njrh_print_local_perception_profile
 
 [[ -f "${CONFIG_FILE}" ]] || {
   echo "[runtime-overlay] driver config missing: ${CONFIG_FILE}" >&2
@@ -170,6 +174,9 @@ if [[ "${NJRH_JT128_ENABLE_POINTCLOUD_DOWNSAMPLE}" == "true" ]]; then
   }
 fi
 if [[ "${NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER}" == "true" ]]; then
+  if [[ -n "${RESOLVED_AXIS_LOCAL_OUTPUT_TOPIC}" ]]; then
+    echo "[runtime-overlay] WARNING: pointcloud component container mode does not apply local branch CLI overrides; use standalone pointcloud_axis_remap for the production local_branch profile" >&2
+  fi
   echo "[runtime-overlay] starting component pointcloud perception pipeline: ${POINTCLOUD_PIPELINE_LAUNCH}" >&2
   njrh_run_affined pointcloud_perception_pipeline \
     ros2 launch "${POINTCLOUD_PIPELINE_LAUNCH}" \
@@ -183,8 +190,16 @@ else
     exit 1
   }
   echo "[runtime-overlay] using compiled pointcloud remap: ${POINTCLOUD_REMAP_CPP_BIN}" >&2
+  pointcloud_remap_args=(--ros-args --params-file "${POINTCLOUD_REMAP_CONFIG}")
+  if [[ -n "${RESOLVED_AXIS_LOCAL_OUTPUT_TOPIC}" ]]; then
+    pointcloud_remap_args+=(
+      -p "local_output_topic:=${RESOLVED_AXIS_LOCAL_OUTPUT_TOPIC}"
+      -p "local_output_stride:=${RESOLVED_AXIS_LOCAL_OUTPUT_STRIDE}"
+      -p "local_output_publish_every_n:=${RESOLVED_AXIS_LOCAL_OUTPUT_PUBLISH_EVERY_N}"
+    )
+  fi
   njrh_run_affined pointcloud_axis_remap \
-    "${POINTCLOUD_REMAP_CPP_BIN}" --ros-args --params-file "${POINTCLOUD_REMAP_CONFIG}" &
+    "${POINTCLOUD_REMAP_CPP_BIN}" "${pointcloud_remap_args[@]}" &
   pointcloud_remap_pid=$!
 fi
 

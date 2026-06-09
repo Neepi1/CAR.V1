@@ -51,12 +51,14 @@ POST /api/v1/safety/resume
 POST /api/v1/floors/switch
 POST /api/v1/localization/trigger
 GET  /api/v1/navigation/state
+GET  /api/v1/navigation/pre_goal_check
 POST /api/v1/navigation/goal
 POST /api/v1/navigation/cancel
 POST /api/v1/navigation/stop
 POST /api/v1/navigation/stop_runtime
 GET  /api/v1/docking/state
 POST /api/v1/docking/start
+POST /api/v1/docking/undock
 POST /api/v1/docking/cancel
 POST /api/v1/docking/stop
 WS   /ws/v1/teleop
@@ -146,7 +148,7 @@ The App should use these lightweight business fields instead of inferring state 
 
 The backend intentionally keeps this status lightweight. It is driven by official API transitions such as `/mapping/2d/start`, `/mapping/2d/stop`, `/mapping/2d/save`, `/floors/switch?resume_navigation=true`, `/navigation/goal`, and `/navigation/cancel`. Deep ROS checks remain backend diagnostics and should not be duplicated in the App. The API has a fixed worker pool instead of one thread per request, so the App should poll with a modest interval, for example `500ms..1000ms` while a task is active and slower while idle. Treat HTTP `503 {"error":"server busy"}` as a transient backend overload and retry with backoff instead of launching more parallel requests.
 
-`bms.soc` is the value the App should display as real battery percentage. The data path is Ranger CAN BMS frame decoded by `ranger_base_node` into `/battery_state`, then subscribed by `robot_api_server`; the App must not read CAN or ROS 2 DDS directly. Treat `soc_valid=false` as stale or unavailable power data. Use `bms.charging_contact` and `bms.charging_contact_reason` for dock-contact diagnostics; full batteries may report `current=0`, so App logic must not use current alone to decide whether undocking is allowed.
+`bms.soc` is the value the App should display as real battery percentage. The data path is Ranger CAN BMS frame decoded by `ranger_base_node` into `/battery_state`, then subscribed by `robot_api_server`; the App must not read CAN or ROS 2 DDS directly. Treat `soc_valid=false` as stale or unavailable power data. Use `bms.charging_contact`, `bms.charging_contact_reason`, and `bms.contact_snapshot` for dock-contact diagnostics; full batteries may report `current=0`, so App logic must not use current alone to decide whether undocking is allowed.
 
 ## Page-Scoped Subscriptions
 
@@ -535,6 +537,14 @@ Content-Type: application/json
 
 The App should use this endpoint for "mark point at current robot position". Do not convert PNG pixels to map coordinates for this workflow. The server fills `x`, `y`, and `yaw` from the same live `map -> base_link` pose returned by `/api/v1/robot/pose`; if `/robot/pose` would return `503`, `save_current` also returns `503` and does not save. Request-body `yaw` or `theta` is ignored so saved orientation always equals the live robot heading. `type: "dock"` means the final charging-contact `base_link` pose, not the pre-dock point. The server writes `maps/<map_id>/poses.yaml` and synchronizes `current/poses.yaml` if that map is active. `pose_id` is optional; when omitted, the server generates a stable ID and returns it.
 
+Check whether a normal point navigation request would need auto-undock:
+
+```text
+GET http://<robot-ip>:8080/api/v1/navigation/pre_goal_check?building_id=B1&floor_id=F1&pose_id=delivery_123456
+```
+
+This endpoint is read-only. It resolves the saved pose from `poses.yaml`, reports the critical Nav2 lifecycle summary, and returns `pre_navigation_dock_check` with backend docking state, `/docking/status`, BMS age/contact reason, `power_supply_status`, current, voltage, `final_is_docked_or_charging`, `final_auto_undock_required`, and `auto_undock_reason`. It never calls `/docking/undock` and never sends a Nav2 goal. Use it for diagnostics before the user taps "go to point"; production execution still uses `POST /api/v1/navigation/goal`.
+
 Send a saved point as a real navigation goal:
 
 ```text
@@ -550,7 +560,7 @@ Content-Type: application/json
 }
 ```
 
-Successful response returns `202 Accepted` with `navigation_goal_id`. The server resolves the pose from `maps_release/<building_id>/<floor_id>/poses.yaml`, sends a Nav2 `NavigateToPose` goal on `/navigate_to_pose`, and tracks the result in the background. If the car is already docked or the backend sees live charging contact, this endpoint automatically performs controlled undocking first, waits for odometry-confirmed `undocked`, arms the bridge one-shot correction service, triggers post-undock relocalization, waits until the result is reflected in `map -> base_link`, and only then sends the Nav2 goal. If undocking, post-undock relocalization, bridge acceptance, or the wait times out, the response is an error and no navigation goal is sent. The App must not send `/cmd_vel` for task navigation, and it should not call `/api/v1/docking/undock` separately before every normal point navigation.
+Successful response returns `202 Accepted` with `navigation_goal_id`. The server resolves the pose from `maps_release/<building_id>/<floor_id>/poses.yaml`, sends a Nav2 `NavigateToPose` goal on `/navigate_to_pose`, and tracks the result in the background. If the car is already docked, `/docking/status` starts with `docked` or `charging`, or the backend sees fresh BMS charging contact, this endpoint automatically performs controlled undocking first, waits for odometry-confirmed `undocked`, arms the bridge one-shot correction service, triggers post-undock relocalization, waits until the result is reflected in `map -> base_link`, and only then sends the Nav2 goal. A full battery may report `current=0`; use `pre_navigation_dock_check.api_bms_charging_contact`, `api_bms_charging_contact_reason`, and `bms.power_supply_status` rather than current alone. If undocking, post-undock relocalization, bridge acceptance, or the wait times out, the response is an error and no navigation goal is sent. Success and admission-failure responses include `pre_navigation_undock`, `pre_navigation_undock_detail`, and `pre_navigation_dock_check`. The App must not send `/cmd_vel` for task navigation, and it should not call `/api/v1/docking/undock` separately before every normal point navigation.
 
 Cancel active navigation goals:
 

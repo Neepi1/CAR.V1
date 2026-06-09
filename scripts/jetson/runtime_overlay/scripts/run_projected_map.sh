@@ -25,11 +25,15 @@ LOCAL_ODOM_MAX_AGE_SEC="${NJRH_SLAM2D_LOCAL_ODOM_MAX_AGE_SEC:-1.0}"
 FASTLIO_POINTS_READY_TIMEOUT="${NJRH_SLAM2D_FASTLIO_POINTS_READY_TIMEOUT:-60}"
 FASTLIO_POINTS_MAX_AGE_SEC="${NJRH_SLAM2D_FASTLIO_POINTS_MAX_AGE_SEC:-1.0}"
 LOCAL_ODOM_MAX_WHEEL_DIFF_M="${NJRH_SLAM2D_LOCAL_ODOM_MAX_WHEEL_DIFF_M:-25.0}"
+SLAM2D_LIDAR_RPS_XPS_ENABLED="${NJRH_SLAM2D_LIDAR_RPS_XPS_ENABLED:-true}"
+SLAM2D_LIDAR_RPS_XPS_INTERFACE="${NJRH_SLAM2D_LIDAR_RPS_XPS_INTERFACE:-${NJRH_LIDAR_INTERFACE:-eth1}}"
+SLAM2D_LIDAR_RPS_XPS_CPUSET="${NJRH_SLAM2D_LIDAR_RPS_XPS_CPUSET:-5}"
+SLAM2D_LIDAR_RPS_XPS_STATE_DIR="${NJRH_SLAM2D_LIDAR_RPS_XPS_STATE_DIR:-/tmp/njrh_slam2d_lidar_rps_xps}"
 
 # Mode scripts can be launched by a long-lived API process that still carries
 # older concrete CPU-set environment values. Re-derive this mapping path from
 # the group defaults here, with explicit per-mode override knobs.
-export NJRH_CPUSET_FASTLIO_DESKEW="${NJRH_SLAM2D_FASTLIO_CPUSET:-${NJRH_CPUSET_MAPPING_FRONTEND:-6,7}}"
+export NJRH_CPUSET_FASTLIO_DESKEW="${NJRH_SLAM2D_FASTLIO_CPUSET:-${NJRH_CPUSET_MAPPING_BACKEND:-7}}"
 export NJRH_CPUSET_SLAM_TOOLBOX_MAPPING="${NJRH_SLAM2D_SLAM_TOOLBOX_CPUSET:-${NJRH_CPUSET_MAPPING_BACKEND:-7}}"
 
 for pattern in \
@@ -69,6 +73,112 @@ fastlio_deskew_pid=""
 fastlio_odom_bridge_pid=""
 fastlio_reused_for_slam2d="false"
 projected_map_exit_code=0
+slam2d_lidar_rps_xps_applied="false"
+
+slam2d_truthy() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+slam2d_cpulist_to_hex_mask() {
+  local cpulist="$1"
+  local mask=0
+  local part start end cpu
+  IFS=',' read -ra parts <<<"${cpulist}"
+  for part in "${parts[@]}"; do
+    [[ -n "${part}" ]] || continue
+    if [[ "${part}" == *-* ]]; then
+      start="${part%-*}"
+      end="${part#*-}"
+      [[ "${start}" =~ ^[0-9]+$ && "${end}" =~ ^[0-9]+$ && "${start}" -le "${end}" ]] || return 1
+      for ((cpu=start; cpu<=end; cpu++)); do
+        mask=$((mask | (1 << cpu)))
+      done
+    else
+      cpu="${part}"
+      [[ "${cpu}" =~ ^[0-9]+$ ]] || return 1
+      mask=$((mask | (1 << cpu)))
+    fi
+  done
+  printf '%x\n' "${mask}"
+}
+
+backup_slam2d_lidar_rps_xps() {
+  local iface="$1"
+  mkdir -p "${SLAM2D_LIDAR_RPS_XPS_STATE_DIR}"
+  if [[ -f "${SLAM2D_LIDAR_RPS_XPS_STATE_DIR}/manifest.env" ]]; then
+    echo "[runtime-overlay] keeping existing slam2d LiDAR RPS/XPS backup: ${SLAM2D_LIDAR_RPS_XPS_STATE_DIR}" >&2
+    return 0
+  fi
+  {
+    printf 'created_utc=%q\n' "$(date -u +%Y%m%dT%H%M%SZ)"
+    printf 'interface=%q\n' "${iface}"
+    printf 'cpuset=%q\n' "${SLAM2D_LIDAR_RPS_XPS_CPUSET}"
+  } >"${SLAM2D_LIDAR_RPS_XPS_STATE_DIR}/manifest.env"
+
+  : >"${SLAM2D_LIDAR_RPS_XPS_STATE_DIR}/rps_xps.tsv"
+  local file value
+  for file in /sys/class/net/"${iface}"/queues/rx-*/rps_cpus /sys/class/net/"${iface}"/queues/tx-*/xps_cpus; do
+    [[ -e "${file}" && -r "${file}" ]] || continue
+    value="$(cat "${file}" 2>/dev/null || true)"
+    printf '%s\t%s\n' "${file}" "${value}" >>"${SLAM2D_LIDAR_RPS_XPS_STATE_DIR}/rps_xps.tsv"
+  done
+}
+
+apply_slam2d_lidar_rps_xps() {
+  if ! slam2d_truthy "${SLAM2D_LIDAR_RPS_XPS_ENABLED}"; then
+    echo "[runtime-overlay] slam2d LiDAR RPS/XPS profile disabled" >&2
+    return 0
+  fi
+  local iface="${SLAM2D_LIDAR_RPS_XPS_INTERFACE}"
+  if [[ -z "${iface}" || ! -d "/sys/class/net/${iface}" ]]; then
+    echo "[runtime-overlay] slam2d LiDAR RPS/XPS skipped; interface not found: ${iface:-unset}" >&2
+    return 0
+  fi
+  local mask
+  if ! mask="$(slam2d_cpulist_to_hex_mask "${SLAM2D_LIDAR_RPS_XPS_CPUSET}")"; then
+    echo "[runtime-overlay] slam2d LiDAR RPS/XPS skipped; invalid cpuset=${SLAM2D_LIDAR_RPS_XPS_CPUSET}" >&2
+    return 0
+  fi
+
+  backup_slam2d_lidar_rps_xps "${iface}"
+
+  local file changed=0 failed=0
+  for file in /sys/class/net/"${iface}"/queues/rx-*/rps_cpus /sys/class/net/"${iface}"/queues/tx-*/xps_cpus; do
+    [[ -e "${file}" ]] || continue
+    if printf '%s\n' "${mask}" >"${file}" 2>/dev/null; then
+      changed=$((changed + 1))
+      echo "[runtime-overlay] slam2d LiDAR RPS/XPS applied ${file}=${mask} cpuset=${SLAM2D_LIDAR_RPS_XPS_CPUSET}" >&2
+    else
+      failed=$((failed + 1))
+      echo "[runtime-overlay] warning: cannot write slam2d LiDAR RPS/XPS file ${file}" >&2
+    fi
+  done
+  if [[ "${changed}" -gt 0 ]]; then
+    slam2d_lidar_rps_xps_applied="true"
+  fi
+  [[ "${failed}" -eq 0 ]] || return 0
+}
+
+restore_slam2d_lidar_rps_xps() {
+  [[ -d "${SLAM2D_LIDAR_RPS_XPS_STATE_DIR}" ]] || return 0
+  [[ -f "${SLAM2D_LIDAR_RPS_XPS_STATE_DIR}/rps_xps.tsv" ]] || return 0
+  local file value failed=0
+  while IFS=$'\t' read -r file value; do
+    [[ -n "${file}" && -e "${file}" ]] || continue
+    if printf '%s\n' "${value}" >"${file}" 2>/dev/null; then
+      echo "[runtime-overlay] restored slam2d LiDAR RPS/XPS ${file}=${value}" >&2
+    else
+      failed=$((failed + 1))
+      echo "[runtime-overlay] warning: failed to restore slam2d LiDAR RPS/XPS ${file}=${value}" >&2
+    fi
+  done <"${SLAM2D_LIDAR_RPS_XPS_STATE_DIR}/rps_xps.tsv"
+  if [[ "${failed}" -eq 0 ]]; then
+    rm -rf "${SLAM2D_LIDAR_RPS_XPS_STATE_DIR}" 2>/dev/null || true
+  fi
+}
 
 private_fastlio_pid_is_owned() {
   local pid="$1"
@@ -287,6 +397,7 @@ cleanup() {
   if [[ "${fastlio_reused_for_slam2d}" != "true" ]]; then
     stop_mapping_fastlio_processes
   fi
+  restore_slam2d_lidar_rps_xps
   cleanup_canonical_helpers
 }
 
@@ -299,6 +410,7 @@ trap cleanup EXIT
 trap on_signal INT TERM
 
 require_resident_common_mapping_prereqs || exit 1
+apply_slam2d_lidar_rps_xps
 
 if [[ "${USE_UPSTREAM_SLAM_SCRIPT}" == "true" && -f "${UPSTREAM_SLAM_SCRIPT}" ]]; then
   bash -lc "PUBLISH_LIDAR_TF=false bash '${UPSTREAM_SLAM_SCRIPT}'" &

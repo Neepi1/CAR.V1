@@ -11,6 +11,12 @@ if [[ -f "${NJRH_CPU_AFFINITY_CONFIG}" ]]; then
   source "${NJRH_CPU_AFFINITY_CONFIG}"
 fi
 
+NJRH_CPU_AFFINITY_RUNTIME_OVERRIDE="${NJRH_CPU_AFFINITY_RUNTIME_OVERRIDE:-${NJRH_OVERLAY_ROOT}/config/cpu_affinity_runtime_override.env}"
+if [[ -f "${NJRH_CPU_AFFINITY_RUNTIME_OVERRIDE}" ]]; then
+  # shellcheck source=../config/cpu_affinity_runtime_override.env
+  source "${NJRH_CPU_AFFINITY_RUNTIME_OVERRIDE}"
+fi
+
 njrh_affinity_truthy() {
   case "${1:-}" in
     1|true|TRUE|yes|YES|on|ON) return 0 ;;

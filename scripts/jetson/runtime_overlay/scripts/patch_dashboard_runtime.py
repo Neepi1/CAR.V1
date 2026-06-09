@@ -89,98 +89,161 @@ NEW_LIDAR_QOS_BLOCK = """            'lidar_cloud': {\n                'msg_type
 OLD_DRIVER_READY_BLOCK = """    def _ensure_driver_ready(self, profile: str = 'mapping') -> List[str]:\n        actions: List[str] = []\n        if profile not in ('mapping', 'navigation'):\n            raise RuntimeError(f'Unsupported driver profile: {profile}')\n        desired_command = ['bash', '-lc', f'DRIVER_PROFILE={profile} bash scripts/run_driver.sh']\n        proc = self.processes.get('driver')\n        needs_restart = self._driver_running() and self._driver_profile != profile\n        if needs_restart:\n            self._stop('driver')\n            self._kill_patterns(['hesai_ros_driver_node', 'ros2 run hesai_ros_driver'])\n            self.ros_state.clear_lidar_cache()\n            actions.append(f'driver restarted with {profile} timestamp profile')\n        if not self._driver_running():\n            self._start('driver', desired_command)\n            self._driver_profile = profile\n            actions.append('driver started')\n        elif proc is not None:\n            proc.command = desired_command\n            self._driver_profile = profile\n            actions.append('driver already running')\n        else:\n            actions.append('driver already running')\n        with self._temporary_view_features(['lidar_view'], source='internal:driver_ready'):\n            self._wait_until(\n                lambda: self._driver_running() and self.ros_state.has_recent_lidar(max_age=3.0),\n                timeout=25.0,\n                description='lidar driver output',\n            )\n        actions.append(f'driver ready ({profile} timestamps)')\n        return actions\n"""
 
 
-NEW_DRIVER_READY_BLOCK = """    def _driver_stack_running(self) -> bool:\n        return (\n            self._process_exists('hesai_ros_driver_node')\n            and self._process_exists('pointcloud_axis_remap')\n            and self._process_exists('imu_axis_remap')\n        )\n\n    def _driver_lidar_age_seconds(self) -> Optional[float]:\n        payload = getattr(self.ros_state, '_lidar_points', None)\n        if not isinstance(payload, dict):\n            return None\n        try:\n            updated_at = float(payload.get('updated_at', 0.0) or 0.0)\n        except Exception:\n            updated_at = 0.0\n        if updated_at <= 0.0:\n            return None\n        return max(0.0, time.time() - updated_at)\n\n    def _driver_ready_snapshot(self, max_age: float = 3.0) -> dict:\n        lidar_age = self._driver_lidar_age_seconds()\n        lidar_recent = self.ros_state.has_recent_lidar(max_age=max_age)\n        return {\n            'driver_proc': self._driver_running(),\n            'stack_proc': self._driver_stack_running(),\n            'lidar_recent': lidar_recent,\n            'lidar_age': lidar_age,\n            'ready': lidar_recent,\n        }\n\n    def _format_driver_ready_snapshot(self, snapshot: dict) -> str:\n        lidar_age = snapshot.get('lidar_age')\n        if isinstance(lidar_age, (int, float)):\n            lidar_age_text = f'{float(lidar_age):.2f}s'\n        else:\n            lidar_age_text = 'n/a'\n        return (\n            f\"driver_proc={snapshot.get('driver_proc')} \"\n            f\"stack_proc={snapshot.get('stack_proc')} \"\n            f\"lidar_recent={snapshot.get('lidar_recent')} \"\n            f\"lidar_age={lidar_age_text}\"\n        )\n\n    def _wait_for_direct_lidar_sample(self, timeout: float = 6.0) -> bool:\n        if self.ros_state.has_recent_lidar(max_age=max(2.0, float(timeout))):\n            return True\n\n        event = __import__('threading').Event()\n        received = {'ok': False}\n        qos = QoSProfile(\n            history=HistoryPolicy.KEEP_LAST,\n            depth=10,\n            reliability=ReliabilityPolicy.BEST_EFFORT,\n            durability=DurabilityPolicy.VOLATILE,\n        )\n\n        def _callback(msg: PointCloud2) -> None:\n            try:\n                self.ros_state._on_lidar_cloud(msg)\n                received['ok'] = True\n            finally:\n                event.set()\n\n        subscription = None\n        try:\n            subscription = self.ros_state.create_subscription(\n                PointCloud2,\n                '/lidar_points',\n                _callback,\n                qos,\n            )\n            deadline = time.time() + max(0.5, float(timeout))\n            while time.time() < deadline:\n                if self.ros_state.has_recent_lidar(max_age=max(2.0, float(timeout))):\n                    return True\n                remaining = deadline - time.time()\n                if remaining <= 0.0:\n                    break\n                event.wait(min(0.2, remaining))\n                if received['ok']:\n                    return True\n            return self.ros_state.has_recent_lidar(max_age=max(2.0, float(timeout)))\n        finally:\n            if subscription is not None:\n                try:\n                    self.ros_state.destroy_subscription(subscription)\n                except Exception:\n                    pass\n\n    def _probe_lidar_topic_external(self, timeout: float = 6.0) -> bool:\n        subprocess_mod = __import__('subprocess')\n        os_mod = __import__('os')\n        env = os_mod.environ.copy()\n        env['FASTDDS_BUILTIN_TRANSPORTS'] = env.get('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4')\n        command = [\n            'bash',\n            '-lc',\n            'source /opt/ros/humble/setup.bash >/dev/null 2>&1 && ros2 topic hz /lidar_points',\n        ]\n        output = ''\n        try:\n            completed = subprocess_mod.run(\n                command,\n                capture_output=True,\n                text=True,\n                timeout=max(2.0, float(timeout)),\n                env=env,\n                check=False,\n            )\n            output = '\\n'.join(part for part in (completed.stdout, completed.stderr) if part)\n        except subprocess_mod.TimeoutExpired as exc:\n            output = '\\n'.join(part for part in (exc.stdout or '', exc.stderr or '') if part)\n        normalized = output.lower()\n        return 'average rate:' in normalized or 'min:' in normalized\n\n    def _ensure_driver_ready(self, profile: str = 'mapping') -> List[str]:\n        actions: List[str] = []\n        if profile not in ('mapping', 'navigation'):\n            raise RuntimeError(f'Unsupported driver profile: {profile}')\n        desired_command = ['bash', '-lc', f'DRIVER_PROFILE={profile} bash scripts/run_driver.sh']\n        proc = self.processes.get('driver')\n        needs_restart = self._driver_running() and self._driver_profile != profile\n        has_live_lidar = self.ros_state.has_recent_lidar(max_age=5.0)\n        if needs_restart:\n            self._stop('driver')\n            self._kill_patterns(['hesai_ros_driver_node', 'ros2 run hesai_ros_driver', 'pointcloud_axis_remap', 'imu_axis_remap'])\n            self.ros_state.clear_lidar_cache()\n            actions.append(f'driver restarted with {profile} timestamp profile')\n        elif self._driver_running() and not self._driver_stack_running() and not has_live_lidar:\n            self._stop('driver')\n            self._kill_patterns(['hesai_ros_driver_node', 'ros2 run hesai_ros_driver', 'pointcloud_axis_remap', 'imu_axis_remap'])\n            self.ros_state.clear_lidar_cache()\n            actions.append('stale driver stack restarted for canonical lidar ingress')\n        if not self._driver_running():\n            self._start('driver', desired_command)\n            self._driver_profile = profile\n            actions.append('driver started')\n        elif proc is not None:\n            proc.command = desired_command\n            self._driver_profile = profile\n            actions.append('driver already running')\n        else:\n            actions.append('driver already running')\n        external_probe_ok = False\n        with self._temporary_view_features(['lidar_view'], source='internal:driver_ready'):\n            try:\n                if not self._wait_for_direct_lidar_sample(timeout=8.0):\n                    external_probe_ok = self._probe_lidar_topic_external(timeout=6.0)\n                    if external_probe_ok:\n                        self._trace('external lidar probe succeeded via ros2 topic hz /lidar_points')\n                    else:\n                        self._wait_until(\n                            lambda: self._driver_ready_snapshot(max_age=5.0)['ready'],\n                            timeout=25.0,\n                            description='lidar driver output',\n                        )\n            except Exception as exc:\n                snapshot = self._driver_ready_snapshot(max_age=5.0)\n                self._trace(f'driver readiness timeout ({profile}): {self._format_driver_ready_snapshot(snapshot)}')\n                raise RuntimeError(\n                    'Timed out waiting for lidar driver output '\n                    f'({self._format_driver_ready_snapshot(snapshot)})'\n                ) from exc\n        snapshot = self._driver_ready_snapshot(max_age=5.0)\n        if external_probe_ok and not snapshot.get('ready'):\n            actions.append('driver live lidar confirmed by external ROS CLI probe; dashboard lidar cache remained stale')\n        elif not snapshot.get('stack_proc'):\n            actions.append('driver live lidar ok; process stack probe incomplete')\n        actions.append(f'driver ready ({profile} timestamps; {self._format_driver_ready_snapshot(snapshot)})')\n        return actions\n"""
+NEW_DRIVER_READY_BLOCK = """    def _driver_stack_running(self) -> bool:
+        return (
+            self._process_exists('hesai_ros_driver_node')
+            and self._process_exists('pointcloud_axis_remap')
+            and self._process_exists('imu_axis_remap')
+        )
 
+    def _driver_axis_status(self) -> dict:
+        payload = getattr(self, '_last_axis_remap_status', None)
+        return payload if isinstance(payload, dict) else {}
 
-NEW_DRIVER_READY_BLOCK = NEW_DRIVER_READY_BLOCK.replace(
-    "        output = ''\\n        try:\\n",
-    "        def _safe_text(value) -> str:\\n"
-    "            if value is None:\\n"
-    "                return ''\\n"
-    "            if isinstance(value, bytes):\\n"
-    "                return value.decode('utf-8', errors='replace')\\n"
-    "            return str(value)\\n\\n"
-    "        output = ''\\n"
-    "        try:\\n",
-)
-NEW_DRIVER_READY_BLOCK = NEW_DRIVER_READY_BLOCK.replace(
-    "            output = '\\\\n'.join(part for part in (completed.stdout, completed.stderr) if part)\\n"
-    "        except subprocess_mod.TimeoutExpired as exc:\\n"
-    "            output = '\\\\n'.join(part for part in (exc.stdout or '', exc.stderr or '') if part)\\n",
-    "            output = '\\\\n'.join(part for part in (_safe_text(completed.stdout), _safe_text(completed.stderr)) if part)\\n"
-    "        except subprocess_mod.TimeoutExpired as exc:\\n"
-    "            output = '\\\\n'.join(part for part in (_safe_text(exc.stdout), _safe_text(exc.stderr)) if part)\\n",
-)
-NEW_DRIVER_READY_BLOCK = NEW_DRIVER_READY_BLOCK.replace(
-    "            except Exception as exc:\\n"
-    "                snapshot = self._driver_ready_snapshot(max_age=5.0)\\n"
-    "                self._trace(f'driver readiness timeout ({profile}): {self._format_driver_ready_snapshot(snapshot)}')\\n"
-    "                raise RuntimeError(\\n"
-    "                    'Timed out waiting for lidar driver output '\\n"
-    "                    f'({self._format_driver_ready_snapshot(snapshot)})'\\n"
-    "                ) from exc\\n",
-    "            except Exception as exc:\\n"
-    "                snapshot = self._driver_ready_snapshot(max_age=5.0)\\n"
-    "                if snapshot.get('ready'):\\n"
-    "                    external_probe_ok = True\\n"
-    "                    self._trace(\\n"
-    "                        f'driver readiness recovered after transient probe error ({profile}): '\\n"
-    "                        f'{self._format_driver_ready_snapshot(snapshot)}; probe_error={exc}'\\n"
-    "                    )\\n"
-    "                else:\\n"
-    "                    self._trace(f'driver readiness timeout ({profile}): {self._format_driver_ready_snapshot(snapshot)}')\\n"
-    "                    raise RuntimeError(\\n"
-    "                        'Timed out waiting for lidar driver output '\\n"
-    "                        f'({self._format_driver_ready_snapshot(snapshot)})'\\n"
-    "                    ) from exc\\n",
-)
-NEW_DRIVER_READY_BLOCK = NEW_DRIVER_READY_BLOCK.replace(
-    "        output = ''\n        try:\n",
-    "        def _safe_text(value) -> str:\n"
-    "            if value is None:\n"
-    "                return ''\n"
-    "            if isinstance(value, bytes):\n"
-    "                return value.decode('utf-8', errors='replace')\n"
-    "            return str(value)\n\n"
-    "        output = ''\n"
-    "        try:\n",
-)
-NEW_DRIVER_READY_BLOCK = NEW_DRIVER_READY_BLOCK.replace(
-    "            output = '\\n'.join(part for part in (completed.stdout, completed.stderr) if part)\n"
-    "        except subprocess_mod.TimeoutExpired as exc:\n"
-    "            output = '\\n'.join(part for part in (exc.stdout or '', exc.stderr or '') if part)\n",
-    "            output = '\\n'.join(part for part in (_safe_text(completed.stdout), _safe_text(completed.stderr)) if part)\n"
-    "        except subprocess_mod.TimeoutExpired as exc:\n"
-    "            output = '\\n'.join(part for part in (_safe_text(exc.stdout), _safe_text(exc.stderr)) if part)\n",
-)
-NEW_DRIVER_READY_BLOCK = NEW_DRIVER_READY_BLOCK.replace(
-    "            except Exception as exc:\n"
-    "                snapshot = self._driver_ready_snapshot(max_age=5.0)\n"
-    "                self._trace(f'driver readiness timeout ({profile}): {self._format_driver_ready_snapshot(snapshot)}')\n"
-    "                raise RuntimeError(\n"
-    "                    'Timed out waiting for lidar driver output '\n"
-    "                    f'({self._format_driver_ready_snapshot(snapshot)})'\n"
-    "                ) from exc\n",
-    "            except Exception as exc:\n"
-    "                snapshot = self._driver_ready_snapshot(max_age=5.0)\n"
-    "                if snapshot.get('ready'):\n"
-    "                    external_probe_ok = True\n"
-    "                    self._trace(\n"
-    "                        f'driver readiness recovered after transient probe error ({profile}): '\n"
-    "                        f'{self._format_driver_ready_snapshot(snapshot)}; probe_error={exc}'\n"
-    "                    )\n"
-    "                else:\n"
-    "                    self._trace(f'driver readiness timeout ({profile}): {self._format_driver_ready_snapshot(snapshot)}')\n"
-    "                    raise RuntimeError(\n"
-    "                        'Timed out waiting for lidar driver output '\n"
-    "                        f'({self._format_driver_ready_snapshot(snapshot)})'\n"
-    "                    ) from exc\n",
-)
-NEW_DRIVER_READY_BLOCK = NEW_DRIVER_READY_BLOCK.replace(
-    "        needs_restart = self._driver_running() and self._driver_profile != profile\n",
-    "        needs_restart = False\n",
-)
+    def _driver_ready_snapshot(self, max_age: float = 3.0) -> dict:
+        axis_status = self._driver_axis_status()
+        try:
+            updated_at = float(axis_status.get('updated_at', 0.0) or 0.0)
+        except Exception:
+            updated_at = 0.0
+        axis_age = None if updated_at <= 0.0 else max(0.0, time.time() - updated_at)
+        try:
+            raw_hz = float(axis_status.get('raw_input_hz', 0.0) or 0.0)
+            publish_hz = float(axis_status.get('lidar_points_publish_hz', 0.0) or 0.0)
+            publish_age_ms = float(axis_status.get('last_publish_age_ms', 999999.0) or 999999.0)
+        except Exception:
+            raw_hz = 0.0
+            publish_hz = 0.0
+            publish_age_ms = 999999.0
+        axis_recent = axis_age is not None and axis_age <= max_age and publish_age_ms <= max(3000.0, max_age * 1000.0)
+        return {
+            'driver_proc': self._driver_running(),
+            'stack_proc': self._driver_stack_running(),
+            'axis_recent': axis_recent,
+            'axis_age': axis_age,
+            'raw_input_hz': raw_hz,
+            'lidar_points_publish_hz': publish_hz,
+            'last_publish_age_ms': publish_age_ms,
+            'ready': self._driver_stack_running() and axis_recent and raw_hz > 0.0 and publish_hz > 0.0,
+        }
 
+    def _format_driver_ready_snapshot(self, snapshot: dict) -> str:
+        axis_age = snapshot.get('axis_age')
+        if isinstance(axis_age, (int, float)):
+            axis_age_text = f'{float(axis_age):.2f}s'
+        else:
+            axis_age_text = 'n/a'
+        return (
+            f"driver_proc={snapshot.get('driver_proc')} "
+            f"stack_proc={snapshot.get('stack_proc')} "
+            f"axis_recent={snapshot.get('axis_recent')} "
+            f"axis_age={axis_age_text} "
+            f"raw_input_hz={float(snapshot.get('raw_input_hz') or 0.0):.2f} "
+            f"lidar_points_publish_hz={float(snapshot.get('lidar_points_publish_hz') or 0.0):.2f} "
+            f"last_publish_age_ms={float(snapshot.get('last_publish_age_ms') or 0.0):.1f}"
+        )
+
+    def _parse_axis_status_text(self, text: str) -> dict:
+        fields = {}
+        for token in str(text or '').replace('\\n', ' ').split():
+            if '=' not in token:
+                continue
+            key, value = token.split('=', 1)
+            fields[key] = value
+        return fields
+
+    def _probe_axis_remap_status_external(self, timeout: float = 6.0) -> bool:
+        subprocess_mod = __import__('subprocess')
+        os_mod = __import__('os')
+        env = os_mod.environ.copy()
+        env['FASTDDS_BUILTIN_TRANSPORTS'] = env.get('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4')
+        command = [
+            'bash',
+            '-lc',
+            'source /opt/ros/humble/setup.bash >/dev/null 2>&1 && timeout 5 ros2 topic echo /lidar/axis_remap_status --field data',
+        ]
+
+        def _safe_text(value) -> str:
+            if value is None:
+                return ''
+            if isinstance(value, bytes):
+                return value.decode('utf-8', errors='replace')
+            return str(value)
+
+        output = ''
+        try:
+            completed = subprocess_mod.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=max(2.0, float(timeout)),
+                env=env,
+                check=False,
+            )
+            output = '\\n'.join(part for part in (_safe_text(completed.stdout), _safe_text(completed.stderr)) if part)
+        except subprocess_mod.TimeoutExpired as exc:
+            output = '\\n'.join(part for part in (_safe_text(exc.stdout), _safe_text(exc.stderr)) if part)
+        samples = [line.strip() for line in output.splitlines() if line.strip() and line.strip() != '---']
+        fields = self._parse_axis_status_text(samples[-1] if samples else '')
+        try:
+            raw_hz = float(fields.get('raw_input_hz', '0') or 0.0)
+            publish_hz = float(fields.get('lidar_points_publish_hz', '0') or 0.0)
+            publish_age_ms = float(fields.get('last_publish_age_ms', '999999') or 999999.0)
+        except Exception:
+            raw_hz = 0.0
+            publish_hz = 0.0
+            publish_age_ms = 999999.0
+        fields['ready'] = raw_hz > 0.0 and publish_hz > 0.0 and publish_age_ms <= max(3000.0, float(timeout) * 1000.0)
+        fields['updated_at'] = time.time()
+        self._last_axis_remap_status = fields
+        return bool(fields['ready'])
+
+    def _ensure_driver_ready(self, profile: str = 'mapping') -> List[str]:
+        actions: List[str] = []
+        if profile not in ('mapping', 'navigation'):
+            raise RuntimeError(f'Unsupported driver profile: {profile}')
+        desired_command = ['bash', '-lc', f'DRIVER_PROFILE={profile} bash scripts/run_driver.sh']
+        proc = self.processes.get('driver')
+        needs_restart = False
+        if needs_restart:
+            self._stop('driver')
+            self._kill_patterns(['hesai_ros_driver_node', 'ros2 run hesai_ros_driver', 'pointcloud_axis_remap', 'imu_axis_remap'])
+            self.ros_state.clear_lidar_cache()
+            actions.append(f'driver restarted with {profile} timestamp profile')
+        elif self._driver_running() and not self._driver_stack_running():
+            self._stop('driver')
+            self._kill_patterns(['hesai_ros_driver_node', 'ros2 run hesai_ros_driver', 'pointcloud_axis_remap', 'imu_axis_remap'])
+            self.ros_state.clear_lidar_cache()
+            actions.append('stale driver stack restarted for canonical lidar ingress')
+        if not self._driver_running():
+            self._start('driver', desired_command)
+            self._driver_profile = profile
+            actions.append('driver started')
+        elif proc is not None:
+            proc.command = desired_command
+            self._driver_profile = profile
+            actions.append('driver already running')
+        else:
+            actions.append('driver already running')
+        try:
+            self._wait_until(
+                lambda: self._driver_running() and self._driver_stack_running() and self._probe_axis_remap_status_external(timeout=5.0),
+                timeout=25.0,
+                description='lidar axis remap status',
+            )
+        except Exception as exc:
+            snapshot = self._driver_ready_snapshot(max_age=5.0)
+            self._trace(f'driver readiness timeout ({profile}): {self._format_driver_ready_snapshot(snapshot)}')
+            raise RuntimeError(
+                'Timed out waiting for lidar axis remap status '
+                f'({self._format_driver_ready_snapshot(snapshot)})'
+            ) from exc
+        snapshot = self._driver_ready_snapshot(max_age=5.0)
+        if not snapshot.get('stack_proc'):
+            actions.append('driver live axis status ok; process stack probe incomplete')
+        actions.append(f'driver ready ({profile} timestamps; {self._format_driver_ready_snapshot(snapshot)})')
+        return actions
+"""
 
 NEW_STORE_OCCUPANCY_GRID_BLOCK = """def _store_occupancy_grid(self, msg: OccupancyGrid, target: str, source: str) -> None:\n        data = list(msg.data)\n        if not data or msg.info.width <= 0 or msg.info.height <= 0:\n            return\n        max_cells = 1440000 if target == 'projected' else 240000\n        stride = max(1, int(math.ceil(math.sqrt(len(data) / max_cells))))\n        sample_width = max(1, int(math.ceil(msg.info.width / stride)))\n        sample_height = max(1, int(math.ceil(msg.info.height / stride)))\n        sampled: List[int] = []\n        for row in range(0, msg.info.height, stride):\n            row_offset = row * msg.info.width\n            for col in range(0, msg.info.width, stride):\n                sampled.append(int(data[row_offset + col]))\n        origin = msg.info.origin.position\n        payload = {\n            'source': source,\n            'frame_id': msg.header.frame_id or 'map',\n            'stamp': {'sec': int(msg.header.stamp.sec), 'nanosec': int(msg.header.stamp.nanosec)},\n            'width': int(msg.info.width),\n            'height': int(msg.info.height),\n            'resolution': float(msg.info.resolution),\n            'origin': {\n                'x': float(origin.x),\n                'y': float(origin.y),\n                'z': float(origin.z),\n            },\n            'sample_stride': int(stride),\n            'sample_width': int(sample_width),\n            'sample_height': int(sample_height),\n            'data': sampled,\n            'updated_at': time.time(),\n        }\n        full_payload = {\n            'source': source,\n            'frame_id': msg.header.frame_id or 'map',\n            'stamp': {'sec': int(msg.header.stamp.sec), 'nanosec': int(msg.header.stamp.nanosec)},\n            'width': int(msg.info.width),\n            'height': int(msg.info.height),\n            'resolution': float(msg.info.resolution),\n            'origin': {\n                'x': float(origin.x),\n                'y': float(origin.y),\n                'z': float(origin.z),\n            },\n            'data': data,\n            'updated_at': payload['updated_at'],\n        }\n        with self._lock:\n            if target == 'projected':\n                self._projected_map_grid = payload\n                self._projected_map_grid_full = full_payload\n            elif target == 'local_costmap':\n                self._local_costmap_grid = payload\n                self._local_costmap_grid_full = full_payload\n            else:\n                self._map_grid = payload\n                self._map_grid_full = full_payload\n\n    """
 
