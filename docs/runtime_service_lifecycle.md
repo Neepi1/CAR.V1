@@ -62,7 +62,30 @@ network IRQs. These tools must not be used as justification to change PointCloud
 QoS reliability, DDS transport, timestamps, Nav2 controller/planner settings,
 EKF, FAST-LIO2 navigation residency, or the App/mapping ownership boundary.
 
+Phase 1.13 adds a pointcloud acceleration profile without changing the
+canonical trunk. `NJRH_POINTCLOUD_ACCEL_PROFILE=legacy` remains the default and
+keeps the validated standalone `pointcloud_axis_remap -> local_branch/nav_branch`
+chain. `ipc_worker` starts `pointcloud_accel_axis_node`, whose raw callback
+publishes full-density/full-fields `/lidar_points` and updates a latest
+normalized buffer before returning. Worker threads named `pc_accel_local` and
+`pc_accel_scan` then derive `/perception/obstacle_points`,
+`/perception/clearing_points`, and `/scan`; `laser_scan_to_flatscan` converts
+`/scan` to `/flatscan`. In this profile, `/_internal/lidar_points_local` and
+`/lidar_points_nav` are compact XYZ/XYZI debug/compat branches, and `/points_nav`
+is not a production hop. `nitros` is a guarded skeleton for future compact
+navigation-branch acceleration only. The NITROS path must run future accelerated
+nodes in one same-process component container and must not replace
+`/lidar_points` or FAST-LIO2 mapping input.
+
 The full-size pointcloud trunk is latest-only after the upstream Hesai driver: `/lidar_points` is the high-density canonical trunk used by mapping-owned FAST-LIO2 and diagnostic consumers, not the default local-obstacle input during production navigation. Production `pointcloud_axis_remap` runs as a standalone process, publishes the only `/lidar_points` trunk, derives `/lidar_points_nav` at stride 4 with `nav_output_publish_every_n=2` for approximately 10 Hz localization scan preprocessing, and derives `/_internal/lidar_points_local` at stride 2 with `local_output_publish_every_n=1` when `NJRH_LOCAL_PERCEPTION_INPUT_PROFILE=local_branch`. That profile is the production default and routes the separate `robot_local_perception` process to `/_internal/lidar_points_local`; `NJRH_LOCAL_PERCEPTION_INPUT_PROFILE=trunk` disables the hidden branch and routes local perception back to `/lidar_points` for rollback/diagnosis. `ROBOT_LOCAL_PERCEPTION_INPUT_TOPIC` overrides the profile input topic, and explicit `NJRH_POINTCLOUD_AXIS_LOCAL_OUTPUT_TOPIC`, `NJRH_POINTCLOUD_AXIS_LOCAL_OUTPUT_STRIDE`, and `NJRH_POINTCLOUD_AXIS_LOCAL_OUTPUT_PUBLISH_EVERY_N` values override the runtime branch injection. `/lidar_points`, `/lidar_points_nav`, `/_internal/lidar_points_local`, `/points_nav`, `/perception/obstacle_points`, and `/perception/clearing_points` use best-effort QoS with depth `1`. Derived branches must not become additional canonical `/lidar_points` publishers. `/points_nav` depends on the upstream `jt128_nav_tools/nav_cloud_preprocessor` patch at `scripts/jetson/runtime_overlay/patches/jt128_nav_tools_pointcloud_qos.patch`; the patched build is sourced from `${NJRH_JT128_NAV_TOOLS_PATCHED_OVERLAY:-${PROJECT_ROOT}/.runtime/jt128_nav_tools_overlay/install}` by `common_env.sh`. Without that overlay the preprocessor falls back to its old mixed QoS behavior and can reintroduce large-message queues. Debug commands, RViz/Foxglove views, and rosbag captures should not stay attached to `/lidar_points`; use status topics or reduced/debug branches where possible, and require explicit env flags for bagging high-density clouds.
+
+For accel-profile validation, use `set_pointcloud_accel_profile.sh`,
+`verify_pointcloud_accel_profile.sh`, and `run_pointcloud_accel_ab.sh`. A valid
+`ipc_worker` run keeps `/lidar_points` publisher count at one, keeps the trunk
+near vendor rate with full fields, leaves FAST-LIO2 non-resident during normal
+navigation, and still feeds Nav2 through `/perception/obstacle_points`,
+`/perception/clearing_points`, `/scan`, and `/flatscan`. Rollback is one command:
+`bash scripts/jetson/runtime_overlay/scripts/set_pointcloud_accel_profile.sh --profile legacy --restart`.
 
 `robot_local_perception` is pinned to the localization/local perception CPU set instead of sharing the Nav2 control CPU set or the raw remap ingress CPU. The local costmap, MPPI controller, collision monitor, and localization bridge need the control/TF cores to service TF message filters and command callbacks with low latency; obstacle filtering is a lidar-derived perception workload and should not compete with those callbacks or with full-size raw remap copies.
 
@@ -84,7 +107,7 @@ The occupancy localization mode may start or reuse localization-specific service
 
 Navigation resume gives the localization layer a short settle window (`NJRH_NAV_LOCALIZATION_START_SETTLE_SEC`, default 3 seconds), then runs a bounded deterministic startup chain before Nav2 is allowed to become ready. The chain waits for `/global_localization/trigger`, Isaac `/trigger_grid_search_localization`, `/map`, an observed `/flatscan` message, and a `/localization_result` publisher, sends one `/global_localization/trigger`, then requires a fresh `/localization_result` and live `map -> odom`. `/flatscan` is `isaac_ros_pointcloud_interfaces/msg/FlatScan`, not `sensor_msgs/msg/LaserScan`; `/scan` is the LaserScan intermediate. The FlatScan gate checks message flow rather than header freshness because the generic startup freshness tool intentionally supports only standard stamped ROS messages. This is the required localization sequence, not a high-frequency Python/rclpy graph watchdog.
 
-Standard Nav2 startup uses two lifecycle managers. `lifecycle_manager_costmap_filters` owns only the keepout/speed mask map servers and filter-info servers. `lifecycle_manager_navigation` owns the core controller, smoother, planner, behavior tree, waypoint follower, velocity smoother, and collision monitor nodes, and starts after `NJRH_NAV_LIFECYCLE_START_DELAY_SEC` seconds so the filter services and map-mask files are already stable. This avoids aborting the whole Nav2 bringup because a filter-mask load or planner/global-costmap configuration burst delays a lifecycle service response.
+Standard Nav2 startup uses two lifecycle managers. `lifecycle_manager_costmap_filters` owns only the keepout/speed mask map servers and filter-info servers. `lifecycle_manager_navigation` owns the core controller, smoother, planner, behavior tree, waypoint follower, velocity smoother, and collision monitor nodes, and starts after `NJRH_NAV_LIFECYCLE_START_DELAY_SEC` seconds (default 18 seconds) so the filter services and map-mask files are already stable. This avoids aborting the whole Nav2 bringup because a filter-mask load or planner/global-costmap configuration burst delays a lifecycle service response.
 
 The occupancy localization startup no longer waits on `/lidar_points` from shell. It launches the localization stack and leaves pointcloud freshness to explicit diagnostics, Isaac/localizer logs, and API goal admission. This prevents a manual navigation stop or short common-service recovery window from causing the resident navigation runtime to exit before Isaac localization and Nav2 are even launched.
 

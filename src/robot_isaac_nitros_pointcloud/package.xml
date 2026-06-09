@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>robot_isaac_nitros_pointcloud</name>
+  <version>0.1.0</version>
+  <description>Experimental NITROS same-process navigation pointcloud branch skeleton. It never replaces the full-density /lidar_points mapping trunk.</description>
+  <maintainer email="codex@example.com">Codex</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>robot_hesai_jt128</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

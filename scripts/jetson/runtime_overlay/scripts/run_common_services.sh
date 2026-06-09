@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/canonical_tf_helpers.sh"
 source "${SCRIPT_DIR}/nav_runtime_helpers.sh"
 source "${SCRIPT_DIR}/cpu_affinity.sh"
+source "${SCRIPT_DIR}/pointcloud_accel_profile.sh"
+njrh_load_pointcloud_accel_profile
 
 common_pids=()
 NAV_LOCAL_STATE_MODE="${NJRH_NAV_LOCAL_STATE_MODE:-ekf}"
@@ -49,10 +51,19 @@ start_common_process() {
 
 canonical_jt128_ingress_running() {
   local pointcloud_pipeline_pattern="pointcloud_perception_pipeline.launch.py|component_container_mt.*pointcloud_perception_pipeline|pointcloud_perception_pipeline"
-  local pointcloud_standalone_pattern="pointcloud_axis_remap"
+  local pointcloud_standalone_pattern="pointcloud_axis_remap|pointcloud_accel_axis"
   pgrep -f "hesai_ros_driver_node" >/dev/null 2>&1 &&
     { pgrep -f "${pointcloud_pipeline_pattern}" >/dev/null 2>&1 || pgrep -f "${pointcloud_standalone_pattern}" >/dev/null 2>&1; } &&
     pgrep -f "imu_axis_remap" >/dev/null 2>&1
+}
+
+pointcloud_accel_pipeline_aux_running() {
+  [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" != "legacy" ]] || return 0
+  pgrep -f "run_pointcloud_accel_pipeline.sh|laser_scan_to_flatscan" >/dev/null 2>&1
+}
+
+canonical_jt128_runtime_complete() {
+  canonical_jt128_ingress_running && pointcloud_accel_pipeline_aux_running
 }
 
 fastlio_runtime_running() {
@@ -246,11 +257,16 @@ trap on_signal INT TERM
 
 require_can_interface_up
 
-if reuse_common_services_enabled && canonical_jt128_ingress_running; then
+if reuse_common_services_enabled && canonical_jt128_runtime_complete; then
   echo "[runtime-overlay] reusing existing jt128_driver; canonical driver/remap chain is complete" >&2
 else
-  start_common_process "jt128_driver" "__njrh_force_start_jt128_driver_chain__" \
-    bash "${SCRIPT_DIR}/run_driver.sh"
+  if [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" == "legacy" ]]; then
+    start_common_process "jt128_driver" "__njrh_force_start_jt128_driver_chain__" \
+      bash "${SCRIPT_DIR}/run_driver.sh"
+  else
+    start_common_process "pointcloud_accel_pipeline" "__njrh_force_start_pointcloud_accel_pipeline__" \
+      bash "${SCRIPT_DIR}/run_pointcloud_accel_pipeline.sh"
+  fi
 fi
 start_canonical_helper "ranger_chassis_common" bash "${SCRIPT_DIR}/run_ranger_chassis.sh"
 start_canonical_helper "robot_description_static_tf_common" bash "${SCRIPT_DIR}/run_robot_description.sh"
@@ -282,7 +298,9 @@ if [[ "${NJRH_RUNTIME_HEALTH_GUARD_AUTOSTART:-false}" == "true" ]]; then
 else
   echo "[runtime-overlay] runtime_health_guard autostart disabled; startup readiness probes are disabled" >&2
 fi
-if [[ "${NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER:-false}" == "true" ]]; then
+if [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" != "legacy" ]]; then
+  echo "[runtime-overlay] local_perception is owned by pointcloud accel profile=${NJRH_POINTCLOUD_ACCEL_PROFILE}; skipping standalone local_perception_common" >&2
+elif [[ "${NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER:-false}" == "true" ]]; then
   echo "[runtime-overlay] local_perception is owned by pointcloud_perception_pipeline; skipping standalone local_perception_common" >&2
 else
   start_overlay_helper "local_perception_common" bash "${SCRIPT_DIR}/run_local_perception.sh"

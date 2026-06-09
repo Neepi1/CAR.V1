@@ -1,0 +1,80 @@
+pointcloud_axis_remap:
+  ros__parameters:
+    input_topic: /jt128/vendor/points_raw
+    output_topic: /lidar_points
+    output_frame_id: lidar_link
+    input_qos_depth: 1
+    input_reliable: false
+    output_qos_depth: 1
+    output_reliable: false
+    status_topic: /lidar/axis_remap_status
+    accel_status_topic: /lidar/pointcloud_accel_status
+    status_publish_period_sec: 1.0
+
+    # /lidar_points is always full-density/full-fields. The compact settings
+    # below affect only navigation/debug branches and never the canonical trunk.
+    accel_profile: ipc_worker
+    local_output_topic: /_internal/lidar_points_local
+    local_compact_enabled: true
+    local_compact_fields: xyzi
+    local_compact_stride: 4
+    local_compact_max_rate_hz: 12.0
+    local_output_qos_depth: 1
+    nav_output_topic: /lidar_points_nav
+    nav_compact_enabled: true
+    nav_compact_fields: xyzi
+    nav_compact_stride: 4
+    nav_compact_max_rate_hz: 10.0
+    nav_output_qos_depth: 1
+
+    worker_local_enabled: true
+    obstacle_output_topic: /perception/obstacle_points
+    clearing_output_topic: /perception/clearing_points
+    local_worker_output_frame_id: base_link
+    local_worker_rate_hz: 12.0
+    local_worker_range_min: 0.5
+    local_worker_range_max: 5.50
+    local_worker_min_z: 0.40
+    local_worker_max_z: 1.30
+    local_worker_min_angle_deg: -110.0
+    local_worker_max_angle_deg: 110.0
+    local_worker_point_stride: 1
+    local_worker_max_points: 12000
+    local_worker_self_mask_min_x: -0.50
+    local_worker_self_mask_max_x: 0.45
+    local_worker_self_mask_min_y: -0.40
+    local_worker_self_mask_max_y: 0.40
+    local_worker_self_mask_min_z: -0.20
+    local_worker_self_mask_max_z: 1.40
+    clearing_worker_rate_hz: 4.0
+    clearing_worker_range_min: 0.10
+    clearing_worker_range_max: 8.00
+    clearing_worker_min_z: -0.30
+    clearing_worker_max_z: 1.40
+    clearing_worker_point_stride: 2
+    clearing_worker_max_points: 15000
+
+    worker_scan_enabled: true
+    scan_output_topic: /scan
+    scan_worker_frame_id: lidar_level_link
+    scan_worker_rate_hz: 9.0
+    scan_worker_min_height: -0.75
+    scan_worker_max_height: 0.35
+    scan_worker_angle_min: -3.141592653589793
+    scan_worker_angle_max: 3.141592653589793
+    scan_worker_angle_increment: 0.004363323129985824
+    scan_worker_range_min: 0.25
+    scan_worker_range_max: 40.0
+    scan_worker_use_inf: true
+    scan_worker_inf_epsilon: 1.0
+
+    rotation_matrix:
+      - 0.0
+      - 1.0
+      - 0.0
+      - -1.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 1.0

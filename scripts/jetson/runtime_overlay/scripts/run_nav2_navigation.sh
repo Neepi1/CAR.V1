@@ -6,6 +6,8 @@ source "${SCRIPT_DIR}/canonical_tf_helpers.sh"
 source "${SCRIPT_DIR}/commercial_runtime_helpers.sh"
 source "${SCRIPT_DIR}/floor_asset_helpers.sh"
 source "${SCRIPT_DIR}/cpu_affinity.sh"
+source "${SCRIPT_DIR}/pointcloud_accel_profile.sh"
+njrh_load_pointcloud_accel_profile
 
 export NAV2_PARAMS_FILE="${NAV2_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/nav2.yaml}"
 LAUNCH_FILE="${NJRH_PROJECT_ROOT}/src/robot_bringup/launch/standard_navigation.launch.py"
@@ -124,7 +126,9 @@ ensure_resident_overlay_helper_process() {
 ensure_resident_overlay_helper_process "floor_manager" "floor_manager" bash "${SCRIPT_DIR}/run_floor_manager.sh"
 ensure_resident_overlay_helper_process "robot_safety" "robot_safety" bash "${SCRIPT_DIR}/run_robot_safety.sh"
 ensure_resident_overlay_helper_process "ranger_mini3_mode_controller" "ranger_mini3_mode_controller" bash "${SCRIPT_DIR}/run_ranger_mini3_mode_controller.sh"
-if [[ "${NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER:-false}" == "true" ]]; then
+if [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" != "legacy" ]]; then
+  echo "[runtime-overlay] local_perception is owned by pointcloud accel profile=${NJRH_POINTCLOUD_ACCEL_PROFILE}; skipping standalone local_perception helper" >&2
+elif [[ "${NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER:-false}" == "true" ]]; then
   echo "[runtime-overlay] local_perception is owned by pointcloud_perception_pipeline; skipping standalone local_perception helper" >&2
 else
   ensure_resident_overlay_helper_process "local_perception" "local_perception" bash "${SCRIPT_DIR}/run_local_perception.sh"

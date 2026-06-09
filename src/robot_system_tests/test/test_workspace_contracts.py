@@ -1172,6 +1172,7 @@ def test_project_runtime_helpers_are_wired():
     assert "cpu_affinity_prefix" in standard_navigation_launch
     assert "TimerAction" in standard_navigation_launch
     assert 'DeclareLaunchArgument(\n                "nav_lifecycle_start_delay"' in standard_navigation_launch
+    assert 'NJRH_NAV_LIFECYCLE_START_DELAY_SEC", "18.0"' in standard_navigation_launch
     assert "filter_lifecycle_nodes = [" in standard_navigation_launch
     assert "navigation_lifecycle_nodes = [" in standard_navigation_launch
     assert 'name="lifecycle_manager_costmap_filters"' in standard_navigation_launch
@@ -4209,3 +4210,191 @@ def test_phase112_cpu_irq_experiment_contracts():
     assert "trap cleanup_restore EXIT" in experiment
     assert "--keep-applied" in experiment
     assert "This experiment does not change ROS QoS" in experiment
+
+
+def test_phase113_pointcloud_accel_profile_contracts():
+    overlay = ROOT / "scripts" / "jetson" / "runtime_overlay"
+    scripts_dir = overlay / "scripts"
+    config_dir = overlay / "config"
+    launch_dir = overlay / "launch"
+
+    required_scripts = {
+        "pointcloud_accel_profile.sh",
+        "set_pointcloud_accel_profile.sh",
+        "run_pointcloud_accel_pipeline.sh",
+        "verify_pointcloud_accel_profile.sh",
+        "run_pointcloud_accel_ab.sh",
+        "check_isaac_ros_nitros_env.sh",
+    }
+    for name in required_scripts:
+        assert (scripts_dir / name).exists(), name
+
+    profile_env = (config_dir / "pointcloud_accel_profile.env").read_text(encoding="utf-8")
+    accel_cfg = (config_dir / "pointcloud_accel_axis.yaml").read_text(encoding="utf-8")
+    accel_profile = (scripts_dir / "pointcloud_accel_profile.sh").read_text(encoding="utf-8")
+    set_profile = (scripts_dir / "set_pointcloud_accel_profile.sh").read_text(encoding="utf-8")
+    run_pipeline = (scripts_dir / "run_pointcloud_accel_pipeline.sh").read_text(encoding="utf-8")
+    verify_profile = (scripts_dir / "verify_pointcloud_accel_profile.sh").read_text(encoding="utf-8")
+    ab_runner = (scripts_dir / "run_pointcloud_accel_ab.sh").read_text(encoding="utf-8")
+    nitros_check = (scripts_dir / "check_isaac_ros_nitros_env.sh").read_text(encoding="utf-8")
+    run_driver = (scripts_dir / "run_driver.sh").read_text(encoding="utf-8")
+    common_services = (scripts_dir / "run_common_services.sh").read_text(encoding="utf-8")
+    nav2_navigation = (scripts_dir / "run_nav2_navigation.sh").read_text(encoding="utf-8")
+    occupancy = (scripts_dir / "run_occupancy_grid_localization.sh").read_text(encoding="utf-8")
+    local_costmap_debug = (scripts_dir / "run_local_costmap_debug.sh").read_text(encoding="utf-8")
+    cpu_affinity = (config_dir / "cpu_affinity.env").read_text(encoding="utf-8")
+    nav2 = (config_dir / "nav2.yaml").read_text(encoding="utf-8")
+    common_env = (scripts_dir / "common_env.sh").read_text(encoding="utf-8")
+    accel_launch = (launch_dir / "pointcloud_accel_pipeline.launch.py").read_text(encoding="utf-8")
+    hesai_cmake = (ROOT / "src" / "robot_hesai_jt128" / "CMakeLists.txt").read_text(encoding="utf-8")
+    hesai_package = (ROOT / "src" / "robot_hesai_jt128" / "package.xml").read_text(encoding="utf-8")
+    legacy_axis = (ROOT / "src" / "robot_hesai_jt128" / "src" / "pointcloud_axis_remap_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    accel_axis = (ROOT / "src" / "robot_hesai_jt128" / "src" / "pointcloud_accel_axis_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    nitros_cmake = (ROOT / "src" / "robot_isaac_nitros_pointcloud" / "CMakeLists.txt").read_text(
+        encoding="utf-8"
+    )
+    nitros_package = (ROOT / "src" / "robot_isaac_nitros_pointcloud" / "package.xml").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'export NJRH_POINTCLOUD_ACCEL_PROFILE="${NJRH_POINTCLOUD_ACCEL_PROFILE:-legacy}"' in profile_env
+    assert "nitros" in accel_profile
+    assert "ipc_worker" in accel_profile
+    assert "--profile legacy|ipc_worker|nitros" in set_profile
+    assert "NJRH_POINTCLOUD_ACCEL_RESTART=true" in set_profile
+    assert "NITROS profile was not written" in set_profile
+    assert "pkill -9" not in set_profile
+    assert "killall" not in set_profile
+    assert "legacy)" in run_pipeline
+    assert "ipc_worker)" in run_pipeline
+    assert "nitros)" in run_pipeline
+    assert "NITROS profile not started" in run_pipeline
+    assert 'NJRH_FORCE_RESTART_DRIVER="${NJRH_FORCE_RESTART_DRIVER:-false}"' in run_pipeline
+    assert "run_local_perception.sh" in run_pipeline
+    assert "NJRH_POINTCLOUD_ACCEL_PROFILE=legacy" in run_pipeline
+    assert "laser_scan_to_flatscan" in run_pipeline
+    assert "pointcloud_accel_axis_node workers publish /perception/* and /scan" in run_pipeline
+    assert "pkill -9" not in run_pipeline
+    assert "killall" not in run_pipeline
+    assert "--duration-sec" in ab_runner
+    assert "pointcloud_accel_ab_" in ab_runner
+    assert "check_isaac_ros_nitros_env.sh" in run_pipeline
+    assert "isaac_ros_nitros" in nitros_check
+    assert "isaac_ros_managed_nitros" in nitros_check
+    assert "isaac_ros_nitros_point_cloud_type" in nitros_check
+    assert "NitrosPointCloud" in nitros_check
+    assert "use NJRH_POINTCLOUD_ACCEL_PROFILE=ipc_worker or legacy" in nitros_check
+
+    assert "pointcloud_accel_axis_node src/pointcloud_accel_axis_node.cpp" in hesai_cmake
+    assert "find_package(tf2_ros REQUIRED)" in hesai_cmake
+    assert "geometry_msgs" in hesai_cmake
+    assert "<depend>tf2_ros</depend>" in hesai_package
+    assert "<depend>geometry_msgs</depend>" in hesai_package
+    assert 'declare_parameter<std::string>("input_topic", "/jt128/vendor/points_raw")' in accel_axis
+    assert 'declare_parameter<std::string>("output_topic", "/lidar_points")' in accel_axis
+    assert 'declare_parameter<bool>("input_reliable", false)' in accel_axis
+    assert 'declare_parameter<bool>("output_reliable", false)' in accel_axis
+    assert "auto cloud = std::shared_ptr<sensor_msgs::msg::PointCloud2>(std::move(output))" in accel_axis
+    assert "trunk_publisher_->publish(*cloud)" in accel_axis
+    assert "latest_cloud_ = cloud" in accel_axis
+    assert accel_axis.index("trunk_publisher_->publish(*cloud)") < accel_axis.index("latest_cloud_ = cloud")
+    assert "local_worker_loop" in accel_axis
+    assert "scan_worker_loop" in accel_axis
+    assert "set_thread_name(\"pc_accel_local\")" in accel_axis
+    assert "set_thread_name(\"pc_accel_scan\")" in accel_axis
+    assert "local_compact_fields" in accel_axis
+    assert "nav_compact_fields" in accel_axis
+    assert "msg.point_step = 12U" in accel_axis
+    assert "msg.point_step = 16U" in accel_axis
+    assert "fast_path_raw_input_hz" in accel_axis
+    assert "trunk_publish_gap_over_150ms_count" in accel_axis
+    assert "trunk_output_subscription_count" in accel_axis
+    assert "local_worker_obstacle_publish_hz" in accel_axis
+    assert "scan_worker_scan_publish_hz" in accel_axis
+    assert "publish_downsample" not in accel_axis
+    assert "publisher_->publish(*output)" in legacy_axis
+    assert "publish_downsample(local_publisher_" in legacy_axis
+
+    assert "input_topic: /jt128/vendor/points_raw" in accel_cfg
+    assert "output_topic: /lidar_points" in accel_cfg
+    assert "output_qos_depth: 1" in accel_cfg
+    assert "output_reliable: false" in accel_cfg
+    assert "local_compact_fields: xyzi" in accel_cfg
+    assert "local_compact_stride: 4" in accel_cfg
+    assert "local_compact_max_rate_hz: 12.0" in accel_cfg
+    assert "nav_compact_fields: xyzi" in accel_cfg
+    assert "nav_compact_stride: 4" in accel_cfg
+    assert "nav_compact_max_rate_hz: 10.0" in accel_cfg
+    assert "obstacle_output_topic: /perception/obstacle_points" in accel_cfg
+    assert "clearing_output_topic: /perception/clearing_points" in accel_cfg
+    assert "scan_output_topic: /scan" in accel_cfg
+    assert "/points_nav" not in accel_cfg
+
+    assert 'source "${SCRIPT_DIR}/pointcloud_accel_profile.sh"' in run_driver
+    assert "njrh_load_pointcloud_accel_profile" in run_driver
+    assert "pointcloud_accel_axis.yaml" in run_driver
+    assert "pointcloud_accel_axis_node" in run_driver
+    assert "pointcloud_accel_container" in run_driver
+    assert '-p "accel_profile:=${NJRH_POINTCLOUD_ACCEL_PROFILE}"' in run_driver
+    assert "NJRH_JT128_ENABLE_POINTCLOUD_DOWNSAMPLE=false" in run_driver
+    assert "pointcloud_axis_remap|pointcloud_accel_axis" in run_driver
+    assert "canonical /lidar_points" in run_driver
+
+    assert "pointcloud_accel_pipeline_aux_running" in common_services
+    assert "run_pointcloud_accel_pipeline.sh" in common_services
+    assert "local_perception is owned by pointcloud accel profile" in common_services
+    assert "local_perception is owned by pointcloud accel profile" in nav2_navigation
+    assert "local_perception is owned by pointcloud accel profile" in local_costmap_debug
+    assert "occupancy_localization.launch.py" in occupancy
+    assert "occupancy_localization_stack.launch.py" in occupancy
+    assert "ensure_pointcloud_accel_pipeline_for_localization" in occupancy
+    assert "pointcloud accel pipeline already running" in occupancy
+    assert "pointcloud_accel_pipeline_localization" in occupancy
+    assert "laser_scan_to_flatscan" in occupancy
+    assert "pointcloud accel profile=${NJRH_POINTCLOUD_ACCEL_PROFILE}" in occupancy
+
+    assert "NJR H_CPUSET_POINTCLOUD_ACCEL" not in cpu_affinity
+    assert "NJRH_CPUSET_POINTCLOUD_ACCEL_CONTAINER" in cpu_affinity
+    assert "NJRH_CPUSET_POINTCLOUD_ACCEL_LOCAL_WORKER" in cpu_affinity
+    assert "NJRH_CPUSET_POINTCLOUD_ACCEL_SCAN_WORKER" in cpu_affinity
+    assert "NJRH_CPUSET_NITROS_POINTCLOUD_CONTAINER" in cpu_affinity
+
+    assert "/perception/obstacle_points" in nav2
+    assert "/perception/clearing_points" in nav2
+    assert 'plugin: "nav2_smac_planner/SmacPlanner2D"' in nav2
+    assert 'primary_controller: "nav2_mppi_controller::MPPIController"' in nav2
+    assert 'plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"' in nav2
+    assert 'export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"' in common_env
+    assert 'export FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}"' in common_env
+    assert "rmw_cyclonedds_cpp" not in common_env
+
+    assert "current NJRH_POINTCLOUD_ACCEL_PROFILE" in verify_profile
+    assert "/lidar_points publisher count" in verify_profile
+    assert "axis publish hz" in verify_profile
+    assert "obstacle_hz" in verify_profile
+    assert "scan_hz" in verify_profile
+    assert "flatscan_hz" in verify_profile
+    assert "FAST-LIO2 residual" in verify_profile
+    assert "local_costmap subscribes" in verify_profile
+    assert "PointCloud2 QoS" in verify_profile
+    assert "DDS transport env" in verify_profile
+
+    assert "ComposableNodeContainer" not in accel_launch
+    assert "pointcloud_accel_axis_node" in accel_launch
+    assert "laser_scan_to_flatscan" in accel_launch
+    assert "ROBOT_ISAAC_NITROS_POINTCLOUD_ENABLE" in nitros_cmake
+    assert "OFF" in nitros_cmake
+    assert "isaac_ros_nitros" in nitros_cmake
+    assert "<depend>isaac_ros_nitros</depend>" not in nitros_package
+    nitros_launch = (
+        ROOT / "src" / "robot_isaac_nitros_pointcloud" / "launch" / "nitros_pointcloud_branch.launch.py"
+    ).read_text(encoding="utf-8")
+    assert "same-process component container" in nitros_launch
+    assert "PointCloud2" not in accel_launch
+    assert "sensor_msgs.msg" not in accel_launch
+    assert "create_subscription" not in accel_launch
+    assert "create_publisher" not in accel_launch

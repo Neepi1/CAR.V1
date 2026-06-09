@@ -107,7 +107,7 @@ def generate_launch_description():
             DeclareLaunchArgument("use_composition", default_value="False"),
             DeclareLaunchArgument(
                 "nav_lifecycle_start_delay",
-                default_value=os.environ.get("NJRH_NAV_LIFECYCLE_START_DELAY_SEC", "3.0"),
+                default_value=os.environ.get("NJRH_NAV_LIFECYCLE_START_DELAY_SEC", "18.0"),
             ),
             DeclareLaunchArgument("log_level", default_value="info"),
             Node(

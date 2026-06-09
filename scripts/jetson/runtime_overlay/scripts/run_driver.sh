@@ -8,7 +8,9 @@ unset NJRH_COMMON_ENV_SETUP_DONE
 source "${SCRIPT_DIR}/common_env.sh"
 source "${SCRIPT_DIR}/cpu_affinity.sh"
 source "${SCRIPT_DIR}/local_perception_profile.sh"
+source "${SCRIPT_DIR}/pointcloud_accel_profile.sh"
 njrh_load_local_perception_input_profile
+njrh_load_pointcloud_accel_profile
 
 CONFIG_FILE="${NJRH_HESAI_CONFIG_FILE:-${UPSTREAM_WS}/src/hesai_lidar_ros2/config/config.yaml}"
 export DRIVER_PROFILE="${DRIVER_PROFILE:-mapping}"
@@ -19,18 +21,31 @@ export POINTS_TOPIC="${NJRH_JT128_POINTS_TOPIC:-/lidar_points}"
 export IMU_TOPIC="${NJRH_JT128_IMU_TOPIC:-/lidar_imu}"
 export VENDOR_POINTS_TOPIC="${NJRH_JT128_VENDOR_POINTS_TOPIC:-/jt128/vendor/points_raw}"
 export VENDOR_IMU_TOPIC="${NJRH_JT128_VENDOR_IMU_TOPIC:-/jt128/vendor/imu_raw}"
-export POINTCLOUD_REMAP_CONFIG="${NJRH_JT128_CANONICAL_POINTCLOUD_REMAP_CONFIG:-${NJRH_OVERLAY_ROOT}/config/jt128_canonical_pointcloud_remap.yaml}"
+if [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" == "legacy" ]]; then
+  export POINTCLOUD_REMAP_CONFIG="${NJRH_JT128_CANONICAL_POINTCLOUD_REMAP_CONFIG:-${NJRH_OVERLAY_ROOT}/config/jt128_canonical_pointcloud_remap.yaml}"
+else
+  export POINTCLOUD_REMAP_CONFIG="${NJRH_POINTCLOUD_ACCEL_AXIS_CONFIG:-${NJRH_OVERLAY_ROOT}/config/pointcloud_accel_axis.yaml}"
+fi
 export POINTCLOUD_DOWNSAMPLE_CONFIG="${NJRH_JT128_POINTCLOUD_DOWNSAMPLE_CONFIG:-${NJRH_OVERLAY_ROOT}/config/jt128_pointcloud_downsample.yaml}"
 export IMU_REMAP_CONFIG="${NJRH_JT128_CANONICAL_IMU_REMAP_CONFIG:-${NJRH_OVERLAY_ROOT}/config/jt128_canonical_imu_remap.yaml}"
 export POINTCLOUD_PIPELINE_LAUNCH="${NJRH_POINTCLOUD_PIPELINE_LAUNCH:-${NJRH_OVERLAY_ROOT}/launch/pointcloud_perception_pipeline.launch.py}"
 export LOCAL_PERCEPTION_CONFIG="${LOCAL_PERCEPTION_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/local_perception.yaml}"
-export POINTCLOUD_REMAP_CPP_BIN="${NJRH_POINTCLOUD_REMAP_CPP_BIN:-${NJRH_PROJECT_ROOT}/install/robot_hesai_jt128/lib/robot_hesai_jt128/pointcloud_axis_remap_node}"
+if [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" == "legacy" ]]; then
+  export POINTCLOUD_REMAP_CPP_BIN="${NJRH_POINTCLOUD_REMAP_CPP_BIN:-${NJRH_PROJECT_ROOT}/install/robot_hesai_jt128/lib/robot_hesai_jt128/pointcloud_axis_remap_node}"
+else
+  export POINTCLOUD_REMAP_CPP_BIN="${NJRH_POINTCLOUD_ACCEL_AXIS_BIN:-${NJRH_PROJECT_ROOT}/install/robot_hesai_jt128/lib/robot_hesai_jt128/pointcloud_accel_axis_node}"
+fi
 export POINTCLOUD_DOWNSAMPLE_CPP_BIN="${NJRH_POINTCLOUD_DOWNSAMPLE_CPP_BIN:-${NJRH_PROJECT_ROOT}/install/robot_hesai_jt128/lib/robot_hesai_jt128/pointcloud_downsample_node}"
 export IMU_REMAP_CPP_BIN="${NJRH_IMU_REMAP_CPP_BIN:-${NJRH_PROJECT_ROOT}/install/robot_hesai_jt128/lib/robot_hesai_jt128/imu_axis_remap_node}"
 export NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER="${NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER:-false}"
 export NJRH_JT128_ENABLE_POINTCLOUD_DOWNSAMPLE="${NJRH_JT128_ENABLE_POINTCLOUD_DOWNSAMPLE:-false}"
+if [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" != "legacy" ]]; then
+  export NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER=false
+  export NJRH_JT128_ENABLE_POINTCLOUD_DOWNSAMPLE=false
+fi
 UPSTREAM_DRIVER_PROFILE="${NJRH_HESAI_UPSTREAM_DRIVER_PROFILE}"
 
+njrh_print_pointcloud_accel_profile
 njrh_print_local_perception_profile
 
 [[ -f "${CONFIG_FILE}" ]] || {
@@ -88,7 +103,7 @@ jt128_pointcloud_remap_running() {
   if [[ "${NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER}" == "true" ]]; then
     pgrep -f "pointcloud_perception_pipeline.launch.py|component_container_mt.*pointcloud_perception_pipeline|pointcloud_perception_pipeline" >/dev/null 2>&1
   else
-    pgrep -f "pointcloud_axis_remap" >/dev/null 2>&1
+    pgrep -f "pointcloud_axis_remap|pointcloud_accel_axis" >/dev/null 2>&1
   fi
 }
 
@@ -118,11 +133,11 @@ any_jt128_ingress_process_running() {
 }
 
 stop_jt128_ingress_processes() {
-  for pattern in "hesai_ros_driver_node" "ros2 run hesai_ros_driver" "imu_axis_remap" "pointcloud_perception_pipeline.launch.py" "component_container_mt.*pointcloud_perception_pipeline" "pointcloud_axis_remap" "pointcloud_fastlio_remap" "pointcloud_downsample"; do
+  for pattern in "hesai_ros_driver_node" "ros2 run hesai_ros_driver" "imu_axis_remap" "pointcloud_perception_pipeline.launch.py" "component_container_mt.*pointcloud_perception_pipeline" "pointcloud_axis_remap" "pointcloud_accel_axis" "pointcloud_fastlio_remap" "pointcloud_downsample"; do
     pkill -INT -f "$pattern" 2>/dev/null || true
   done
   sleep 1
-  for pattern in "hesai_ros_driver_node" "ros2 run hesai_ros_driver" "imu_axis_remap" "pointcloud_perception_pipeline.launch.py" "component_container_mt.*pointcloud_perception_pipeline" "pointcloud_axis_remap" "pointcloud_fastlio_remap" "pointcloud_downsample"; do
+  for pattern in "hesai_ros_driver_node" "ros2 run hesai_ros_driver" "imu_axis_remap" "pointcloud_perception_pipeline.launch.py" "component_container_mt.*pointcloud_perception_pipeline" "pointcloud_axis_remap" "pointcloud_accel_axis" "pointcloud_fastlio_remap" "pointcloud_downsample"; do
     pkill -9 -f "$pattern" 2>/dev/null || true
   done
 }
@@ -191,6 +206,11 @@ else
   }
   echo "[runtime-overlay] using compiled pointcloud remap: ${POINTCLOUD_REMAP_CPP_BIN}" >&2
   pointcloud_remap_args=(--ros-args --params-file "${POINTCLOUD_REMAP_CONFIG}")
+  if [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" != "legacy" ]]; then
+    pointcloud_remap_args+=(
+      -p "accel_profile:=${NJRH_POINTCLOUD_ACCEL_PROFILE}"
+    )
+  fi
   if [[ -n "${RESOLVED_AXIS_LOCAL_OUTPUT_TOPIC}" ]]; then
     pointcloud_remap_args+=(
       -p "local_output_topic:=${RESOLVED_AXIS_LOCAL_OUTPUT_TOPIC}"
@@ -198,7 +218,11 @@ else
       -p "local_output_publish_every_n:=${RESOLVED_AXIS_LOCAL_OUTPUT_PUBLISH_EVERY_N}"
     )
   fi
-  njrh_run_affined pointcloud_axis_remap \
+  pointcloud_remap_service="pointcloud_axis_remap"
+  if [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" != "legacy" ]]; then
+    pointcloud_remap_service="pointcloud_accel_container"
+  fi
+  njrh_run_affined "${pointcloud_remap_service}" \
     "${POINTCLOUD_REMAP_CPP_BIN}" "${pointcloud_remap_args[@]}" &
   pointcloud_remap_pid=$!
 fi

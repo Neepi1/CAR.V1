@@ -531,6 +531,12 @@ private:
            << " output_topic=" << output_topic_
            << " raw_input_hz=" << static_cast<double>(raw_delta) / elapsed_sec
            << " lidar_points_publish_hz=" << static_cast<double>(publish_delta) / elapsed_sec
+           << " fast_path_raw_input_hz=" << static_cast<double>(raw_delta) / elapsed_sec
+           << " fast_path_lidar_points_publish_hz=" << static_cast<double>(publish_delta) / elapsed_sec
+           << " fast_path_duration_ms=" << last_raw_callback_duration_ms_
+           << " latest_buffer_update_hz=" << static_cast<double>(publish_delta) / elapsed_sec
+           << " latest_buffer_points=" << last_cloud_points_
+           << " latest_buffer_bytes=" << last_cloud_bytes_
            << " last_raw_age_ms=" << raw_age_ms
            << " last_raw_stamp_age_ms=" << raw_stamp_age_ms
            << " last_publish_age_ms=" << publish_age_ms
@@ -553,6 +559,10 @@ private:
            << " last_cloud_points=" << last_cloud_points_
            << " last_cloud_bytes=" << last_cloud_bytes_
            << " output_subscription_count=" << last_output_subscription_count_
+           << " trunk_output_subscription_count=" << last_output_subscription_count_
+           << " accel_profile=legacy"
+           << " worker_local_enabled=false"
+           << " worker_scan_enabled=false"
            << " nav_branch_enabled=" << (nav_publisher_ ? "true" : "false")
            << " local_branch_enabled=" << (local_publisher_ ? "true" : "false")
            << " nav_branch_attempt_count=" << nav_branch_.attempt_count
@@ -579,6 +589,18 @@ private:
            << " local_output_stride=" << local_output_stride_
            << " local_output_publish_every_n=" << local_output_publish_every_n_
            << " local_branch_publish_count=" << local_branch_.publish_count
+           << " local_compact_last_points=" << local_branch_.last_points
+           << " local_compact_last_bytes=" << local_branch_.last_bytes
+           << " local_compact_bytes_per_point=" <<
+      (local_branch_.last_points > 0U ? local_branch_.last_bytes / local_branch_.last_points : 0U)
+           << " local_compact_publish_hz=" << static_cast<double>(local_publish_delta) / elapsed_sec
+           << " local_compact_skip_busy_count=0"
+           << " nav_compact_last_points=" << nav_branch_.last_points
+           << " nav_compact_last_bytes=" << nav_branch_.last_bytes
+           << " nav_compact_bytes_per_point=" <<
+      (nav_branch_.last_points > 0U ? nav_branch_.last_bytes / nav_branch_.last_points : 0U)
+           << " nav_compact_publish_hz=" << static_cast<double>(nav_publish_delta) / elapsed_sec
+           << " nav_compact_skip_busy_count=0"
            << " dropped_or_skipped_count=" << dropped_or_skipped_count_
            << " node_uptime_sec=" << uptime_sec;
     msg.data = stream.str();

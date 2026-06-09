@@ -7,9 +7,15 @@ source "${SCRIPT_DIR}/nav_runtime_helpers.sh"
 source "${SCRIPT_DIR}/map_server_helpers.sh"
 source "${SCRIPT_DIR}/floor_asset_helpers.sh"
 source "${SCRIPT_DIR}/cpu_affinity.sh"
+source "${SCRIPT_DIR}/pointcloud_accel_profile.sh"
+njrh_load_pointcloud_accel_profile
 
 export PUBLISH_LIDAR_TF="${PUBLISH_LIDAR_TF:-false}"
-LAUNCH_FILE="${NJRH_OVERLAY_ROOT}/launch/occupancy_localization_stack.launch.py"
+if [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" == "legacy" ]]; then
+  LAUNCH_FILE="${NJRH_OVERLAY_ROOT}/launch/occupancy_localization_stack.launch.py"
+else
+  LAUNCH_FILE="${NJRH_OVERLAY_ROOT}/launch/occupancy_localization.launch.py"
+fi
 NAV_LOCAL_STATE_MODE="${NJRH_NAV_LOCAL_STATE_MODE:-ekf}"
 POINTS_TOPIC="${NJRH_LOCALIZATION_POINTS_TOPIC:-/lidar_points_nav}"
 FASTLIO_POINTS_TOPIC="${NJRH_FASTLIO_POINTS_TOPIC:-/cloud_registered_body}"
@@ -94,19 +100,32 @@ patterns=(
   "ros2 launch .*jt128_occupancy_localization_stack.launch.py"
   "jt128_occupancy_localization_stack.launch.py"
   "jt128_occupancy_localization.launch.py"
-  "jt128_nav_sensing.launch.py"
   "occupancy_grid_localizer_container"
   "occupancy_grid_localizer"
   "map_to_odom_tf_bridge"
-  "laser_scan_to_flatscan"
-  "pointcloud_to_laserscan_node"
-  "pointcloud_to_laserscan"
-  "robot_hesai_jt128/scan_republisher_node"
-  "scan_republisher_node"
-  "nav_cloud_preprocessor"
   "map_server"
   "lifecycle_manager_map"
 )
+if [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" == "legacy" ]]; then
+  patterns+=(
+    "jt128_nav_sensing.launch.py"
+    "laser_scan_to_flatscan"
+    "pointcloud_to_laserscan_node"
+    "pointcloud_to_laserscan"
+    "robot_hesai_jt128/scan_republisher_node"
+    "scan_republisher_node"
+    "nav_cloud_preprocessor"
+  )
+else
+  patterns+=(
+    "jt128_nav_sensing.launch.py"
+    "pointcloud_to_laserscan_node"
+    "pointcloud_to_laserscan"
+    "robot_hesai_jt128/scan_republisher_node"
+    "scan_republisher_node"
+    "nav_cloud_preprocessor"
+  )
+fi
 
 for pattern in "${patterns[@]}"; do
   pkill -INT -f "$pattern" 2>/dev/null || true
@@ -140,9 +159,19 @@ launch_args=(
   "map_yaml:=${NAV2_MAP_YAML}"
   "localizer_map_yaml:=${LOCALIZER_MAP_YAML}"
   "use_sim_time:=false"
-  "publish_lidar_tf:=${PUBLISH_LIDAR_TF}"
-  "points_topic:=${POINTS_TOPIC}"
 )
+if [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" == "legacy" ]]; then
+  launch_args+=(
+    "publish_lidar_tf:=${PUBLISH_LIDAR_TF}"
+    "points_topic:=${POINTS_TOPIC}"
+  )
+else
+  launch_args+=(
+    "start_map_server:=true"
+    "map_frame:=map"
+  )
+  echo "[runtime-overlay] pointcloud accel profile=${NJRH_POINTCLOUD_ACCEL_PROFILE}; occupancy localization reuses /scan and /flatscan from pointcloud_accel_pipeline instead of launching /points_nav legacy sensing" >&2
+fi
 
 wait_for_child_exit() {
   local pid="$1"
@@ -199,6 +228,24 @@ ensure_localization_pointcloud_ready() {
   return 0
 }
 
+pointcloud_accel_pipeline_runtime_running() {
+  [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" != "legacy" ]] || return 0
+  pgrep -f "run_pointcloud_accel_pipeline.sh|pointcloud_accel_axis_node|laser_scan_to_flatscan" >/dev/null 2>&1
+}
+
+ensure_pointcloud_accel_pipeline_for_localization() {
+  [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" != "legacy" ]] || return 0
+  if pointcloud_accel_pipeline_runtime_running; then
+    echo "[runtime-overlay] pointcloud accel pipeline already running for localization profile=${NJRH_POINTCLOUD_ACCEL_PROFILE}" >&2
+    return 0
+  fi
+  echo "[runtime-overlay] starting pointcloud accel pipeline for localization profile=${NJRH_POINTCLOUD_ACCEL_PROFILE}" >&2
+  start_overlay_helper "pointcloud_accel_pipeline_localization" env \
+    NJRH_FORCE_RESTART_DRIVER="${NJRH_POINTCLOUD_ACCEL_FORCE_RESTART_DRIVER:-false}" \
+    bash "${SCRIPT_DIR}/run_pointcloud_accel_pipeline.sh"
+  sleep "${NJRH_POINTCLOUD_ACCEL_START_SETTLE_SEC:-3}"
+}
+
 if [[ -n "${NAV2_LOCALIZER_PARAMS}" ]]; then
   launch_args+=("localizer_params:=${NAV2_LOCALIZER_PARAMS}")
 fi
@@ -243,6 +290,7 @@ ensure_resident_local_state_for_localization() {
 
 start_canonical_helper "ranger_chassis_localization" bash "${SCRIPT_DIR}/run_ranger_chassis.sh"
 start_canonical_helper "robot_description_static_tf_localization" bash "${SCRIPT_DIR}/run_robot_description.sh"
+ensure_pointcloud_accel_pipeline_for_localization
 ensure_localization_pointcloud_ready
 if [[ "${NAV_LOCAL_STATE_MODE}" == "fastlio" ]]; then
   ensure_resident_fastlio_for_local_state || exit 1
