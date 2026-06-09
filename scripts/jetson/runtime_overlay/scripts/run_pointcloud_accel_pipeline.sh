@@ -11,9 +11,17 @@ njrh_load_pointcloud_accel_profile
 PROFILE="${NJRH_POINTCLOUD_ACCEL_PROFILE}"
 RESTART="${NJRH_POINTCLOUD_ACCEL_RESTART:-false}"
 FLATSCAN_PARAMS="${NJRH_POINTCLOUD_ACCEL_FLATSCAN_PARAMS:-${NJRH_OVERLAY_ROOT}/config/jt128_flatscan.yaml}"
+LEGACY_SCAN_PREPROCESSOR_PARAMS="${NJRH_LEGACY_SCAN_PREPROCESSOR_PARAMS:-${NJRH_OVERLAY_ROOT}/config/jt128_nav_cloud_preprocessor.yaml}"
+LEGACY_SCAN_PARAMS="${NJRH_LEGACY_SCAN_PARAMS:-${NJRH_OVERLAY_ROOT}/config/jt128_scan_slam2d.yaml}"
+LEGACY_SCAN_FLATSCAN_PARAMS="${NJRH_LEGACY_SCAN_FLATSCAN_PARAMS:-${NJRH_OVERLAY_ROOT}/config/jt128_flatscan.yaml}"
+LEGACY_SCAN_POINTS_TOPIC="${NJRH_LEGACY_SCAN_POINTS_TOPIC:-/lidar_points_nav}"
+LEGACY_SCAN_NAV_POINTS_TOPIC="${NJRH_LEGACY_SCAN_NAV_POINTS_TOPIC:-/points_nav}"
+LEGACY_SCAN_TOPIC="${NJRH_LEGACY_SCAN_TOPIC:-/scan}"
+LEGACY_SCAN_FLATSCAN_TOPIC="${NJRH_LEGACY_SCAN_FLATSCAN_TOPIC:-/flatscan}"
 
 driver_pid=""
 local_perception_pid=""
+legacy_scan_pid=""
 flatscan_pid=""
 
 truthy() {
@@ -26,6 +34,7 @@ truthy() {
 stop_pointcloud_profile_processes() {
   local patterns=(
     "pointcloud_accel_axis_node"
+    "pointcloud_axis_remap_node"
     "pointcloud_axis_remap"
     "pointcloud_perception_pipeline.launch.py"
     "component_container_mt.*pointcloud_perception_pipeline"
@@ -43,12 +52,38 @@ stop_pointcloud_profile_processes() {
     pkill -INT -f "${pattern}" 2>/dev/null || true
   done
   sleep 1
+  for pattern in "${patterns[@]}"; do
+    pkill -TERM -f "${pattern}" 2>/dev/null || true
+  done
+  sleep 1
+}
+
+profile_process_running() {
+  pgrep -f "$1" >/dev/null 2>&1
+}
+
+legacy_scan_chain_running() {
+  profile_process_running "nav_cloud_preprocessor" \
+    && profile_process_running "pointcloud_to_laserscan" \
+    && profile_process_running "scan_republisher" \
+    && profile_process_running "laser_scan_to_flatscan"
+}
+
+legacy_scan_chain_partial_running() {
+  local running=0
+  profile_process_running "nav_cloud_preprocessor" && running=$((running + 1))
+  profile_process_running "pointcloud_to_laserscan" && running=$((running + 1))
+  profile_process_running "scan_republisher" && running=$((running + 1))
+  profile_process_running "laser_scan_to_flatscan" && running=$((running + 1))
+  [[ "${running}" -gt 0 && "${running}" -lt 4 ]]
 }
 
 cleanup() {
+  [[ -n "${legacy_scan_pid}" ]] && kill -INT "${legacy_scan_pid}" 2>/dev/null || true
   [[ -n "${flatscan_pid}" ]] && kill -INT "${flatscan_pid}" 2>/dev/null || true
   [[ -n "${local_perception_pid}" ]] && kill -INT "${local_perception_pid}" 2>/dev/null || true
   [[ -n "${driver_pid}" ]] && kill -INT "${driver_pid}" 2>/dev/null || true
+  [[ -n "${legacy_scan_pid}" ]] && wait "${legacy_scan_pid}" 2>/dev/null || true
   [[ -n "${flatscan_pid}" ]] && wait "${flatscan_pid}" 2>/dev/null || true
   [[ -n "${local_perception_pid}" ]] && wait "${local_perception_pid}" 2>/dev/null || true
   [[ -n "${driver_pid}" ]] && wait "${driver_pid}" 2>/dev/null || true
@@ -73,7 +108,24 @@ case "${PROFILE}" in
     sleep 5
     env NJRH_POINTCLOUD_ACCEL_PROFILE=legacy bash "${SCRIPT_DIR}/run_local_perception.sh" &
     local_perception_pid=$!
-    echo "[pointcloud-accel] final topology: /lidar_points full trunk; /_internal/lidar_points_local -> robot_local_perception -> /perception/*; localization scan chain remains legacy-owned by occupancy runtime" >&2
+    if legacy_scan_chain_running; then
+      echo "[pointcloud-accel] legacy scan chain already running; reusing" >&2
+    elif legacy_scan_chain_partial_running; then
+      echo "[pointcloud-accel] WARN legacy scan chain is partially running; use --restart to stop stale pointcloud profile processes before recovery" >&2
+    elif ros2 pkg prefix jt128_nav_tools >/dev/null 2>&1 && ros2 pkg prefix pointcloud_to_laserscan >/dev/null 2>&1; then
+      ros2 launch "${NJRH_OVERLAY_ROOT}/launch/jt128_localization_sensing.launch.py" \
+        preprocessor_params:="${LEGACY_SCAN_PREPROCESSOR_PARAMS}" \
+        scan_params:="${LEGACY_SCAN_PARAMS}" \
+        flatscan_params:="${LEGACY_SCAN_FLATSCAN_PARAMS}" \
+        points_topic:="${LEGACY_SCAN_POINTS_TOPIC}" \
+        nav_points_topic:="${LEGACY_SCAN_NAV_POINTS_TOPIC}" \
+        scan_topic:="${LEGACY_SCAN_TOPIC}" \
+        flatscan_topic:="${LEGACY_SCAN_FLATSCAN_TOPIC}" &
+      legacy_scan_pid=$!
+    else
+      echo "[pointcloud-accel] WARN legacy sensing dependencies are unavailable; /scan and /flatscan will not be restored by this profile restart" >&2
+    fi
+    echo "[pointcloud-accel] final topology: /lidar_points full trunk; /_internal/lidar_points_local -> robot_local_perception -> /perception/*; /lidar_points_nav -> /points_nav -> /scan -> /flatscan" >&2
     ;;
   ipc_worker)
     echo "[pointcloud-accel] starting ipc_worker fast trunk + same-process worker pipeline" >&2

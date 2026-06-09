@@ -138,15 +138,16 @@ stop_jt128_ingress_processes() {
   done
   sleep 1
   for pattern in "hesai_ros_driver_node" "ros2 run hesai_ros_driver" "imu_axis_remap" "pointcloud_perception_pipeline.launch.py" "component_container_mt.*pointcloud_perception_pipeline" "pointcloud_axis_remap" "pointcloud_accel_axis" "pointcloud_fastlio_remap" "pointcloud_downsample"; do
-    pkill -9 -f "$pattern" 2>/dev/null || true
+    pkill -TERM -f "$pattern" 2>/dev/null || true
   done
+  sleep 1
 }
 
 if [[ "${NJRH_JT128_ENABLE_POINTCLOUD_DOWNSAMPLE}" != "true" ]] && jt128_pointcloud_downsample_running; then
   echo "[runtime-overlay] stopping diagnostic pointcloud_downsample; production /lidar_points is produced by pointcloud_axis_remap" >&2
   pkill -INT -f "pointcloud_downsample" 2>/dev/null || true
   sleep 1
-  pkill -9 -f "pointcloud_downsample" 2>/dev/null || true
+  pkill -TERM -f "pointcloud_downsample" 2>/dev/null || true
   stopped_disabled_pointcloud_downsample="true"
 fi
 

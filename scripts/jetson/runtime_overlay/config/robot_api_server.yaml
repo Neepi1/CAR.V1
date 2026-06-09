@@ -73,6 +73,8 @@ robot_api_server:
     tf_base_frame: "base_link"
     tf_pose_max_age_sec: 2.0
     robot_pose_freshness_sec: 0.5
+    tf_chain_freshness_sec: 0.30
+    tf_chain_settle_timeout_sec: 2.0
 
     teleop_cmd_topic: "/cmd_vel_collision_checked"
     teleop_reverse_enable_topic: "/ranger_mini3/teleop_allow_reverse"
@@ -89,17 +91,35 @@ robot_api_server:
 
     service_timeout_sec: 8.0
     navigation_cancel_action_wait_sec: 0.75
+    docking_stop_service_wait_sec: 3.0
     localization_trigger_service_timeout_sec: 15.0
     localization_bridge_acceptance_timeout_sec: 3.0
     localization_bridge_acceptance_max_distance_m: 1.0
     localization_bridge_acceptance_max_yaw_rad: 0.35
+    # Enable the pre-goal relocalization gate, but do not force a map->odom
+    # update before every normal same-map goal. Cold/unconfirmed runtime
+    # context, stale map-frame pose, undock, docking, or explicit
+    # force_relocalize requests still trigger localization.
     navigation_relocalize_before_goal: true
+    navigation_relocalize_before_goal_always: false
     navigation_relocalize_before_goal_required: true
     navigation_relocalize_wait_sec: 8.0
     navigation_goal_result_timeout_sec: 600.0
-    navigation_goal_position_success_tolerance_m: 0.30
+    navigation_goal_position_success_tolerance_m: 0.20
     navigation_final_yaw_align_enable: true
-    navigation_final_yaw_tolerance_rad: 0.15
+    navigation_final_yaw_tolerance_rad: 0.05
+    navigation_final_yaw_align_trigger_rad: 0.08
     navigation_final_yaw_align_speed_radps: 0.25
-    navigation_final_yaw_align_timeout_sec: 4.0
+    navigation_final_yaw_align_min_speed_radps: 0.06
+    navigation_final_yaw_align_kp: 1.2
+    navigation_final_yaw_align_max_speed_radps: 0.25
+    navigation_final_yaw_align_timeout_sec: 8.0
+    navigation_final_yaw_align_max_xy_drift_m: 0.08
+    navigation_final_yaw_align_require_fresh_pose: true
+    # First field version keeps final yaw on /cmd_vel_collision_checked:
+    # robot_safety remains authoritative, but collision_monitor is bypassed
+    # until a dedicated cmd_vel_nav mux is introduced.
+    navigation_final_yaw_align_cmd_topic: "/cmd_vel_collision_checked"
+    navigation_final_yaw_align_bypass_collision_monitor: true
+    navigation_final_yaw_align_zero_cmd_count: 3
     navigation_lifecycle_check_timeout_sec: 0.35

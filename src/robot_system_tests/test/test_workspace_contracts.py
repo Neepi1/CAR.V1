@@ -13,6 +13,24 @@ def local_costmap_config_block(nav2_yaml: str) -> str:
     return nav2_yaml[start:end]
 
 
+def assert_nav2_local_costmap_frame_contract(nav2_yaml: str, local_costmap: str) -> None:
+    assert "global_frame: odom" in local_costmap
+    assert "global_frame: base_link" not in local_costmap
+    assert "robot_base_frame: base_link" in local_costmap
+    assert "required_movement_radius:" in nav2_yaml
+    assert "movement_time_allowance:" in nav2_yaml
+    assert (
+        "        obstacle_points:\n"
+        "          topic: /perception/obstacle_points\n"
+        "          sensor_frame: base_link\n"
+    ) in local_costmap
+    assert (
+        "        clearing_points:\n"
+        "          topic: /perception/clearing_points\n"
+        "          sensor_frame: base_link\n"
+    ) in local_costmap
+
+
 def test_reports_exist():
     for name in (
         "car_project_reuse_report.md",
@@ -55,8 +73,12 @@ def test_nav_defaults_are_fixed():
     assert "z_voxels: 16" in nav2
     assert "min_obstacle_height: -0.20" in nav2
     assert "max_obstacle_height: 1.40" in nav2
-    assert "global_frame: base_link" in nav2_local_costmap
-    assert "global_frame: base_link" in overlay_local_costmap
+    assert "global_frame: odom" in nav2_local_costmap
+    assert "global_frame: odom" in overlay_local_costmap
+    assert "global_frame: base_link" not in nav2_local_costmap
+    assert "global_frame: base_link" not in overlay_local_costmap
+    assert "robot_base_frame: base_link" in nav2_local_costmap
+    assert "robot_base_frame: base_link" in overlay_local_costmap
     assert "sensor_frame: base_link" in nav2
     assert "sensor_frame: base_link" in overlay_nav2
     assert "clearing: true" in nav2
@@ -143,6 +165,65 @@ def test_nav_defaults_are_fixed():
     assert "clearing.publish_every_n: 4" in overlay_local_perception
     assert "status_topic: /perception/local_perception_status" in overlay_local_perception
     assert "status_publish_period_sec: 2.0" in overlay_local_perception
+
+
+def test_nav2_local_costmap_frame_contract():
+    nav2 = (ROOT / "src" / "robot_nav_config" / "config" / "nav2.yaml").read_text(encoding="utf-8")
+    overlay_nav2 = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "nav2.yaml").read_text(
+        encoding="utf-8"
+    )
+    assert_nav2_local_costmap_frame_contract(nav2, local_costmap_config_block(nav2))
+    assert_nav2_local_costmap_frame_contract(overlay_nav2, local_costmap_config_block(overlay_nav2))
+
+
+def test_verify_nav2_local_costmap_frame_script_contract():
+    script = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "verify_nav2_local_costmap_frame.sh"
+    ).read_text(encoding="utf-8")
+    assert "read_nav2_value \"local_costmap.local_costmap.ros__parameters.global_frame\"" in script
+    assert "param_value /local_costmap/local_costmap global_frame" in script
+    assert "param_value /local_costmap/local_costmap robot_base_frame" in script
+    assert "ros2 run tf2_ros tf2_echo odom base_link" in script
+    assert "ros2 topic echo /local_state/odometry --once" in script
+    assert "ros2 topic info -v /perception/obstacle_points" in script
+    assert "Node name: local_costmap" in script
+    assert "Node name: collision_monitor" in script
+    assert "ros2 lifecycle get /controller_server" in script
+
+
+def test_verify_navigation_final_yaw_align_script_contract():
+    script = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "verify_navigation_final_yaw_align.sh"
+    ).read_text(encoding="utf-8")
+    assert "Default mode is dry-run and never sends a navigation goal." in script
+    assert "--execute-goal" in script
+    assert "--goal-json" in script
+    assert "POST /api/v1/navigation/goal" in script
+    assert "navigation_final_yaw_tolerance_rad" in script
+    assert "navigation_final_yaw_align_trigger_rad" in script
+    assert "navigation_final_yaw_align_timeout_sec" in script
+    assert "navigation_final_yaw_align_cmd_topic" in script
+    assert "navigation_final_yaw_align_bypass_collision_monitor" in script
+    assert 'runtime_lc_frame="$(param_value /local_costmap/local_costmap global_frame || true)"' in script
+    assert '[[ "$runtime_lc_frame" == "odom" ]]' in script
+    assert '"/cmd_vel_safe"' in script
+    assert '"/cmd_vel"' in script
+    assert "FAST-LIO2-like node is present during navigation" in script
+    assert "Node name: local_costmap" in script
+    assert "Node name: collision_monitor" in script
+    assert "final_pose_verified" in script
+    assert "final_pose_verify_reason" in script
+    assert "final_yaw_align_attempted" in script
 
 
 def test_tf_policy_is_canonical():
@@ -1963,6 +2044,13 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "handle_robot_pose" in node_cpp
     assert "wait_for_current_robot_pose" in node_cpp
     assert "robot_pose_freshness_sec" in node_cpp
+    assert "TfChainFreshnessSnapshot" in node_cpp
+    assert "tf_chain_freshness_sec" in node_cpp
+    assert "tf_chain_settle_timeout_sec" in node_cpp
+    assert "wait_for_fresh_tf_chain" in node_cpp
+    assert '"navigation goal"' in node_cpp
+    assert '"docking predock navigation"' in node_cpp
+    assert '"docking fine docking"' in node_cpp
     assert '#include "robot_api_server/localization_result_model.hpp"' in node_cpp
     assert "localization_result_topic" in node_cpp
     assert "handle_localization_result" in node_cpp
@@ -1977,8 +2065,15 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "struct LocalizationResultSnapshot" not in node_cpp
     assert '#include "lifecycle_msgs/srv/get_state.hpp"' in node_cpp
     assert "navigation_relocalize_before_goal" in node_cpp
+    assert "navigation_relocalize_before_goal_always" in node_cpp
     assert "navigation_relocalize_before_goal_required" in node_cpp
     assert "navigation_relocalize_wait_sec" in node_cpp
+    assert "navigation_goal_relocalization_decision" in node_cpp
+    assert "force_relocalize" in node_cpp
+    assert "confirmed runtime map context and fresh map-frame pose" in node_cpp
+    assert "target floor differs from confirmed runtime map context" not in node_cpp
+    assert "requested pose target does not match confirmed runtime map context" in node_cpp
+    assert "if (navigation_relocalize_before_goal_ && !pre_navigation_undock)" not in node_cpp
     assert "navigation_lifecycle_check_timeout_sec" in node_cpp
     assert "navigation_lifecycle_snapshot" in node_cpp
     assert "navigation lifecycle inactive" in node_cpp
@@ -2032,6 +2127,9 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "post_predock_relocalization_requested" in node_cpp
     assert "post_predock_relocalization_succeeded" in node_cpp
     assert "docking_cancel_active_goal_before_predock" in node_cpp
+    assert "docking canceled before GS2 fine docking start" in node_cpp
+    assert "docking_stop_service_wait_sec" in node_cpp
+    assert "docking_stop_client_->wait_for_service(docking_stop_service_wait())" in node_cpp
     assert "runtime_map_context_file" in node_cpp
     assert "confirmed_runtime_map_manifest" in node_cpp
     assert "unique_active_map_manifest" in node_cpp
@@ -2079,16 +2177,44 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "navigation_goal_id" in node_cpp
     assert "run_navigation_goal_job" in node_cpp
     assert "run_final_yaw_align" in node_cpp
-    assert "publish_direct_safe_command" in node_cpp
+    assert "publish_final_yaw_align_command" in node_cpp
+    assert "navigation_final_yaw_cmd_pub_" in node_cpp
     assert "navigation_goal_position_success_tolerance_m" in node_cpp
     assert "navigation_final_yaw_align_enable" in node_cpp
+    assert "navigation_final_yaw_align_trigger_rad" in node_cpp
+    assert "navigation_final_yaw_align_kp" in node_cpp
+    assert "navigation_final_yaw_align_max_xy_drift_m" in node_cpp
+    assert "navigation_final_yaw_align_cmd_topic" in node_cpp
+    assert 'navigation_final_yaw_align_cmd_topic_ != "/cmd_vel_nav"' in node_cpp
+    assert 'navigation_final_yaw_align_cmd_topic_ != "/cmd_vel_collision_checked"' in node_cpp
+    assert 'navigation_final_yaw_align_cmd_topic_ = "/cmd_vel_collision_checked"' in node_cpp
+    assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel_safe"' not in node_cpp
+    assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel"' not in node_cpp
     assert "position_reached_yaw_warning" in node_cpp
+    assert "position_reached_verifying" in node_cpp
+    assert "position_reached_yaw_aligning" in node_cpp
+    assert "final_pose_verifying" in node_cpp
+    assert "final_pose_verified" in node_cpp
+    assert "failed_final_pose_verify" in node_cpp
+    assert "blocked_by_safety" in node_cpp
     assert "navigation position reached; final yaw alignment warning" in node_cpp
-    assert "bool position_reached = false;" in node_cpp
+    assert "bool position_reached = pose_check.position_reached;" in node_cpp
     assert "bool position_reached = nav2_succeeded" not in node_cpp
     assert "navigation reported success but final position is outside tolerance" in node_cpp
-    assert 'nav2_succeeded ? "position_not_reached" : "nav2_failed"' in node_cpp
+    assert '"failed_position"' in node_cpp
+    assert '"position_not_reached"' not in node_cpp[node_cpp.index("void run_navigation_goal_job("):]
     assert "final_yaw_align_blocked" in node_cpp
+    assert "final_yaw_align_attempted" in node_cpp
+    assert "final_yaw_align_blocked_reason" in node_cpp
+    assert "final_yaw_align_duration_sec" in node_cpp
+    assert "final_yaw_align_target_yaw_rad" in node_cpp
+    assert "final_yaw_align_initial_yaw_error_rad" in node_cpp
+    assert "final_yaw_align_final_yaw_error_rad" in node_cpp
+    assert "final_yaw_align_observed_xy_drift_m" in node_cpp
+    assert "final_yaw_align_bypass_collision_monitor" in node_cpp
+    assert "final_pose_verify_reason" in node_cpp
+    assert "request_navigation_goal_cancel" in node_cpp
+    assert "navigation_goal_cancel_requested" in node_cpp
     assert "exception sending navigation goal" in node_cpp
     assert "async_cancel_goal" in node_cpp
     assert "async_cancel_all_goals" in node_cpp
@@ -2249,17 +2375,29 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "bms_full_soc_threshold_pct: 99.0" in config
     assert "bms_full_soc_voltage_contact_enable: true" in config
     assert "robot_pose_freshness_sec: 0.5" in config
+    assert "tf_chain_freshness_sec: 0.30" in config
+    assert "tf_chain_settle_timeout_sec: 2.0" in config
     assert "localization_result_topic: \"/localization_result\"" in config
     assert "navigation_relocalize_before_goal: true" in config
+    assert "navigation_relocalize_before_goal_always: false" in config
     assert "navigation_relocalize_before_goal_required: true" in config
     assert "navigation_relocalize_wait_sec: 8.0" in config
     assert "navigation_lifecycle_check_timeout_sec: 0.35" in config
     assert "navigation_goal_result_timeout_sec: 600.0" in config
-    assert "navigation_goal_position_success_tolerance_m: 0.30" in config
+    assert "navigation_goal_position_success_tolerance_m: 0.20" in config
     assert "navigation_final_yaw_align_enable: true" in config
-    assert "navigation_final_yaw_tolerance_rad: 0.15" in config
+    assert "navigation_final_yaw_tolerance_rad: 0.05" in config
+    assert "navigation_final_yaw_align_trigger_rad: 0.08" in config
     assert "navigation_final_yaw_align_speed_radps: 0.25" in config
-    assert "navigation_final_yaw_align_timeout_sec: 4.0" in config
+    assert "navigation_final_yaw_align_min_speed_radps: 0.06" in config
+    assert "navigation_final_yaw_align_kp: 1.2" in config
+    assert "navigation_final_yaw_align_max_speed_radps: 0.25" in config
+    assert "navigation_final_yaw_align_timeout_sec: 8.0" in config
+    assert "navigation_final_yaw_align_max_xy_drift_m: 0.08" in config
+    assert "navigation_final_yaw_align_require_fresh_pose: true" in config
+    assert "navigation_final_yaw_align_cmd_topic: \"/cmd_vel_collision_checked\"" in config
+    assert "navigation_final_yaw_align_bypass_collision_monitor: true" in config
+    assert "navigation_final_yaw_align_zero_cmd_count: 3" in config
     assert "docking_relocalize_before_predock: true" in config
     assert "docking_relocalize_after_predock: true" in config
     assert "docking_relocalize_after_predock_required: true" in config
@@ -2279,6 +2417,7 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "localization_bridge_acceptance_max_distance_m: 1.0" in config
     assert "localization_bridge_acceptance_max_yaw_rad: 0.35" in config
     assert "navigation_cancel_action_wait_sec: 0.75" in config
+    assert "docking_stop_service_wait_sec: 3.0" in config
     assert "undock_relocalize_after_success: true" in config
     assert "undock_relocalize_wait_sec: 8.0" in config
     assert "docking_cancel_active_goal_before_predock: true" in config
@@ -2343,16 +2482,28 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "bms_full_soc_threshold_pct: 99.0" in overlay_config
     assert "bms_full_soc_voltage_contact_enable: true" in overlay_config
     assert "robot_pose_freshness_sec: 0.5" in overlay_config
+    assert "tf_chain_freshness_sec: 0.30" in overlay_config
+    assert "tf_chain_settle_timeout_sec: 2.0" in overlay_config
     assert "navigation_relocalize_before_goal: true" in overlay_config
+    assert "navigation_relocalize_before_goal_always: false" in overlay_config
     assert "navigation_relocalize_before_goal_required: true" in overlay_config
     assert "navigation_relocalize_wait_sec: 8.0" in overlay_config
     assert "navigation_lifecycle_check_timeout_sec: 0.35" in overlay_config
     assert "navigation_goal_result_timeout_sec: 600.0" in overlay_config
-    assert "navigation_goal_position_success_tolerance_m: 0.30" in overlay_config
+    assert "navigation_goal_position_success_tolerance_m: 0.20" in overlay_config
     assert "navigation_final_yaw_align_enable: true" in overlay_config
-    assert "navigation_final_yaw_tolerance_rad: 0.15" in overlay_config
+    assert "navigation_final_yaw_tolerance_rad: 0.05" in overlay_config
+    assert "navigation_final_yaw_align_trigger_rad: 0.08" in overlay_config
     assert "navigation_final_yaw_align_speed_radps: 0.25" in overlay_config
-    assert "navigation_final_yaw_align_timeout_sec: 4.0" in overlay_config
+    assert "navigation_final_yaw_align_min_speed_radps: 0.06" in overlay_config
+    assert "navigation_final_yaw_align_kp: 1.2" in overlay_config
+    assert "navigation_final_yaw_align_max_speed_radps: 0.25" in overlay_config
+    assert "navigation_final_yaw_align_timeout_sec: 8.0" in overlay_config
+    assert "navigation_final_yaw_align_max_xy_drift_m: 0.08" in overlay_config
+    assert "navigation_final_yaw_align_require_fresh_pose: true" in overlay_config
+    assert "navigation_final_yaw_align_cmd_topic: \"/cmd_vel_collision_checked\"" in overlay_config
+    assert "navigation_final_yaw_align_bypass_collision_monitor: true" in overlay_config
+    assert "navigation_final_yaw_align_zero_cmd_count: 3" in overlay_config
     assert "localization_result_topic: \"/localization_result\"" in overlay_config
     assert "docking_relocalize_before_predock: true" in overlay_config
     assert "docking_relocalize_after_predock: true" in overlay_config
@@ -2364,6 +2515,7 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "localization_bridge_acceptance_max_distance_m: 1.0" in overlay_config
     assert "localization_bridge_acceptance_max_yaw_rad: 0.35" in overlay_config
     assert "navigation_cancel_action_wait_sec: 0.75" in overlay_config
+    assert "docking_stop_service_wait_sec: 3.0" in overlay_config
     assert "undock_relocalize_after_success: true" in overlay_config
     assert "undock_relocalize_wait_sec: 8.0" in overlay_config
     assert "docking_cancel_active_goal_before_predock: true" in overlay_config
@@ -4276,10 +4428,37 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert 'NJRH_FORCE_RESTART_DRIVER="${NJRH_FORCE_RESTART_DRIVER:-false}"' in run_pipeline
     assert "run_local_perception.sh" in run_pipeline
     assert "NJRH_POINTCLOUD_ACCEL_PROFILE=legacy" in run_pipeline
+    assert "jt128_localization_sensing.launch.py" in run_pipeline
+    assert "legacy_scan_pid" in run_pipeline
+    assert "legacy_scan_chain_running()" in run_pipeline
+    assert "legacy_scan_chain_partial_running()" in run_pipeline
+    assert "legacy scan chain already running; reusing" in run_pipeline
+    assert "preprocessor_params:=" in run_pipeline
+    assert "scan_params:=" in run_pipeline
+    assert "flatscan_params:=" in run_pipeline
+    assert "points_topic:=" in run_pipeline
+    assert "nav_points_topic:=" in run_pipeline
+    assert "scan_topic:=" in run_pipeline
+    assert "flatscan_topic:=" in run_pipeline
+    assert "pkill -TERM -f" in run_pipeline
     assert "laser_scan_to_flatscan" in run_pipeline
     assert "pointcloud_accel_axis_node workers publish /perception/* and /scan" in run_pipeline
     assert "pkill -9" not in run_pipeline
     assert "killall" not in run_pipeline
+    for protected_process in (
+        "controller_server",
+        "planner_server",
+        "bt_navigator",
+        "map_server",
+        "robot_local_state",
+        "robot_safety",
+        "ranger_base_node",
+        "robot_api_server",
+        "robot_floor_manager",
+    ):
+        assert protected_process not in run_pipeline
+    assert "pkill -9" not in run_driver
+    assert "killall -9" not in run_driver
     assert "--duration-sec" in ab_runner
     assert "pointcloud_accel_ab_" in ab_runner
     assert "check_isaac_ros_nitros_env.sh" in run_pipeline
@@ -4290,18 +4469,32 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "use NJRH_POINTCLOUD_ACCEL_PROFILE=ipc_worker or legacy" in nitros_check
 
     assert "pointcloud_accel_axis_node src/pointcloud_accel_axis_node.cpp" in hesai_cmake
+    assert "install(TARGETS" in hesai_cmake
+    assert "  pointcloud_accel_axis_node" in hesai_cmake
     assert "find_package(tf2_ros REQUIRED)" in hesai_cmake
     assert "geometry_msgs" in hesai_cmake
     assert "<depend>tf2_ros</depend>" in hesai_package
     assert "<depend>geometry_msgs</depend>" in hesai_package
     assert 'declare_parameter<std::string>("input_topic", "/jt128/vendor/points_raw")' in accel_axis
     assert 'declare_parameter<std::string>("output_topic", "/lidar_points")' in accel_axis
+    assert 'Node("pointcloud_accel_axis_node", options)' in accel_axis
     assert 'declare_parameter<bool>("input_reliable", false)' in accel_axis
     assert 'declare_parameter<bool>("output_reliable", false)' in accel_axis
-    assert "auto cloud = std::shared_ptr<sensor_msgs::msg::PointCloud2>(std::move(output))" in accel_axis
-    assert "trunk_publisher_->publish(*cloud)" in accel_axis
-    assert "latest_cloud_ = cloud" in accel_axis
-    assert accel_axis.index("trunk_publisher_->publish(*cloud)") < accel_axis.index("latest_cloud_ = cloud")
+    assert 'declare_parameter<bool>("local_worker_enabled", true)' in accel_axis
+    assert 'declare_parameter<bool>("scan_worker_enabled", true)' in accel_axis
+    assert 'declare_parameter<std::string>("flatscan_output_topic", "/flatscan")' in accel_axis
+    assert "local_worker_enabled=" in accel_axis
+    assert "scan_worker_enabled=" in accel_axis
+    assert "struct NormalizedPointView" in accel_axis
+    assert "struct LatestNormalizedBuffer" in accel_axis
+    assert "std::vector<NormalizedPointView> points" in accel_axis
+    assert "trunk_publisher_->publish(*output)" in accel_axis
+    assert "latest_normalized_buffer_ = normalized_buffer" in accel_axis
+    assert accel_axis.index("trunk_publisher_->publish(*output)") < accel_axis.index(
+        "latest_normalized_buffer_ = normalized_buffer"
+    )
+    assert "latest_cloud_ = cloud" not in accel_axis
+    assert "auto cloud = std::shared_ptr<sensor_msgs::msg::PointCloud2>(std::move(output))" not in accel_axis
     assert "local_worker_loop" in accel_axis
     assert "scan_worker_loop" in accel_axis
     assert "set_thread_name(\"pc_accel_local\")" in accel_axis
@@ -4315,14 +4508,26 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "trunk_output_subscription_count" in accel_axis
     assert "local_worker_obstacle_publish_hz" in accel_axis
     assert "scan_worker_scan_publish_hz" in accel_axis
+    assert "internal_zero_copy_profile=true" in accel_axis
+    assert "latest_internal_buffer_points" in accel_axis
+    assert "local_worker_full_cloud_copy_count" in accel_axis
+    assert "scan_worker_full_cloud_copy_count" in accel_axis
+    assert "local_worker_intermediate_pointcloud_build_count" in accel_axis
+    assert "scan_worker_intermediate_pointcloud_build_count" in accel_axis
+    assert "local_worker_lock_wait_ms_max" in accel_axis
+    assert "scan_worker_lock_wait_ms_max" in accel_axis
     assert "publish_downsample" not in accel_axis
     assert "publisher_->publish(*output)" in legacy_axis
     assert "publish_downsample(local_publisher_" in legacy_axis
 
+    assert "pointcloud_accel_axis_node:" in accel_cfg
     assert "input_topic: /jt128/vendor/points_raw" in accel_cfg
     assert "output_topic: /lidar_points" in accel_cfg
     assert "output_qos_depth: 1" in accel_cfg
     assert "output_reliable: false" in accel_cfg
+    assert "flatscan_output_topic: /flatscan" in accel_cfg
+    assert "local_worker_enabled: true" in accel_cfg
+    assert "scan_worker_enabled: true" in accel_cfg
     assert "local_compact_fields: xyzi" in accel_cfg
     assert "local_compact_stride: 4" in accel_cfg
     assert "local_compact_max_rate_hz: 12.0" in accel_cfg
@@ -4338,6 +4543,7 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "njrh_load_pointcloud_accel_profile" in run_driver
     assert "pointcloud_accel_axis.yaml" in run_driver
     assert "pointcloud_accel_axis_node" in run_driver
+    assert "pointcloud_axis_remap_node" in run_driver
     assert "pointcloud_accel_container" in run_driver
     assert '-p "accel_profile:=${NJRH_POINTCLOUD_ACCEL_PROFILE}"' in run_driver
     assert "NJRH_JT128_ENABLE_POINTCLOUD_DOWNSAMPLE=false" in run_driver
@@ -4373,6 +4579,8 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "rmw_cyclonedds_cpp" not in common_env
 
     assert "current NJRH_POINTCLOUD_ACCEL_PROFILE" in verify_profile
+    assert "requested_profile" in verify_profile
+    assert "resolved_profile" in verify_profile
     assert "/lidar_points publisher count" in verify_profile
     assert "axis publish hz" in verify_profile
     assert "obstacle_hz" in verify_profile
@@ -4382,6 +4590,78 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "local_costmap subscribes" in verify_profile
     assert "PointCloud2 QoS" in verify_profile
     assert "DDS transport env" in verify_profile
+    assert "/lidar_points publisher_nodes" in verify_profile
+    assert "actual trunk owner" in verify_profile
+    assert "actual obstacle owner" in verify_profile
+    assert "actual clearing owner" in verify_profile
+    assert "actual points_nav owner" in verify_profile
+    assert "actual scan owner" in verify_profile
+    assert "actual flatscan owner" in verify_profile
+    assert "legacy trunk owner is pointcloud_axis_remap" in verify_profile
+    assert "trunk owner is pointcloud_accel_axis_node" in verify_profile
+    assert "obstacle owner is pointcloud_accel_axis_node" in verify_profile
+    assert "clearing owner is pointcloud_accel_axis_node" in verify_profile
+    assert "legacy points_nav owner is nav_cloud_preprocessor" in verify_profile
+    assert "legacy missing /scan publisher from scan_republisher" in verify_profile
+    assert "legacy missing /flatscan publisher from laser_scan_to_flatscan" in verify_profile
+    assert "still using legacy pointcloud_axis_remap as trunk owner" in verify_profile
+    assert "scan owner is pointcloud_accel_axis_node" in verify_profile
+    assert "local_worker_enabled must be true" in verify_profile
+    assert "scan_worker_enabled must be true" in verify_profile
+    assert "internal_zero_copy_profile must be true" in verify_profile
+    assert "latest_internal_buffer_points must be present and nonzero" in verify_profile
+    assert "worker full PointCloud2 copy counters must stay zero" in verify_profile
+    assert "worker intermediate PointCloud2 build counters must stay zero" in verify_profile
+    assert "NITROS_ENV_GUARDED_UNAVAILABLE" in verify_profile
+    assert "production_hop_internal_local_branch=false" in verify_profile
+    assert "production_hop_points_nav=false" in verify_profile
+    assert "/points_nav still has a production publisher" in verify_profile
+    assert "PROFILE_OWNER_CONTRACT_OK" in verify_profile
+    assert "LEGACY_SCAN_CHAIN_OK" in verify_profile
+    assert "IPC_WORKER_OWNER_OK" in verify_profile
+    assert "TRUNK_FULL_DENSITY_OK" in verify_profile
+    assert "NAV2_COMPAT_TOPICS_OK" in verify_profile
+
+    assert "--profile legacy|ipc_worker|nitros" in ab_runner
+    assert "--duration-sec" in ab_runner
+    assert "--apply" in ab_runner
+    assert "--restart" in ab_runner
+    assert "--restore" in ab_runner
+    assert "profile requested" in ab_runner
+    assert "profile before run" in ab_runner
+    assert "profile actually running" in ab_runner
+    assert "binary actually running" in ab_runner
+    assert "trunk owner" in ab_runner
+    assert "obstacle owner" in ab_runner
+    assert "clearing owner" in ab_runner
+    assert "points_nav owner" in ab_runner
+    assert "scan owner" in ab_runner
+    assert "flatscan owner" in ab_runner
+    assert "internal_zero_copy_profile" in ab_runner
+    assert "latest_internal_buffer_points" in ab_runner
+    assert "local_worker_full_cloud_copy_count" in ab_runner
+    assert "scan_worker_full_cloud_copy_count" in ab_runner
+    assert "/lidar_points subscriber_count" in ab_runner
+    assert "/points_nav subscribers" in ab_runner
+    assert "/scan subscribers" in ab_runner
+    assert "/flatscan subscribers" in ab_runner
+    assert "legacy scan chain recovered" in ab_runner
+    assert "ipc_worker no production /points_nav hop" in ab_runner
+    assert "PASS/WARN/FAIL" in ab_runner
+    assert "restoring prior profile" in ab_runner
+    assert "pointcloud_accel_ab_" in ab_runner
+    assert "cpu0" in ab_runner
+    assert "cpu4" in ab_runner
+    assert "cpu5" in ab_runner
+    assert "cpu6" in ab_runner
+    assert "cpu7" in ab_runner
+
+    assert 'export NJRH_LOCAL_PERCEPTION_INPUT_PROFILE=local_branch' in (
+        config_dir / "local_perception_input_profile.env"
+    ).read_text(encoding="utf-8")
+    assert "INPUT_TOPIC=\"${RESOLVED_LOCAL_PERCEPTION_INPUT_TOPIC}\"" in (
+        scripts_dir / "run_local_perception.sh"
+    ).read_text(encoding="utf-8")
 
     assert "ComposableNodeContainer" not in accel_launch
     assert "pointcloud_accel_axis_node" in accel_launch

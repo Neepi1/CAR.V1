@@ -153,12 +153,25 @@ struct Transform3x4
   double m23{0.0};
 };
 
-struct PointXYZI
+struct NormalizedPointView
 {
   float x{0.0F};
   float y{0.0F};
   float z{0.0F};
   float intensity{0.0F};
+};
+
+using PointXYZI = NormalizedPointView;
+
+struct LatestNormalizedBuffer
+{
+  std::vector<NormalizedPointView> points;
+  rclcpp::Time stamp{0, 0, RCL_ROS_TIME};
+  std::string frame_id;
+  std::uint64_t seq{0U};
+  Clock::time_point update_time{};
+  bool has_intensity{false};
+  std::size_t source_bytes{0U};
 };
 
 PointXYZI transform_point(const Transform3x4 & transform, const PointXYZI & point)
@@ -259,6 +272,7 @@ struct CompactDiagnostics
   std::uint64_t publish_count{0U};
   std::uint64_t previous_publish_count{0U};
   std::uint64_t skip_busy_count{0U};
+  std::uint64_t allocation_count{0U};
   std::size_t last_points{0U};
   std::size_t last_bytes{0U};
   std::size_t bytes_per_point{0U};
@@ -278,8 +292,20 @@ struct WorkerDiagnostics
   std::uint64_t scan_publish_count{0U};
   std::uint64_t previous_scan_publish_count{0U};
   std::uint64_t skip_busy_count{0U};
+  std::uint64_t full_cloud_copy_count{0U};
+  std::uint64_t intermediate_pointcloud_build_count{0U};
+  std::uint64_t allocation_count{0U};
+  std::size_t last_obstacle_output_bytes{0U};
+  std::size_t last_clearing_output_bytes{0U};
+  std::size_t last_scan_output_ranges{0U};
+  std::size_t last_scan_output_bytes{0U};
+  bool reused_output_buffer{true};
+  bool scan_bins_reused{true};
   double last_processing_ms{0.0};
   double processing_ms_max{0.0};
+  double processing_ms_sum{0.0};
+  std::uint64_t processing_ms_count{0U};
+  double lock_wait_ms_max{0.0};
 };
 
 }  // namespace
@@ -288,7 +314,7 @@ class PointCloudAccelAxisNode : public rclcpp::Node
 {
 public:
   explicit PointCloudAccelAxisNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions())
-  : Node("pointcloud_axis_remap", options),
+  : Node("pointcloud_accel_axis_node", options),
     tf_buffer_(this->get_clock()),
     tf_listener_(tf_buffer_),
     logged_ready_(false),
@@ -332,6 +358,7 @@ public:
     declare_parameter<int>("nav_output_qos_depth", 1);
 
     declare_parameter<bool>("worker_local_enabled", true);
+    declare_parameter<bool>("local_worker_enabled", true);
     declare_parameter<std::string>("obstacle_output_topic", "/perception/obstacle_points");
     declare_parameter<std::string>("clearing_output_topic", "/perception/clearing_points");
     declare_parameter<std::string>("local_worker_output_frame_id", "base_link");
@@ -359,6 +386,8 @@ public:
     declare_parameter<int>("clearing_worker_max_points", 15000);
 
     declare_parameter<bool>("worker_scan_enabled", true);
+    declare_parameter<bool>("scan_worker_enabled", true);
+    declare_parameter<std::string>("flatscan_output_topic", "/flatscan");
     declare_parameter<std::string>("scan_output_topic", "/scan");
     declare_parameter<std::string>("scan_worker_frame_id", "lidar_level_link");
     declare_parameter<double>("scan_worker_rate_hz", 9.0);
@@ -398,8 +427,14 @@ public:
     sanitize_compact_fields(local_compact_fields_);
     sanitize_compact_fields(nav_compact_fields_);
 
-    worker_local_enabled_ = get_parameter("worker_local_enabled").as_bool() && profile_uses_workers(accel_profile_);
-    worker_scan_enabled_ = get_parameter("worker_scan_enabled").as_bool() && profile_uses_workers(accel_profile_);
+    worker_local_enabled_ =
+      get_parameter("worker_local_enabled").as_bool() &&
+      get_parameter("local_worker_enabled").as_bool() &&
+      profile_uses_workers(accel_profile_);
+    worker_scan_enabled_ =
+      get_parameter("worker_scan_enabled").as_bool() &&
+      get_parameter("scan_worker_enabled").as_bool() &&
+      profile_uses_workers(accel_profile_);
     obstacle_output_topic_ = get_parameter("obstacle_output_topic").as_string();
     clearing_output_topic_ = get_parameter("clearing_output_topic").as_string();
     local_worker_output_frame_id_ = get_parameter("local_worker_output_frame_id").as_string();
@@ -563,9 +598,72 @@ private:
     }
   }
 
+  static builtin_interfaces::msg::Time stamp_to_msg(const rclcpp::Time & stamp)
+  {
+    const auto total_ns = stamp.nanoseconds();
+    builtin_interfaces::msg::Time msg;
+    msg.sec = static_cast<std::int32_t>(total_ns / 1000000000LL);
+    msg.nanosec = static_cast<std::uint32_t>(total_ns % 1000000000LL);
+    return msg;
+  }
+
+  static std_msgs::msg::Header header_from_buffer(const LatestNormalizedBuffer & buffer)
+  {
+    std_msgs::msg::Header header;
+    header.stamp = stamp_to_msg(buffer.stamp);
+    header.frame_id = buffer.frame_id;
+    return header;
+  }
+
+  std::shared_ptr<LatestNormalizedBuffer> take_reusable_normalized_buffer()
+  {
+    std::lock_guard<std::mutex> lock(latest_cloud_mutex_);
+    if (reusable_normalized_buffer_) {
+      auto buffer = reusable_normalized_buffer_;
+      reusable_normalized_buffer_.reset();
+      return buffer;
+    }
+    ++normalized_buffer_allocation_count_;
+    return std::make_shared<LatestNormalizedBuffer>();
+  }
+
+  std::shared_ptr<LatestNormalizedBuffer> build_latest_normalized_buffer(
+    const sensor_msgs::msg::PointCloud2 & cloud)
+  {
+    auto buffer = take_reusable_normalized_buffer();
+    buffer->stamp = rclcpp::Time(cloud.header.stamp);
+    buffer->frame_id = cloud.header.frame_id;
+    buffer->seq = 0U;
+    buffer->update_time = Clock::time_point{};
+    buffer->source_bytes = cloud.data.size();
+    buffer->has_intensity = false;
+    buffer->points.clear();
+
+    const auto offsets = field_offsets(cloud);
+    if (!offsets.valid || cloud.point_step == 0U || cloud.width == 0U || cloud.height == 0U) {
+      return buffer;
+    }
+
+    buffer->has_intensity = offsets.has_intensity;
+    const std::size_t point_count = static_cast<std::size_t>(cloud.width) * cloud.height;
+    if (buffer->points.capacity() < point_count) {
+      ++normalized_buffer_allocation_count_;
+      buffer->points.reserve(point_count);
+    }
+    for (std::size_t i = 0U; i < point_count; ++i) {
+      const auto point = read_point(cloud, offsets, i);
+      if (!point) {
+        break;
+      }
+      buffer->points.push_back(*point);
+    }
+    return buffer;
+  }
+
   void publish_fast_path(
     std::unique_ptr<sensor_msgs::msg::PointCloud2> output,
-    const Clock::time_point & callback_start)
+    const Clock::time_point & callback_start,
+    std::shared_ptr<LatestNormalizedBuffer> normalized_buffer)
   {
     const auto publish_start = Clock::now();
     if (last_publish_time_ != Clock::time_point{}) {
@@ -585,25 +683,46 @@ private:
       }
     }
 
-    auto cloud = std::shared_ptr<sensor_msgs::msg::PointCloud2>(std::move(output));
-    trunk_publisher_->publish(*cloud);
+    trunk_publisher_->publish(*output);
     const auto publish_end = Clock::now();
     ++lidar_points_publish_count_;
     ++latest_buffer_update_count_;
     last_publish_time_ = publish_end;
-    last_output_stamp_sec_ = stamp_to_sec(cloud->header.stamp);
+    last_output_stamp_sec_ = stamp_to_sec(output->header.stamp);
     last_output_subscription_count_ = trunk_publisher_->get_subscription_count();
-    last_cloud_points_ = static_cast<std::size_t>(cloud->width) * cloud->height;
-    last_cloud_bytes_ = cloud->data.size();
+    last_cloud_points_ = static_cast<std::size_t>(output->width) * output->height;
+    last_cloud_bytes_ = output->data.size();
     last_trunk_publish_duration_ms_ =
       std::chrono::duration<double, std::milli>(publish_end - publish_start).count();
     last_fast_path_duration_ms_ =
       std::chrono::duration<double, std::milli>(publish_end - callback_start).count();
+
+    if (!normalized_buffer) {
+      normalized_buffer = std::make_shared<LatestNormalizedBuffer>();
+      normalized_buffer->stamp = rclcpp::Time(output->header.stamp);
+      normalized_buffer->frame_id = output->header.frame_id;
+      normalized_buffer->source_bytes = output->data.size();
+    }
+    normalized_buffer->update_time = publish_end;
+    std::shared_ptr<const LatestNormalizedBuffer> old_buffer;
     {
+      const auto lock_start = Clock::now();
       std::lock_guard<std::mutex> lock(latest_cloud_mutex_);
-      latest_cloud_ = cloud;
-      latest_cloud_time_ = publish_end;
-      latest_cloud_seq_++;
+      latest_buffer_lock_wait_ms_max_ = std::max(
+        latest_buffer_lock_wait_ms_max_,
+        std::chrono::duration<double, std::milli>(Clock::now() - lock_start).count());
+      old_buffer = latest_normalized_buffer_;
+      normalized_buffer->seq = latest_normalized_seq_ + 1U;
+      latest_normalized_buffer_ = normalized_buffer;
+      latest_normalized_time_ = publish_end;
+      latest_normalized_seq_ = normalized_buffer->seq;
+    }
+    if (old_buffer && old_buffer.use_count() == 1U) {
+      auto reusable = std::const_pointer_cast<LatestNormalizedBuffer>(old_buffer);
+      std::lock_guard<std::mutex> lock(latest_cloud_mutex_);
+      if (!reusable_normalized_buffer_) {
+        reusable_normalized_buffer_ = reusable;
+      }
     }
 
     if (!logged_ready_) {
@@ -639,7 +758,8 @@ private:
     output->header.frame_id = output_frame_id_;
 
     if (output->data.empty() || output->width == 0U || output->height == 0U) {
-      publish_fast_path(std::move(output), callback_start);
+      auto normalized = build_latest_normalized_buffer(*output);
+      publish_fast_path(std::move(output), callback_start, std::move(normalized));
       return;
     }
     if (!has_xyz_fields(*output)) {
@@ -671,7 +791,8 @@ private:
       rotation_[6] == 0.0F && rotation_[7] == 0.0F && rotation_[8] == 1.0F;
 
     if (fast_path_identity) {
-      publish_fast_path(std::move(output), callback_start);
+      auto normalized = build_latest_normalized_buffer(*output);
+      publish_fast_path(std::move(output), callback_start, std::move(normalized));
       return;
     }
 
@@ -692,7 +813,8 @@ private:
         xyz[0] = fast_path_raw_y_neg_raw_x ? raw_y : -raw_y;
         xyz[1] = -raw_x;
       }
-      publish_fast_path(std::move(output), callback_start);
+      auto normalized = build_latest_normalized_buffer(*output);
+      publish_fast_path(std::move(output), callback_start, std::move(normalized));
       return;
     }
 
@@ -707,17 +829,25 @@ private:
       *iter_y = rotation_[3] * x + rotation_[4] * y + rotation_[5] * z;
       *iter_z = rotation_[6] * x + rotation_[7] * y + rotation_[8] * z;
     }
-    publish_fast_path(std::move(output), callback_start);
+    auto normalized = build_latest_normalized_buffer(*output);
+    publish_fast_path(std::move(output), callback_start, std::move(normalized));
   }
 
-  std::shared_ptr<const sensor_msgs::msg::PointCloud2> latest_cloud_snapshot(
+  std::shared_ptr<const LatestNormalizedBuffer> latest_normalized_snapshot(
     Clock::time_point & stamp,
-    std::uint64_t & seq) const
+    std::uint64_t & seq,
+    WorkerDiagnostics * diagnostics = nullptr) const
   {
+    const auto lock_start = Clock::now();
     std::lock_guard<std::mutex> lock(latest_cloud_mutex_);
-    stamp = latest_cloud_time_;
-    seq = latest_cloud_seq_;
-    return latest_cloud_;
+    if (diagnostics) {
+      diagnostics->lock_wait_ms_max = std::max(
+        diagnostics->lock_wait_ms_max,
+        std::chrono::duration<double, std::milli>(Clock::now() - lock_start).count());
+    }
+    stamp = latest_normalized_time_;
+    seq = latest_normalized_seq_;
+    return latest_normalized_buffer_;
   }
 
   void local_worker_loop()
@@ -735,6 +865,8 @@ private:
       const auto elapsed_ms = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
       local_worker_.last_processing_ms = elapsed_ms;
       local_worker_.processing_ms_max = std::max(local_worker_.processing_ms_max, elapsed_ms);
+      local_worker_.processing_ms_sum += elapsed_ms;
+      ++local_worker_.processing_ms_count;
       std::this_thread::sleep_until(next);
       if (Clock::now() > next + std::chrono::seconds(1)) {
         next = Clock::now();
@@ -757,6 +889,8 @@ private:
       const auto elapsed_ms = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
       scan_worker_.last_processing_ms = elapsed_ms;
       scan_worker_.processing_ms_max = std::max(scan_worker_.processing_ms_max, elapsed_ms);
+      scan_worker_.processing_ms_sum += elapsed_ms;
+      ++scan_worker_.processing_ms_count;
       std::this_thread::sleep_until(next);
       if (Clock::now() > next + std::chrono::seconds(1)) {
         next = Clock::now();
@@ -764,28 +898,99 @@ private:
     }
   }
 
-  sensor_msgs::msg::PointCloud2 make_compact_cloud(
-    const sensor_msgs::msg::PointCloud2 & cloud,
-    const std::size_t stride,
-    const std::string & fields,
-    CompactDiagnostics & diagnostics)
+  void prepare_xyzi_layout(sensor_msgs::msg::PointCloud2 & msg, const bool include_intensity)
   {
-    const auto offsets = field_offsets(cloud);
-    diagnostics.intensity_missing = fields == "xyzi" && !offsets.has_intensity;
-    const bool include_intensity = fields == "xyzi";
-    std::vector<PointXYZI> points;
-    if (!offsets.valid || cloud.point_step == 0U || cloud.width == 0U) {
-      return make_xyzi_cloud(points, cloud.header, include_intensity);
+    const std::uint32_t expected_point_step = include_intensity ? 16U : 12U;
+    const bool layout_matches =
+      msg.point_step == expected_point_step &&
+      msg.fields.size() == (include_intensity ? 4U : 3U) &&
+      msg.fields.size() >= 3U &&
+      msg.fields[0].name == "x" &&
+      msg.fields[1].name == "y" &&
+      msg.fields[2].name == "z" &&
+      (!include_intensity || msg.fields[3].name == "intensity");
+    if (layout_matches) {
+      return;
     }
-    const std::size_t point_count = static_cast<std::size_t>(cloud.width) * cloud.height;
-    points.reserve((point_count + stride - 1U) / stride);
-    for (std::size_t i = 0U; i < point_count; i += stride) {
-      auto point = read_point(cloud, offsets, i);
-      if (point) {
-        points.push_back(*point);
+    msg.fields.clear();
+    msg.fields.reserve(include_intensity ? 4U : 3U);
+    msg.fields.push_back(make_float32_field("x", 0U));
+    msg.fields.push_back(make_float32_field("y", 4U));
+    msg.fields.push_back(make_float32_field("z", 8U));
+    msg.point_step = 12U;
+    if (include_intensity) {
+      msg.fields.push_back(make_float32_field("intensity", 12U));
+      msg.point_step = 16U;
+    }
+    msg.is_bigendian = false;
+    msg.is_dense = false;
+  }
+
+  void fill_xyzi_cloud(
+    const std::vector<PointXYZI> & points,
+    const std_msgs::msg::Header & header,
+    const bool include_intensity,
+    sensor_msgs::msg::PointCloud2 & msg,
+    WorkerDiagnostics & diagnostics)
+  {
+    prepare_xyzi_layout(msg, include_intensity);
+    msg.header = header;
+    msg.height = 1U;
+    msg.width = static_cast<std::uint32_t>(points.size());
+    msg.row_step = msg.point_step * msg.width;
+    const auto required_bytes = static_cast<std::size_t>(msg.row_step);
+    if (msg.data.capacity() < required_bytes) {
+      ++diagnostics.allocation_count;
+      diagnostics.reused_output_buffer = false;
+    }
+    msg.data.resize(required_bytes);
+    for (std::size_t i = 0U; i < points.size(); ++i) {
+      auto * data = msg.data.data() + i * msg.point_step;
+      write_float32(data + 0U, points[i].x);
+      write_float32(data + 4U, points[i].y);
+      write_float32(data + 8U, points[i].z);
+      if (include_intensity) {
+        write_float32(data + 12U, points[i].intensity);
       }
     }
-    return make_xyzi_cloud(points, cloud.header, include_intensity);
+  }
+
+  void fill_compact_cloud(
+    const LatestNormalizedBuffer & buffer,
+    const std::size_t stride,
+    const std::string & fields,
+    CompactDiagnostics & diagnostics,
+    sensor_msgs::msg::PointCloud2 & msg)
+  {
+    const auto effective_stride = std::max<std::size_t>(stride, 1U);
+    const bool include_intensity = fields == "xyzi";
+    diagnostics.intensity_missing = include_intensity && !buffer.has_intensity;
+    prepare_xyzi_layout(msg, include_intensity);
+    msg.header = header_from_buffer(buffer);
+    msg.height = 1U;
+    msg.width = static_cast<std::uint32_t>(
+      (buffer.points.size() + effective_stride - 1U) / effective_stride);
+    msg.row_step = msg.point_step * msg.width;
+    const auto required_bytes = static_cast<std::size_t>(msg.row_step);
+    if (msg.data.capacity() < required_bytes) {
+      ++diagnostics.allocation_count;
+    }
+    msg.data.resize(required_bytes);
+    std::size_t out_index = 0U;
+    for (std::size_t i = 0U; i < buffer.points.size(); i += effective_stride) {
+      auto * data = msg.data.data() + out_index * msg.point_step;
+      const auto & point = buffer.points[i];
+      write_float32(data + 0U, point.x);
+      write_float32(data + 4U, point.y);
+      write_float32(data + 8U, point.z);
+      if (include_intensity) {
+        write_float32(data + 12U, point.intensity);
+      }
+      ++out_index;
+    }
+    diagnostics.last_points = static_cast<std::size_t>(msg.width) * msg.height;
+    diagnostics.last_bytes = msg.data.size();
+    diagnostics.bytes_per_point = msg.point_step;
   }
 
   void publish_local_compact_once()
@@ -808,15 +1013,12 @@ private:
     }
     Clock::time_point stamp;
     std::uint64_t seq = 0U;
-    const auto cloud = latest_cloud_snapshot(stamp, seq);
-    if (!cloud || seq == local_compact_last_seq_) {
+    const auto buffer = latest_normalized_snapshot(stamp, seq);
+    if (!buffer || seq == local_compact_last_seq_) {
       return;
     }
-    auto compact = make_compact_cloud(*cloud, local_compact_stride_, local_compact_fields_, local_compact_);
-    local_compact_.last_points = static_cast<std::size_t>(compact.width) * compact.height;
-    local_compact_.last_bytes = compact.data.size();
-    local_compact_.bytes_per_point = compact.point_step;
-    local_compact_publisher_->publish(compact);
+    fill_compact_cloud(*buffer, local_compact_stride_, local_compact_fields_, local_compact_, local_compact_msg_);
+    local_compact_publisher_->publish(local_compact_msg_);
     ++local_compact_.publish_count;
     local_compact_last_publish_ = now;
     local_compact_last_seq_ = seq;
@@ -842,15 +1044,12 @@ private:
     }
     Clock::time_point stamp;
     std::uint64_t seq = 0U;
-    const auto cloud = latest_cloud_snapshot(stamp, seq);
-    if (!cloud || seq == nav_compact_last_seq_) {
+    const auto buffer = latest_normalized_snapshot(stamp, seq);
+    if (!buffer || seq == nav_compact_last_seq_) {
       return;
     }
-    auto compact = make_compact_cloud(*cloud, nav_compact_stride_, nav_compact_fields_, nav_compact_);
-    nav_compact_.last_points = static_cast<std::size_t>(compact.width) * compact.height;
-    nav_compact_.last_bytes = compact.data.size();
-    nav_compact_.bytes_per_point = compact.point_step;
-    nav_compact_publisher_->publish(compact);
+    fill_compact_cloud(*buffer, nav_compact_stride_, nav_compact_fields_, nav_compact_, nav_compact_msg_);
+    nav_compact_publisher_->publish(nav_compact_msg_);
     ++nav_compact_.publish_count;
     nav_compact_last_publish_ = now;
     nav_compact_last_seq_ = seq;
@@ -901,65 +1100,72 @@ private:
   void process_local_obstacles_once()
   {
     ++local_worker_.tick_count;
+    local_worker_.reused_output_buffer = true;
     if (obstacle_publisher_->get_subscription_count() == 0U) {
       return;
     }
     Clock::time_point stamp;
     std::uint64_t seq = 0U;
-    const auto cloud = latest_cloud_snapshot(stamp, seq);
-    if (!cloud || seq == local_worker_last_seq_) {
-      return;
-    }
-    const auto offsets = field_offsets(*cloud);
-    if (!offsets.valid) {
+    const auto buffer = latest_normalized_snapshot(stamp, seq, &local_worker_);
+    if (!buffer || seq == local_worker_last_seq_) {
       return;
     }
     Transform3x4 transform;
-    if (!lookup_transform(local_worker_output_frame_id_, cloud->header.frame_id, transform)) {
+    if (!lookup_transform(local_worker_output_frame_id_, buffer->frame_id, transform)) {
       return;
     }
-    const std::size_t point_count = static_cast<std::size_t>(cloud->width) * cloud->height;
-    std::vector<PointXYZI> obstacle_points;
-    obstacle_points.reserve(std::min(local_worker_max_points_, point_count / local_worker_point_stride_ + 1U));
-    std::vector<PointXYZI> clearing_points;
+    const std::size_t point_count = buffer->points.size();
+    const auto obstacle_reserve =
+      std::min(local_worker_max_points_, point_count / local_worker_point_stride_ + 1U);
+    if (local_worker_obstacle_points_.capacity() < obstacle_reserve) {
+      ++local_worker_.allocation_count;
+      local_worker_obstacle_points_.reserve(obstacle_reserve);
+      local_worker_.reused_output_buffer = false;
+    }
+    local_worker_obstacle_points_.clear();
     const bool publish_clearing =
       clearing_publisher_ &&
       clearing_publisher_->get_subscription_count() > 0U &&
       (local_worker_.tick_count % std::max<std::uint64_t>(
         1U, static_cast<std::uint64_t>(std::round(local_worker_rate_hz_ / clearing_worker_rate_hz_))) == 0U);
     if (publish_clearing) {
-      clearing_points.reserve(std::min(clearing_worker_max_points_, point_count / clearing_worker_point_stride_ + 1U));
+      const auto clearing_reserve =
+        std::min(clearing_worker_max_points_, point_count / clearing_worker_point_stride_ + 1U);
+      if (local_worker_clearing_points_.capacity() < clearing_reserve) {
+        ++local_worker_.allocation_count;
+        local_worker_clearing_points_.reserve(clearing_reserve);
+        local_worker_.reused_output_buffer = false;
+      }
+      local_worker_clearing_points_.clear();
     }
     for (std::size_t i = 0U; i < point_count; ++i) {
-      const auto raw_point = read_point(*cloud, offsets, i);
-      if (!raw_point) {
-        break;
-      }
-      const auto point = transform_point(transform, *raw_point);
+      const auto point = transform_point(transform, buffer->points[i]);
       if (publish_clearing && i % clearing_worker_point_stride_ == 0U && passes_clearing_filter(point)) {
-        if (clearing_points.size() < clearing_worker_max_points_) {
-          clearing_points.push_back(point);
+        if (local_worker_clearing_points_.size() < clearing_worker_max_points_) {
+          local_worker_clearing_points_.push_back(point);
         }
       }
       if (i % local_worker_point_stride_ != 0U) {
         continue;
       }
       if (passes_obstacle_filter(point)) {
-        obstacle_points.push_back(point);
-        if (obstacle_points.size() >= local_worker_max_points_) {
+        local_worker_obstacle_points_.push_back(point);
+        if (local_worker_obstacle_points_.size() >= local_worker_max_points_) {
           break;
         }
       }
     }
-    auto header = cloud->header;
+    auto header = header_from_buffer(*buffer);
     header.frame_id = local_worker_output_frame_id_;
-    auto obstacle_msg = make_xyzi_cloud(obstacle_points, header, true);
-    obstacle_publisher_->publish(obstacle_msg);
+    fill_xyzi_cloud(local_worker_obstacle_points_, header, true, obstacle_output_msg_, local_worker_);
+    local_worker_.last_obstacle_output_bytes = obstacle_output_msg_.data.size();
+    obstacle_publisher_->publish(obstacle_output_msg_);
     ++local_worker_.processed_count;
     ++local_worker_.obstacle_publish_count;
     if (publish_clearing) {
-      auto clearing_msg = make_xyzi_cloud(clearing_points, header, true);
-      clearing_publisher_->publish(clearing_msg);
+      fill_xyzi_cloud(local_worker_clearing_points_, header, true, clearing_output_msg_, local_worker_);
+      local_worker_.last_clearing_output_bytes = clearing_output_msg_.data.size();
+      clearing_publisher_->publish(clearing_output_msg_);
       ++local_worker_.clearing_publish_count;
     }
     local_worker_last_seq_ = seq;
@@ -968,21 +1174,18 @@ private:
   void process_scan_once()
   {
     ++scan_worker_.tick_count;
+    scan_worker_.reused_output_buffer = true;
     if (!scan_publisher_ || scan_publisher_->get_subscription_count() == 0U) {
       return;
     }
     Clock::time_point stamp;
     std::uint64_t seq = 0U;
-    const auto cloud = latest_cloud_snapshot(stamp, seq);
-    if (!cloud || seq == scan_worker_last_seq_) {
-      return;
-    }
-    const auto offsets = field_offsets(*cloud);
-    if (!offsets.valid) {
+    const auto buffer = latest_normalized_snapshot(stamp, seq, &scan_worker_);
+    if (!buffer || seq == scan_worker_last_seq_) {
       return;
     }
     Transform3x4 transform;
-    if (!lookup_transform(scan_worker_frame_id_, cloud->header.frame_id, transform)) {
+    if (!lookup_transform(scan_worker_frame_id_, buffer->frame_id, transform)) {
       return;
     }
     const auto bin_count = static_cast<std::size_t>(
@@ -990,17 +1193,18 @@ private:
     if (bin_count == 0U || bin_count > 10000U) {
       return;
     }
-    std::vector<float> ranges(
-      bin_count,
-      scan_worker_use_inf_ ? std::numeric_limits<float>::infinity() :
-      static_cast<float>(scan_worker_range_max_ + scan_worker_inf_epsilon_));
-    const std::size_t point_count = static_cast<std::size_t>(cloud->width) * cloud->height;
+    scan_worker_.scan_bins_reused = scan_msg_.ranges.capacity() >= bin_count;
+    if (!scan_worker_.scan_bins_reused) {
+      ++scan_worker_.allocation_count;
+      scan_worker_.reused_output_buffer = false;
+    }
+    const float default_range = scan_worker_use_inf_ ?
+      std::numeric_limits<float>::infinity() :
+      static_cast<float>(scan_worker_range_max_ + scan_worker_inf_epsilon_);
+    scan_msg_.ranges.assign(bin_count, default_range);
+    const std::size_t point_count = buffer->points.size();
     for (std::size_t i = 0U; i < point_count; ++i) {
-      const auto raw_point = read_point(*cloud, offsets, i);
-      if (!raw_point) {
-        break;
-      }
-      const auto point = transform_point(transform, *raw_point);
+      const auto point = transform_point(transform, buffer->points[i]);
       if (point.z < scan_worker_min_height_ || point.z > scan_worker_max_height_) {
         continue;
       }
@@ -1013,22 +1217,23 @@ private:
         continue;
       }
       const auto index = static_cast<std::size_t>((angle - scan_worker_angle_min_) / scan_worker_angle_increment_);
-      if (index < ranges.size() && range < ranges[index]) {
-        ranges[index] = static_cast<float>(range);
+      if (index < scan_msg_.ranges.size() && range < scan_msg_.ranges[index]) {
+        scan_msg_.ranges[index] = static_cast<float>(range);
       }
     }
-    sensor_msgs::msg::LaserScan scan;
-    scan.header = cloud->header;
-    scan.header.frame_id = scan_worker_frame_id_;
-    scan.angle_min = static_cast<float>(scan_worker_angle_min_);
-    scan.angle_max = static_cast<float>(scan_worker_angle_min_ + scan_worker_angle_increment_ * (bin_count - 1U));
-    scan.angle_increment = static_cast<float>(scan_worker_angle_increment_);
-    scan.time_increment = 0.0F;
-    scan.scan_time = static_cast<float>(1.0 / scan_worker_rate_hz_);
-    scan.range_min = static_cast<float>(scan_worker_range_min_);
-    scan.range_max = static_cast<float>(scan_worker_range_max_);
-    scan.ranges = std::move(ranges);
-    scan_publisher_->publish(scan);
+    scan_msg_.header = header_from_buffer(*buffer);
+    scan_msg_.header.frame_id = scan_worker_frame_id_;
+    scan_msg_.angle_min = static_cast<float>(scan_worker_angle_min_);
+    scan_msg_.angle_max =
+      static_cast<float>(scan_worker_angle_min_ + scan_worker_angle_increment_ * (bin_count - 1U));
+    scan_msg_.angle_increment = static_cast<float>(scan_worker_angle_increment_);
+    scan_msg_.time_increment = 0.0F;
+    scan_msg_.scan_time = static_cast<float>(1.0 / scan_worker_rate_hz_);
+    scan_msg_.range_min = static_cast<float>(scan_worker_range_min_);
+    scan_msg_.range_max = static_cast<float>(scan_worker_range_max_);
+    scan_worker_.last_scan_output_ranges = scan_msg_.ranges.size();
+    scan_worker_.last_scan_output_bytes = scan_msg_.ranges.size() * sizeof(float);
+    scan_publisher_->publish(scan_msg_);
     ++scan_worker_.processed_count;
     ++scan_worker_.scan_publish_count;
     scan_worker_last_seq_ = seq;
@@ -1066,9 +1271,13 @@ private:
       -1.0 : std::chrono::duration<double, std::milli>(now_steady - last_publish_time_).count();
     Clock::time_point latest_stamp;
     std::uint64_t latest_seq = 0U;
-    const auto latest = latest_cloud_snapshot(latest_stamp, latest_seq);
+    const auto latest = latest_normalized_snapshot(latest_stamp, latest_seq);
     const double latest_age_ms = latest_stamp == Clock::time_point{} ?
       -1.0 : std::chrono::duration<double, std::milli>(now_steady - latest_stamp).count();
+    const double local_processing_ms_avg = local_worker_.processing_ms_count > 0U ?
+      local_worker_.processing_ms_sum / static_cast<double>(local_worker_.processing_ms_count) : -1.0;
+    const double scan_processing_ms_avg = scan_worker_.processing_ms_count > 0U ?
+      scan_worker_.processing_ms_sum / static_cast<double>(scan_worker_.processing_ms_count) : -1.0;
     const double raw_stamp_age_ms = last_raw_stamp_sec_ <= 0.0 ?
       -1.0 : (now().seconds() - last_raw_stamp_sec_) * 1000.0;
     const double publish_stamp_age_ms = last_output_stamp_sec_ <= 0.0 ?
@@ -1085,9 +1294,18 @@ private:
            << " fast_path_lidar_points_publish_hz=" << static_cast<double>(publish_delta) / elapsed_sec
            << " fast_path_duration_ms=" << last_fast_path_duration_ms_
            << " latest_buffer_update_hz=" << static_cast<double>(latest_delta) / elapsed_sec
-           << " latest_buffer_points=" << (latest ? static_cast<std::size_t>(latest->width) * latest->height : 0U)
-           << " latest_buffer_bytes=" << (latest ? latest->data.size() : 0U)
+           << " latest_buffer_points=" << (latest ? latest->points.size() : 0U)
+           << " latest_buffer_bytes=" << (latest ? latest->points.size() * sizeof(NormalizedPointView) : 0U)
            << " latest_buffer_age_ms=" << latest_age_ms
+           << " internal_zero_copy_profile=true"
+           << " latest_internal_buffer_points=" << (latest ? latest->points.size() : 0U)
+           << " latest_internal_buffer_bytes=" << (latest ? latest->points.size() * sizeof(NormalizedPointView) : 0U)
+           << " latest_internal_buffer_source_bytes=" << (latest ? latest->source_bytes : 0U)
+           << " latest_internal_buffer_age_ms=" << latest_age_ms
+           << " latest_internal_buffer_seq=" << latest_seq
+           << " normalized_buffer_allocation_count=" << normalized_buffer_allocation_count_
+           << " latest_buffer_lock_wait_ms_max=" << latest_buffer_lock_wait_ms_max_
+           << " trunk_copy_count_per_frame=0"
            << " last_raw_age_ms=" << raw_age_ms
            << " last_raw_stamp_age_ms=" << raw_stamp_age_ms
            << " last_publish_age_ms=" << publish_age_ms
@@ -1112,6 +1330,8 @@ private:
            << " accel_profile=" << accel_profile_
            << " worker_local_enabled=" << (worker_local_enabled_ ? "true" : "false")
            << " worker_scan_enabled=" << (worker_scan_enabled_ ? "true" : "false")
+           << " local_worker_enabled=" << (worker_local_enabled_ ? "true" : "false")
+           << " scan_worker_enabled=" << (worker_scan_enabled_ ? "true" : "false")
            << " nav_branch_enabled=" << (nav_compact_publisher_ ? "true" : "false")
            << " local_branch_enabled=" << (local_compact_publisher_ ? "true" : "false")
            << " nav_branch_publish_hz=" << static_cast<double>(nav_compact_delta) / elapsed_sec
@@ -1130,26 +1350,47 @@ private:
            << " local_compact_publish_hz=" << static_cast<double>(local_compact_delta) / elapsed_sec
            << " local_compact_skip_busy_count=" << local_compact_.skip_busy_count
            << " local_compact_intensity_missing=" << (local_compact_.intensity_missing ? "true" : "false")
+           << " local_compact_allocation_count=" << local_compact_.allocation_count
            << " nav_compact_last_points=" << nav_compact_.last_points
            << " nav_compact_last_bytes=" << nav_compact_.last_bytes
            << " nav_compact_bytes_per_point=" << nav_compact_.bytes_per_point
            << " nav_compact_publish_hz=" << static_cast<double>(nav_compact_delta) / elapsed_sec
            << " nav_compact_skip_busy_count=" << nav_compact_.skip_busy_count
            << " nav_compact_intensity_missing=" << (nav_compact_.intensity_missing ? "true" : "false")
+           << " nav_compact_allocation_count=" << nav_compact_.allocation_count
            << " local_worker_tick_hz=" << static_cast<double>(local_tick_delta) / elapsed_sec
            << " local_worker_processed_hz=" << static_cast<double>(local_processed_delta) / elapsed_sec
            << " local_worker_obstacle_publish_hz=" << static_cast<double>(obstacle_delta) / elapsed_sec
            << " local_worker_clearing_publish_hz=" << static_cast<double>(clearing_delta) / elapsed_sec
            << " local_worker_last_processing_ms=" << local_worker_.last_processing_ms
+           << " local_worker_processing_ms_avg=" << local_processing_ms_avg
            << " local_worker_processing_ms_max=" << local_worker_.processing_ms_max
            << " local_worker_skip_busy_count=" << local_worker_.skip_busy_count
+           << " local_worker_full_cloud_copy_count=" << local_worker_.full_cloud_copy_count
+           << " local_worker_intermediate_pointcloud_build_count=" <<
+             local_worker_.intermediate_pointcloud_build_count
+           << " local_worker_allocation_count=" << local_worker_.allocation_count
+           << " local_worker_reused_buffer=" << (local_worker_.reused_output_buffer ? "true" : "false")
+           << " local_worker_lock_wait_ms_max=" << local_worker_.lock_wait_ms_max
+           << " obstacle_output_last_bytes=" << local_worker_.last_obstacle_output_bytes
+           << " clearing_output_last_bytes=" << local_worker_.last_clearing_output_bytes
            << " scan_worker_tick_hz=" << static_cast<double>(scan_tick_delta) / elapsed_sec
            << " scan_worker_processed_hz=" << static_cast<double>(scan_processed_delta) / elapsed_sec
            << " scan_worker_scan_publish_hz=" << static_cast<double>(scan_delta) / elapsed_sec
            << " scan_worker_flatscan_publish_hz=0.000"
            << " scan_worker_last_processing_ms=" << scan_worker_.last_processing_ms
+           << " scan_worker_processing_ms_avg=" << scan_processing_ms_avg
            << " scan_worker_processing_ms_max=" << scan_worker_.processing_ms_max
            << " scan_worker_skip_busy_count=" << scan_worker_.skip_busy_count
+           << " scan_worker_full_cloud_copy_count=" << scan_worker_.full_cloud_copy_count
+           << " scan_worker_intermediate_pointcloud_build_count=" <<
+             scan_worker_.intermediate_pointcloud_build_count
+           << " scan_worker_allocation_count=" << scan_worker_.allocation_count
+           << " scan_worker_reused_buffer=" << (scan_worker_.reused_output_buffer ? "true" : "false")
+           << " scan_worker_scan_bins_reused=" << (scan_worker_.scan_bins_reused ? "true" : "false")
+           << " scan_worker_lock_wait_ms_max=" << scan_worker_.lock_wait_ms_max
+           << " scan_output_last_ranges=" << scan_worker_.last_scan_output_ranges
+           << " scan_output_last_bytes=" << scan_worker_.last_scan_output_bytes
            << " dropped_or_skipped_count=" << dropped_or_skipped_count_
            << " node_uptime_sec=" << uptime_sec;
 
@@ -1182,8 +1423,15 @@ private:
     trunk_publish_gap_over_100ms_count_ = 0U;
     trunk_publish_gap_over_150ms_count_ = 0U;
     trunk_publish_gap_over_200ms_count_ = 0U;
+    latest_buffer_lock_wait_ms_max_ = 0.0;
     local_worker_.processing_ms_max = 0.0;
+    local_worker_.processing_ms_sum = 0.0;
+    local_worker_.processing_ms_count = 0U;
+    local_worker_.lock_wait_ms_max = 0.0;
     scan_worker_.processing_ms_max = 0.0;
+    scan_worker_.processing_ms_sum = 0.0;
+    scan_worker_.processing_ms_count = 0U;
+    scan_worker_.lock_wait_ms_max = 0.0;
   }
 
   std::string input_topic_;
@@ -1255,9 +1503,12 @@ private:
   bool warned_missing_xyz_;
   std::atomic<bool> stop_workers_{false};
   mutable std::mutex latest_cloud_mutex_;
-  std::shared_ptr<const sensor_msgs::msg::PointCloud2> latest_cloud_;
-  Clock::time_point latest_cloud_time_{};
-  std::uint64_t latest_cloud_seq_{0U};
+  std::shared_ptr<const LatestNormalizedBuffer> latest_normalized_buffer_;
+  std::shared_ptr<LatestNormalizedBuffer> reusable_normalized_buffer_;
+  Clock::time_point latest_normalized_time_{};
+  std::uint64_t latest_normalized_seq_{0U};
+  std::uint64_t normalized_buffer_allocation_count_{0U};
+  double latest_buffer_lock_wait_ms_max_{0.0};
   std::uint64_t local_worker_last_seq_{0U};
   std::uint64_t scan_worker_last_seq_{0U};
   std::uint64_t local_compact_last_seq_{0U};
@@ -1297,6 +1548,13 @@ private:
   CompactDiagnostics nav_compact_;
   WorkerDiagnostics local_worker_;
   WorkerDiagnostics scan_worker_;
+  sensor_msgs::msg::PointCloud2 local_compact_msg_;
+  sensor_msgs::msg::PointCloud2 nav_compact_msg_;
+  sensor_msgs::msg::PointCloud2 obstacle_output_msg_;
+  sensor_msgs::msg::PointCloud2 clearing_output_msg_;
+  sensor_msgs::msg::LaserScan scan_msg_;
+  std::vector<PointXYZI> local_worker_obstacle_points_;
+  std::vector<PointXYZI> local_worker_clearing_points_;
 
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;

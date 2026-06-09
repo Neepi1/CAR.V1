@@ -62,11 +62,19 @@ network IRQs. These tools must not be used as justification to change PointCloud
 QoS reliability, DDS transport, timestamps, Nav2 controller/planner settings,
 EKF, FAST-LIO2 navigation residency, or the App/mapping ownership boundary.
 
-Phase 1.13 adds a pointcloud acceleration profile without changing the
-canonical trunk. `NJRH_POINTCLOUD_ACCEL_PROFILE=legacy` remains the default and
-keeps the validated standalone `pointcloud_axis_remap -> local_branch/nav_branch`
-chain. `ipc_worker` starts `pointcloud_accel_axis_node`, whose raw callback
-publishes full-density/full-fields `/lidar_points` and updates a latest
+Phase 1.14 wires the pointcloud acceleration profile into the runtime driver
+entrypoint without changing the canonical trunk. `NJRH_POINTCLOUD_ACCEL_PROFILE=legacy`
+remains the default and keeps the validated standalone branch chain. In legacy,
+`pointcloud_axis_remap_node` owns the only `/lidar_points` full-density trunk,
+`robot_local_perception` owns `/perception/obstacle_points` and
+`/perception/clearing_points`, and `jt128_localization_sensing.launch.py`
+recovers the minimal scan chain
+`/lidar_points_nav -> nav_cloud_preprocessor -> /points_nav ->
+pointcloud_to_laserscan -> /scan_raw -> scan_republisher -> /scan ->
+laser_scan_to_flatscan -> /flatscan`. The legacy restart path restores that
+chain without starting the full localizer. `ipc_worker` starts
+`pointcloud_accel_axis_node` as the single `/lidar_points` publisher; its raw
+callback publishes full-density/full-fields `/lidar_points` and updates a latest
 normalized buffer before returning. Worker threads named `pc_accel_local` and
 `pc_accel_scan` then derive `/perception/obstacle_points`,
 `/perception/clearing_points`, and `/scan`; `laser_scan_to_flatscan` converts
@@ -77,13 +85,59 @@ navigation-branch acceleration only. The NITROS path must run future accelerated
 nodes in one same-process component container and must not replace
 `/lidar_points` or FAST-LIO2 mapping input.
 
-The full-size pointcloud trunk is latest-only after the upstream Hesai driver: `/lidar_points` is the high-density canonical trunk used by mapping-owned FAST-LIO2 and diagnostic consumers, not the default local-obstacle input during production navigation. Production `pointcloud_axis_remap` runs as a standalone process, publishes the only `/lidar_points` trunk, derives `/lidar_points_nav` at stride 4 with `nav_output_publish_every_n=2` for approximately 10 Hz localization scan preprocessing, and derives `/_internal/lidar_points_local` at stride 2 with `local_output_publish_every_n=1` when `NJRH_LOCAL_PERCEPTION_INPUT_PROFILE=local_branch`. That profile is the production default and routes the separate `robot_local_perception` process to `/_internal/lidar_points_local`; `NJRH_LOCAL_PERCEPTION_INPUT_PROFILE=trunk` disables the hidden branch and routes local perception back to `/lidar_points` for rollback/diagnosis. `ROBOT_LOCAL_PERCEPTION_INPUT_TOPIC` overrides the profile input topic, and explicit `NJRH_POINTCLOUD_AXIS_LOCAL_OUTPUT_TOPIC`, `NJRH_POINTCLOUD_AXIS_LOCAL_OUTPUT_STRIDE`, and `NJRH_POINTCLOUD_AXIS_LOCAL_OUTPUT_PUBLISH_EVERY_N` values override the runtime branch injection. `/lidar_points`, `/lidar_points_nav`, `/_internal/lidar_points_local`, `/points_nav`, `/perception/obstacle_points`, and `/perception/clearing_points` use best-effort QoS with depth `1`. Derived branches must not become additional canonical `/lidar_points` publishers. `/points_nav` depends on the upstream `jt128_nav_tools/nav_cloud_preprocessor` patch at `scripts/jetson/runtime_overlay/patches/jt128_nav_tools_pointcloud_qos.patch`; the patched build is sourced from `${NJRH_JT128_NAV_TOOLS_PATCHED_OVERLAY:-${PROJECT_ROOT}/.runtime/jt128_nav_tools_overlay/install}` by `common_env.sh`. Without that overlay the preprocessor falls back to its old mixed QoS behavior and can reintroduce large-message queues. Debug commands, RViz/Foxglove views, and rosbag captures should not stay attached to `/lidar_points`; use status topics or reduced/debug branches where possible, and require explicit env flags for bagging high-density clouds.
+Phase Z1 tightens the `ipc_worker` implementation without adding topics:
+workers no longer keep or parse a latest `PointCloud2` snapshot. The raw
+callback publishes the full trunk, refreshes a latest normalized in-process
+buffer, and exits; obstacle, clearing, compact compatibility, and scan workers
+read that buffer directly and only allocate/build the final existing outputs.
+The existing `/lidar/pointcloud_accel_status` reports
+`internal_zero_copy_profile=true`, latest internal buffer size, worker full
+cloud copy counters, intermediate PointCloud2 build counters, allocation counts,
+lock wait maxima, and processing averages.
+
+The full-size pointcloud trunk is latest-only after the upstream Hesai driver:
+`/lidar_points` is the high-density canonical trunk used by mapping-owned
+FAST-LIO2 and diagnostic consumers. It must not be compacted or downsampled.
+In `legacy`, production `pointcloud_axis_remap_node` runs as a standalone process,
+publishes the only `/lidar_points` trunk, derives `/lidar_points_nav` at stride
+4 with `nav_output_publish_every_n=2` for approximately 10 Hz localization scan
+preprocessing, and derives `/_internal/lidar_points_local` at stride 2 with
+`local_output_publish_every_n=1` when `NJRH_LOCAL_PERCEPTION_INPUT_PROFILE=local_branch`.
+That profile is the production default and routes the separate
+`robot_local_perception` process to `/_internal/lidar_points_local`;
+`NJRH_LOCAL_PERCEPTION_INPUT_PROFILE=trunk` disables the hidden branch and routes
+local perception back to `/lidar_points` for rollback/diagnosis. In `ipc_worker`,
+`pointcloud_accel_axis_node` owns `/lidar_points` and same-process workers own
+`/perception/obstacle_points`, `/perception/clearing_points`, and `/scan`;
+`/_internal/lidar_points_local`, `/lidar_points_nav`, and `/points_nav` are not
+production-required DDS hops. `ROBOT_LOCAL_PERCEPTION_INPUT_TOPIC` overrides the
+legacy profile input topic, and explicit `NJRH_POINTCLOUD_AXIS_LOCAL_OUTPUT_TOPIC`,
+`NJRH_POINTCLOUD_AXIS_LOCAL_OUTPUT_STRIDE`, and
+`NJRH_POINTCLOUD_AXIS_LOCAL_OUTPUT_PUBLISH_EVERY_N` values override legacy branch
+injection. `/lidar_points`, `/lidar_points_nav`, `/_internal/lidar_points_local`,
+`/points_nav`, `/perception/obstacle_points`, and `/perception/clearing_points`
+use best-effort QoS with depth `1`. Derived branches must not become additional
+canonical `/lidar_points` publishers. `/points_nav` depends on the upstream
+`jt128_nav_tools/nav_cloud_preprocessor` patch at
+`scripts/jetson/runtime_overlay/patches/jt128_nav_tools_pointcloud_qos.patch`;
+the patched build is sourced from
+`${NJRH_JT128_NAV_TOOLS_PATCHED_OVERLAY:-${PROJECT_ROOT}/.runtime/jt128_nav_tools_overlay/install}`
+by `common_env.sh`. Without that overlay the preprocessor falls back to its old
+mixed QoS behavior and can reintroduce large-message queues. Debug commands,
+RViz/Foxglove views, and rosbag captures should not stay attached to
+`/lidar_points`; use status topics or reduced/debug branches where possible, and
+require explicit env flags for bagging high-density clouds.
 
 For accel-profile validation, use `set_pointcloud_accel_profile.sh`,
-`verify_pointcloud_accel_profile.sh`, and `run_pointcloud_accel_ab.sh`. A valid
-`ipc_worker` run keeps `/lidar_points` publisher count at one, keeps the trunk
-near vendor rate with full fields, leaves FAST-LIO2 non-resident during normal
-navigation, and still feeds Nav2 through `/perception/obstacle_points`,
+`verify_pointcloud_accel_profile.sh`, and `run_pointcloud_accel_ab.sh`. The
+verify script reports requested/resolved profile, trunk/obstacle/clearing/
+points_nav/scan/flatscan owners, `/lidar_points` publisher count, Nav2
+subscribers, status topics, internal zero-copy counters, FAST-LIO2 residuals,
+and final owner-contract summary flags. A valid `ipc_worker` run keeps
+`/lidar_points` publisher count at one, keeps the trunk near vendor rate with
+full fields, reports zero worker full-cloud copies and zero intermediate
+PointCloud2 builds, leaves FAST-LIO2 non-resident during normal navigation, and
+still feeds Nav2 through `/perception/obstacle_points`,
 `/perception/clearing_points`, `/scan`, and `/flatscan`. Rollback is one command:
 `bash scripts/jetson/runtime_overlay/scripts/set_pointcloud_accel_profile.sh --profile legacy --restart`.
 
@@ -95,7 +149,7 @@ For field diagnosis, the same C++ node publishes `/perception/local_perception_s
 
 Pointcloud source and localization-preprocessor diagnostics are also emitted from C++ nodes. `pointcloud_axis_remap` publishes `/lidar/axis_remap_status` at 1 Hz with raw input rate, `/lidar_points` publish rate, raw callback inter-arrival, `/lidar_points` publish interval and gap counters, raw callback duration, trunk/branch/total publish timing, cloud size, output subscriber count, branch flags, branch publish/skip/attempt rates, branch subscriber counts, branch last points/bytes/duration, and skipped-cloud count. The patched `nav_cloud_preprocessor` publishes `/lidar/nav_cloud_preprocessor_status` at 1 Hz with input callback/accept rate, `/points_nav` output rate, TF/empty/filter-empty skips, input inter-arrival, input stamp/message age, processing average/max, input/output point counts, lookup timeout, source/target frame, range/height filters, matched publisher/subscriber counts, and QoS. These status topics are the preferred field inputs for `diagnose_lidar_points_jitter.sh`, `diagnose_local_perception_pipeline.sh`, `diagnose_nav_scan_pipeline.sh`, `verify_lidar_trunk_jitter.sh`, and `verify_pointcloud_delivery_matrix.sh`; use direct `ros2 topic hz` on full-density clouds only when a status topic is unavailable or when deliberately comparing subscriber-side delivery with `--include-cli-hz` or a manual `NJRH_VERIFY_MATRIX_LIDAR_POINTS_CLI_HZ` value for CASE_G.
 
-The default navigation local-state mode is wheel-odom + JT128-IMU EKF because Nav2 control needs low-latency, continuous `odom -> base_link` more than globally consistent lidar-inertial smoothing. When FAST-LIO local-state mode is explicitly selected, `/Odometry` can arrive behind wall time because the lidar-inertial frontend has processing latency; that latency must be diagnosed at the producer and transport layers, not hidden by changing local-obstacle cloud stamps. `robot_local_perception` publishes `/perception/obstacle_points` and `/perception/clearing_points` with the input pointcloud acquisition stamp preserved. The local costmap runs in `base_link`, so its obstacle layer consumes robot-frame clouds directly instead of depending on a historical `odom <- base_link` transform for every local obstacle update. The local perception hot path uses latest/static TF for the `lidar_link -> base_link` sensor extrinsic (`input_transform_use_latest=true`) while preserving the original cloud header stamp, so static extrinsic lookup cannot block every obstacle frame. Startup-time costmap MessageFilter drops are kept as diagnostics, not as shell-level startup blockers.
+The default navigation local-state mode is wheel-odom + JT128-IMU EKF because Nav2 control needs low-latency, continuous `odom -> base_link` more than globally consistent lidar-inertial smoothing. When FAST-LIO local-state mode is explicitly selected, `/Odometry` can arrive behind wall time because the lidar-inertial frontend has processing latency; that latency must be diagnosed at the producer and transport layers, not hidden by changing local-obstacle cloud stamps. `robot_local_perception` publishes `/perception/obstacle_points` and `/perception/clearing_points` with the input pointcloud acquisition stamp preserved. The local costmap rolling window runs in `odom` so controller progress checks see a robot pose that changes with motion; `robot_base_frame` remains `base_link`, and obstacle/clearing sources keep `sensor_frame=base_link` because those clouds are already expressed in the robot frame. Do not use `base_link` as the local costmap `global_frame`: it makes the pose returned to controller-side progress checking nearly constant in the robot frame and can cause false `Failed to make progress` aborts. The local perception hot path uses latest/static TF for the `lidar_link -> base_link` sensor extrinsic (`input_transform_use_latest=true`) while preserving the original cloud header stamp, so static extrinsic lookup cannot block every obstacle frame. Startup-time costmap MessageFilter drops are kept as diagnostics, not as shell-level startup blockers.
 
 Canonical local-state is owned by common services, not by Nav2 startup. In the default EKF mode, common services start the wheel-odom preprocessor, IMU bias filter, and `robot_localization` EKF process, and process existence is the startup ownership check. In explicit FAST-LIO local-state mode the common layer requires both `fastlio_odom_bridge_node` and `robot_local_state/local_state_node`. Endpoint/topic/TF validation is manual diagnostics and API admission, not a shell launch gate. Runtime graph-probe misses under Nav2 startup load must not cause the canonical `odom -> base_link` owner to kill itself.
 
@@ -154,7 +208,11 @@ Nav2's behavior tree is a coordinator, not the low-level controller loop. The fi
 
 Return-to-dock uses Nav2 only up to the pre-dock approach pose. The backend prefers a manual point (`predock_pose_id`, `approach_pose_id`, or a saved pose such as `dock_main_predock`) and validates its yaw against the dock contact pose. Manual pre-dock distance checking is disabled by default (`docking_manual_predock_distance_check_enable=false`), so a close but intentionally saved point is not rejected only because it is below the old `0.50m` lower bound. If no manual point exists, the backend falls back to a geometric offset from the saved dock contact pose. After Nav2 reports success, `robot_api_server` triggers localization again and checks the refreshed `map -> base_link` pose against the approach pose before handing motion to `robot_docking_manager`. If the pose is outside the configured tolerance, GS2 fine docking is not started. Once fine docking succeeds, fails, or is stopped, the API triggers another localization refresh in `relocalize_after_fine_docking` before publishing the final docking state, so the next Nav2 action starts from a corrected `map -> odom` rather than odometry accumulated during non-Nav2 fine docking.
 
-Normal point navigation also treats dock/contact state and localization freshness as gates. `robot_api_server` first builds one pre-navigation dock-contact snapshot from backend docking state, `/docking/status`, and fresh Ranger BMS charging contact. If the backend state is `docked`, `/docking/status` starts with `docked` or `charging`, or BMS contact is active, `POST /api/v1/navigation/goal` performs controlled `/docking/undock` and waits for post-undock relocalization before any Nav2 action is sent. Full batteries may report `current=0`, so this gate uses `power_supply_status=FULL/CHARGING`, BMS contact reason, valid contact voltage, and configured full-SOC contact inference rather than current alone. `GET /api/v1/navigation/pre_goal_check` and `scripts/jetson/runtime_overlay/scripts/verify_pre_navigation_undock_gate.sh` expose the same gate read-only for field diagnosis. After the dock/contact gate passes, `robot_api_server` checks the critical Nav2 lifecycle nodes, triggers `/global_localization/trigger`, waits for a fresh `/localization_result`, and verifies that `robot_localization_bridge` accepted the resulting `map -> odom` before sending `/navigate_to_pose`. If Nav2 lifecycle heartbeat loss has left controller/planner/BT/costmap nodes inactive, the API reports navigation as degraded and rejects new goals instead of exposing a false running state. Accepted goals are tracked as a background `navigation_goal`; the business completion rule is position-first. If the target position is reached but final yaw alignment is blocked by the safety chain, the API reports `position_reached_yaw_warning` with `final_yaw_align_blocked=true` and still marks the goal succeeded so a delivery does not fail only because the last in-place spin was unsafe.
+After each docking relocalization gate, the API also waits for the live TF chain to settle: `map -> odom`, `odom -> base_link`, and the composed `map -> base_link` pose must all be fresh before the pre-dock Nav2 goal or GS2 fine-docking handoff proceeds. Docking cancel calls `/docking/stop` with the configured service wait and records that result instead of treating a short service-discovery miss as a clean stop.
+
+Normal point navigation also treats dock/contact state and localization freshness as gates. `robot_api_server` first builds one pre-navigation dock-contact snapshot from backend docking state, `/docking/status`, and fresh Ranger BMS charging contact. If the backend state is `docked`, `/docking/status` starts with `docked` or `charging`, or BMS contact is active, `POST /api/v1/navigation/goal` performs controlled `/docking/undock` and waits for post-undock relocalization before any Nav2 action is sent. Full batteries may report `current=0`, so this gate uses `power_supply_status=FULL/CHARGING`, BMS contact reason, valid contact voltage, and configured full-SOC contact inference rather than current alone. `GET /api/v1/navigation/pre_goal_check` and `scripts/jetson/runtime_overlay/scripts/verify_pre_navigation_undock_gate.sh` expose the same gate read-only for field diagnosis. After the dock/contact gate passes, `robot_api_server` checks the critical Nav2 lifecycle nodes and evaluates a when-needed relocalization decision: confirmed same-map runtime context plus a fresh map-frame pose skips `/global_localization/trigger`; cold/unconfirmed context, stale or missing map-frame pose, undock, docking transitions, or explicit `force_relocalize` still trigger localization and require `robot_localization_bridge` to accept the resulting `map -> odom` before sending `/navigate_to_pose`. This prevents repeated normal goals from injecting avoidable `map -> odom` jumps while preserving recovery and startup safety. If Nav2 lifecycle heartbeat loss has left controller/planner/BT/costmap nodes inactive, the API reports navigation as degraded and rejects new goals instead of exposing a false running state. Accepted goals are tracked as a background `navigation_goal`; after Nav2 returns, the API enters `position_reached_verifying`, checks a fresh `map -> base_link` pose, and only then optionally enters `position_reached_yaw_aligning` for a bounded mission-layer final yaw correction. The command currently enters `/cmd_vel_collision_checked`, so `robot_safety` remains authoritative while `final_yaw_align_bypass_collision_monitor=true` is reported until a `/cmd_vel_nav` mux is added. It then enters `final_pose_verifying` and reports `final_pose_verified` or a specific warning/failure reason. The business completion rule remains position-first: if the target position is reached but final yaw alignment is blocked by the safety chain, the API reports `position_reached_yaw_warning` with `final_yaw_align_blocked=true` and still marks the goal succeeded so a delivery does not fail only because the last in-place spin was unsafe.
+
+Before any normal Nav2 goal is sent, `robot_api_server` waits for fresh `map -> odom`, `odom -> base_link`, and composed `map -> base_link` TF samples. If the localization bridge has accepted a new result but the TF stream has not caught up yet, the API returns a TF-not-ready admission failure rather than letting Nav2 immediately abort on future extrapolation.
 
 By default, runtime scripts reuse common services:
 

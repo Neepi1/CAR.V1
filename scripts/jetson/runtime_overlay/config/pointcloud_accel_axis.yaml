@@ -1,4 +1,4 @@
-pointcloud_axis_remap:
+pointcloud_accel_axis_node:
   ros__parameters:
     input_topic: /jt128/vendor/points_raw
     output_topic: /lidar_points
@@ -9,6 +9,7 @@ pointcloud_axis_remap:
     output_reliable: false
     status_topic: /lidar/axis_remap_status
     accel_status_topic: /lidar/pointcloud_accel_status
+    flatscan_output_topic: /flatscan
     status_publish_period_sec: 1.0
 
     # /lidar_points is always full-density/full-fields. The compact settings
@@ -27,6 +28,7 @@ pointcloud_axis_remap:
     nav_compact_max_rate_hz: 10.0
     nav_output_qos_depth: 1
 
+    local_worker_enabled: true
     worker_local_enabled: true
     obstacle_output_topic: /perception/obstacle_points
     clearing_output_topic: /perception/clearing_points
@@ -54,6 +56,7 @@ pointcloud_axis_remap:
     clearing_worker_point_stride: 2
     clearing_worker_max_points: 15000
 
+    scan_worker_enabled: true
     worker_scan_enabled: true
     scan_output_topic: /scan
     scan_worker_frame_id: lidar_level_link
