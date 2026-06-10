@@ -16,6 +16,8 @@ ACCEL_CONFIG="${NJRH_POINTCLOUD_ACCEL_AXIS_CONFIG:-${NJRH_OVERLAY_ROOT}/config/p
 MIN_TRUNK_HZ="${NJRH_POINTCLOUD_ACCEL_MIN_TRUNK_HZ:-18.0}"
 MIN_OBSTACLE_HZ="${NJRH_POINTCLOUD_ACCEL_MIN_OBSTACLE_HZ:-10.0}"
 MIN_SCAN_HZ="${NJRH_POINTCLOUD_ACCEL_MIN_SCAN_HZ:-8.0}"
+MIN_FLATSCAN_HZ="${NJRH_FLATSCAN_MIN_HZ:-5.0}"
+FLATSCAN_STATUS_FILE="${NJRH_FLATSCAN_HELPER_STATUS_FILE:-${NJRH_RUNTIME_LOG_DIR}/flatscan_helper_status.env}"
 ALLOW_LOCAL_PERCEPTION_FALLBACK="${NJRH_POINTCLOUD_ACCEL_ALLOW_LOCAL_PERCEPTION_FALLBACK:-false}"
 ALLOW_LEGACY_SCAN_FALLBACK="${NJRH_POINTCLOUD_ACCEL_ALLOW_LEGACY_SCAN_FALLBACK:-false}"
 TMP_DIR="$(mktemp -d /tmp/njrh_pointcloud_accel_verify_XXXX)"
@@ -27,6 +29,9 @@ legacy_scan_chain_ok=true
 ipc_worker_owner_ok=true
 trunk_full_density_ok=true
 nav2_compat_topics_ok=true
+flatscan_owner_ok=false
+flatscan_hz_ok=false
+flatscan_nav_startup_gate_ok=false
 
 field_value() {
   local text="$1"
@@ -149,6 +154,18 @@ echo "[pointcloud-accel-verify] profile_source=${NJRH_POINTCLOUD_ACCEL_PROFILE_S
 echo "[pointcloud-accel-verify] DDS transport env: RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-unset} FASTDDS_BUILTIN_TRANSPORTS=${FASTDDS_BUILTIN_TRANSPORTS:-unset}"
 echo "[pointcloud-accel-verify] RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-unset}"
 echo "[pointcloud-accel-verify] FASTDDS_BUILTIN_TRANSPORTS=${FASTDDS_BUILTIN_TRANSPORTS:-unset}"
+
+FLATSCAN_HELPER_MODE="missing"
+FLATSCAN_HELPER_PID=""
+FLATSCAN_HELPER_RESTART_COUNT=""
+if [[ -f "${FLATSCAN_STATUS_FILE}" ]]; then
+  # shellcheck disable=SC1090
+  source "${FLATSCAN_STATUS_FILE}"
+fi
+echo "[pointcloud-accel-verify] flatscan_helper_status_file=${FLATSCAN_STATUS_FILE}"
+echo "[pointcloud-accel-verify] flatscan_helper_mode=${FLATSCAN_HELPER_MODE:-missing}"
+echo "[pointcloud-accel-verify] flatscan_helper_pid=${FLATSCAN_HELPER_PID:-missing}"
+echo "[pointcloud-accel-verify] flatscan_helper_restart_count=${FLATSCAN_HELPER_RESTART_COUNT:-missing}"
 
 lidar_publishers="$(topic_count lidar "Publisher count")"
 lidar_subscribers="$(topic_count lidar "Subscription count")"
@@ -363,6 +380,26 @@ echo "[pointcloud-accel-verify] clearing_hz=${clearing_hz:-missing}"
 echo "[pointcloud-accel-verify] scan_hz=${scan_hz:-missing}"
 echo "[pointcloud-accel-verify] flatscan_hz=${flatscan_hz:-missing}"
 
+if [[ "${scan_publishers}" != "0" && "${flatscan_publishers}" == "0" ]]; then
+  fail "CASE_FLATSCAN_HELPER_DEAD: /scan has publisher_nodes=${scan_owner:-missing} but /flatscan publisher is missing"
+  mark_nav2_fail
+fi
+if [[ "${flatscan_publishers}" != "0" ]]; then
+  if [[ -z "${flatscan_hz}" ]]; then
+    fail "/flatscan publisher exists but hz could not be measured"
+    mark_nav2_fail
+  elif float_ge "${flatscan_hz}" "${MIN_FLATSCAN_HZ}"; then
+    flatscan_hz_ok=true
+    echo "[pointcloud-accel-verify] PASS FLATSCAN_HZ_OK hz=${flatscan_hz} min=${MIN_FLATSCAN_HZ}"
+  else
+    fail "/flatscan hz ${flatscan_hz} below ${MIN_FLATSCAN_HZ}"
+    mark_nav2_fail
+  fi
+else
+  fail "/flatscan publisher count is 0"
+  mark_nav2_fail
+fi
+
 if [[ "${RESOLVED_PROFILE}" != "legacy" ]]; then
   if [[ -z "${obstacle_hz}" ]] || ! float_ge "${obstacle_hz}" "${MIN_OBSTACLE_HZ}"; then
     if [[ -n "${obstacle_hz}" ]] && float_ge "${obstacle_hz}" 9.0; then
@@ -408,6 +445,7 @@ if [[ "${RESOLVED_PROFILE}" == "legacy" ]]; then
     mark_legacy_scan_fail
   fi
   if [[ "${flatscan_publishers}" != "0" ]] && node_list_has "${flatscan_publisher_nodes}" '(^|[[:space:]])laser_scan_to_flatscan($|[[:space:]])'; then
+    flatscan_owner_ok=true
     echo "[pointcloud-accel-verify] PASS legacy flatscan owner is laser_scan_to_flatscan"
   else
     fail "legacy missing /flatscan publisher from laser_scan_to_flatscan"
@@ -459,11 +497,32 @@ else
     echo "[pointcloud-accel-verify] /_internal/lidar_points_local debug_compat_publishers=${internal_local_publishers}"
   fi
   if [[ "${flatscan_publishers}" != "0" ]] && node_list_has "${flatscan_publisher_nodes}" '(^|[[:space:]])laser_scan_to_flatscan($|[[:space:]])'; then
+    flatscan_owner_ok=true
     echo "[pointcloud-accel-verify] PASS ${RESOLVED_PROFILE} flatscan compatibility owner is laser_scan_to_flatscan"
+  elif [[ "${flatscan_publishers}" != "0" ]] && node_list_has "${flatscan_publisher_nodes}" '(^|[[:space:]])pointcloud_accel_axis_node($|[[:space:]])'; then
+    flatscan_owner_ok=true
+    echo "[pointcloud-accel-verify] PASS ${RESOLVED_PROFILE} flatscan owner is pointcloud_accel_axis_node direct publisher"
   elif [[ "${flatscan_publishers}" == "0" ]]; then
     fail "${RESOLVED_PROFILE} /flatscan compatibility publisher is missing"
     mark_nav2_fail
+  else
+    fail "${RESOLVED_PROFILE} /flatscan publisher owner is unexpected: ${flatscan_owner:-missing}"
+    mark_nav2_fail
   fi
+fi
+
+if [[ "${flatscan_owner_ok}" == "true" ]]; then
+  echo "[pointcloud-accel-verify] PASS FLATSCAN_OWNER_OK owner=${flatscan_owner}"
+else
+  echo "[pointcloud-accel-verify] FAIL FLATSCAN_OWNER_OK=false owner=${flatscan_owner:-missing}"
+  status=1
+fi
+if [[ "${flatscan_owner_ok}" == "true" && "${flatscan_hz_ok}" == "true" ]]; then
+  flatscan_nav_startup_gate_ok=true
+  echo "[pointcloud-accel-verify] PASS FLATSCAN_NAV_STARTUP_GATE_OK"
+else
+  echo "[pointcloud-accel-verify] FAIL FLATSCAN_NAV_STARTUP_GATE_OK=false"
+  status=1
 fi
 
 fastlio_residual=false
@@ -523,6 +582,9 @@ echo "[pointcloud-accel-verify] LEGACY_SCAN_CHAIN_OK=${legacy_scan_chain_ok}"
 echo "[pointcloud-accel-verify] IPC_WORKER_OWNER_OK=${ipc_worker_owner_ok}"
 echo "[pointcloud-accel-verify] TRUNK_FULL_DENSITY_OK=${trunk_full_density_ok}"
 echo "[pointcloud-accel-verify] NAV2_COMPAT_TOPICS_OK=${nav2_compat_topics_ok}"
+echo "[pointcloud-accel-verify] FLATSCAN_OWNER_OK=${flatscan_owner_ok}"
+echo "[pointcloud-accel-verify] FLATSCAN_HZ_OK=${flatscan_hz_ok}"
+echo "[pointcloud-accel-verify] FLATSCAN_NAV_STARTUP_GATE_OK=${flatscan_nav_startup_gate_ok}"
 
 if [[ "${status}" -eq 0 ]]; then
   echo "[pointcloud-accel-verify] PASS"

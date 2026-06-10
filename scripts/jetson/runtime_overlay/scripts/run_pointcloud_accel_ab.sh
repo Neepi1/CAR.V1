@@ -156,6 +156,10 @@ fastlio_residual() {
   fi
 }
 
+flatscan_helper_status_file() {
+  printf '%s\n' "${NJRH_FLATSCAN_HELPER_STATUS_FILE:-${NJRH_RUNTIME_LOG_DIR}/flatscan_helper_status.env}"
+}
+
 nav2_state() {
   {
     timeout 5 ros2 lifecycle get /controller_server 2>/dev/null || true
@@ -259,6 +263,17 @@ flatscan_owner="$(publisher_nodes_from_file "${tmp_dir}/flatscan.info")"
 obstacle_hz="$(light_hz /perception/obstacle_points)"
 scan_hz="$(light_hz /scan)"
 flatscan_hz="$(light_hz /flatscan)"
+flatscan_helper_pid="missing"
+flatscan_helper_restart_count="missing"
+flatscan_helper_mode="missing"
+helper_status_file="$(flatscan_helper_status_file)"
+if [[ -f "${helper_status_file}" ]]; then
+  # shellcheck disable=SC1090
+  source "${helper_status_file}"
+  flatscan_helper_pid="${FLATSCAN_HELPER_PID:-missing}"
+  flatscan_helper_restart_count="${FLATSCAN_HELPER_RESTART_COUNT:-missing}"
+  flatscan_helper_mode="${FLATSCAN_HELPER_MODE:-missing}"
+fi
 cpu_usage="$(cpu_subset_usage)"
 thermal="$( { tegrastats --interval 1000 --count 1 2>/dev/null || true; } )"
 nav2_lifecycle="$(nav2_state)"
@@ -280,6 +295,13 @@ if [[ "${verify_result}" != "PASS" || "${fastlio}" != "false" ]]; then
   overall_result="FAIL"
 elif [[ -z "${obstacle_hz}" || -z "${scan_hz}" || -z "${flatscan_hz}" ]]; then
   overall_result="WARN"
+fi
+flatscan_case="OK"
+if [[ "${scan_publishers:-0}" != "0" && "${flatscan_publishers:-0}" == "0" ]]; then
+  flatscan_case="CASE_FLATSCAN_HELPER_DEAD"
+  overall_result="FAIL"
+elif [[ -z "${flatscan_hz}" ]]; then
+  flatscan_case="CASE_FLATSCAN_HZ_MISSING"
 fi
 
 legacy_scan_chain_recovered="n/a"
@@ -319,6 +341,10 @@ fi
   echo "- points_nav owner: ${points_nav_owner:-missing}"
   echo "- scan owner: ${scan_owner:-missing}"
   echo "- flatscan owner: ${flatscan_owner:-missing}"
+  echo "- flatscan helper mode: ${flatscan_helper_mode}"
+  echo "- flatscan helper pid: ${flatscan_helper_pid}"
+  echo "- flatscan helper restart count: ${flatscan_helper_restart_count}"
+  echo "- flatscan case: ${flatscan_case}"
   echo "- /points_nav publishers: ${points_nav_publishers:-0}"
   echo "- /points_nav subscribers: ${points_nav_subscribers:-0}"
   echo "- /lidar_points_nav publishers: ${lidar_points_nav_publishers:-0}"
@@ -329,6 +355,7 @@ fi
   echo "- obstacle_hz: ${obstacle_hz:-missing}"
   echo "- scan_hz: ${scan_hz:-missing}"
   echo "- flatscan_hz: ${flatscan_hz:-missing}"
+  echo "- helper_status_file: ${helper_status_file}"
   echo "- internal_zero_copy_profile: ${internal_zero_copy_profile:-missing}"
   echo "- latest_internal_buffer_points: ${latest_internal_buffer_points:-missing}"
   echo "- local_worker_full_cloud_copy_count: ${local_worker_full_cloud_copy_count:-missing}"

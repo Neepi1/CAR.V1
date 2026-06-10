@@ -49,8 +49,12 @@ controller_server:
     goal_checker_plugins: ["goal_checker"]
     controller_plugins: ["FollowPath", "FollowPathFallback"]
     progress_checker:
-      plugin: "nav2_controller::SimpleProgressChecker"
+      # PoseProgressChecker counts legitimate in-place yaw progress during
+      # RotationShim startup alignment. The radius and timeout stay unchanged;
+      # this avoids masking stalls by only extending movement_time_allowance.
+      plugin: "nav2_controller::PoseProgressChecker"
       required_movement_radius: 0.10
+      required_movement_angle: 0.10
       movement_time_allowance: 12.0
     goal_checker:
       plugin: "nav2_controller::SimpleGoalChecker"
@@ -65,7 +69,10 @@ controller_server:
       rotate_to_heading_angular_vel: 0.85
       max_angular_accel: 2.4
       simulate_ahead_time: 1.0
-      rotate_to_goal_heading: true
+      # RotationShim still handles large startup path-alignment errors. Final
+      # goal heading is owned by mission-layer final_yaw_align after position
+      # verification, so Nav2 should not run a second terminal yaw controller.
+      rotate_to_goal_heading: false
       time_steps: 44
       model_dt: 0.0833333333
       batch_size: 1200

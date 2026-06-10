@@ -41,6 +41,7 @@ robot_api_server:
     docking_stop_service: "/docking/stop"
     docking_undock_service: "/docking/undock"
     docking_status_topic: "/docking/status"
+    docking_contact_latch_file: "/workspaces/njrh-v3/workspace1/maps_release/docking_contact_latch.json"
     docking_pre_dock_distance_m: 0.60
     docking_navigation_start_wait_sec: 45.0
     docking_predock_nav_timeout_sec: 180.0
@@ -61,7 +62,7 @@ robot_api_server:
     undock_relocalize_after_success: true
     undock_relocalize_wait_sec: 8.0
     docking_cancel_active_goal_before_predock: true
-    navigation_auto_undock_timeout_sec: 18.0
+    navigation_auto_undock_timeout_sec: 28.0
     docking_undock_charging_retry_sec: 3.0
     mapping_2d_live_map_topic: "/map"
     mapping_2d_live_map_max_age_sec: 3.0

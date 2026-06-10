@@ -60,6 +60,22 @@ double stamp_to_sec(const builtin_interfaces::msg::Time & stamp)
   return static_cast<double>(stamp.sec) + static_cast<double>(stamp.nanosec) * 1.0e-9;
 }
 
+double age_ms_from_stamp_sec(const double now_sec, const double stamp_sec)
+{
+  if (stamp_sec <= 0.0) {
+    return -1.0;
+  }
+  return (now_sec - stamp_sec) * 1000.0;
+}
+
+double age_ms_from_ros_stamp(const double now_sec, const rclcpp::Time & stamp)
+{
+  if (stamp.nanoseconds() <= 0) {
+    return -1.0;
+  }
+  return age_ms_from_stamp_sec(now_sec, stamp.seconds());
+}
+
 bool find_float32_field_offset(
   const sensor_msgs::msg::PointCloud2 & msg,
   const std::string & name,
@@ -306,6 +322,16 @@ struct WorkerDiagnostics
   double processing_ms_sum{0.0};
   std::uint64_t processing_ms_count{0U};
   double lock_wait_ms_max{0.0};
+  double start_source_age_ms{-1.0};
+  double end_source_age_ms{-1.0};
+  double obstacle_output_header_age_ms{-1.0};
+  double obstacle_output_source_age_ms{-1.0};
+  double obstacle_output_publish_delay_ms{-1.0};
+  double clearing_output_header_age_ms{-1.0};
+  double clearing_output_source_age_ms{-1.0};
+  double clearing_output_publish_delay_ms{-1.0};
+  double scan_output_header_age_ms{-1.0};
+  double scan_output_source_age_ms{-1.0};
 };
 
 }  // namespace
@@ -1110,6 +1136,7 @@ private:
     if (!buffer || seq == local_worker_last_seq_) {
       return;
     }
+    local_worker_.start_source_age_ms = age_ms_from_ros_stamp(now().seconds(), buffer->stamp);
     Transform3x4 transform;
     if (!lookup_transform(local_worker_output_frame_id_, buffer->frame_id, transform)) {
       return;
@@ -1159,15 +1186,34 @@ private:
     header.frame_id = local_worker_output_frame_id_;
     fill_xyzi_cloud(local_worker_obstacle_points_, header, true, obstacle_output_msg_, local_worker_);
     local_worker_.last_obstacle_output_bytes = obstacle_output_msg_.data.size();
+    const auto obstacle_ready = Clock::now();
+    local_worker_.obstacle_output_source_age_ms = age_ms_from_ros_stamp(now().seconds(), buffer->stamp);
+    local_worker_.obstacle_output_publish_delay_ms =
+      std::chrono::duration<double, std::milli>(Clock::now() - obstacle_ready).count();
     obstacle_publisher_->publish(obstacle_output_msg_);
+    local_worker_.obstacle_output_header_age_ms =
+      age_ms_from_stamp_sec(now().seconds(), stamp_to_sec(obstacle_output_msg_.header.stamp));
+    if (local_worker_.obstacle_output_header_age_ms > 100.0) {
+      ++tf_drop_suspect_obstacle_header_age_over_100ms_count_;
+    }
+    if (local_worker_.obstacle_output_header_age_ms > 200.0) {
+      ++tf_drop_suspect_obstacle_header_age_over_200ms_count_;
+    }
     ++local_worker_.processed_count;
     ++local_worker_.obstacle_publish_count;
     if (publish_clearing) {
       fill_xyzi_cloud(local_worker_clearing_points_, header, true, clearing_output_msg_, local_worker_);
       local_worker_.last_clearing_output_bytes = clearing_output_msg_.data.size();
+      const auto clearing_ready = Clock::now();
+      local_worker_.clearing_output_source_age_ms = age_ms_from_ros_stamp(now().seconds(), buffer->stamp);
+      local_worker_.clearing_output_publish_delay_ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - clearing_ready).count();
       clearing_publisher_->publish(clearing_output_msg_);
+      local_worker_.clearing_output_header_age_ms =
+        age_ms_from_stamp_sec(now().seconds(), stamp_to_sec(clearing_output_msg_.header.stamp));
       ++local_worker_.clearing_publish_count;
     }
+    local_worker_.end_source_age_ms = age_ms_from_ros_stamp(now().seconds(), buffer->stamp);
     local_worker_last_seq_ = seq;
   }
 
@@ -1184,6 +1230,7 @@ private:
     if (!buffer || seq == scan_worker_last_seq_) {
       return;
     }
+    scan_worker_.start_source_age_ms = age_ms_from_ros_stamp(now().seconds(), buffer->stamp);
     Transform3x4 transform;
     if (!lookup_transform(scan_worker_frame_id_, buffer->frame_id, transform)) {
       return;
@@ -1234,6 +1281,10 @@ private:
     scan_worker_.last_scan_output_ranges = scan_msg_.ranges.size();
     scan_worker_.last_scan_output_bytes = scan_msg_.ranges.size() * sizeof(float);
     scan_publisher_->publish(scan_msg_);
+    scan_worker_.scan_output_header_age_ms =
+      age_ms_from_stamp_sec(now().seconds(), stamp_to_sec(scan_msg_.header.stamp));
+    scan_worker_.scan_output_source_age_ms = age_ms_from_ros_stamp(now().seconds(), buffer->stamp);
+    scan_worker_.end_source_age_ms = scan_worker_.scan_output_source_age_ms;
     ++scan_worker_.processed_count;
     ++scan_worker_.scan_publish_count;
     scan_worker_last_seq_ = seq;
@@ -1278,10 +1329,16 @@ private:
       local_worker_.processing_ms_sum / static_cast<double>(local_worker_.processing_ms_count) : -1.0;
     const double scan_processing_ms_avg = scan_worker_.processing_ms_count > 0U ?
       scan_worker_.processing_ms_sum / static_cast<double>(scan_worker_.processing_ms_count) : -1.0;
+    const double status_ros_now_sec = now().seconds();
     const double raw_stamp_age_ms = last_raw_stamp_sec_ <= 0.0 ?
-      -1.0 : (now().seconds() - last_raw_stamp_sec_) * 1000.0;
+      -1.0 : (status_ros_now_sec - last_raw_stamp_sec_) * 1000.0;
     const double publish_stamp_age_ms = last_output_stamp_sec_ <= 0.0 ?
-      -1.0 : (now().seconds() - last_output_stamp_sec_) * 1000.0;
+      -1.0 : (status_ros_now_sec - last_output_stamp_sec_) * 1000.0;
+    const double latest_internal_buffer_stamp_age_ms = latest ?
+      age_ms_from_ros_stamp(status_ros_now_sec, latest->stamp) : -1.0;
+    const double latest_internal_buffer_update_age_ms =
+      latest && latest->update_time != Clock::time_point{} ?
+      std::chrono::duration<double, std::milli>(now_steady - latest->update_time).count() : -1.0;
     const double uptime_sec = std::chrono::duration<double>(now_steady - start_time_).count();
 
     std::ostringstream stream;
@@ -1302,10 +1359,13 @@ private:
            << " latest_internal_buffer_bytes=" << (latest ? latest->points.size() * sizeof(NormalizedPointView) : 0U)
            << " latest_internal_buffer_source_bytes=" << (latest ? latest->source_bytes : 0U)
            << " latest_internal_buffer_age_ms=" << latest_age_ms
+           << " latest_internal_buffer_stamp_age_ms=" << latest_internal_buffer_stamp_age_ms
+           << " latest_internal_buffer_update_age_ms=" << latest_internal_buffer_update_age_ms
            << " latest_internal_buffer_seq=" << latest_seq
            << " normalized_buffer_allocation_count=" << normalized_buffer_allocation_count_
            << " latest_buffer_lock_wait_ms_max=" << latest_buffer_lock_wait_ms_max_
            << " trunk_copy_count_per_frame=0"
+           << " raw_header_age_ms=" << raw_stamp_age_ms
            << " last_raw_age_ms=" << raw_age_ms
            << " last_raw_stamp_age_ms=" << raw_stamp_age_ms
            << " last_publish_age_ms=" << publish_age_ms
@@ -1365,6 +1425,8 @@ private:
            << " local_worker_last_processing_ms=" << local_worker_.last_processing_ms
            << " local_worker_processing_ms_avg=" << local_processing_ms_avg
            << " local_worker_processing_ms_max=" << local_worker_.processing_ms_max
+           << " local_worker_start_source_age_ms=" << local_worker_.start_source_age_ms
+           << " local_worker_end_source_age_ms=" << local_worker_.end_source_age_ms
            << " local_worker_skip_busy_count=" << local_worker_.skip_busy_count
            << " local_worker_full_cloud_copy_count=" << local_worker_.full_cloud_copy_count
            << " local_worker_intermediate_pointcloud_build_count=" <<
@@ -1373,7 +1435,17 @@ private:
            << " local_worker_reused_buffer=" << (local_worker_.reused_output_buffer ? "true" : "false")
            << " local_worker_lock_wait_ms_max=" << local_worker_.lock_wait_ms_max
            << " obstacle_output_last_bytes=" << local_worker_.last_obstacle_output_bytes
+           << " obstacle_output_header_age_ms=" << local_worker_.obstacle_output_header_age_ms
+           << " obstacle_output_source_age_ms=" << local_worker_.obstacle_output_source_age_ms
+           << " obstacle_output_publish_delay_ms=" << local_worker_.obstacle_output_publish_delay_ms
+           << " obstacle_output_frame_id=" << local_worker_output_frame_id_
+           << " obstacle_output_header_stamp_source=source_stamp"
            << " clearing_output_last_bytes=" << local_worker_.last_clearing_output_bytes
+           << " clearing_output_header_age_ms=" << local_worker_.clearing_output_header_age_ms
+           << " clearing_output_source_age_ms=" << local_worker_.clearing_output_source_age_ms
+           << " clearing_output_publish_delay_ms=" << local_worker_.clearing_output_publish_delay_ms
+           << " clearing_output_frame_id=" << local_worker_output_frame_id_
+           << " clearing_output_header_stamp_source=source_stamp"
            << " scan_worker_tick_hz=" << static_cast<double>(scan_tick_delta) / elapsed_sec
            << " scan_worker_processed_hz=" << static_cast<double>(scan_processed_delta) / elapsed_sec
            << " scan_worker_scan_publish_hz=" << static_cast<double>(scan_delta) / elapsed_sec
@@ -1381,6 +1453,8 @@ private:
            << " scan_worker_last_processing_ms=" << scan_worker_.last_processing_ms
            << " scan_worker_processing_ms_avg=" << scan_processing_ms_avg
            << " scan_worker_processing_ms_max=" << scan_worker_.processing_ms_max
+           << " scan_worker_start_source_age_ms=" << scan_worker_.start_source_age_ms
+           << " scan_worker_end_source_age_ms=" << scan_worker_.end_source_age_ms
            << " scan_worker_skip_busy_count=" << scan_worker_.skip_busy_count
            << " scan_worker_full_cloud_copy_count=" << scan_worker_.full_cloud_copy_count
            << " scan_worker_intermediate_pointcloud_build_count=" <<
@@ -1391,6 +1465,13 @@ private:
            << " scan_worker_lock_wait_ms_max=" << scan_worker_.lock_wait_ms_max
            << " scan_output_last_ranges=" << scan_worker_.last_scan_output_ranges
            << " scan_output_last_bytes=" << scan_worker_.last_scan_output_bytes
+           << " scan_output_header_age_ms=" << scan_worker_.scan_output_header_age_ms
+           << " scan_output_source_age_ms=" << scan_worker_.scan_output_source_age_ms
+           << " scan_output_frame_id=" << scan_worker_frame_id_
+           << " tf_drop_suspect_obstacle_header_age_over_100ms_count=" <<
+             tf_drop_suspect_obstacle_header_age_over_100ms_count_
+           << " tf_drop_suspect_obstacle_header_age_over_200ms_count=" <<
+             tf_drop_suspect_obstacle_header_age_over_200ms_count_
            << " dropped_or_skipped_count=" << dropped_or_skipped_count_
            << " node_uptime_sec=" << uptime_sec;
 
@@ -1532,6 +1613,8 @@ private:
   std::uint64_t trunk_publish_gap_over_100ms_count_{0U};
   std::uint64_t trunk_publish_gap_over_150ms_count_{0U};
   std::uint64_t trunk_publish_gap_over_200ms_count_{0U};
+  std::uint64_t tf_drop_suspect_obstacle_header_age_over_100ms_count_{0U};
+  std::uint64_t tf_drop_suspect_obstacle_header_age_over_200ms_count_{0U};
   std::size_t last_cloud_points_{0U};
   std::size_t last_cloud_bytes_{0U};
   std::size_t last_output_subscription_count_{0U};

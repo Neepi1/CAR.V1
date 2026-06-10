@@ -50,6 +50,14 @@ double stamp_to_sec(const builtin_interfaces::msg::Time & stamp)
   return static_cast<double>(stamp.sec) + static_cast<double>(stamp.nanosec) * 1.0e-9;
 }
 
+double age_ms_from_stamp_sec(const double now_sec, const double stamp_sec)
+{
+  if (stamp_sec <= 0.0) {
+    return -1.0;
+  }
+  return (now_sec - stamp_sec) * 1000.0;
+}
+
 double rad_to_deg(const double radians)
 {
   return radians * 180.0 / M_PI;
@@ -123,6 +131,7 @@ struct ClearingRayBin
 struct PendingClearingJob
 {
   std_msgs::msg::Header header;
+  builtin_interfaces::msg::Time source_stamp;
   ModeProfile profile;
   std::vector<ClearingRayBin> bins;
   std::vector<PointT> points;
@@ -930,6 +939,11 @@ private:
       clearing_points = limitPointCount(std::move(clearing_points), clearing_max_points_);
       auto clearing_output_msg = makePointCloud2FromPoints(clearing_points, job.header);
       clearing_publisher_->publish(clearing_output_msg);
+      const double publish_now_sec = now().seconds();
+      last_clearing_output_header_age_ms_.store(
+        age_ms_from_stamp_sec(publish_now_sec, stamp_to_sec(clearing_output_msg.header.stamp)));
+      last_clearing_output_source_age_ms_.store(
+        age_ms_from_stamp_sec(publish_now_sec, stamp_to_sec(job.source_stamp)));
       ++published_clearing_count_;
       last_clearing_point_count_.store(clearing_points.size());
       if (publish_debug_log_) {
@@ -1070,6 +1084,11 @@ private:
       output_msg.header.stamp = *output_stamp;
     }
     publisher_->publish(output_msg);
+    const double publish_now_sec = now().seconds();
+    last_obstacle_output_header_age_ms_ =
+      age_ms_from_stamp_sec(publish_now_sec, stamp_to_sec(output_msg.header.stamp));
+    last_obstacle_output_source_age_ms_ =
+      age_ms_from_stamp_sec(publish_now_sec, stamp_to_sec(input_msg.header.stamp));
     ++published_empty_obstacle_count_;
   }
 
@@ -1262,6 +1281,11 @@ private:
     auto t_to_ros_clearing = t_stamp;
     auto t_publish_clearing = t_stamp;
     publisher_->publish(output_msg);
+    const double obstacle_publish_now_sec = now().seconds();
+    last_obstacle_output_header_age_ms_ =
+      age_ms_from_stamp_sec(obstacle_publish_now_sec, stamp_to_sec(output_msg.header.stamp));
+    last_obstacle_output_source_age_ms_ =
+      age_ms_from_stamp_sec(obstacle_publish_now_sec, stamp_to_sec(msg->header.stamp));
     ++published_obstacle_count_;
     ++processed_cloud_count_;
     const auto t_publish_obstacle = std::chrono::steady_clock::now();
@@ -1271,6 +1295,7 @@ private:
     if (publish_clearing_this_frame) {
       PendingClearingJob job;
       job.header = output_msg.header;
+      job.source_stamp = msg->header.stamp;
       job.profile = profile;
       job.virtual_rays_enabled = clearing_virtual_rays_enabled_;
       job.ray_origin_x = ray_origin_x;
@@ -1376,6 +1401,8 @@ private:
            << " input_cloud_accept_hz=" << static_cast<double>(accepted_delta) / elapsed_sec
            << " input_last_msg_age_ms=" << input_last_msg_age_ms
            << " input_last_stamp_age_ms=" << last_input_stamp_age_ms_
+           << " input_header_age_ms=" << last_input_stamp_age_ms_
+           << " input_receive_age_ms=" << input_last_msg_age_ms
            << " input_interarrival_ms_avg=" << input_interarrival_ms_avg
            << " input_interarrival_ms_max=" << input_interarrival_ms_max_
            << " input_cloud_points=" << last_input_point_count_
@@ -1390,8 +1417,14 @@ private:
            << " published_obstacle=" << published_obstacle_count_
            << " published_obstacle_hz=" << static_cast<double>(obstacle_delta) / elapsed_sec
            << " published_empty=" << published_empty_obstacle_count_
+           << " obstacle_output_header_age_ms=" << last_obstacle_output_header_age_ms_
+           << " obstacle_output_source_age_ms=" << last_obstacle_output_source_age_ms_
+           << " obstacle_output_frame_id=" << output_frame_id_
            << " published_clearing=" << published_clearing_count
            << " published_clearing_hz=" << static_cast<double>(clearing_delta) / elapsed_sec
+           << " clearing_output_header_age_ms=" << last_clearing_output_header_age_ms_.load()
+           << " clearing_output_source_age_ms=" << last_clearing_output_source_age_ms_.load()
+           << " clearing_output_frame_id=" << output_frame_id_
            << " no_latest=" << no_latest_cloud_count_
            << " no_new=" << no_new_cloud_count_
            << " no_new_count=" << no_new_cloud_count_
@@ -1557,6 +1590,10 @@ private:
   std::uint64_t processing_ms_count_{0};
   double last_input_stamp_age_sec_{0.0};
   double last_input_stamp_age_ms_{0.0};
+  double last_obstacle_output_header_age_ms_{-1.0};
+  double last_obstacle_output_source_age_ms_{-1.0};
+  std::atomic<double> last_clearing_output_header_age_ms_{-1.0};
+  std::atomic<double> last_clearing_output_source_age_ms_{-1.0};
 };
 
 #ifndef ROBOT_LOCAL_PERCEPTION_COMPONENT_ONLY

@@ -22,6 +22,7 @@ navigation_pid=""
 exit_code=0
 runtime_ready=0
 cleanup_started=0
+localization_ready_failure_reason=""
 
 wait_for_child_exit() {
   local pid="$1"
@@ -135,17 +136,67 @@ trigger_global_localization_for_navigation() {
   echo "[runtime-overlay] initial localization accepted: localization_result and map->odom are ready" >&2
 }
 
+scan_flatscan_admission_diagnostics() {
+  local scan_info
+  local scan_publishers
+  local flatscan_process
+  local profile
+  profile="${NJRH_POINTCLOUD_ACCEL_PROFILE:-unknown}"
+  if [[ -f "${NJRH_OVERLAY_ROOT}/config/pointcloud_accel_profile.env" ]]; then
+    # shellcheck source=../config/pointcloud_accel_profile.env
+    source "${NJRH_OVERLAY_ROOT}/config/pointcloud_accel_profile.env"
+    profile="${NJRH_POINTCLOUD_ACCEL_PROFILE:-${profile}}"
+  fi
+  scan_info="$(timeout 4 ros2 topic info -v /scan 2>&1 || true)"
+  scan_publishers="$(awk -F: '/Publisher count/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' <<<"${scan_info}")"
+  if pgrep -af "laser_scan_to_flatscan" >/dev/null 2>&1; then
+    flatscan_process="present"
+  else
+    flatscan_process="missing"
+  fi
+
+  echo "[runtime-overlay] FLATSCAN_MISSING diagnostics:" >&2
+  echo "[runtime-overlay]   /scan publisher_count=${scan_publishers:-0}" >&2
+  echo "[runtime-overlay]   laser_scan_to_flatscan_process=${flatscan_process}" >&2
+  echo "[runtime-overlay]   pointcloud_accel_profile=${profile}" >&2
+  echo "[runtime-overlay]   suggested_fix=bash scripts/jetson/runtime_overlay/scripts/verify_pointcloud_accel_profile.sh; bash scripts/jetson/runtime_overlay/scripts/set_pointcloud_accel_profile.sh --profile ${profile} --restart" >&2
+}
+
+set_localization_ready_failure() {
+  local reason="$1"
+  local detail="$2"
+  localization_ready_failure_reason="${reason}: ${detail}"
+  echo "[runtime-overlay] localization startup admission failed: ${localization_ready_failure_reason}" >&2
+  write_runtime_map_context "failed" "false" "${localization_ready_failure_reason}"
+}
+
 ensure_localization_stack_ready_for_navigation() {
   local service_timeout="${NJRH_INITIAL_LOCALIZATION_SERVICE_WAIT_SEC:-45}"
   local map_timeout="${NJRH_INITIAL_LOCALIZATION_MAP_WAIT_SEC:-45}"
   local flatscan_timeout="${NJRH_INITIAL_LOCALIZATION_FLATSCAN_WAIT_SEC:-45}"
   local publisher_timeout="${NJRH_INITIAL_LOCALIZATION_RESULT_PUBLISHER_WAIT_SEC:-45}"
 
-  wait_for_ros_service "/global_localization/trigger" "${service_timeout}" || return 1
-  wait_for_ros_service "/trigger_grid_search_localization" "${service_timeout}" || return 1
-  wait_for_occupancy_grid "/map" "${map_timeout}" >/dev/null || return 1
-  wait_for_topic_message "/flatscan" "${flatscan_timeout}" || return 1
-  wait_for_topic_publisher "/localization_result" "${publisher_timeout}" || return 1
+  if ! wait_for_ros_service "/global_localization/trigger" "${service_timeout}"; then
+    set_localization_ready_failure "GLOBAL_LOCALIZATION_TRIGGER_SERVICE_MISSING" "/global_localization/trigger not ready within ${service_timeout}s"
+    return 1
+  fi
+  if ! wait_for_ros_service "/trigger_grid_search_localization" "${service_timeout}"; then
+    set_localization_ready_failure "GRID_SEARCH_LOCALIZATION_SERVICE_MISSING" "/trigger_grid_search_localization not ready within ${service_timeout}s"
+    return 1
+  fi
+  if ! wait_for_occupancy_grid "/map" "${map_timeout}" >/dev/null; then
+    set_localization_ready_failure "MAP_TOPIC_MISSING" "/map OccupancyGrid not ready within ${map_timeout}s"
+    return 1
+  fi
+  if ! wait_for_topic_message "/flatscan" "${flatscan_timeout}"; then
+    scan_flatscan_admission_diagnostics
+    set_localization_ready_failure "FLATSCAN_MISSING" "/flatscan FlatScan message not ready within ${flatscan_timeout}s"
+    return 1
+  fi
+  if ! wait_for_topic_publisher "/localization_result" "${publisher_timeout}"; then
+    set_localization_ready_failure "LOCALIZATION_RESULT_PUBLISHER_MISSING" "/localization_result publisher not ready within ${publisher_timeout}s"
+    return 1
+  fi
   echo "[runtime-overlay] localization stack ready for initial relocalization" >&2
 }
 
@@ -225,7 +276,7 @@ localization_pid=$!
 sleep "${NJRH_NAV_LOCALIZATION_START_SETTLE_SEC:-3}"
 ensure_localization_layer_alive || exit 1
 ensure_localization_stack_ready_for_navigation || {
-  write_runtime_map_context "failed" "false" "resident localization stack did not become ready before initial relocalization"
+  write_runtime_map_context "failed" "false" "${localization_ready_failure_reason:-resident localization stack did not become ready before initial relocalization}"
   exit 1
 }
 

@@ -20,7 +20,15 @@ write_runtime_map_context() {
   local state="$1"
   local confirmed="$2"
   local message="$3"
-  [[ -n "${NJRH_RUNTIME_MAP_CONTEXT_FILE:-}" && -n "${NJRH_MAP_ID:-}" ]] || return 0
+  local context_map_id="${NJRH_MAP_ID:-${NJRH_NAV_MAP_ID:-}}"
+  local context_display_name="${NJRH_MAP_DISPLAY_NAME:-${NJRH_NAV_MAP_NAME:-}}"
+  [[ -n "${NJRH_RUNTIME_MAP_CONTEXT_FILE:-}" ]] || return 0
+  if [[ -z "${context_map_id}" ]]; then
+    echo "[runtime-overlay] WARN: runtime map context skipped because no map_id is available from resolved floor assets" >&2
+    return 0
+  fi
+  export NJRH_MAP_ID="${context_map_id}"
+  export NJRH_MAP_DISPLAY_NAME="${context_display_name}"
   python3 - "$state" "$confirmed" "$message" <<'PY'
 import json
 import os
@@ -73,7 +81,10 @@ map_server_asset_matches_current_floor() {
 
 runtime_map_context_matches_current_floor() {
   [[ -n "${NJRH_RUNTIME_MAP_CONTEXT_FILE:-}" && -f "${NJRH_RUNTIME_MAP_CONTEXT_FILE}" ]] || return 1
-  [[ -n "${NJRH_MAP_ID:-}" ]] || return 1
+  local context_map_id="${NJRH_MAP_ID:-${NJRH_NAV_MAP_ID:-}}"
+  [[ -n "${context_map_id}" ]] || return 1
+  export NJRH_MAP_ID="${context_map_id}"
+  export NJRH_MAP_DISPLAY_NAME="${NJRH_MAP_DISPLAY_NAME:-${NJRH_NAV_MAP_NAME:-}}"
   python3 <<'PY'
 import json
 import os

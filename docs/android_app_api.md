@@ -114,7 +114,9 @@ Relevant response fields:
   "navigation": {
     "active": false,
     "state": "stopped",
-    "action": "/navigate_to_pose"
+    "action": "/navigate_to_pose",
+    "blocked_by_docked_contact": false,
+    "normal_motion_blocked_reason": ""
   },
   "docking_active": false,
   "docking": {
@@ -126,6 +128,11 @@ Relevant response fields:
   },
   "safety_status": "OK",
   "motion_allowed": true,
+  "safety": {
+    "status": "OK",
+    "motion_allowed": true,
+    "motion_allowed_valid": true
+  },
   "bms": {
     "soc": 48.0,
     "soc_valid": true,
@@ -543,7 +550,7 @@ Check whether a normal point navigation request would need auto-undock:
 GET http://<robot-ip>:8080/api/v1/navigation/pre_goal_check?building_id=B1&floor_id=F1&pose_id=delivery_123456
 ```
 
-This endpoint is read-only. It resolves the saved pose from `poses.yaml`, reports the critical Nav2 lifecycle summary, and returns `pre_navigation_dock_check` with backend docking state, `/docking/status`, BMS age/contact reason, `power_supply_status`, current, voltage, `final_is_docked_or_charging`, `final_auto_undock_required`, and `auto_undock_reason`. It never calls `/docking/undock` and never sends a Nav2 goal. Use it for diagnostics before the user taps "go to point"; production execution still uses `POST /api/v1/navigation/goal`.
+This endpoint is read-only. It resolves the saved pose from `poses.yaml`, reports the critical Nav2 lifecycle summary, and returns `would_auto_undock`, `auto_undock_required`, and `pre_navigation_dock_check` with backend docking state, `/docking/status`, BMS age/contact reason, `power_supply_status`, current, voltage, `dock_contact_snapshot`, `docked_state_class`, `docked_evidence`, `docked_warnings`, `final_is_docked_or_charging`, `final_auto_undock_required`, and `auto_undock_reason`. It never calls `/docking/undock` and never sends a Nav2 goal. Use it for diagnostics before the user taps "go to point"; production execution still uses `POST /api/v1/navigation/goal`.
 
 Send a saved point as a real navigation goal:
 
@@ -561,6 +568,17 @@ Content-Type: application/json
 ```
 
 Successful response returns `202 Accepted` with `navigation_goal_id`. The server resolves the pose from `maps_release/<building_id>/<floor_id>/poses.yaml`, sends a Nav2 `NavigateToPose` goal on `/navigate_to_pose`, and tracks the result in the background. If the car is already docked, `/docking/status` starts with `docked` or `charging`, or the backend sees fresh BMS charging contact, this endpoint automatically performs controlled undocking first, waits for odometry-confirmed `undocked`, arms the bridge one-shot correction service, triggers post-undock relocalization, waits until the result is reflected in `map -> base_link`, and only then sends the Nav2 goal. A full battery may report `current=0`; use `pre_navigation_dock_check.api_bms_charging_contact`, `api_bms_charging_contact_reason`, and `bms.power_supply_status` rather than current alone. If undocking, post-undock relocalization, bridge acceptance, or the wait times out, the response is an error and no navigation goal is sent. Success and admission-failure responses include `pre_navigation_undock`, `pre_navigation_undock_detail`, and `pre_navigation_dock_check`. The App must not send `/cmd_vel` for task navigation, and it should not call `/api/v1/docking/undock` separately before every normal point navigation.
+
+The App must not infer docked state solely from current map position. Use `bms.charging_contact`, `docking.inferred_docked`, and `pre_navigation_dock_check.dock_contact_snapshot`. While docked or charging, normal navigation auto-undocks first; if that fails, no Nav2 goal is sent. Normal command velocity is also blocked by `robot_safety`, and only the controlled docking/undock path may move the chassis. Undock first-motion delay is handled in `robot_docking_manager`: the retained calibrated reverse speed is `undock.speed_mps=0.06`, `motion_start_timeout_s` waits for the first odometry displacement, and `no_progress_timeout_s` applies only after movement has started. The App should surface the backend failure string, such as `undock_failed_motion_start_timeout` or `undock_failed_no_progress`, rather than publishing reverse velocity or enabling ordinary navigation reverse.
+
+Maintenance recovery for a robot physically on the charger with missing BMS/contact evidence is handled through protected backend endpoints, not ordinary user UI:
+
+```text
+POST /api/v1/docking/confirm_docked
+POST /api/v1/docking/clear_docked_latch
+```
+
+Both endpoints send no velocity. They only set or clear the persistent docked latch used by pre-goal admission and `robot_safety`.
 
 Cancel active navigation goals:
 
@@ -668,7 +686,7 @@ Content-Type: application/json
 {"dock_id":"dock_main","reason":"app_manual_undock"}
 ```
 
-The undock endpoint is accepted only when the car is already docked or the backend sees live charging contact. Contact can come from `power_supply_status=CHARGING/FULL`, charge current, `present=true` with valid voltage, or `present=true` with full-SOC/valid-voltage inference until the dedicated contact signal is wired. Full SOC plus pack voltage alone is not treated as dock contact because a full battery away from the charger can report the same values. It calls the car-side `/docking/undock` service; the App must not send reverse velocity directly. The car backs out through `/cmd_vel_docking`, `robot_safety`, and the Ranger mode controller, with reverse permitted by `/ranger_mini3/docking_allow_reverse`. After `/local_state/odometry` confirms departure, the backend state briefly becomes `relocalize_after_undock` while it triggers `/global_localization/trigger`; the API requires the new localization result to be reflected in `map -> base_link` so a rejected `map -> odom` jump is not reported as success. The docking job exposes `post_undock_relocalization_requested`, `post_undock_relocalization_succeeded`, `post_undock_relocalization_required`, and `post_undock_relocalization_detail`. Poll `/api/v1/docking/state` until `state` becomes `undocked` or `failed`; use `charging_contact`, `charging_contact_reason`, and `inferred_docked` to explain why undock is available while `docking.state` is not `docked`.
+The undock endpoint is accepted only when the car is already docked, the backend sees live charging contact, or the explicit dock-contact latch indicates a manually confirmed docked state. Contact can come from `power_supply_status=CHARGING/FULL`, charge current, `present=true` with valid voltage, or `present=true` with full-SOC/valid-voltage inference until the dedicated contact signal is wired. Full SOC plus pack voltage alone is not treated as dock contact because a full battery away from the charger can report the same values. It calls the car-side `/docking/undock` service; the App must not send reverse velocity directly. The car backs out through `/cmd_vel_docking`, `robot_safety`, and the Ranger mode controller, with reverse permitted by `/ranger_mini3/docking_allow_reverse`. `robot_docking_manager` allows a command-settle window and a first-motion window before declaring `undock_failed_motion_start_timeout`; once odometry has moved, a later stall reports `undock_failed_no_progress`. After `/local_state/odometry` confirms departure, the backend state briefly becomes `relocalize_after_undock` while it triggers `/global_localization/trigger`; the API requires the new localization result to be reflected in `map -> base_link` so a rejected `map -> odom` jump is not reported as success. The docking job exposes `post_undock_relocalization_requested`, `post_undock_relocalization_succeeded`, `post_undock_relocalization_required`, and `post_undock_relocalization_detail`. Poll `/api/v1/docking/state` until `state` becomes `undocked` or `failed`; use `charging_contact`, `charging_contact_reason`, and `inferred_docked` to explain why undock is available while `docking.state` is not `docked`.
 
 The App must not use mapping teleop or direct velocity commands for docking. Docking motion is owned by Nav2 plus `robot_docking_manager`.
 

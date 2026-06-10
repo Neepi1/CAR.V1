@@ -292,6 +292,9 @@ public:
     docking_stop_service_ = declare_parameter<std::string>("docking_stop_service", "/docking/stop");
     docking_undock_service_ = declare_parameter<std::string>("docking_undock_service", "/docking/undock");
     docking_status_topic_ = declare_parameter<std::string>("docking_status_topic", "/docking/status");
+    docking_contact_latch_file_ = declare_parameter<std::string>(
+      "docking_contact_latch_file",
+      "/workspaces/njrh-v3/workspace1/maps_release/docking_contact_latch.json");
     docking_pre_dock_distance_m_ =
       std::max(0.05, declare_parameter<double>("docking_pre_dock_distance_m", 0.60));
     mapping_2d_live_map_topic_ = declare_parameter<std::string>("mapping_2d_live_map_topic", "/map");
@@ -446,7 +449,7 @@ public:
     docking_cancel_active_goal_before_predock_ =
       declare_parameter<bool>("docking_cancel_active_goal_before_predock", true);
     navigation_auto_undock_timeout_sec_ =
-      std::max(service_timeout_sec_, declare_parameter<double>("navigation_auto_undock_timeout_sec", 18.0));
+      std::max(service_timeout_sec_, declare_parameter<double>("navigation_auto_undock_timeout_sec", 28.0));
     docking_undock_charging_retry_sec_ =
       std::max(0.0, declare_parameter<double>("docking_undock_charging_retry_sec", 3.0));
 
@@ -563,21 +566,45 @@ private:
     bool present{false};
   };
 
+  struct DockContactLatchSnapshot
+  {
+    bool valid{false};
+    bool docked{false};
+    bool latched_docked{false};
+    std::string source{"none"};
+    std::string reason{"not_latched"};
+    std::string building_id;
+    std::string floor_id;
+    std::string map_id;
+    std::string dock_id;
+    std::string latched_at;
+    std::string last_confirmed_at;
+    std::string cleared_at;
+    std::string clear_reason;
+    std::string note;
+    std::string updated_at;
+  };
+
   struct PreNavigationDockCheck
   {
     RuntimeModeSnapshot runtime;
     BmsChargingContactSnapshot bms;
+    DockContactLatchSnapshot dock_latch;
     bool runtime_state_docked{false};
     bool runtime_state_charging{false};
     bool runtime_state_undocking{false};
     bool docking_status_indicates_docked{false};
     bool docking_status_indicates_charging{false};
     bool docking_status_indicates_undocking{false};
+    bool dock_latch_indicates_docked{false};
     bool inferred_docked{false};
     bool final_is_docked_or_charging{false};
     bool final_auto_undock_required{false};
     bool docking_active_not_docked_block{false};
     bool can_auto_undock{false};
+    std::string docked_state_class{"UNKNOWN"};
+    std::vector<std::string> docked_evidence;
+    std::vector<std::string> docked_warnings;
     std::string auto_undock_reason{"not_docked"};
   };
 
@@ -1062,6 +1089,106 @@ private:
     return snapshot;
   }
 
+  DockContactLatchSnapshot read_dock_contact_latch() const
+  {
+    DockContactLatchSnapshot snapshot;
+    if (docking_contact_latch_file_.empty()) {
+      snapshot.reason = "latch_file_not_configured";
+      return snapshot;
+    }
+    try {
+      const auto text = read_optional_text_file(fs::path(docking_contact_latch_file_));
+      if (text.empty()) {
+        snapshot.reason = "latch_file_missing";
+        return snapshot;
+      }
+      snapshot.valid = true;
+      snapshot.latched_docked = json_bool_value(text, "latched_docked", json_bool_value(text, "docked", false));
+      snapshot.docked = snapshot.latched_docked;
+      snapshot.source = json_string_value(text, "source").value_or("unknown");
+      snapshot.reason = json_string_value(text, "reason").value_or("no_reason");
+      snapshot.building_id = json_string_value(text, "building_id").value_or("");
+      snapshot.floor_id = json_string_value(text, "floor_id").value_or("");
+      snapshot.map_id = json_string_value(text, "map_id").value_or("");
+      snapshot.dock_id = json_string_value(text, "dock_id").value_or("");
+      snapshot.latched_at = json_string_value(text, "latched_at").value_or("");
+      snapshot.last_confirmed_at = json_string_value(text, "last_confirmed_at").value_or("");
+      snapshot.cleared_at = json_string_value(text, "cleared_at").value_or("");
+      snapshot.clear_reason = json_string_value(text, "clear_reason").value_or("");
+      snapshot.note = json_string_value(text, "note").value_or("");
+      snapshot.updated_at = json_string_value(text, "updated_at").value_or("");
+      return snapshot;
+    } catch (const std::exception & exc) {
+      snapshot.reason = std::string("latch_read_failed:") + exc.what();
+      return snapshot;
+    }
+  }
+
+  void update_dock_contact_latch(
+    const bool docked,
+    const std::string & source,
+    const std::string & reason,
+    const std::string & dock_id,
+    const std::string & building_id = "",
+    const std::string & floor_id = "",
+    const std::string & map_id = "",
+    const std::string & note = "")
+  {
+    if (docking_contact_latch_file_.empty()) {
+      return;
+    }
+    if (have_last_dock_contact_latch_write_ &&
+      docked == last_dock_contact_latch_docked_ &&
+      source == last_dock_contact_latch_source_ &&
+      reason == last_dock_contact_latch_reason_ &&
+      dock_id == last_dock_contact_latch_dock_id_ &&
+      note == last_dock_contact_latch_note_)
+    {
+      return;
+    }
+    const auto previous = read_dock_contact_latch();
+    const auto now_text = utc_timestamp_iso8601();
+    const auto latched_at = docked ? (previous.latched_docked && !previous.latched_at.empty() ?
+      previous.latched_at : now_text) : previous.latched_at;
+    std::ostringstream body;
+    body << "{\n"
+         << "  \"schema\": \"njrh.docking_contact_latch.v1\",\n"
+         << "  \"latched_docked\": " << (docked ? "true" : "false") << ",\n"
+         << "  \"docked\": " << (docked ? "true" : "false") << ",\n"
+         << "  \"source\": " << json_string(source) << ",\n"
+         << "  \"reason\": " << json_string(reason) << ",\n"
+         << "  \"building_id\": " << json_string(building_id.empty() ? previous.building_id : building_id) << ",\n"
+         << "  \"floor_id\": " << json_string(floor_id.empty() ? previous.floor_id : floor_id) << ",\n"
+         << "  \"map_id\": " << json_string(map_id.empty() ? previous.map_id : map_id) << ",\n"
+         << "  \"dock_id\": " << json_string(dock_id) << ",\n"
+         << "  \"latched_at\": " << json_string(latched_at) << ",\n"
+         << "  \"last_confirmed_at\": " << json_string(docked ? now_text : previous.last_confirmed_at) << ",\n"
+         << "  \"cleared_at\": " << json_string(docked ? "" : now_text) << ",\n"
+         << "  \"clear_reason\": " << json_string(docked ? "" : reason) << ",\n"
+         << "  \"note\": " << json_string(note.empty() ? previous.note : note) << ",\n"
+         << "  \"updated_at\": " << json_string(now_text) << "\n"
+         << "}\n";
+    try {
+      const auto path = fs::path(docking_contact_latch_file_);
+      fs::create_directories(path.parent_path());
+      const auto tmp = path.string() + ".tmp";
+      write_text_file(fs::path(tmp), body.str());
+      fs::rename(fs::path(tmp), path);
+      have_last_dock_contact_latch_write_ = true;
+      last_dock_contact_latch_docked_ = docked;
+      last_dock_contact_latch_source_ = source;
+      last_dock_contact_latch_reason_ = reason;
+      last_dock_contact_latch_dock_id_ = dock_id;
+      last_dock_contact_latch_note_ = note;
+    } catch (const std::exception & exc) {
+      RCLCPP_WARN(
+        get_logger(),
+        "failed to write docking contact latch %s: %s",
+        docking_contact_latch_file_.c_str(),
+        exc.what());
+    }
+  }
+
   void handle_bms_state(const sensor_msgs::msg::BatteryState::SharedPtr msg)
   {
     const auto charging_contact = battery_charging_contact(*msg);
@@ -1084,6 +1211,13 @@ private:
       latest_bms_charging_contact_reason_ = charging_contact.reason;
       latest_bms_received_at_ = std::chrono::steady_clock::now();
       have_bms_state_ = true;
+    }
+    if (charging_contact.contact) {
+      update_dock_contact_latch(
+        true,
+        "bms",
+        "bms_charging_contact:" + charging_contact.reason,
+        "");
     }
     if (charging_contact.contact && teleop_stop_on_charging_ && teleop_session_active()) {
       clear_teleop_command();
@@ -2039,6 +2173,12 @@ private:
     if (request.method == "POST" && request.path == "/api/v1/docking/undock") {
       return handle_docking_undock(request.body);
     }
+    if (request.method == "POST" && request.path == "/api/v1/docking/confirm_docked") {
+      return handle_docking_confirm_docked(request.body);
+    }
+    if (request.method == "POST" && request.path == "/api/v1/docking/clear_docked_latch") {
+      return handle_docking_clear_latch(request.body);
+    }
     if (request.method == "POST" &&
       (request.path == "/api/v1/docking/cancel" || request.path == "/api/v1/docking/stop")) {
       return handle_docking_cancel(request.body);
@@ -2103,8 +2243,8 @@ private:
     }
     const bool bms_valid = have_bms_state && have_bms_soc && bms_age_sec <= bms_state_max_age_sec_;
     const auto runtime = runtime_mode_snapshot();
-    const bool inferred_docked = runtime.docking_state != "docked" && bms_charging_contact;
     const auto status_dock_check = pre_navigation_dock_check_snapshot();
+    const bool inferred_docked = status_dock_check.inferred_docked;
     const auto status_dock_check_json = pre_navigation_dock_check_json(
       status_dock_check,
       "status",
@@ -2166,6 +2306,11 @@ private:
     body << "\"state\":" << json_string(runtime.navigation_state) << ",";
     body << "\"action\":" << json_string(navigate_to_pose_action_) << ",";
     body << "\"pre_goal_check_endpoint\":\"/api/v1/navigation/pre_goal_check\",";
+    body << "\"blocked_by_docked_contact\":"
+         << (status_dock_check.final_auto_undock_required ? "true" : "false") << ",";
+    body << "\"normal_motion_blocked_reason\":"
+         << json_string(safety_status == "DOCKED_CONTACT_BLOCK" ? "DOCKED_CONTACT_BLOCK" : "") << ",";
+    body << "\"pre_navigation_dock_check\":" << status_dock_check_json << ",";
     body << "\"goal\":" << navigation_goal_json;
     body << "},";
     body << "\"docking_active\":" << (runtime.docking_active ? "true" : "false") << ",";
@@ -2184,6 +2329,11 @@ private:
     body << "\"safety_status\":" << json_string(safety_status) << ",";
     body << "\"motion_allowed\":" << (motion_allowed ? "true" : "false") << ",";
     body << "\"motion_allowed_valid\":" << (have_motion_allowed ? "true" : "false") << ",";
+    body << "\"safety\":{";
+    body << "\"status\":" << json_string(safety_status) << ",";
+    body << "\"motion_allowed\":" << (motion_allowed ? "true" : "false") << ",";
+    body << "\"motion_allowed_valid\":" << (have_motion_allowed ? "true" : "false");
+    body << "},";
     body << "\"floor_status\":" << json_string(floor_status) << ",";
     body << "\"localization\":{";
     body << "\"trigger_service\":" << json_string(localization_trigger_service_) << ",";
@@ -2319,6 +2469,8 @@ private:
       "\"GET /api/v1/docking/state\","
       "\"POST /api/v1/docking/start\","
       "\"POST /api/v1/docking/undock\","
+      "\"POST /api/v1/docking/confirm_docked\","
+      "\"POST /api/v1/docking/clear_docked_latch\","
       "\"POST /api/v1/docking/cancel\","
       "\"POST /api/v1/docking/stop\","
       "\"WS /ws/v1/teleop\""
@@ -4649,6 +4801,8 @@ private:
              << "\"endpoint\":\"GET /api/v1/navigation/pre_goal_check\","
              << "\"would_auto_undock\":"
              << (dock_check.final_auto_undock_required ? "true" : "false") << ","
+             << "\"auto_undock_required\":"
+             << (dock_check.final_auto_undock_required ? "true" : "false") << ","
              << "\"can_auto_undock\":" << (dock_check.can_auto_undock ? "true" : "false") << ","
              << "\"pre_navigation_dock_check\":" << pre_navigation_dock_check_json(
                dock_check,
@@ -4711,6 +4865,19 @@ private:
       json_bool_value(body, "force_relocalize", false) ||
       json_bool_value(body, "force_relocalization", false);
     const auto pre_navigation_dock_check = pre_navigation_dock_check_snapshot();
+    RCLCPP_INFO(
+      get_logger(),
+      "pre_navigation dock gate source=%s pose_id=%s auto_undock_required=%s can_auto_undock=%s reason=%s "
+      "bms_contact=%s latch_docked=%s docking_state=%s docking_status=%s",
+      by_pose_id ? "pose_id" : "direct_pose",
+      pose_id.c_str(),
+      pre_navigation_dock_check.final_auto_undock_required ? "true" : "false",
+      pre_navigation_dock_check.can_auto_undock ? "true" : "false",
+      pre_navigation_dock_check.auto_undock_reason.c_str(),
+      pre_navigation_dock_check.bms.contact ? "true" : "false",
+      pre_navigation_dock_check.dock_latch_indicates_docked ? "true" : "false",
+      pre_navigation_dock_check.runtime.docking_state.c_str(),
+      pre_navigation_dock_check.runtime.docking_status.c_str());
     auto pre_navigation_dock_check_payload = [&]() {
         return pre_navigation_dock_check_json(
           pre_navigation_dock_check,
@@ -5693,6 +5860,17 @@ private:
     result.final_yaw_error_rad = initial_check.yaw_error_rad;
     result.attempted = true;
 
+    const auto initial_dock_check = pre_navigation_dock_check_snapshot();
+    if (initial_dock_check.final_auto_undock_required) {
+      result.blocked = true;
+      result.phase = "blocked_by_docked_contact";
+      result.blocked_reason = "DOCKED_OR_CHARGING_CONTACT";
+      result.detail = "final yaw alignment blocked by dock/contact gate: " +
+        initial_dock_check.auto_undock_reason;
+      publish_final_yaw_align_zero_burst();
+      return result;
+    }
+
     const auto deadline =
       std::chrono::steady_clock::now() +
       std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -5717,6 +5895,16 @@ private:
         result.phase = "blocked_by_safety";
         result.blocked_reason = safety_detail;
         result.detail = "final yaw alignment blocked by safety: " + safety_detail;
+        break;
+      }
+
+      const auto dock_check = pre_navigation_dock_check_snapshot();
+      if (dock_check.final_auto_undock_required) {
+        result.blocked = true;
+        result.phase = "blocked_by_docked_contact";
+        result.blocked_reason = "DOCKED_OR_CHARGING_CONTACT";
+        result.detail = "final yaw alignment stopped by dock/contact gate: " +
+          dock_check.auto_undock_reason;
         break;
       }
 
@@ -6125,6 +6313,24 @@ private:
     refresh_navigation_resume_runtime_state(false);
 
     const auto runtime = runtime_mode_snapshot();
+    const auto dock_check = pre_navigation_dock_check_snapshot();
+    const auto dock_check_json = pre_navigation_dock_check_json(
+      dock_check,
+      "navigation_state",
+      "",
+      "",
+      "",
+      "map",
+      false);
+    std::string safety_status;
+    bool motion_allowed = false;
+    bool have_motion_allowed = false;
+    {
+      std::lock_guard<std::mutex> state_lock(state_mutex_);
+      safety_status = latest_safety_status_;
+      motion_allowed = latest_motion_allowed_;
+      have_motion_allowed = have_motion_allowed_;
+    }
     std::lock_guard<std::mutex> lock(navigation_cancel_job_mutex_);
     std::lock_guard<std::mutex> goal_lock(navigation_goal_job_mutex_);
     std::ostringstream response;
@@ -6134,6 +6340,15 @@ private:
              << "\"navigation_active\":" << (runtime.navigation_active ? "true" : "false") << ","
              << "\"healthy\":" << (runtime.healthy ? "true" : "false") << ","
              << "\"message\":" << json_string(runtime.message) << ","
+             << "\"pre_navigation_dock_check\":" << dock_check_json << ","
+             << "\"blocked_by_docked_contact\":"
+             << (dock_check.final_auto_undock_required ? "true" : "false") << ","
+             << "\"normal_motion_blocked_reason\":"
+             << json_string(safety_status == "DOCKED_CONTACT_BLOCK" ? "DOCKED_CONTACT_BLOCK" : "") << ","
+             << "\"safety\":{"
+             << "\"status\":" << json_string(safety_status) << ","
+             << "\"motion_allowed\":" << (motion_allowed ? "true" : "false") << ","
+             << "\"motion_allowed_valid\":" << (have_motion_allowed ? "true" : "false") << "},"
              << "\"navigation_goal\":" << navigation_goal_job_json_locked() << ","
              << "\"navigation_cancel\":" << navigation_cancel_job_json_locked() << "}";
     return {200, "application/json", response.str()};
@@ -6472,6 +6687,17 @@ private:
 
   void handle_docking_status(const std::string & status)
   {
+    if (docking_status_is_success(status)) {
+      std::string dock_id;
+      {
+        std::lock_guard<std::mutex> runtime_lock(runtime_mode_mutex_);
+        dock_id = docking_runtime_dock_id_;
+      }
+      update_dock_contact_latch(true, "docking_status", status, dock_id);
+    } else if (docking_status_is_undocked(status)) {
+      update_dock_contact_latch(false, "docking_status", status, "");
+    }
+
     {
       std::lock_guard<std::mutex> runtime_lock(runtime_mode_mutex_);
       docking_runtime_status_ = status;
@@ -6503,6 +6729,12 @@ private:
           set_docking_runtime_state(false, "undocked", status);
         } else if (docking_status_is_undock_failed(status)) {
           set_docking_runtime_state(false, "failed", status);
+        } else if (docking_status_is_success(status)) {
+          const auto lowered = lower_copy(status);
+          set_docking_runtime_state(
+            false,
+            starts_with(lowered, "charging") ? "charging" : "docked",
+            status);
         }
         return;
       }
@@ -6727,6 +6959,11 @@ private:
 
   void finish_docking_job_locked(const bool ok, const std::string & final_state, const std::string & detail)
   {
+    if (ok && (final_state == "docked" || final_state == "charging")) {
+      update_dock_contact_latch(true, "docking_job", detail, docking_job_.dock_id);
+    } else if (ok && final_state == "undocked") {
+      update_dock_contact_latch(false, "docking_job", detail, docking_job_.dock_id);
+    }
     docking_job_.state = final_state;
     docking_job_.phase = "finished";
     docking_job_.ok = ok;
@@ -7262,6 +7499,69 @@ private:
     return {202, "application/json", response.str()};
   }
 
+  HttpResponse handle_docking_confirm_docked(const std::string & body)
+  {
+    auto building_id = json_string_value(body, "building_id").value_or("");
+    auto floor_id = json_string_value(body, "floor_id").value_or("");
+    auto map_id = json_string_value(body, "map_id").value_or("");
+    const auto dock_id = json_string_value(body, "dock_id").value_or("");
+    const auto note = json_string_value(body, "note").value_or("");
+    const auto reason = json_string_value(body, "reason").value_or("manual_confirm");
+    if (!building_id.empty() && !safe_asset_id(building_id)) {
+      return {400, "application/json", error_json("valid building_id is required")};
+    }
+    if (!floor_id.empty() && !safe_asset_id(floor_id)) {
+      return {400, "application/json", error_json("valid floor_id is required")};
+    }
+    if (!map_id.empty() && !safe_asset_id(map_id)) {
+      return {400, "application/json", error_json("valid map_id is required")};
+    }
+    if (!dock_id.empty() && !safe_pose_id(dock_id)) {
+      return {400, "application/json", error_json("dock_id must be a safe pose id when provided")};
+    }
+    if (auto context = read_runtime_map_context()) {
+      if (building_id.empty()) {
+        building_id = context->building_id;
+      }
+      if (floor_id.empty()) {
+        floor_id = context->floor_id;
+      }
+      if (map_id.empty()) {
+        map_id = context->map_id;
+      }
+    }
+    update_dock_contact_latch(
+      true,
+      "manual_confirm",
+      reason,
+      dock_id,
+      building_id,
+      floor_id,
+      map_id,
+      note);
+    const auto latch = read_dock_contact_latch();
+    std::ostringstream response;
+    response << "{\"ok\":true,"
+             << "\"maintenance_only\":true,"
+             << "\"sent_velocity\":false,"
+             << "\"latch\":" << dock_contact_latch_snapshot_json(latch) << "}";
+    return {200, "application/json", response.str()};
+  }
+
+  HttpResponse handle_docking_clear_latch(const std::string & body)
+  {
+    const auto reason = json_string_value(body, "reason").value_or("manual_clear");
+    const auto note = json_string_value(body, "note").value_or("");
+    update_dock_contact_latch(false, "manual_clear", reason, "", "", "", "", note);
+    const auto latch = read_dock_contact_latch();
+    std::ostringstream response;
+    response << "{\"ok\":true,"
+             << "\"maintenance_only\":true,"
+             << "\"sent_velocity\":false,"
+             << "\"latch\":" << dock_contact_latch_snapshot_json(latch) << "}";
+    return {200, "application/json", response.str()};
+  }
+
   HttpResponse handle_docking_undock(const std::string & body)
   {
     const auto reason = json_string_value(body, "reason").value_or("app_manual_undock");
@@ -7298,8 +7598,10 @@ private:
     }
     const auto charging_contact_snapshot = bms_charging_contact_snapshot();
     const bool charging_contact = charging_contact_snapshot.contact;
+    const auto dock_check = pre_navigation_dock_check_snapshot();
     const bool docked_state = runtime.docking_state == "docked" ||
-      docking_status_is_success(runtime.docking_status);
+      docking_status_is_success(runtime.docking_status) ||
+      dock_check.dock_latch_indicates_docked;
     if (!docked_state && !charging_contact) {
       return {
         409,
@@ -7369,7 +7671,7 @@ private:
       "",
       "map",
       false);
-    const bool inferred_docked = runtime.docking_state != "docked" && charging_contact.contact;
+    const bool inferred_docked = dock_check.inferred_docked;
     std::lock_guard<std::mutex> lock(docking_job_mutex_);
     std::ostringstream response;
     response << "{\"ok\":true,"
@@ -7604,6 +7906,20 @@ private:
     return out.str();
   }
 
+  static std::string json_string_array_fragment(const std::vector<std::string> & values)
+  {
+    std::ostringstream out;
+    out << "[";
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      if (i > 0) {
+        out << ",";
+      }
+      out << json_string(values[i]);
+    }
+    out << "]";
+    return out.str();
+  }
+
   BmsChargingContactSnapshot bms_charging_contact_snapshot()
   {
     BmsChargingContactSnapshot snapshot;
@@ -7639,6 +7955,7 @@ private:
     PreNavigationDockCheck check;
     check.runtime = runtime_mode_snapshot();
     check.bms = bms_charging_contact_snapshot();
+    check.dock_latch = read_dock_contact_latch();
 
     const auto docking_state = lower_copy(check.runtime.docking_state);
     const auto docking_status = lower_copy(check.runtime.docking_status);
@@ -7648,13 +7965,44 @@ private:
     check.docking_status_indicates_docked = starts_with(docking_status, "docked");
     check.docking_status_indicates_charging = starts_with(docking_status, "charging");
     check.docking_status_indicates_undocking = docking_status_is_undocking(docking_status);
-    check.inferred_docked = !check.runtime_state_docked && check.bms.contact;
+    check.dock_latch_indicates_docked = check.dock_latch.valid && check.dock_latch.docked;
+    if (check.runtime_state_docked) {
+      check.docked_evidence.push_back("runtime_state:docked");
+    }
+    if (check.runtime_state_charging) {
+      check.docked_evidence.push_back("runtime_state:charging");
+    }
+    if (check.docking_status_indicates_docked) {
+      check.docked_evidence.push_back("docking_status:docked");
+    }
+    if (check.docking_status_indicates_charging) {
+      check.docked_evidence.push_back("docking_status:charging");
+    }
+    if (check.bms.contact) {
+      check.docked_evidence.push_back("bms:" + check.bms.reason);
+    }
+    if (check.dock_latch_indicates_docked) {
+      check.docked_evidence.push_back("latch:" + check.dock_latch.source + ":" + check.dock_latch.reason);
+    }
+    if (!check.bms.have_state) {
+      check.docked_warnings.push_back("no_bms_state");
+    } else if (!check.bms.fresh) {
+      check.docked_warnings.push_back("stale_bms_state");
+    } else if (!check.bms.contact) {
+      check.docked_warnings.push_back("bms_contact_false:" + check.bms.reason);
+    }
+    if (!check.dock_latch.valid) {
+      check.docked_warnings.push_back("dock_latch_unavailable:" + check.dock_latch.reason);
+    }
+    check.inferred_docked =
+      !check.runtime_state_docked && (check.bms.contact || check.dock_latch_indicates_docked);
     check.final_is_docked_or_charging =
       check.runtime_state_docked ||
       check.runtime_state_charging ||
       check.docking_status_indicates_docked ||
       check.docking_status_indicates_charging ||
-      check.bms.contact;
+      check.bms.contact ||
+      check.dock_latch_indicates_docked;
     check.final_auto_undock_required =
       check.final_is_docked_or_charging ||
       check.runtime_state_undocking ||
@@ -7665,6 +8013,23 @@ private:
       !check.runtime_state_undocking &&
       !check.docking_status_indicates_undocking;
     check.can_auto_undock = check.final_auto_undock_required && !check.docking_active_not_docked_block;
+
+    const bool live_confirmed = check.runtime_state_docked ||
+      check.runtime_state_charging ||
+      check.docking_status_indicates_docked ||
+      check.docking_status_indicates_charging ||
+      check.bms.contact;
+    if (live_confirmed) {
+      check.docked_state_class = "DOCKED_CONFIRMED";
+    } else if (check.dock_latch_indicates_docked) {
+      check.docked_state_class = "DOCKED_LATCHED";
+    } else if (check.docking_active_not_docked_block) {
+      check.docked_state_class = "UNKNOWN";
+    } else if (check.runtime.docking_state == "undocked" || docking_status_is_undocked(docking_status)) {
+      check.docked_state_class = "NOT_DOCKED";
+    } else {
+      check.docked_state_class = "UNKNOWN";
+    }
 
     if (check.runtime_state_undocking || check.docking_status_indicates_undocking) {
       check.auto_undock_reason = "undocking_already_active";
@@ -7678,6 +8043,8 @@ private:
       check.auto_undock_reason = "docking_status_docked";
     } else if (check.bms.contact) {
       check.auto_undock_reason = "bms_charging_contact:" + check.bms.reason;
+    } else if (check.dock_latch_indicates_docked) {
+      check.auto_undock_reason = "dock_contact_latch:" + check.dock_latch.source + ":" + check.dock_latch.reason;
     } else if (check.docking_active_not_docked_block) {
       check.auto_undock_reason = "docking_active_not_docked:" + check.runtime.docking_state;
     } else {
@@ -7706,6 +8073,28 @@ private:
     return body.str();
   }
 
+  std::string dock_contact_latch_snapshot_json(const DockContactLatchSnapshot & latch) const
+  {
+    std::ostringstream body;
+    body << "{"
+         << "\"valid\":" << (latch.valid ? "true" : "false") << ","
+         << "\"latched_docked\":" << (latch.latched_docked ? "true" : "false") << ","
+         << "\"docked\":" << (latch.docked ? "true" : "false") << ","
+         << "\"source\":" << json_string(latch.source) << ","
+         << "\"reason\":" << json_string(latch.reason) << ","
+         << "\"building_id\":" << json_string(latch.building_id) << ","
+         << "\"floor_id\":" << json_string(latch.floor_id) << ","
+         << "\"map_id\":" << json_string(latch.map_id) << ","
+         << "\"dock_id\":" << json_string(latch.dock_id) << ","
+         << "\"latched_at\":" << json_string(latch.latched_at) << ","
+         << "\"last_confirmed_at\":" << json_string(latch.last_confirmed_at) << ","
+         << "\"cleared_at\":" << json_string(latch.cleared_at) << ","
+         << "\"clear_reason\":" << json_string(latch.clear_reason) << ","
+         << "\"note\":" << json_string(latch.note) << ","
+         << "\"updated_at\":" << json_string(latch.updated_at) << "}";
+    return body.str();
+  }
+
   std::string pre_navigation_dock_check_json(
     const PreNavigationDockCheck & check,
     const std::string & request_source,
@@ -7727,6 +8116,7 @@ private:
          << "\"api_bms_charging_contact\":" << (check.bms.contact ? "true" : "false") << ","
          << "\"api_bms_charging_contact_reason\":" << json_string(check.bms.reason) << ","
          << "\"bms\":{" << bms_charging_contact_snapshot_json(check.bms) << "},"
+         << "\"dock_contact_snapshot\":" << dock_contact_latch_snapshot_json(check.dock_latch) << ","
          << "\"docking\":{"
          << "\"state\":" << json_string(check.runtime.docking_state) << ","
          << "\"active\":" << (check.runtime.docking_active ? "true" : "false") << ","
@@ -7740,8 +8130,16 @@ private:
          << "\"status_indicates_charging\":"
          << (check.docking_status_indicates_charging ? "true" : "false") << ","
          << "\"status_indicates_undocking\":"
-         << (check.docking_status_indicates_undocking ? "true" : "false") << "},"
+         << (check.docking_status_indicates_undocking ? "true" : "false") << ","
+         << "\"dock_latch_indicates_docked\":"
+         << (check.dock_latch_indicates_docked ? "true" : "false") << "},"
          << "\"inferred_docked\":" << (check.inferred_docked ? "true" : "false") << ","
+         << "\"latched_docked\":" << (check.dock_latch_indicates_docked ? "true" : "false") << ","
+         << "\"latched_docked_source\":" << json_string(check.dock_latch.source) << ","
+         << "\"latched_docked_age_sec\":null,"
+         << "\"docked_state_class\":" << json_string(check.docked_state_class) << ","
+         << "\"docked_evidence\":" << json_string_array_fragment(check.docked_evidence) << ","
+         << "\"docked_warnings\":" << json_string_array_fragment(check.docked_warnings) << ","
          << "\"final_is_docked_or_charging\":"
          << (check.final_is_docked_or_charging ? "true" : "false") << ","
          << "\"final_auto_undock_required\":"
@@ -8130,6 +8528,13 @@ private:
   std::string docking_stop_service_;
   std::string docking_undock_service_;
   std::string docking_status_topic_;
+  std::string docking_contact_latch_file_;
+  bool have_last_dock_contact_latch_write_{false};
+  bool last_dock_contact_latch_docked_{false};
+  std::string last_dock_contact_latch_source_;
+  std::string last_dock_contact_latch_reason_;
+  std::string last_dock_contact_latch_dock_id_;
+  std::string last_dock_contact_latch_note_;
   double docking_pre_dock_distance_m_{0.60};
   double docking_navigation_start_wait_sec_{45.0};
   double docking_predock_nav_timeout_sec_{180.0};
@@ -8150,7 +8555,7 @@ private:
   bool undock_relocalize_after_success_{true};
   double undock_relocalize_wait_sec_{8.0};
   bool docking_cancel_active_goal_before_predock_{true};
-  double navigation_auto_undock_timeout_sec_{18.0};
+  double navigation_auto_undock_timeout_sec_{28.0};
   double docking_undock_charging_retry_sec_{3.0};
   std::string localization_bridge_force_accept_service_;
   std::string mapping_2d_live_map_topic_;

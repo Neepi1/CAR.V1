@@ -11,6 +11,21 @@ robot_safety:
     estop_topic: /safety/estop
     localization_ok_topic: /localization/health
     require_localization_health: false
+    block_normal_motion_when_docked: true
+    enable_bms_contact_guard: true
+    enable_docking_status_guard: true
+    enable_docked_latch_file_guard: true
+    docked_status_prefixes: [docked, charging]
+    battery_state_topic: /battery_state
+    docking_status_topic: /docking/status
+    docking_contact_latch_file: /workspaces/njrh-v3/workspace1/maps_release/docking_contact_latch.json
+    dock_contact_max_age_sec: 3.0
+    allow_docking_cmd_when_docked: true
+    charging_current_min_a: 0.10
+    charging_contact_voltage_min_v: 40.0
+    charging_contact_voltage_max_v: 1000.0
+    charging_full_soc_threshold_pct: 99.0
+    charging_full_soc_voltage_contact_enable: true
     status_topic: /safety/status
     motion_allowed_topic: /safety/motion_allowed
     publish_zero_on_startup: true

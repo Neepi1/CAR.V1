@@ -96,6 +96,10 @@ PY
   fi
   export NJRH_NAV_MAP_NAME="${nav_map_name}"
   export NJRH_NAV_MAP_ID="${nav_map_id}"
+  export NJRH_MAP_ID="${nav_map_id:-${NJRH_MAP_ID:-}}"
+  export NJRH_MAP_DISPLAY_NAME="${nav_map_name:-${NJRH_MAP_DISPLAY_NAME:-}}"
+  export NJRH_MAP_CONTEXT_BUILDING_ID="${building_id}"
+  export NJRH_MAP_CONTEXT_FLOOR_ID="${floor_id}"
 
   printf '[runtime-overlay] selected floor %s/%s\n' "${building_id}" "${floor_id}" >&2
   printf '[runtime-overlay] selected floor asset root=%s\n' "${runtime_root}" >&2
