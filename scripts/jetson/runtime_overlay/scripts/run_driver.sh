@@ -11,8 +11,10 @@ source "${SCRIPT_DIR}/local_perception_profile.sh"
 source "${SCRIPT_DIR}/pointcloud_accel_profile.sh"
 njrh_load_local_perception_input_profile
 njrh_load_pointcloud_accel_profile
+njrh_load_pointcloud_ingress_profile
 
 CONFIG_FILE="${NJRH_HESAI_CONFIG_FILE:-${UPSTREAM_WS}/src/hesai_lidar_ros2/config/config.yaml}"
+HESAI_ACCEL_DRIVER_CONFIG="${NJRH_HESAI_ACCEL_DRIVER_CONFIG:-${NJRH_OVERLAY_ROOT}/config/hesai_accel_driver.yaml}"
 export DRIVER_PROFILE="${DRIVER_PROFILE:-mapping}"
 export NJRH_HESAI_UPSTREAM_DRIVER_PROFILE="${NJRH_HESAI_UPSTREAM_DRIVER_PROFILE:-navigation}"
 export LIDAR_FRAME="${LIDAR_FRAME:-lidar_link}"
@@ -37,6 +39,7 @@ else
 fi
 export POINTCLOUD_DOWNSAMPLE_CPP_BIN="${NJRH_POINTCLOUD_DOWNSAMPLE_CPP_BIN:-${NJRH_PROJECT_ROOT}/install/robot_hesai_jt128/lib/robot_hesai_jt128/pointcloud_downsample_node}"
 export IMU_REMAP_CPP_BIN="${NJRH_IMU_REMAP_CPP_BIN:-${NJRH_PROJECT_ROOT}/install/robot_hesai_jt128/lib/robot_hesai_jt128/imu_axis_remap_node}"
+export HESAI_ACCEL_DRIVER_CPP_BIN="${NJRH_HESAI_ACCEL_DRIVER_BIN:-${NJRH_PROJECT_ROOT}/install/hesai_ros_driver/lib/hesai_ros_driver/hesai_accel_driver_node}"
 export NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER="${NJRH_JT128_USE_POINTCLOUD_PIPELINE_CONTAINER:-false}"
 export NJRH_JT128_ENABLE_POINTCLOUD_DOWNSAMPLE="${NJRH_JT128_ENABLE_POINTCLOUD_DOWNSAMPLE:-false}"
 if [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" != "legacy" ]]; then
@@ -96,7 +99,11 @@ cleanup() {
 trap cleanup EXIT
 
 jt128_driver_process_running() {
-  pgrep -f "hesai_ros_driver_node" >/dev/null 2>&1
+  pgrep -f "[h]esai_ros_driver_node" >/dev/null 2>&1
+}
+
+jt128_accel_driver_process_running() {
+  pgrep -f "[h]esai_accel_driver_node|[j]t128_accel_driver_node" >/dev/null 2>&1
 }
 
 jt128_pointcloud_remap_running() {
@@ -127,17 +134,18 @@ canonical_jt128_ingress_running() {
 
 any_jt128_ingress_process_running() {
   jt128_driver_process_running ||
+    jt128_accel_driver_process_running ||
     jt128_pointcloud_remap_running ||
     jt128_pointcloud_downsample_running ||
     jt128_imu_remap_running
 }
 
 stop_jt128_ingress_processes() {
-  for pattern in "hesai_ros_driver_node" "ros2 run hesai_ros_driver" "imu_axis_remap" "pointcloud_perception_pipeline.launch.py" "component_container_mt.*pointcloud_perception_pipeline" "pointcloud_axis_remap" "pointcloud_accel_axis" "pointcloud_fastlio_remap" "pointcloud_downsample"; do
+  for pattern in "[h]esai_ros_driver_node" "[r]os2 run hesai_ros_driver" "[h]esai_accel_driver_node" "[j]t128_accel_driver_node" "[i]mu_axis_remap" "[p]ointcloud_perception_pipeline.launch.py" "[c]omponent_container_mt.*pointcloud_perception_pipeline" "[p]ointcloud_axis_remap" "[p]ointcloud_accel_axis" "[p]ointcloud_fastlio_remap" "[p]ointcloud_downsample"; do
     pkill -INT -f "$pattern" 2>/dev/null || true
   done
   sleep 1
-  for pattern in "hesai_ros_driver_node" "ros2 run hesai_ros_driver" "imu_axis_remap" "pointcloud_perception_pipeline.launch.py" "component_container_mt.*pointcloud_perception_pipeline" "pointcloud_axis_remap" "pointcloud_accel_axis" "pointcloud_fastlio_remap" "pointcloud_downsample"; do
+  for pattern in "[h]esai_ros_driver_node" "[r]os2 run hesai_ros_driver" "[h]esai_accel_driver_node" "[j]t128_accel_driver_node" "[i]mu_axis_remap" "[p]ointcloud_perception_pipeline.launch.py" "[c]omponent_container_mt.*pointcloud_perception_pipeline" "[p]ointcloud_axis_remap" "[p]ointcloud_accel_axis" "[p]ointcloud_fastlio_remap" "[p]ointcloud_downsample"; do
     pkill -TERM -f "$pattern" 2>/dev/null || true
   done
   sleep 1
@@ -153,7 +161,9 @@ fi
 
 if any_jt128_ingress_process_running; then
   if [[ "${NJRH_FORCE_RESTART_DRIVER:-false}" != "true" ]]; then
-    if [[ "${stopped_disabled_pointcloud_downsample}" != "true" ]] && canonical_jt128_ingress_running; then
+    if [[ "${NJRH_POINTCLOUD_INGRESS_PROFILE}" == "separate_process" ]] &&
+      [[ "${stopped_disabled_pointcloud_downsample}" != "true" ]] &&
+      canonical_jt128_ingress_running; then
       echo "[runtime-overlay] canonical JT128 driver/remap chain already running; reusing existing ingress" >&2
       while canonical_jt128_ingress_running; do
         sleep 2
@@ -163,6 +173,45 @@ if any_jt128_ingress_process_running; then
     echo "[runtime-overlay] incomplete JT128 ingress detected; restarting driver plus canonical pointcloud/IMU remaps" >&2
   fi
   stop_jt128_ingress_processes
+fi
+
+if [[ "${NJRH_POINTCLOUD_INGRESS_PROFILE}" == "driver_integrated" ]]; then
+  if [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" != "ipc_worker" && "${NJRH_POINTCLOUD_ACCEL_PROFILE}" != "nitros" ]]; then
+    echo "[runtime-overlay] driver_integrated ingress requires ipc_worker or future accel profile; current accel=${NJRH_POINTCLOUD_ACCEL_PROFILE}" >&2
+    exit 2
+  fi
+  [[ -x "${HESAI_ACCEL_DRIVER_CPP_BIN}" ]] || {
+    echo "[runtime-overlay] DRIVER_INTEGRATED_UNAVAILABLE_REASON=hesai_accel_driver_node_missing: ${HESAI_ACCEL_DRIVER_CPP_BIN}" >&2
+    echo "[runtime-overlay] rollback: export NJRH_POINTCLOUD_INGRESS_PROFILE=separate_process" >&2
+    exit 3
+  }
+  [[ -f "${HESAI_ACCEL_DRIVER_CONFIG}" ]] || {
+    echo "[runtime-overlay] DRIVER_INTEGRATED_UNAVAILABLE_REASON=hesai_accel_driver_config_missing: ${HESAI_ACCEL_DRIVER_CONFIG}" >&2
+    echo "[runtime-overlay] rollback: export NJRH_POINTCLOUD_INGRESS_PROFILE=separate_process" >&2
+    exit 3
+  }
+  [[ -f "${IMU_REMAP_CONFIG}" ]] || {
+    echo "[runtime-overlay] canonical imu remap config missing: ${IMU_REMAP_CONFIG}" >&2
+    exit 1
+  }
+  [[ -x "${IMU_REMAP_CPP_BIN}" ]] || {
+    echo "[runtime-overlay] compiled imu remap missing or not executable: ${IMU_REMAP_CPP_BIN}" >&2
+    exit 1
+  }
+  echo "[runtime-overlay] starting driver_integrated JT128 ingress: ${HESAI_ACCEL_DRIVER_CPP_BIN}" >&2
+  echo "[runtime-overlay] production pointcloud path bypasses /jt128/vendor/points_raw DDS; rollback keeps hesai_ros_driver_node -> /jt128/vendor/points_raw -> pointcloud_accel_axis_node" >&2
+  njrh_run_affined hesai_ros_driver \
+    "${HESAI_ACCEL_DRIVER_CPP_BIN}" --ros-args \
+      --params-file "${HESAI_ACCEL_DRIVER_CONFIG}" \
+      -p "config_path:=${RUNTIME_CONFIG_FILE}" &
+  driver_pid=$!
+  sleep 2
+  echo "[runtime-overlay] starting canonical imu remap for driver_integrated ingress: ${IMU_REMAP_CPP_BIN}" >&2
+  njrh_run_affined imu_axis_remap \
+    "${IMU_REMAP_CPP_BIN}" --ros-args --params-file "${IMU_REMAP_CONFIG}" &
+  imu_remap_pid=$!
+  wait "${driver_pid}"
+  exit $?
 fi
 
 [[ -f "${POINTCLOUD_REMAP_CONFIG}" ]] || {

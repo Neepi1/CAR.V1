@@ -6,6 +6,7 @@ source "${SCRIPT_DIR}/common_env.sh"
 source "${SCRIPT_DIR}/pointcloud_accel_profile.sh"
 
 PROFILE=""
+INGRESS_PROFILE=""
 DURATION_SEC=120
 DO_APPLY=false
 DO_RESTART=false
@@ -13,7 +14,7 @@ DO_RESTORE=false
 
 usage() {
   cat <<'EOF'
-Usage: run_pointcloud_accel_ab.sh --profile legacy|ipc_worker|nitros [--duration-sec SEC] [--apply] [--restart] [--restore]
+Usage: run_pointcloud_accel_ab.sh --profile legacy|ipc_worker|nitros [--ingress-profile separate_process|driver_integrated] [--duration-sec SEC] [--apply] [--restart] [--restore]
 
 Without --apply this script only records the current runtime. With --restore it
 switches back to the profile that was active before this A/B run.
@@ -30,6 +31,11 @@ while [[ "$#" -gt 0 ]]; do
     --duration-sec)
       [[ "$#" -ge 2 ]] || { echo "[pointcloud-accel-ab] --duration-sec requires a value" >&2; exit 2; }
       DURATION_SEC="$2"
+      shift 2
+      ;;
+    --ingress-profile)
+      [[ "$#" -ge 2 ]] || { echo "[pointcloud-accel-ab] --ingress-profile requires a value" >&2; exit 2; }
+      INGRESS_PROFILE="$2"
       shift 2
       ;;
     --apply)
@@ -65,12 +71,25 @@ case "${PROFILE}" in
     ;;
 esac
 
+case "${INGRESS_PROFILE:-separate_process}" in
+  separate_process|driver_integrated) ;;
+  *)
+    echo "[pointcloud-accel-ab] invalid --ingress-profile: ${INGRESS_PROFILE}" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
 [[ "${DURATION_SEC}" =~ ^[0-9]+$ ]] || { echo "[pointcloud-accel-ab] invalid duration: ${DURATION_SEC}" >&2; exit 2; }
 
 unset NJRH_POINTCLOUD_ACCEL_PROFILE
+unset NJRH_POINTCLOUD_INGRESS_PROFILE
 njrh_load_pointcloud_accel_profile
+njrh_load_pointcloud_ingress_profile
 prior_profile="${NJRH_POINTCLOUD_ACCEL_PROFILE}"
+prior_ingress_profile="${NJRH_POINTCLOUD_INGRESS_PROFILE}"
 requested_profile="${PROFILE}"
+requested_ingress_profile="${INGRESS_PROFILE:-${prior_ingress_profile}}"
 
 topic_info_file() {
   local topic="$1"
@@ -102,7 +121,17 @@ publisher_nodes_from_file() {
 }
 
 process_snapshot() {
-  pgrep -af "pointcloud_axis_remap|pointcloud_accel_axis|robot_local_perception|nav_cloud_preprocessor|pointcloud_to_laserscan|scan_republisher|laser_scan_to_flatscan" 2>/dev/null || true
+  pgrep -af "hesai_ros_driver_node|hesai_accel_driver_node|jt128_accel_driver_node|pointcloud_axis_remap|pointcloud_accel_axis|robot_local_perception|nav_cloud_preprocessor|pointcloud_to_laserscan|scan_republisher|laser_scan_to_flatscan" 2>/dev/null || true
+}
+
+socket_drop_snapshot() {
+  {
+    ss -u -n -a -i 2>/dev/null | grep -E "2368|7400|7417|7463|rcvbuf|drops" || true
+    echo "--- /proc/net/udp"
+    awk 'NR<=5 || /:09[4-9][0-9]|:1C[Ff][0-9]|:1D[0-9A-Fa-f][0-9A-Fa-f]/ {print}' /proc/net/udp 2>/dev/null || true
+    echo "--- /proc/softirqs"
+    grep -E "NET_RX|NET_TX" /proc/softirqs 2>/dev/null || true
+  }
 }
 
 status_once() {
@@ -174,6 +203,9 @@ report="${report_dir}/pointcloud_accel_ab_${timestamp}.md"
 
 if [[ "${DO_APPLY}" == "true" ]]; then
   args=(--profile "${PROFILE}")
+  if [[ -n "${INGRESS_PROFILE}" ]]; then
+    args+=(--ingress-profile "${INGRESS_PROFILE}")
+  fi
   [[ "${DO_RESTART}" == "true" ]] && args+=(--restart)
   bash "${SCRIPT_DIR}/set_pointcloud_accel_profile.sh" "${args[@]}"
   if [[ "${DO_RESTART}" == "true" ]]; then
@@ -184,8 +216,11 @@ else
 fi
 
 unset NJRH_POINTCLOUD_ACCEL_PROFILE
+unset NJRH_POINTCLOUD_INGRESS_PROFILE
 njrh_load_pointcloud_accel_profile
+njrh_load_pointcloud_ingress_profile
 actual_profile="${NJRH_POINTCLOUD_ACCEL_PROFILE}"
+actual_ingress_profile="${NJRH_POINTCLOUD_INGRESS_PROFILE}"
 
 tmp_dir="$(mktemp -d /tmp/njrh_pointcloud_accel_ab_XXXX)"
 trap 'rm -rf "${tmp_dir}"' EXIT
@@ -213,6 +248,7 @@ else
 fi
 
 topic_info_file /lidar_points lidar "${tmp_dir}"
+topic_info_file /jt128/vendor/points_raw vendor_raw "${tmp_dir}"
 topic_info_file /perception/obstacle_points obstacle "${tmp_dir}"
 topic_info_file /perception/clearing_points clearing "${tmp_dir}"
 topic_info_file /scan scan "${tmp_dir}"
@@ -240,6 +276,12 @@ status_field() {
   }' <<<"${text}"
 }
 internal_zero_copy_profile="$(status_field "${accel_status}" internal_zero_copy_profile)"
+status_accel_ingress_profile="$(status_field "${accel_status}" accel_ingress_profile)"
+status_input_path="$(status_field "${accel_status}" input_path)"
+status_vendor_raw_ros_hop_required="$(status_field "${accel_status}" vendor_raw_ros_hop_required)"
+status_driver_integrated_process="$(status_field "${accel_status}" driver_integrated_process)"
+status_accel_core_process_pointcloud2_count="$(status_field "${accel_status}" accel_core_process_pointcloud2_count)"
+status_accel_core_process_decoded_view_count="$(status_field "${accel_status}" accel_core_process_decoded_view_count)"
 latest_internal_buffer_points="$(status_field "${accel_status}" latest_internal_buffer_points)"
 local_worker_full_cloud_copy_count="$(status_field "${accel_status}" local_worker_full_cloud_copy_count)"
 scan_worker_full_cloud_copy_count="$(status_field "${accel_status}" scan_worker_full_cloud_copy_count)"
@@ -247,6 +289,8 @@ local_worker_intermediate_pointcloud_build_count="$(status_field "${accel_status
 scan_worker_intermediate_pointcloud_build_count="$(status_field "${accel_status}" scan_worker_intermediate_pointcloud_build_count)"
 lidar_publishers="$(topic_count_from_file "${tmp_dir}/lidar.info" "Publisher count")"
 lidar_subscribers="$(topic_count_from_file "${tmp_dir}/lidar.info" "Subscription count")"
+vendor_raw_publishers="$(topic_count_from_file "${tmp_dir}/vendor_raw.info" "Publisher count")"
+vendor_raw_subscribers="$(topic_count_from_file "${tmp_dir}/vendor_raw.info" "Subscription count")"
 points_nav_publishers="$(topic_count_from_file "${tmp_dir}/points_nav.info" "Publisher count")"
 points_nav_subscribers="$(topic_count_from_file "${tmp_dir}/points_nav.info" "Subscription count")"
 lidar_points_nav_publishers="$(topic_count_from_file "${tmp_dir}/lidar_points_nav.info" "Publisher count")"
@@ -255,6 +299,7 @@ scan_subscribers="$(topic_count_from_file "${tmp_dir}/scan.info" "Subscription c
 flatscan_publishers="$(topic_count_from_file "${tmp_dir}/flatscan.info" "Publisher count")"
 flatscan_subscribers="$(topic_count_from_file "${tmp_dir}/flatscan.info" "Subscription count")"
 trunk_owner="$(publisher_nodes_from_file "${tmp_dir}/lidar.info")"
+vendor_raw_owner="$(publisher_nodes_from_file "${tmp_dir}/vendor_raw.info")"
 obstacle_owner="$(publisher_nodes_from_file "${tmp_dir}/obstacle.info")"
 clearing_owner="$(publisher_nodes_from_file "${tmp_dir}/clearing.info")"
 points_nav_owner="$(publisher_nodes_from_file "${tmp_dir}/points_nav.info")"
@@ -279,11 +324,15 @@ thermal="$( { tegrastats --interval 1000 --count 1 2>/dev/null || true; } )"
 nav2_lifecycle="$(nav2_state)"
 fastlio="$(fastlio_residual)"
 binary_snapshot="$(process_snapshot)"
+socket_snapshot="$(socket_drop_snapshot)"
 binary_running="$(awk '
+  /hesai_accel_driver_node|jt128_accel_driver_node/ {integrated=1}
   /pointcloud_accel_axis/ {accel=1}
   /pointcloud_axis_remap/ {legacy=1}
   END {
-    if (legacy && accel) print "legacy_and_ipc";
+    if (integrated && (legacy || accel)) print "integrated_and_standalone";
+    else if (integrated) print "hesai_accel_driver_node";
+    else if (legacy && accel) print "legacy_and_ipc";
     else if (accel) print "pointcloud_accel_axis_node";
     else if (legacy) print "pointcloud_axis_remap_node";
     else print "missing";
@@ -326,6 +375,10 @@ fi
   echo "- profile requested: ${requested_profile}"
   echo "- profile before run: ${prior_profile}"
   echo "- profile actually running: ${actual_profile}"
+  echo "- ingress profile requested: ${requested_ingress_profile}"
+  echo "- ingress profile before run: ${prior_ingress_profile}"
+  echo "- ingress profile actually running: ${actual_ingress_profile}"
+  echo "- actual driver process: $(awk '/hesai_accel_driver_node|jt128_accel_driver_node/ {print "hesai_accel_driver_node"; found=1; exit} /hesai_ros_driver_node/ {driver=1} END {if (!found && driver) print "hesai_ros_driver_node"; else if (!found && !driver) print "missing"}' <<<"${binary_snapshot}")"
   echo "- binary actually running: ${binary_running}"
   echo "- apply: ${DO_APPLY}"
   echo "- restart: ${DO_RESTART}"
@@ -336,6 +389,9 @@ fi
   echo "- /lidar_points publisher_count: ${lidar_publishers:-missing}"
   echo "- /lidar_points subscriber_count: ${lidar_subscribers:-missing}"
   echo "- trunk owner: ${trunk_owner:-missing}"
+  echo "- /jt128/vendor/points_raw publisher_count: ${vendor_raw_publishers:-missing}"
+  echo "- /jt128/vendor/points_raw subscriber_count: ${vendor_raw_subscribers:-missing}"
+  echo "- /jt128/vendor/points_raw owner: ${vendor_raw_owner:-missing}"
   echo "- obstacle owner: ${obstacle_owner:-missing}"
   echo "- clearing owner: ${clearing_owner:-missing}"
   echo "- points_nav owner: ${points_nav_owner:-missing}"
@@ -357,6 +413,12 @@ fi
   echo "- flatscan_hz: ${flatscan_hz:-missing}"
   echo "- helper_status_file: ${helper_status_file}"
   echo "- internal_zero_copy_profile: ${internal_zero_copy_profile:-missing}"
+  echo "- status_accel_ingress_profile: ${status_accel_ingress_profile:-missing}"
+  echo "- status_input_path: ${status_input_path:-missing}"
+  echo "- status_vendor_raw_ros_hop_required: ${status_vendor_raw_ros_hop_required:-missing}"
+  echo "- status_driver_integrated_process: ${status_driver_integrated_process:-missing}"
+  echo "- status_accel_core_process_pointcloud2_count: ${status_accel_core_process_pointcloud2_count:-missing}"
+  echo "- status_accel_core_process_decoded_view_count: ${status_accel_core_process_decoded_view_count:-missing}"
   echo "- latest_internal_buffer_points: ${latest_internal_buffer_points:-missing}"
   echo "- local_worker_full_cloud_copy_count: ${local_worker_full_cloud_copy_count:-missing}"
   echo "- scan_worker_full_cloud_copy_count: ${scan_worker_full_cloud_copy_count:-missing}"
@@ -375,10 +437,15 @@ fi
       echo "- /lidar_points_nav -> /points_nav -> /scan -> /flatscan"
       ;;
     ipc_worker|nitros)
-      echo "- /lidar_points full trunk"
-      echo "- pointcloud_accel_axis_node workers -> /perception/* and /scan"
-      echo "- /_internal/lidar_points_local and /lidar_points_nav compact debug/compat only"
-      echo "- /points_nav is not production"
+      if [[ "${actual_ingress_profile}" == "driver_integrated" ]]; then
+        echo "- driver_integrated path: hesai_accel_driver_node -> AccelCore"
+        echo "- /jt128/vendor/points_raw is not a production input in this path"
+      else
+        echo "- /lidar_points full trunk"
+        echo "- pointcloud_accel_axis_node workers -> /perception/* and /scan"
+        echo "- /_internal/lidar_points_local and /lidar_points_nav compact debug/compat only"
+        echo "- /points_nav is not production"
+      fi
       ;;
   esac
   echo
@@ -404,9 +471,15 @@ fi
   echo "${binary_snapshot}"
   echo '```'
   echo
+  echo "## Socket Drop Snapshot"
+  echo '```text'
+  echo "${socket_snapshot}"
+  echo '```'
+  echo
   echo "## Topic Graphs"
   echo '```text'
   cat "${tmp_dir}/lidar.info"
+  cat "${tmp_dir}/vendor_raw.info"
   cat "${tmp_dir}/obstacle.info"
   cat "${tmp_dir}/clearing.info"
   cat "${tmp_dir}/scan.info"
@@ -432,14 +505,15 @@ echo "[pointcloud-accel-ab] report=${report}"
 cat "${status_out}"
 
 if [[ "${DO_RESTORE}" == "true" ]]; then
-  echo "[pointcloud-accel-ab] restoring prior profile=${prior_profile}"
-  bash "${SCRIPT_DIR}/set_pointcloud_accel_profile.sh" --profile "${prior_profile}" --restart
+  echo "[pointcloud-accel-ab] restoring prior profile=${prior_profile} ingress=${prior_ingress_profile}"
+  bash "${SCRIPT_DIR}/set_pointcloud_accel_profile.sh" --profile "${prior_profile}" --ingress-profile "${prior_ingress_profile}" --restart
   sleep "${NJRH_POINTCLOUD_ACCEL_AB_RESTART_SETTLE_SEC:-12}"
   {
     echo
     echo "## Restore"
     echo
     echo "- restored_profile: ${prior_profile}"
-    echo "- restore_command: set_pointcloud_accel_profile.sh --profile ${prior_profile} --restart"
+    echo "- restored_ingress_profile: ${prior_ingress_profile}"
+    echo "- restore_command: set_pointcloud_accel_profile.sh --profile ${prior_profile} --ingress-profile ${prior_ingress_profile} --restart"
   } >>"${report}"
 fi

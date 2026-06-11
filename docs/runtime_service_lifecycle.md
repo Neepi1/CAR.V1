@@ -121,6 +121,21 @@ The existing `/lidar/pointcloud_accel_status` reports
 cloud copy counters, intermediate PointCloud2 build counters, allocation counts,
 lock wait maxima, and processing averages.
 
+Phase D1 separates pointcloud acceleration from ingress selection. The default
+`NJRH_POINTCLOUD_INGRESS_PROFILE=separate_process` keeps the validated runtime:
+`hesai_ros_driver_node` decodes JT128 UDP packets and publishes the decoded ROS
+`PointCloud2` topic `/jt128/vendor/points_raw`; `pointcloud_accel_axis_node`
+subscribes to that topic and calls the shared C++ `PointCloudAccelCore`. The
+`driver_integrated` profile builds the repo-owned
+`src/third_party/hesai_lidar_ros2_overlay` source and starts
+`hesai_accel_driver_node`; Hesai decode constructs one in-process `PointCloud2`
+and moves it directly into `PointCloudAccelCore`, so `/jt128/vendor/points_raw`
+is no longer a production DDS input. `/jt128/vendor/imu_raw` remains available
+for the existing IMU remap path. Rollback is
+`NJRH_POINTCLOUD_INGRESS_PROFILE=separate_process`.
+`/lidar_points` remains full-density/full-fields for FAST-LIO2 mapping, and no
+new pointcloud or status topics are introduced.
+
 The full-size pointcloud trunk is latest-only after the upstream Hesai driver:
 `/lidar_points` is the high-density canonical trunk used by mapping-owned
 FAST-LIO2 and diagnostic consumers. It must not be compacted or downsampled.

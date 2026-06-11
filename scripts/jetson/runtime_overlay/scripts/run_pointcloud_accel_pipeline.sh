@@ -7,8 +7,10 @@ source "${SCRIPT_DIR}/common_env.sh"
 source "${SCRIPT_DIR}/cpu_affinity.sh"
 source "${SCRIPT_DIR}/pointcloud_accel_profile.sh"
 njrh_load_pointcloud_accel_profile
+njrh_load_pointcloud_ingress_profile
 
 PROFILE="${NJRH_POINTCLOUD_ACCEL_PROFILE}"
+INGRESS_PROFILE="${NJRH_POINTCLOUD_INGRESS_PROFILE}"
 RESTART="${NJRH_POINTCLOUD_ACCEL_RESTART:-false}"
 FLATSCAN_PARAMS="${NJRH_FLATSCAN_PARAMS:-${NJRH_POINTCLOUD_ACCEL_FLATSCAN_PARAMS:-${NJRH_OVERLAY_ROOT}/config/jt128_flatscan.yaml}}"
 FLATSCAN_HELPER_REQUIRED="${NJRH_FLATSCAN_HELPER_REQUIRED:-true}"
@@ -43,19 +45,22 @@ truthy() {
 
 stop_pointcloud_profile_processes() {
   local patterns=(
-    "pointcloud_accel_axis_node"
-    "pointcloud_axis_remap_node"
-    "pointcloud_axis_remap"
-    "pointcloud_perception_pipeline.launch.py"
-    "component_container_mt.*pointcloud_perception_pipeline"
-    "pointcloud_downsample"
-    "robot_local_perception/local_perception_node"
-    "install/robot_local_perception/.*/local_perception_node"
-    "nav_cloud_preprocessor"
-    "pointcloud_to_laserscan_node"
-    "pointcloud_to_laserscan"
-    "scan_republisher_node"
-    "laser_scan_to_flatscan"
+    "[h]esai_ros_driver_node"
+    "[p]ointcloud_accel_axis_node"
+    "[h]esai_accel_driver_node"
+    "[j]t128_accel_driver_node"
+    "[p]ointcloud_axis_remap_node"
+    "[p]ointcloud_axis_remap"
+    "[p]ointcloud_perception_pipeline.launch.py"
+    "[c]omponent_container_mt.*pointcloud_perception_pipeline"
+    "[p]ointcloud_downsample"
+    "[r]obot_local_perception/local_perception_node"
+    "[i]nstall/robot_local_perception/.*/local_perception_node"
+    "[n]av_cloud_preprocessor"
+    "[p]ointcloud_to_laserscan_node"
+    "[p]ointcloud_to_laserscan"
+    "[s]can_republisher_node"
+    "[l]aser_scan_to_flatscan"
   )
   local pattern
   for pattern in "${patterns[@]}"; do
@@ -278,6 +283,7 @@ case "${PROFILE}" in
     echo "[pointcloud-accel] starting legacy trunk/local-branch pipeline" >&2
     env \
       NJRH_POINTCLOUD_ACCEL_PROFILE=legacy \
+      NJRH_POINTCLOUD_INGRESS_PROFILE=separate_process \
       NJRH_FORCE_RESTART_DRIVER="${NJRH_FORCE_RESTART_DRIVER:-false}" \
       bash "${SCRIPT_DIR}/run_driver.sh" &
     driver_pid=$!
@@ -311,14 +317,27 @@ case "${PROFILE}" in
     echo "[pointcloud-accel] final topology: /lidar_points full trunk; /_internal/lidar_points_local -> robot_local_perception -> /perception/*; /lidar_points_nav -> /points_nav -> /scan -> /flatscan" >&2
     ;;
   ipc_worker)
-    echo "[pointcloud-accel] starting ipc_worker fast trunk + same-process worker pipeline" >&2
-    env \
-      NJRH_POINTCLOUD_ACCEL_PROFILE=ipc_worker \
-      NJRH_FORCE_RESTART_DRIVER="${NJRH_FORCE_RESTART_DRIVER:-false}" \
-      bash "${SCRIPT_DIR}/run_driver.sh" &
-    driver_pid=$!
-    start_flatscan_helper
-    echo "[pointcloud-accel] final topology: /lidar_points full trunk; pointcloud_accel_axis_node workers publish /perception/* and /scan; /_internal/lidar_points_local and /lidar_points_nav are compact debug/compat only; /points_nav is not production" >&2
+    echo "[pointcloud-accel] starting ipc_worker fast trunk + same-process worker pipeline ingress=${INGRESS_PROFILE}" >&2
+    if [[ "${INGRESS_PROFILE}" == "driver_integrated" ]]; then
+      echo "[pointcloud-accel] driver_integrated ingress selected; run_driver.sh will not start standalone hesai_ros_driver_node or pointcloud_accel_axis_node" >&2
+      env \
+        NJRH_POINTCLOUD_ACCEL_PROFILE=ipc_worker \
+        NJRH_POINTCLOUD_INGRESS_PROFILE=driver_integrated \
+        NJRH_FORCE_RESTART_DRIVER="${NJRH_FORCE_RESTART_DRIVER:-false}" \
+        bash "${SCRIPT_DIR}/run_driver.sh" &
+      driver_pid=$!
+      start_flatscan_helper
+      echo "[pointcloud-accel] final topology: hesai_accel_driver_node decodes JT128 and feeds PointCloudAccelCore in-process; /jt128/vendor/points_raw is debug-only; /scan -> /flatscan helper remains supervised" >&2
+    else
+      env \
+        NJRH_POINTCLOUD_ACCEL_PROFILE=ipc_worker \
+        NJRH_POINTCLOUD_INGRESS_PROFILE="${INGRESS_PROFILE}" \
+        NJRH_FORCE_RESTART_DRIVER="${NJRH_FORCE_RESTART_DRIVER:-false}" \
+        bash "${SCRIPT_DIR}/run_driver.sh" &
+      driver_pid=$!
+      start_flatscan_helper
+      echo "[pointcloud-accel] final topology: /lidar_points full trunk; pointcloud_accel_axis_node workers publish /perception/* and /scan; /_internal/lidar_points_local and /lidar_points_nav are compact debug/compat only; /points_nav is not production" >&2
+    fi
     ;;
   nitros)
     echo "[pointcloud-accel] validating NITROS environment before startup" >&2
@@ -329,6 +348,7 @@ case "${PROFILE}" in
     echo "[pointcloud-accel] NITROS skeleton available; launching ROS-compatible worker outputs while NITROS components are integrated" >&2
     env \
       NJRH_POINTCLOUD_ACCEL_PROFILE=nitros \
+      NJRH_POINTCLOUD_INGRESS_PROFILE="${INGRESS_PROFILE}" \
       NJRH_FORCE_RESTART_DRIVER="${NJRH_FORCE_RESTART_DRIVER:-false}" \
       bash "${SCRIPT_DIR}/run_driver.sh" &
     driver_pid=$!

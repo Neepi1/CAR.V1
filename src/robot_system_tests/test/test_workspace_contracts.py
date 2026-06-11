@@ -4202,7 +4202,7 @@ def test_jt128_driver_normalizes_vendor_raw_to_canonical_topics():
     assert "does not apply local branch CLI overrides" in driver_script
     assert "ros2 launch \"${POINTCLOUD_PIPELINE_LAUNCH}\"" in driver_script
     assert "pointcloud ingress publishes only canonical /lidar_points" in driver_script
-    assert "pointcloud_fastlio_remap" in driver_script
+    assert "[p]ointcloud_fastlio_remap" in driver_script
     assert '--params-file "${POINTCLOUD_FASTLIO_REMAP_CONFIG}" -r __node:=pointcloud_fastlio_remap &' not in driver_script
     assert '[[ -x "${IMU_REMAP_CPP_BIN}" ]]' in driver_script
     assert '"${IMU_REMAP_CPP_BIN}" --ros-args --params-file "${IMU_REMAP_CONFIG}" &' in driver_script
@@ -4877,6 +4877,7 @@ def test_phase113_pointcloud_accel_profile_contracts():
     scripts_dir = overlay / "scripts"
     config_dir = overlay / "config"
     launch_dir = overlay / "launch"
+    hesai_overlay_dir = ROOT / "src" / "third_party" / "hesai_lidar_ros2_overlay"
 
     required_scripts = {
         "pointcloud_accel_profile.sh",
@@ -4890,6 +4891,8 @@ def test_phase113_pointcloud_accel_profile_contracts():
         assert (scripts_dir / name).exists(), name
 
     profile_env = (config_dir / "pointcloud_accel_profile.env").read_text(encoding="utf-8")
+    ingress_env = (config_dir / "pointcloud_ingress_profile.env").read_text(encoding="utf-8")
+    hesai_accel_cfg = (config_dir / "hesai_accel_driver.yaml").read_text(encoding="utf-8")
     accel_cfg = (config_dir / "pointcloud_accel_axis.yaml").read_text(encoding="utf-8")
     accel_profile = (scripts_dir / "pointcloud_accel_profile.sh").read_text(encoding="utf-8")
     set_profile = (scripts_dir / "set_pointcloud_accel_profile.sh").read_text(encoding="utf-8")
@@ -4911,9 +4914,25 @@ def test_phase113_pointcloud_accel_profile_contracts():
     legacy_axis = (ROOT / "src" / "robot_hesai_jt128" / "src" / "pointcloud_axis_remap_node.cpp").read_text(
         encoding="utf-8"
     )
-    accel_axis = (ROOT / "src" / "robot_hesai_jt128" / "src" / "pointcloud_accel_axis_node.cpp").read_text(
+    accel_axis_wrapper = (ROOT / "src" / "robot_hesai_jt128" / "src" / "pointcloud_accel_axis_node.cpp").read_text(
         encoding="utf-8"
     )
+    accel_core_header = (
+        ROOT / "src" / "robot_hesai_jt128" / "include" / "robot_hesai_jt128" / "pointcloud_accel_core.hpp"
+    ).read_text(encoding="utf-8")
+    accel_core = (ROOT / "src" / "robot_hesai_jt128" / "src" / "pointcloud_accel_core.cpp").read_text(
+        encoding="utf-8"
+    )
+    hesai_accel_driver = (ROOT / "src" / "robot_hesai_jt128" / "src" / "hesai_accel_driver_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    hesai_overlay_cmake = (hesai_overlay_dir / "CMakeLists.txt").read_text(encoding="utf-8")
+    hesai_overlay_package = (hesai_overlay_dir / "package.xml").read_text(encoding="utf-8")
+    hesai_overlay_source_driver = (
+        hesai_overlay_dir / "src" / "manager" / "source_driver_ros2.hpp"
+    ).read_text(encoding="utf-8")
+    hesai_overlay_node = (hesai_overlay_dir / "node" / "hesai_ros_driver_node.cc").read_text(encoding="utf-8")
+    accel_axis = accel_axis_wrapper + "\n" + accel_core
     nitros_cmake = (ROOT / "src" / "robot_isaac_nitros_pointcloud" / "CMakeLists.txt").read_text(
         encoding="utf-8"
     )
@@ -4922,9 +4941,13 @@ def test_phase113_pointcloud_accel_profile_contracts():
     )
 
     assert 'export NJRH_POINTCLOUD_ACCEL_PROFILE="${NJRH_POINTCLOUD_ACCEL_PROFILE:-legacy}"' in profile_env
+    assert 'export NJRH_POINTCLOUD_INGRESS_PROFILE="${NJRH_POINTCLOUD_INGRESS_PROFILE:-separate_process}"' in ingress_env
+    assert "separate_process" in accel_profile
+    assert "driver_integrated" in accel_profile
     assert "nitros" in accel_profile
     assert "ipc_worker" in accel_profile
     assert "--profile legacy|ipc_worker|nitros" in set_profile
+    assert "--ingress-profile separate_process|driver_integrated" in set_profile
     assert "NJRH_POINTCLOUD_ACCEL_RESTART=true" in set_profile
     assert "NITROS profile was not written" in set_profile
     assert "pkill -9" not in set_profile
@@ -4933,6 +4956,9 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "ipc_worker)" in run_pipeline
     assert "nitros)" in run_pipeline
     assert "NITROS profile not started" in run_pipeline
+    assert "NJRH_POINTCLOUD_INGRESS_PROFILE=driver_integrated" in run_pipeline
+    assert "driver_integrated ingress selected" in run_pipeline
+    assert "standalone hesai_ros_driver_node or pointcloud_accel_axis_node" in run_pipeline
     assert 'NJRH_FORCE_RESTART_DRIVER="${NJRH_FORCE_RESTART_DRIVER:-false}"' in run_pipeline
     assert "run_local_perception.sh" in run_pipeline
     assert "NJRH_POINTCLOUD_ACCEL_PROFILE=legacy" in run_pipeline
@@ -4977,12 +5003,46 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "use NJRH_POINTCLOUD_ACCEL_PROFILE=ipc_worker or legacy" in nitros_check
 
     assert "pointcloud_accel_axis_node src/pointcloud_accel_axis_node.cpp" in hesai_cmake
+    assert "pointcloud_accel_core src/pointcloud_accel_core.cpp" in hesai_cmake
+    assert "hesai_accel_driver_node src/hesai_accel_driver_node.cpp" in hesai_cmake
+    assert "install(DIRECTORY include/ DESTINATION include)" in hesai_cmake
     assert "install(TARGETS" in hesai_cmake
+    assert "  pointcloud_accel_core" in hesai_cmake
+    assert "ament_export_libraries(pointcloud_accel_core)" in hesai_cmake
+    assert "ament_export_targets(export_pointcloud_accel_core HAS_LIBRARY_TARGET)" in hesai_cmake
     assert "  pointcloud_accel_axis_node" in hesai_cmake
+    assert "  hesai_accel_driver_node" in hesai_cmake
     assert "find_package(tf2_ros REQUIRED)" in hesai_cmake
     assert "geometry_msgs" in hesai_cmake
     assert "<depend>tf2_ros</depend>" in hesai_package
     assert "<depend>geometry_msgs</depend>" in hesai_package
+    assert "class PointCloudAccelCore" in accel_core_header
+    assert "DecodedCloudView" in accel_core_header
+    assert "PointCloudAccelCoreOptions" in accel_core_header
+    assert "process_pointcloud2" in accel_core_header
+    assert "process_decoded_points" in accel_core_header
+    assert "PointCloudAccelCore" in accel_axis_wrapper
+    assert "struct NormalizedPointView" not in accel_axis_wrapper
+    assert "trunk_publisher_" not in accel_axis_wrapper
+    assert "create_subscription<sensor_msgs::msg::PointCloud2>" in accel_axis_wrapper
+    assert "core_->process_pointcloud2" in accel_axis_wrapper
+    assert "DRIVER_INTEGRATED_UNAVAILABLE_REASON" in hesai_accel_driver
+    assert "repo_owned_hesai_driver_overlay_not_available" in hesai_accel_driver
+    assert "PointCloudAccelCoreOptions" in hesai_accel_driver
+    assert "hesai_accel_driver_node" in hesai_overlay_cmake
+    assert "HESAI_ACCEL_DRIVER_INTEGRATED" in hesai_overlay_cmake
+    assert 'HESAI_ROS_DRIVER_NODE_NAME="hesai_accel_driver_node"' in hesai_overlay_cmake
+    assert "find_package(robot_hesai_jt128 REQUIRED)" in hesai_overlay_cmake
+    assert "ROBOT_HESAI_JT128_POINTCLOUD_ACCEL_CORE_LIBRARY" in hesai_overlay_cmake
+    assert 'target_link_libraries(hesai_accel_driver_node' in hesai_overlay_cmake
+    assert "<depend condition=\"$ROS_VERSION == 2\">robot_hesai_jt128</depend>" in hesai_overlay_package
+    assert "PointCloudAccelCore" in hesai_overlay_source_driver
+    assert "driver_callback_pointcloud2" in hesai_overlay_source_driver
+    assert "vendor_raw_ros_hop_required = false" in hesai_overlay_source_driver
+    assert "publish_vendor_raw_debug_" in hesai_overlay_source_driver
+    assert "accel_core_->process_pointcloud2(std::move(cloud))" in hesai_overlay_source_driver
+    assert "pub_->publish(cloud)" in hesai_overlay_source_driver
+    assert "HESAI_ROS_DRIVER_NODE_NAME" in hesai_overlay_node
     assert 'declare_parameter<std::string>("input_topic", "/jt128/vendor/points_raw")' in accel_axis
     assert 'declare_parameter<std::string>("output_topic", "/lidar_points")' in accel_axis
     assert 'Node("pointcloud_accel_axis_node", options)' in accel_axis
@@ -5046,9 +5106,24 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "clearing_output_topic: /perception/clearing_points" in accel_cfg
     assert "scan_output_topic: /scan" in accel_cfg
     assert "/points_nav" not in accel_cfg
+    assert "driver_integrated_available: true" in hesai_accel_cfg
+    assert "vendor_raw_ros_hop_required: false" in hesai_accel_cfg
+    assert "input_path: driver_callback_pointcloud2" in hesai_accel_cfg
+    assert "publish_vendor_raw_debug: false" in hesai_accel_cfg
+    assert "publish_vendor_imu_raw_debug: true" in hesai_accel_cfg
+    assert "lidar_points_full_density_full_fields: true" in hesai_accel_cfg
 
     assert 'source "${SCRIPT_DIR}/pointcloud_accel_profile.sh"' in run_driver
     assert "njrh_load_pointcloud_accel_profile" in run_driver
+    assert "njrh_load_pointcloud_ingress_profile" in run_driver
+    assert "NJRH_POINTCLOUD_INGRESS_PROFILE" in run_driver
+    assert "HESAI_ACCEL_DRIVER_CPP_BIN" in run_driver
+    assert "hesai_accel_driver_node" in run_driver
+    assert "driver_integrated JT128 ingress" in run_driver
+    assert "standalone hesai_ros_driver_node" not in run_driver
+    assert 'install/hesai_ros_driver/lib/hesai_ros_driver/hesai_accel_driver_node' in run_driver
+    assert '-p "config_path:=${RUNTIME_CONFIG_FILE}"' in run_driver
+    assert "starting canonical imu remap for driver_integrated ingress" in run_driver
     assert "pointcloud_accel_axis.yaml" in run_driver
     assert "pointcloud_accel_axis_node" in run_driver
     assert "pointcloud_axis_remap_node" in run_driver
@@ -5087,6 +5162,15 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "rmw_cyclonedds_cpp" not in common_env
 
     assert "current NJRH_POINTCLOUD_ACCEL_PROFILE" in verify_profile
+    assert "ingress_profile" in verify_profile
+    assert "/jt128/vendor/points_raw publishers" in verify_profile
+    assert "status_accel_ingress_profile" in verify_profile
+    assert "status_input_path" in verify_profile
+    assert "status_vendor_raw_ros_hop_required" in verify_profile
+    assert "status_driver_integrated_process" in verify_profile
+    assert "status_accel_core_process_pointcloud2_count" in verify_profile
+    assert "status_accel_core_process_decoded_view_count" in verify_profile
+    assert "lidar_driver_owner" in verify_profile
     assert "requested_profile" in verify_profile
     assert "resolved_profile" in verify_profile
     assert "/lidar_points publisher count" in verify_profile
@@ -5107,13 +5191,13 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "actual flatscan owner" in verify_profile
     assert "legacy trunk owner is pointcloud_axis_remap" in verify_profile
     assert "trunk owner is pointcloud_accel_axis_node" in verify_profile
-    assert "obstacle owner is pointcloud_accel_axis_node" in verify_profile
-    assert "clearing owner is pointcloud_accel_axis_node" in verify_profile
+    assert "obstacle owner is accel core process" in verify_profile
+    assert "clearing owner is accel core process" in verify_profile
     assert "legacy points_nav owner is nav_cloud_preprocessor" in verify_profile
     assert "legacy missing /scan publisher from scan_republisher" in verify_profile
     assert "legacy missing /flatscan publisher from laser_scan_to_flatscan" in verify_profile
     assert "still using legacy pointcloud_axis_remap as trunk owner" in verify_profile
-    assert "scan owner is pointcloud_accel_axis_node" in verify_profile
+    assert "scan owner is accel core process" in verify_profile
     assert "local_worker_enabled must be true" in verify_profile
     assert "scan_worker_enabled must be true" in verify_profile
     assert "internal_zero_copy_profile must be true" in verify_profile
@@ -5129,8 +5213,10 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "IPC_WORKER_OWNER_OK" in verify_profile
     assert "TRUNK_FULL_DENSITY_OK" in verify_profile
     assert "NAV2_COMPAT_TOPICS_OK" in verify_profile
+    assert "INGRESS_PROFILE" in verify_profile
 
     assert "--profile legacy|ipc_worker|nitros" in ab_runner
+    assert "--ingress-profile separate_process|driver_integrated" in ab_runner
     assert "--duration-sec" in ab_runner
     assert "--apply" in ab_runner
     assert "--restart" in ab_runner
@@ -5138,6 +5224,11 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "profile requested" in ab_runner
     assert "profile before run" in ab_runner
     assert "profile actually running" in ab_runner
+    assert "ingress profile requested" in ab_runner
+    assert "ingress profile actually running" in ab_runner
+    assert "/jt128/vendor/points_raw publisher_count" in ab_runner
+    assert "Socket Drop Snapshot" in ab_runner
+    assert "status_vendor_raw_ros_hop_required" in ab_runner
     assert "binary actually running" in ab_runner
     assert "trunk owner" in ab_runner
     assert "obstacle owner" in ab_runner
@@ -5186,6 +5277,157 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "sensor_msgs.msg" not in accel_launch
     assert "create_subscription" not in accel_launch
     assert "create_publisher" not in accel_launch
+
+
+def test_phase_d1_pointcloud_driver_integrated_ingress_contracts():
+    overlay = ROOT / "scripts" / "jetson" / "runtime_overlay"
+    scripts_dir = overlay / "scripts"
+    config_dir = overlay / "config"
+    hesai_dir = ROOT / "src" / "robot_hesai_jt128"
+    hesai_overlay_dir = ROOT / "src" / "third_party" / "hesai_lidar_ros2_overlay"
+
+    ingress_env_path = config_dir / "pointcloud_ingress_profile.env"
+    accel_core_header_path = hesai_dir / "include" / "robot_hesai_jt128" / "pointcloud_accel_core.hpp"
+    accel_core_cpp_path = hesai_dir / "src" / "pointcloud_accel_core.cpp"
+    hesai_accel_driver_path = hesai_dir / "src" / "hesai_accel_driver_node.cpp"
+    hesai_overlay_source_driver_path = hesai_overlay_dir / "src" / "manager" / "source_driver_ros2.hpp"
+
+    assert ingress_env_path.exists()
+    assert accel_core_header_path.exists()
+    assert accel_core_cpp_path.exists()
+    assert hesai_accel_driver_path.exists()
+    assert hesai_overlay_source_driver_path.exists()
+
+    ingress_env = ingress_env_path.read_text(encoding="utf-8")
+    accel_cfg = (config_dir / "pointcloud_accel_axis.yaml").read_text(encoding="utf-8")
+    hesai_accel_cfg = (config_dir / "hesai_accel_driver.yaml").read_text(encoding="utf-8")
+    accel_profile = (scripts_dir / "pointcloud_accel_profile.sh").read_text(encoding="utf-8")
+    run_driver = (scripts_dir / "run_driver.sh").read_text(encoding="utf-8")
+    run_pipeline = (scripts_dir / "run_pointcloud_accel_pipeline.sh").read_text(encoding="utf-8")
+    verify_profile = (scripts_dir / "verify_pointcloud_accel_profile.sh").read_text(encoding="utf-8")
+    ab_runner = (scripts_dir / "run_pointcloud_accel_ab.sh").read_text(encoding="utf-8")
+    set_profile = (scripts_dir / "set_pointcloud_accel_profile.sh").read_text(encoding="utf-8")
+    common_env = (scripts_dir / "common_env.sh").read_text(encoding="utf-8")
+    nav2 = (config_dir / "nav2.yaml").read_text(encoding="utf-8")
+    hesai_cmake = (hesai_dir / "CMakeLists.txt").read_text(encoding="utf-8")
+    hesai_overlay_cmake = (hesai_overlay_dir / "CMakeLists.txt").read_text(encoding="utf-8")
+    hesai_overlay_package = (hesai_overlay_dir / "package.xml").read_text(encoding="utf-8")
+    hesai_overlay_source_driver = hesai_overlay_source_driver_path.read_text(encoding="utf-8")
+    accel_axis_wrapper = (hesai_dir / "src" / "pointcloud_accel_axis_node.cpp").read_text(encoding="utf-8")
+    accel_core = accel_core_cpp_path.read_text(encoding="utf-8")
+    hesai_accel_driver = hesai_accel_driver_path.read_text(encoding="utf-8")
+
+    assert 'NJR H_POINTCLOUD_INGRESS_PROFILE' not in ingress_env
+    assert 'export NJRH_POINTCLOUD_INGRESS_PROFILE="${NJRH_POINTCLOUD_INGRESS_PROFILE:-separate_process}"' in ingress_env
+    assert "driver_integrated_available: true" in hesai_accel_cfg
+    assert "hesai_accel_driver_node src/hesai_accel_driver_node.cpp" in hesai_cmake
+    assert "pointcloud_accel_core src/pointcloud_accel_core.cpp" in hesai_cmake
+    assert "ament_export_libraries(pointcloud_accel_core)" in hesai_cmake
+    assert "ament_export_targets(export_pointcloud_accel_core HAS_LIBRARY_TARGET)" in hesai_cmake
+    assert "hesai_accel_driver_node" in hesai_overlay_cmake
+    assert "HESAI_ACCEL_DRIVER_INTEGRATED" in hesai_overlay_cmake
+    assert "find_package(robot_hesai_jt128 REQUIRED)" in hesai_overlay_cmake
+    assert "ROBOT_HESAI_JT128_POINTCLOUD_ACCEL_CORE_LIBRARY" in hesai_overlay_cmake
+    assert 'target_link_libraries(hesai_accel_driver_node' in hesai_overlay_cmake
+    assert "<depend condition=\"$ROS_VERSION == 2\">robot_hesai_jt128</depend>" in hesai_overlay_package
+    assert "PointCloudAccelCore" in hesai_overlay_source_driver
+    assert "driver_callback_pointcloud2" in hesai_overlay_source_driver
+    assert "vendor_raw_ros_hop_required = false" in hesai_overlay_source_driver
+    assert "accel_core_->process_pointcloud2(std::move(cloud))" in hesai_overlay_source_driver
+
+    assert "PointCloudAccelCore" in accel_axis_wrapper
+    assert "create_subscription<sensor_msgs::msg::PointCloud2>" in accel_axis_wrapper
+    assert "core_->process_pointcloud2" in accel_axis_wrapper
+    assert "struct LatestNormalizedBuffer" not in accel_axis_wrapper
+    assert "trunk_publisher_->publish(*output)" not in accel_axis_wrapper
+    assert "struct LatestNormalizedBuffer" in accel_core
+    assert "trunk_publisher_->publish(*output)" in accel_core
+    assert "process_decoded_points" in accel_core
+    assert "accel_ingress_profile" in accel_core
+    assert "input_path" in accel_core
+    assert "vendor_raw_ros_hop_required" in accel_core
+    assert "driver_integrated_process" in accel_core
+    assert "accel_core_process_pointcloud2_count" in accel_core
+    assert "accel_core_process_decoded_view_count" in accel_core
+
+    for script in (run_driver, run_pipeline, verify_profile, ab_runner, set_profile):
+        assert "NJRH_POINTCLOUD_INGRESS_PROFILE" in script
+
+    assert "driver_integrated" in accel_profile
+    assert "forcing pointcloud ingress separate_process for legacy" in accel_profile
+    assert "NJRH_POINTCLOUD_INGRESS_PROFILE=driver_integrated" in run_pipeline
+    assert "driver_integrated ingress selected" in run_pipeline
+    assert "HESAI_ACCEL_DRIVER_CPP_BIN" in run_driver
+    assert run_driver.index('if [[ "${NJRH_POINTCLOUD_INGRESS_PROFILE}" == "driver_integrated" ]]') < run_driver.index('[[ -f "${POINTCLOUD_REMAP_CONFIG}" ]]')
+    assert "hesai_accel_driver_node" in run_driver
+    assert "hesai_ros_driver_node" in run_driver
+    assert 'install/hesai_ros_driver/lib/hesai_ros_driver/hesai_accel_driver_node' in run_driver
+    assert '-p "config_path:=${RUNTIME_CONFIG_FILE}"' in run_driver
+    assert "starting canonical imu remap for driver_integrated ingress" in run_driver
+    assert "both hesai_ros_driver_node and hesai_accel_driver_node" not in run_driver
+    assert "driver_integrated must not run standalone hesai_ros_driver_node" in verify_profile
+    assert "driver_integrated must not run standalone pointcloud_accel_axis_node" in verify_profile
+    assert "driver_integrated must not require /jt128/vendor/points_raw subscribers" in verify_profile
+    assert "vendor_raw_ros_hop_required=false" in verify_profile
+
+    assert "/lidar_points is always full-density/full-fields" in accel_cfg
+    assert "output_topic: /lidar_points" in accel_cfg
+    assert "output_reliable: false" in accel_cfg
+    assert "local_compact_stride: 4" in accel_cfg
+    assert "nav_compact_stride: 4" in accel_cfg
+    assert "lidar_points_full_density_full_fields: true" in hesai_accel_cfg
+    assert "publish_vendor_raw_debug: false" in hesai_accel_cfg
+    assert "publish_vendor_imu_raw_debug: true" in hesai_accel_cfg
+    assert "vendor_raw_ros_hop_required: false" in hesai_accel_cfg
+
+    status_topics = {
+        "/lidar/axis_remap_status",
+        "/lidar/pointcloud_accel_status",
+        "/perception/local_perception_status",
+    }
+    allowed_topics = {
+        "/jt128/vendor/points_raw",
+        "/jt128/vendor/imu_raw",
+        "/lidar_points",
+        "/_internal/lidar_points_local",
+        "/lidar_points_nav",
+        "/points_nav",
+        "/perception/obstacle_points",
+        "/perception/clearing_points",
+        "/scan",
+        "/flatscan",
+    }
+    topic_prefixes = ("/jt128/", "/lidar", "/_internal/", "/points", "/perception/", "/scan", "/flatscan")
+    for text in (accel_cfg, hesai_accel_cfg, accel_core, hesai_overlay_source_driver, verify_profile, ab_runner):
+        for topic in re.findall(r"/[A-Za-z0-9_][A-Za-z0-9_./-]*", text):
+            if not topic.startswith(topic_prefixes):
+                continue
+            if (
+                topic.endswith(".sh")
+                or topic.endswith(".info")
+                or topic.endswith(".env")
+                or topic.endswith(".")
+                or topic.endswith("/")
+            ):
+                continue
+            if topic in status_topics:
+                continue
+            assert topic in allowed_topics, topic
+
+    assert "pkill -9" not in run_driver
+    assert "killall -9" not in run_driver
+    assert "pkill -9" not in run_pipeline
+    assert "killall -9" not in run_pipeline
+    assert 'export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"' in common_env
+    assert 'export FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}"' in common_env
+    assert "rmw_cyclonedds_cpp" not in common_env
+    assert 'export NJRH_POINTCLOUD_ACCEL_PROFILE="${NJRH_POINTCLOUD_ACCEL_PROFILE:-legacy}"' in (
+        config_dir / "pointcloud_accel_profile.env"
+    ).read_text(encoding="utf-8")
+    assert "global_frame: odom" in local_costmap_config_block(nav2)
+    assert "global_frame: base_link" not in local_costmap_config_block(nav2)
+    assert "MPPIController" in nav2
+    assert "SmacPlanner2D" in nav2
 
 
 def test_phase115_flatscan_lifecycle_hardening_contracts():
@@ -5264,9 +5506,13 @@ def test_phase24a_local_costmap_timestamp_audit_contracts():
     assert script.exists()
 
     script_text = script.read_text(encoding="utf-8")
-    accel_axis = (ROOT / "src" / "robot_hesai_jt128" / "src" / "pointcloud_accel_axis_node.cpp").read_text(
+    accel_axis_wrapper = (ROOT / "src" / "robot_hesai_jt128" / "src" / "pointcloud_accel_axis_node.cpp").read_text(
         encoding="utf-8"
     )
+    accel_core = (ROOT / "src" / "robot_hesai_jt128" / "src" / "pointcloud_accel_core.cpp").read_text(
+        encoding="utf-8"
+    )
+    accel_axis = accel_axis_wrapper + "\n" + accel_core
     local_perception = (
         ROOT / "src" / "robot_local_perception" / "src" / "local_perception_node.cpp"
     ).read_text(encoding="utf-8")

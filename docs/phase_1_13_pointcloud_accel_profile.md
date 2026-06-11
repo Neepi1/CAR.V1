@@ -12,6 +12,12 @@ Default remains:
 export NJRH_POINTCLOUD_ACCEL_PROFILE="${NJRH_POINTCLOUD_ACCEL_PROFILE:-legacy}"
 ```
 
+Ingress selection is separate:
+
+```bash
+export NJRH_POINTCLOUD_INGRESS_PROFILE="${NJRH_POINTCLOUD_INGRESS_PROFILE:-separate_process}"
+```
+
 `/lidar_points` is always the full-density/full-fields canonical trunk for
 mapping, FAST-LIO2 mapping input, and diagnostics. Navigation profiles must not
 compact, downsample, or add a second publisher to `/lidar_points`.
@@ -90,6 +96,41 @@ that buffer directly and only build the final existing ROS outputs
 This is an internal copy/allocation cleanup, not RMW loaned messages and not a
 new PointCloud2 topic.
 
+### Ingress Profiles
+
+`/jt128/vendor/points_raw` is the Hesai driver decoded ROS
+`sensor_msgs/msg/PointCloud2` output. It is not the sensor UDP packet stream.
+
+`separate_process` is the default and current production path:
+
+```text
+hesai_ros_driver_node
+  -> /jt128/vendor/points_raw
+  -> pointcloud_accel_axis_node
+  -> PointCloudAccelCore
+  -> /lidar_points + /perception/obstacle_points + /perception/clearing_points + /scan
+```
+
+`driver_integrated` builds the repo-owned
+`src/third_party/hesai_lidar_ros2_overlay` source and starts
+`hesai_accel_driver_node`. Hesai decode constructs one `PointCloud2` inside the
+driver process, then moves it directly into `PointCloudAccelCore`; this removes
+the production `/jt128/vendor/points_raw` DDS hop. `/jt128/vendor/points_raw`
+may stay as an optional debug/compat topic, but it must not be the production
+input to AccelCore. Typed decoded-frame input remains the next optimization
+step.
+
+Switch and rollback:
+
+```bash
+export NJRH_POINTCLOUD_ACCEL_PROFILE=ipc_worker
+export NJRH_POINTCLOUD_INGRESS_PROFILE=separate_process
+bash scripts/jetson/runtime_overlay/scripts/set_pointcloud_accel_profile.sh --profile ipc_worker --ingress-profile separate_process --restart
+```
+
+Only use `driver_integrated` for explicit overlay tests until 5-minute and
+20-minute navigation plus mapping validation pass.
+
 ### `nitros`
 
 `nitros` remains a guarded experimental skeleton. `check_isaac_ros_nitros_env.sh`
@@ -122,9 +163,10 @@ ros2 topic info -v /flatscan
 `ipc_worker`:
 
 ```bash
-bash scripts/jetson/runtime_overlay/scripts/set_pointcloud_accel_profile.sh --profile ipc_worker --restart
+bash scripts/jetson/runtime_overlay/scripts/set_pointcloud_accel_profile.sh --profile ipc_worker --ingress-profile separate_process --restart
 sleep 20
 bash scripts/jetson/runtime_overlay/scripts/verify_pointcloud_accel_profile.sh
+ros2 topic info -v /jt128/vendor/points_raw
 ros2 topic info -v /lidar_points
 ros2 topic info -v /perception/obstacle_points
 ros2 topic info -v /perception/clearing_points
@@ -137,8 +179,8 @@ timeout 12 ros2 topic echo /lidar/pointcloud_accel_status --field data
 A/B:
 
 ```bash
-bash scripts/jetson/runtime_overlay/scripts/run_pointcloud_accel_ab.sh --profile legacy --duration-sec 120 --apply --restart
-bash scripts/jetson/runtime_overlay/scripts/run_pointcloud_accel_ab.sh --profile ipc_worker --duration-sec 120 --apply --restart
+bash scripts/jetson/runtime_overlay/scripts/run_pointcloud_accel_ab.sh --profile legacy --ingress-profile separate_process --duration-sec 120 --apply --restart
+bash scripts/jetson/runtime_overlay/scripts/run_pointcloud_accel_ab.sh --profile ipc_worker --ingress-profile separate_process --duration-sec 120 --apply --restart
 ```
 
 Rollback:
@@ -153,9 +195,14 @@ bash scripts/jetson/runtime_overlay/scripts/verify_pointcloud_accel_profile.sh
 `verify_pointcloud_accel_profile.sh` reports:
 
 - requested and resolved profile
+- requested/resolved ingress profile and driver owner
 - trunk, obstacle, clearing, points_nav, scan, and flatscan owners
-- publisher/subscriber counts for `/lidar_points`, `/points_nav`, `/scan`, and `/flatscan`
+- publisher/subscriber counts for `/jt128/vendor/points_raw`, `/lidar_points`, `/points_nav`, `/scan`, and `/flatscan`
 - `/lidar/axis_remap_status`, `/lidar/pointcloud_accel_status`, and legacy `/perception/local_perception_status`
+- accel status fields `accel_ingress_profile`, `input_path`,
+  `vendor_raw_ros_hop_required`, `driver_integrated_process`,
+  `accel_core_process_pointcloud2_count`, and
+  `accel_core_process_decoded_view_count`
 - internal zero-copy status fields, including latest internal buffer points,
   worker full-cloud-copy counters, intermediate PointCloud2 build counters,
   allocation counters, lock wait maxima, and worker processing averages
@@ -164,9 +211,10 @@ bash scripts/jetson/runtime_overlay/scripts/verify_pointcloud_accel_profile.sh
 - final summary flags: `PROFILE_OWNER_CONTRACT_OK`, `LEGACY_SCAN_CHAIN_OK`, `IPC_WORKER_OWNER_OK`, `TRUNK_FULL_DENSITY_OK`, and `NAV2_COMPAT_TOPICS_OK`
 
 `run_pointcloud_accel_ab.sh` writes `reports/pointcloud_accel_ab_<timestamp>.md`
-with requested profile, actual profile, binary actually running, topic owners,
-topic counts, status samples, obstacle/scan/flatscan Hz, CPU0/4/5/6/7 snapshot,
-FAST-LIO2 residual, Nav2 lifecycle, and PASS/WARN/FAIL.
+with requested profile, actual profile, ingress profile, actual driver process,
+raw-topic pub/sub counts, topic owners, topic counts, status samples,
+obstacle/scan/flatscan Hz, read-only socket/drop snapshots, CPU0/4/5/6/7
+snapshot, FAST-LIO2 residual, Nav2 lifecycle, and PASS/WARN/FAIL.
 
 ## Acceptance
 
