@@ -1,9 +1,15 @@
 #include <algorithm>
+#include <chrono>
+#include <cinttypes>
 #include <cmath>
+#include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 
+#include "builtin_interfaces/msg/time.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "geometry_msgs/msg/vector3_stamped.hpp"
 #include "nav_msgs/msg/odometry.hpp"
@@ -25,6 +31,17 @@ bool near_zero(const double value, const double threshold)
 double ewma(const double alpha, const double previous, const double sample)
 {
   return alpha * sample + (1.0 - alpha) * previous;
+}
+
+std::chrono::nanoseconds period_from_hz(const double rate_hz)
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::duration<double>(1.0 / std::max(0.1, rate_hz)));
+}
+
+double stamp_seconds(const builtin_interfaces::msg::Time & stamp)
+{
+  return static_cast<double>(stamp.sec) + static_cast<double>(stamp.nanosec) * 1e-9;
 }
 }  // namespace
 
@@ -52,6 +69,18 @@ public:
     max_bias_sample_abs_radps_ = declare_parameter<double>("max_bias_sample_abs_radps", 0.05);
     accumulator_alpha_ = std::clamp(declare_parameter<double>("accumulator_alpha", 0.02), 0.0, 1.0);
     zero_output_when_stationary_ = declare_parameter<bool>("zero_output_when_stationary", true);
+    corrected_output_rate_hz_ =
+      std::max(0.1, declare_parameter<double>("corrected_output_rate_hz", 100.0));
+    bias_publish_rate_hz_ =
+      std::max(0.1, declare_parameter<double>("bias_publish_rate_hz", 10.0));
+    corrected_output_latest_on_timer_ =
+      declare_parameter<bool>("corrected_output_latest_on_timer", true);
+    corrected_output_preserve_source_stamp_ =
+      declare_parameter<bool>("corrected_output_preserve_source_stamp", true);
+    corrected_output_max_source_age_sec_ =
+      std::max(0.0, declare_parameter<double>("corrected_output_max_source_age_sec", 0.20));
+    bias_publish_preserve_source_stamp_ =
+      declare_parameter<bool>("bias_publish_preserve_source_stamp", true);
 
     corrected_imu_pub_ = create_publisher<sensor_msgs::msg::Imu>(
       output_imu_topic_,
@@ -74,6 +103,15 @@ public:
       imu_topic_,
       rclcpp::SensorDataQoS(),
       std::bind(&ImuGyroBiasFilterNode::on_imu, this, std::placeholders::_1));
+
+    if (corrected_output_latest_on_timer_) {
+      corrected_output_timer_ = create_wall_timer(
+        period_from_hz(corrected_output_rate_hz_),
+        std::bind(&ImuGyroBiasFilterNode::on_corrected_output_timer, this));
+    }
+    bias_publish_timer_ = create_wall_timer(
+      period_from_hz(bias_publish_rate_hz_),
+      std::bind(&ImuGyroBiasFilterNode::on_bias_publish_timer, this));
   }
 
 private:
@@ -150,12 +188,117 @@ private:
     bias_.z = ewma(accumulator_alpha_, bias_.z, msg.angular_velocity.z);
   }
 
-  void publish_bias(const sensor_msgs::msg::Imu & msg)
+  geometry_msgs::msg::Vector3Stamped make_bias_msg(const sensor_msgs::msg::Imu & msg)
   {
     geometry_msgs::msg::Vector3Stamped bias_msg;
     bias_msg.header = msg.header;
+    if (!bias_publish_preserve_source_stamp_) {
+      bias_msg.header.stamp = now();
+    }
     bias_msg.vector = bias_;
-    bias_pub_->publish(bias_msg);
+    return bias_msg;
+  }
+
+  double corrected_source_age_sec(const double now_sec) const
+  {
+    if (!latest_corrected_imu_) {
+      return std::numeric_limits<double>::infinity();
+    }
+    const double source_stamp_sec = stamp_seconds(latest_corrected_imu_->header.stamp);
+    if (source_stamp_sec <= 0.0) {
+      return now_sec - latest_imu_receive_sec_;
+    }
+    return now_sec - source_stamp_sec;
+  }
+
+  void publish_corrected_imu(const sensor_msgs::msg::Imu & msg)
+  {
+    corrected_imu_pub_->publish(msg);
+    ++output_corrected_count_;
+    ++output_corrected_window_count_;
+  }
+
+  void publish_bias_msg(const geometry_msgs::msg::Vector3Stamped & msg)
+  {
+    bias_pub_->publish(msg);
+    ++output_bias_count_;
+    ++output_bias_window_count_;
+  }
+
+  void maybe_publish_corrected_direct(const double now_sec)
+  {
+    if (!latest_corrected_imu_) {
+      return;
+    }
+    const double min_period_sec = 1.0 / corrected_output_rate_hz_;
+    if (last_corrected_publish_sec_ > 0.0 &&
+      (now_sec - last_corrected_publish_sec_) < min_period_sec)
+    {
+      return;
+    }
+    if (corrected_source_age_sec(now_sec) > corrected_output_max_source_age_sec_) {
+      ++stale_corrected_skip_count_;
+      return;
+    }
+    publish_corrected_imu(*latest_corrected_imu_);
+    last_corrected_publish_sec_ = now_sec;
+  }
+
+  void maybe_report_rates(const double now_sec)
+  {
+    if (rate_window_start_sec_ <= 0.0) {
+      rate_window_start_sec_ = now_sec;
+      return;
+    }
+    const double elapsed_sec = now_sec - rate_window_start_sec_;
+    if (elapsed_sec < rate_report_period_sec_) {
+      return;
+    }
+
+    const double input_hz = static_cast<double>(input_imu_window_count_) / elapsed_sec;
+    const double corrected_hz = static_cast<double>(output_corrected_window_count_) / elapsed_sec;
+    const double bias_hz = static_cast<double>(output_bias_window_count_) / elapsed_sec;
+    RCLCPP_INFO(
+      get_logger(),
+      "IMU bias filter rates input=%.1fHz corrected_out=%.1fHz bias_out=%.1fHz "
+      "totals input=%" PRIu64 " corrected=%" PRIu64 " bias=%" PRIu64 " stale_skips=%" PRIu64,
+      input_hz,
+      corrected_hz,
+      bias_hz,
+      input_imu_count_,
+      output_corrected_count_,
+      output_bias_count_,
+      stale_corrected_skip_count_);
+    rate_window_start_sec_ = now_sec;
+    input_imu_window_count_ = 0;
+    output_corrected_window_count_ = 0;
+    output_bias_window_count_ = 0;
+  }
+
+  void on_corrected_output_timer()
+  {
+    const double now_sec = now().seconds();
+    if (!latest_corrected_imu_) {
+      maybe_report_rates(now_sec);
+      return;
+    }
+    if (corrected_source_age_sec(now_sec) > corrected_output_max_source_age_sec_) {
+      ++stale_corrected_skip_count_;
+      maybe_report_rates(now_sec);
+      return;
+    }
+    publish_corrected_imu(*latest_corrected_imu_);
+    last_corrected_publish_sec_ = now_sec;
+    maybe_report_rates(now_sec);
+  }
+
+  void on_bias_publish_timer()
+  {
+    const double now_sec = now().seconds();
+    if (latest_bias_msg_) {
+      publish_bias_msg(*latest_bias_msg_);
+    }
+    maybe_report_rates(now_sec);
   }
 
   void on_odom(const nav_msgs::msg::Odometry::SharedPtr msg)
@@ -176,8 +319,12 @@ private:
 
   void on_imu(const sensor_msgs::msg::Imu::SharedPtr msg)
   {
+    const double now_sec = now().seconds();
+    ++input_imu_count_;
+    ++input_imu_window_count_;
+
     sensor_msgs::msg::Imu corrected = *msg;
-    const bool stationary = stationary_confirmed(now().seconds());
+    const bool stationary = stationary_confirmed(now_sec);
     if (stationary && sample_is_safe_for_bias_update(*msg)) {
       update_bias(*msg);
       if (zero_output_when_stationary_) {
@@ -190,8 +337,17 @@ private:
       corrected.angular_velocity.y -= bias_.y;
       corrected.angular_velocity.z -= bias_.z;
     }
-    corrected_imu_pub_->publish(corrected);
-    publish_bias(*msg);
+    if (!corrected_output_preserve_source_stamp_) {
+      corrected.header.stamp = now();
+    }
+    latest_corrected_imu_ = corrected;
+    latest_imu_receive_sec_ = now_sec;
+    latest_bias_msg_ = make_bias_msg(*msg);
+
+    if (!corrected_output_latest_on_timer_) {
+      maybe_publish_corrected_direct(now_sec);
+    }
+    maybe_report_rates(now_sec);
   }
 
   std::string imu_topic_;
@@ -212,6 +368,12 @@ private:
   double max_bias_sample_abs_radps_{0.05};
   double accumulator_alpha_{0.02};
   bool zero_output_when_stationary_{true};
+  double corrected_output_rate_hz_{100.0};
+  double bias_publish_rate_hz_{10.0};
+  bool corrected_output_latest_on_timer_{true};
+  bool corrected_output_preserve_source_stamp_{true};
+  double corrected_output_max_source_age_sec_{0.20};
+  bool bias_publish_preserve_source_stamp_{true};
 
   bool has_odom_{false};
   bool has_cmd_vel_{false};
@@ -222,12 +384,27 @@ private:
   double stationary_since_sec_{0.0};
   bool bias_initialized_{false};
   geometry_msgs::msg::Vector3 bias_;
+  std::optional<sensor_msgs::msg::Imu> latest_corrected_imu_;
+  std::optional<geometry_msgs::msg::Vector3Stamped> latest_bias_msg_;
+  double latest_imu_receive_sec_{0.0};
+  double last_corrected_publish_sec_{0.0};
+  double rate_window_start_sec_{0.0};
+  double rate_report_period_sec_{10.0};
+  std::uint64_t input_imu_count_{0};
+  std::uint64_t output_corrected_count_{0};
+  std::uint64_t output_bias_count_{0};
+  std::uint64_t input_imu_window_count_{0};
+  std::uint64_t output_corrected_window_count_{0};
+  std::uint64_t output_bias_window_count_{0};
+  std::uint64_t stale_corrected_skip_count_{0};
 
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr corrected_imu_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr bias_pub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_sub_;
+  rclcpp::TimerBase::SharedPtr corrected_output_timer_;
+  rclcpp::TimerBase::SharedPtr bias_publish_timer_;
 };
 
 int main(int argc, char ** argv)

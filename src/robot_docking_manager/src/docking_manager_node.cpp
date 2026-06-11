@@ -340,15 +340,15 @@ private:
       return false;
     }
 
-    publish_park(false);
-    publish_forced_mode(release_forced_mode_);
-    publish_reverse_enable(true);
     reset_undock_tracking();
     state_ = State::Undocking;
     undock_phase_ = UndockPhase::UNDOCK_PREPARE;
     state_entered_time_ = now();
+    publish_park(false);
+    publish_forced_mode(release_forced_mode_);
+    publish_reverse_enable(true);
     message = "undocking started";
-    publish_status("undocking preparing");
+    publish_status("undocking preparing phase=preparing cmd_count=0 reverse_enable=true reverse_enable_count=1");
     return true;
   }
 
@@ -634,29 +634,35 @@ private:
   {
     const auto stamp = now();
     const double speed = clamp(undock_speed_mps_, 0.0, max_linear_speed_mps_);
+    const double elapsed = (stamp - state_entered_time_).seconds();
+    const double distance = std::max(0.0, undock_distance_m_);
     if (speed <= 1.0e-3) {
-      fail("undock_failed_invalid_speed");
+      fail_undock(
+        UndockPhase::UNDOCK_FAILED_TIMEOUT,
+        undock_failure_status("undock_failed_invalid_speed", 0.0, distance, stamp));
       return;
     }
 
-    const double elapsed = (stamp - state_entered_time_).seconds();
-    const double distance = std::max(0.0, undock_distance_m_);
     if (!have_undock_start_odom_) {
       if (capture_undock_start_odom()) {
-        publish_status("undocking odom_reference_captured");
+        publish_status(undock_running_status("odom_reference_captured", stamp, 0.0, distance));
       } else {
         publish_zero();
         if (elapsed > undock_odom_start_timeout_s_) {
-          fail("undock_failed_no_fresh_odom");
+          fail_undock(
+            UndockPhase::UNDOCK_FAILED_TIMEOUT,
+            undock_failure_status("undock_failed_no_fresh_odom", 0.0, distance, stamp));
           return;
         }
-        publish_status("undocking waiting_for_fresh_odom");
+        publish_status(undock_running_status("waiting_for_fresh_odom", stamp, 0.0, distance));
         return;
       }
     }
 
     if (!odom_fresh()) {
-      fail("undock_failed_stale_odom");
+      fail_undock(
+        UndockPhase::UNDOCK_FAILED_TIMEOUT,
+        undock_failure_status("undock_failed_stale_odom", undock_traveled_m(), distance, stamp));
       return;
     }
 
@@ -666,16 +672,15 @@ private:
       return;
     }
     if (elapsed > undock_timeout_s_) {
-      std::ostringstream status;
       if (undock_nonzero_cmd_publish_count_ == 0U) {
-        status << "undock_failed_no_command_published";
-        fail_undock(UndockPhase::UNDOCK_FAILED_NO_COMMAND_PUBLISHED, status.str());
+        fail_undock(
+          UndockPhase::UNDOCK_FAILED_NO_COMMAND_PUBLISHED,
+          undock_failure_status("undock_failed_no_command_published", traveled, distance, stamp));
         return;
       }
-      status << "undock_failed_timeout distance=" << std::fixed << std::setprecision(3) << traveled
-             << " cmd_count=" << undock_nonzero_cmd_publish_count_
-             << " cmd_x=" << last_undock_cmd_x_;
-      fail_undock(UndockPhase::UNDOCK_FAILED_TIMEOUT, status.str());
+      fail_undock(
+        UndockPhase::UNDOCK_FAILED_TIMEOUT,
+        undock_failure_status("undock_failed_timeout", traveled, distance, stamp));
       return;
     }
 
@@ -686,11 +691,11 @@ private:
       const double settle_s = std::max(0.0, undock_command_settle_s_);
       if (elapsed < settle_s) {
         std::ostringstream status;
-        status << "undocking command_settle elapsed=" << std::fixed << std::setprecision(2)
+        status << "undocking command_settle phase=command_settle elapsed=" << std::fixed << std::setprecision(2)
                << elapsed << "/" << settle_s
                << " distance=" << std::setprecision(3) << traveled << "/" << distance
                << " cmd_x=0.000 cmd_count=" << undock_nonzero_cmd_publish_count_
-               << " reverse_enable=true";
+               << " reverse_enable=true reverse_enable_count=" << undock_reverse_enable_publish_count_;
         publish_status(status.str());
         return;
       }
@@ -716,25 +721,24 @@ private:
           elapsed > std::max(0.0, undock_command_settle_s_) + undock_motion_start_timeout_s_) {
           fail_undock(
             UndockPhase::UNDOCK_FAILED_NO_COMMAND_PUBLISHED,
-            "undock_failed_no_command_published");
+            undock_failure_status("undock_failed_no_command_published", traveled, distance, stamp));
           return;
         }
         if (undock_nonzero_cmd_publish_count_ > 0U && motion_wait > undock_motion_start_timeout_s_) {
-          std::ostringstream status;
-          status << "undock_failed_motion_start_timeout distance=" << std::fixed
-                 << std::setprecision(3) << traveled
-                 << " cmd_count=" << undock_nonzero_cmd_publish_count_
-                 << " cmd_x=" << last_undock_cmd_x_;
-          fail_undock(UndockPhase::UNDOCK_FAILED_MOTION_START_TIMEOUT, status.str());
+          fail_undock(
+            UndockPhase::UNDOCK_FAILED_MOTION_START_TIMEOUT,
+            undock_failure_status("undock_failed_motion_start_timeout", traveled, distance, stamp));
           return;
         }
         std::ostringstream status;
-        status << "undocking waiting_first_motion distance=" << std::fixed << std::setprecision(3)
+        status << "undocking waiting_first_motion phase=waiting_first_motion distance=" << std::fixed
+               << std::setprecision(3)
                << traveled << "/" << distance
                << " cmd_x=" << last_undock_cmd_x_
                << " cmd_count=" << undock_nonzero_cmd_publish_count_
-               << " reverse_enable=true start_elapsed=" << std::setprecision(2)
-               << motion_wait << "/" << undock_motion_start_timeout_s_;
+               << " reverse_enable=true reverse_enable_count=" << undock_reverse_enable_publish_count_
+               << " command_start_elapsed_s=" << std::setprecision(2) << motion_wait
+               << " motion_start_timeout_s=" << undock_motion_start_timeout_s_;
         publish_status(status.str());
         return;
       }
@@ -746,12 +750,9 @@ private:
         last_undock_progress_time_ = stamp;
       }
       if ((stamp - last_undock_progress_time_).seconds() > undock_no_progress_timeout_s_) {
-        std::ostringstream status;
-        status << "undock_failed_no_progress distance=" << std::fixed
-               << std::setprecision(3) << traveled
-               << " cmd_count=" << undock_nonzero_cmd_publish_count_
-               << " cmd_x=" << last_undock_cmd_x_;
-        fail_undock(UndockPhase::UNDOCK_FAILED_NO_PROGRESS, status.str());
+        fail_undock(
+          UndockPhase::UNDOCK_FAILED_NO_PROGRESS,
+          undock_failure_status("undock_failed_no_progress", traveled, distance, stamp));
         return;
       }
     }
@@ -767,11 +768,13 @@ private:
 
     std::ostringstream status;
     status << undock_status_prefix(traveled)
+           << " phase=active"
            << " distance=" << std::fixed << std::setprecision(3) << traveled
            << "/" << distance
            << " cmd_x=" << last_undock_cmd_x_
            << " cmd_count=" << undock_nonzero_cmd_publish_count_
-           << " reverse_enable=true";
+           << " reverse_enable=true reverse_enable_count=" << undock_reverse_enable_publish_count_
+           << " no_progress_timeout_s=" << undock_no_progress_timeout_s_;
     if (undock_phase_ == UndockPhase::UNDOCK_ACTIVE && last_undock_progress_time_.nanoseconds() > 0) {
       status << " last_progress_age=" << std::setprecision(2)
              << (stamp - last_undock_progress_time_).seconds();
@@ -790,10 +793,72 @@ private:
     return "undocking active backing_out";
   }
 
+  double elapsed_since_or_negative(const rclcpp::Time & reference, const rclcpp::Time & stamp) const
+  {
+    if (reference.nanoseconds() <= 0) {
+      return -1.0;
+    }
+    return std::max(0.0, (stamp - reference).seconds());
+  }
+
+  std::string bool_text(const bool value) const
+  {
+    return value ? "true" : "false";
+  }
+
+  std::string undock_running_status(
+    const std::string & phase, const rclcpp::Time & stamp, const double traveled, const double distance) const
+  {
+    std::ostringstream status;
+    status << "undocking " << phase
+           << " phase=" << phase
+           << " distance=" << std::fixed << std::setprecision(3) << traveled << "/" << distance
+           << " cmd_x=" << last_undock_cmd_x_
+           << " cmd_count=" << undock_nonzero_cmd_publish_count_
+           << " reverse_enable=" << bool_text(last_undock_reverse_enable_)
+           << " reverse_enable_count=" << undock_reverse_enable_publish_count_
+           << " last_cmd_stamp_age_s=" << std::setprecision(2)
+           << elapsed_since_or_negative(last_undock_cmd_publish_time_, stamp)
+           << " command_start_elapsed_s="
+           << elapsed_since_or_negative(undock_nonzero_cmd_start_time_, stamp)
+           << " first_motion_started=" << bool_text(have_undock_first_motion_);
+    return status.str();
+  }
+
+  std::string undock_failure_status(
+    const std::string & failure_reason,
+    const double traveled,
+    const double distance,
+    const rclcpp::Time & stamp) const
+  {
+    std::ostringstream status;
+    status << failure_reason
+           << " phase=failed"
+           << " failure_reason=" << failure_reason
+           << " distance=" << std::fixed << std::setprecision(3) << traveled << "/" << distance
+           << " cmd_count=" << undock_nonzero_cmd_publish_count_
+           << " reverse_enable_count=" << undock_reverse_enable_publish_count_
+           << " last_cmd_x=" << last_undock_cmd_x_
+           << " cmd_x=" << last_undock_cmd_x_
+           << " last_cmd_stamp_age_s=" << std::setprecision(2)
+           << elapsed_since_or_negative(last_undock_cmd_publish_time_, stamp)
+           << " last_cmd_age=" << elapsed_since_or_negative(last_undock_cmd_publish_time_, stamp)
+           << " command_start_elapsed_s="
+           << elapsed_since_or_negative(undock_nonzero_cmd_start_time_, stamp)
+           << " motion_start_timeout_s=" << undock_motion_start_timeout_s_
+           << " first_motion_started=" << bool_text(have_undock_first_motion_);
+    return status.str();
+  }
+
   void finish_undock_success(const double final_distance)
   {
+    const auto stamp = now();
     const auto cmd_count = undock_nonzero_cmd_publish_count_;
+    const auto reverse_enable_count = undock_reverse_enable_publish_count_;
     const double cmd_x = last_undock_cmd_x_;
+    const double last_cmd_age = elapsed_since_or_negative(last_undock_cmd_publish_time_, stamp);
+    const double command_elapsed = elapsed_since_or_negative(undock_nonzero_cmd_start_time_, stamp);
+    const bool first_motion_started = have_undock_first_motion_;
     reset_undock_tracking();
     undock_phase_ = UndockPhase::UNDOCK_SUCCEEDED;
     state_ = State::Idle;
@@ -802,9 +867,16 @@ private:
     release_docking_motion_mode(false);
     update_dock_contact_latch(false, "docking_manager", "undocked", "");
     std::ostringstream status;
-    status << "undocked distance=" << std::fixed << std::setprecision(3) << final_distance
+    status << "undocked phase=succeeded failure_reason=none distance=" << std::fixed
+           << std::setprecision(3) << final_distance
            << " cmd_count=" << cmd_count
-           << " cmd_x=" << cmd_x;
+           << " reverse_enable_count=" << reverse_enable_count
+           << " last_cmd_x=" << cmd_x
+           << " cmd_x=" << cmd_x
+           << " last_cmd_stamp_age_s=" << std::setprecision(2) << last_cmd_age
+           << " command_start_elapsed_s=" << command_elapsed
+           << " motion_start_timeout_s=" << undock_motion_start_timeout_s_
+           << " first_motion_started=" << bool_text(first_motion_started);
     publish_status(status.str());
   }
 
@@ -815,6 +887,7 @@ private:
     publish_reverse_enable(true);
     publish_cmd(cmd);
     last_undock_cmd_x_ = cmd.linear.x;
+    last_undock_cmd_publish_time_ = stamp;
     ++undock_nonzero_cmd_publish_count_;
     if (undock_nonzero_cmd_start_time_.nanoseconds() == 0) {
       undock_nonzero_cmd_start_time_ = stamp;
@@ -871,8 +944,11 @@ private:
     have_undock_first_motion_ = false;
     undock_phase_ = UndockPhase::UNDOCK_IDLE;
     undock_nonzero_cmd_publish_count_ = 0U;
+    undock_reverse_enable_publish_count_ = 0U;
     last_undock_cmd_x_ = 0.0;
+    last_undock_reverse_enable_ = false;
     undock_nonzero_cmd_start_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    last_undock_cmd_publish_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
     first_undock_motion_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
     last_undock_progress_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
   }
@@ -1064,6 +1140,12 @@ private:
     std_msgs::msg::Bool msg;
     msg.data = enabled;
     reverse_enable_pub_->publish(msg);
+    if (state_ == State::Undocking) {
+      last_undock_reverse_enable_ = enabled;
+      if (enabled) {
+        ++undock_reverse_enable_publish_count_;
+      }
+    }
   }
 
   std::string detection_status(const std::string & state, const Detection & detection) const
@@ -1190,11 +1272,14 @@ private:
   double undock_max_progress_m_{0.0};
   double last_undock_cmd_x_{0.0};
   size_t undock_nonzero_cmd_publish_count_{0U};
+  mutable size_t undock_reverse_enable_publish_count_{0U};
+  mutable bool last_undock_reverse_enable_{false};
   Detection filtered_detection_;
   rclcpp::Time state_entered_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_scan_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_odom_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time undock_nonzero_cmd_start_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_undock_cmd_publish_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time first_undock_motion_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_undock_progress_time_{0, 0, RCL_ROS_TIME};
   sensor_msgs::msg::LaserScan::SharedPtr latest_scan_;

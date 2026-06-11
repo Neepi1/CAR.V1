@@ -18,3 +18,9 @@ imu_gyro_bias_filter:
     max_bias_sample_abs_radps: 0.05
     accumulator_alpha: 0.02
     zero_output_when_stationary: true
+    corrected_output_rate_hz: 100.0
+    bias_publish_rate_hz: 10.0
+    corrected_output_latest_on_timer: true
+    corrected_output_preserve_source_stamp: true
+    corrected_output_max_source_age_sec: 0.20
+    bias_publish_preserve_source_stamp: true

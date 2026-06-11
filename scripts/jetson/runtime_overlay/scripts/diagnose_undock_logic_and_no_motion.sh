@@ -75,12 +75,28 @@ if ! [[ "${DURATION_SEC}" =~ ^[0-9]+$ ]] || [[ "${DURATION_SEC}" -lt 5 ]]; then
   echo "${PREFIX} FAIL --duration-sec must be an integer >= 5" >&2
   exit 2
 fi
+CAPTURE_SEC=$((DURATION_SEC + 2))
 
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 if [[ -z "${OUTPUT_DIR}" ]]; then
   OUTPUT_DIR="${NJRH_PROJECT_ROOT}/reports/undock_logic/${TIMESTAMP}"
 fi
-mkdir -p "${OUTPUT_DIR}"
+if ! mkdir -p "${OUTPUT_DIR}"; then
+  echo "${PREFIX} FAIL cannot create report directory: ${OUTPUT_DIR}" >&2
+  echo "${PREFIX} hint: fix ownership, or pass --output-dir /tmp/undock_logic_<tag>" >&2
+  exit 1
+fi
+if [[ ! -d "${OUTPUT_DIR}" || ! -w "${OUTPUT_DIR}" ]]; then
+  echo "${PREFIX} FAIL report directory is not writable: ${OUTPUT_DIR}" >&2
+  echo "${PREFIX} hint: fix ownership, or pass --output-dir /tmp/undock_logic_<tag>" >&2
+  exit 1
+fi
+if ! : >"${OUTPUT_DIR}/.write_probe"; then
+  echo "${PREFIX} FAIL cannot write report directory: ${OUTPUT_DIR}" >&2
+  echo "${PREFIX} hint: fix ownership, or pass --output-dir /tmp/undock_logic_<tag>" >&2
+  exit 1
+fi
+rm -f "${OUTPUT_DIR}/.write_probe"
 
 PIDS=()
 
@@ -117,7 +133,7 @@ start_timed_echo() {
   local name="$1"
   local topic="$2"
   shift 2
-  start_logged "${name}" timeout --signal=INT "${DURATION_SEC}" bash -lc \
+  start_logged "${name}" timeout --signal=INT "${CAPTURE_SEC}" bash -lc \
     "ros2 topic echo ${topic} $* | awk '{ print systime(), \$0; fflush(); }'"
 }
 
@@ -223,6 +239,9 @@ checks = [
     ("first motion timeout exists", "undock_failed_motion_start_timeout" in docking_cpp),
     ("true no-command failure exists", "undock_failed_no_command_published" in docking_cpp),
     ("waiting-first-motion status exposes command evidence", "undocking waiting_first_motion" in docking_cpp and "cmd_count=" in docking_cpp and "cmd_x=" in docking_cpp),
+    ("undock status exposes reverse enable count", "reverse_enable_count=" in docking_cpp and "undock_reverse_enable_publish_count_" in docking_cpp),
+    ("undock failure status exposes command age", "last_cmd_stamp_age_s=" in docking_cpp and "command_start_elapsed_s=" in docking_cpp),
+    ("undock failure status exposes first-motion state", "first_motion_started=" in docking_cpp),
     ("after-motion no-progress exists", "undock_failed_no_progress" in docking_cpp),
     ("no old no-motion failure string", "undock_failed_no_motion" not in docking_cpp),
     ("docking path remains /cmd_vel_docking", "/cmd_vel_docking" in docking and "/cmd_vel_docking" in safety_cpp),
@@ -286,12 +305,28 @@ def first_nonzero_twist_time(text):
             return float(m.group(1))
     return None
 
+def count_nonzero_twist(text):
+    count = 0
+    for line in text.splitlines():
+        m = re.match(r"^(\d+)\s+\s*(?:x|y|z):\s*(-?\d+(?:\.\d+)?)", line)
+        if m and abs(float(m.group(2))) > 1.0e-6:
+            count += 1
+    return count
+
 def first_reverse_true_time(text):
     for line in text.splitlines():
         m = re.match(r"^(\d+)\s+(.*)$", line)
         if m and "true" in m.group(2).lower():
             return float(m.group(1))
     return None
+
+def count_reverse_true(text):
+    count = 0
+    for line in text.splitlines():
+        m = re.match(r"^(\d+)\s+(.*)$", line)
+        if m and "true" in m.group(2).lower():
+            count += 1
+    return count
 
 def timestamped_status_lines(text):
     rows = []
@@ -313,6 +348,18 @@ def status_cmd_count(lines):
         if m:
             counts.append(int(m.group(1)))
     return max(counts) if counts else None
+
+def status_int_value(text, key):
+    counts = [int(m.group(1)) for m in re.finditer(rf"\b{re.escape(key)}=(-?\d+)", text or "")]
+    return max(counts) if counts else None
+
+def status_float_value(text, key):
+    values = [float(m.group(1)) for m in re.finditer(rf"\b{re.escape(key)}=(-?\d+(?:\.\d+)?)", text or "")]
+    return values[-1] if values else None
+
+def status_token_value(text, key):
+    m = re.search(rf"\b{re.escape(key)}=([^\s]+)", text or "")
+    return m.group(1) if m else None
 
 def text_cmd_count(text):
     counts = [int(m.group(1)) for m in re.finditer(r"\bcmd_count=(\d+)", text or "")]
@@ -378,22 +425,88 @@ def odom_motion(text, epsilon=0.005):
             first_motion = t
     return first_motion, max_dist, len(samples)
 
+def topic_sections(text):
+    sections = {}
+    current = None
+    buf = []
+    for line in text.splitlines():
+        if line.startswith("## "):
+            if current is not None:
+                sections[current] = "\n".join(buf)
+            current = line[3:].strip()
+            buf = []
+        elif current is not None:
+            buf.append(line)
+    if current is not None:
+        sections[current] = "\n".join(buf)
+    return sections
+
+def topic_identity(topic):
+    sections = topic_sections(read("topic_info_after.log"))
+    if topic not in sections:
+        sections = topic_sections(read("topic_info_armed.log"))
+    if topic not in sections:
+        sections = topic_sections(read("topic_info_before.log"))
+    section = sections.get(topic, "")
+    pub_count = None
+    sub_count = None
+    publisher_names = []
+    subscriber_names = []
+    mode = None
+    for line in section.splitlines():
+        m = re.search(r"Publisher count:\s*(\d+)", line)
+        if m:
+            pub_count = int(m.group(1))
+            mode = "publisher"
+            continue
+        m = re.search(r"Subscription count:\s*(\d+)", line)
+        if m:
+            sub_count = int(m.group(1))
+            mode = "subscriber"
+            continue
+        m = re.search(r"Node name:\s*(\S+)", line)
+        if m and mode == "publisher":
+            publisher_names.append(m.group(1))
+        elif m and mode == "subscriber":
+            subscriber_names.append(m.group(1))
+    namespace_mismatch = any(name.startswith("/") for name in publisher_names + subscriber_names)
+    return {
+        "publisher_count": pub_count,
+        "publisher_names": publisher_names,
+        "subscriber_count": sub_count,
+        "subscriber_names": subscriber_names,
+        "namespace_mismatch": namespace_mismatch,
+    }
+
 after = json_objects(read("api_after.json"))
 post = json_objects(read("post_undock_response.json"))
 status = after[0] if len(after) > 0 else {}
 docking_state = after[2] if len(after) > 2 else {}
 post_response = post[0] if len(post) > 0 else {}
-cmd_time = first_nonzero_twist_time(read("echo_cmd_vel_docking.log"))
-safe_time = first_nonzero_twist_time(read("echo_cmd_vel_safe.log"))
-base_time = first_nonzero_twist_time(read("echo_cmd_vel.log"))
-reverse_time = first_reverse_true_time(read("echo_docking_allow_reverse.log"))
-first_motion, final_distance, odom_samples = odom_motion(read("echo_local_state_odometry.log"))
+cmd_vel_docking_text = read("echo_cmd_vel_docking.log")
+cmd_vel_safe_text = read("echo_cmd_vel_safe.log")
+cmd_vel_text = read("echo_cmd_vel.log")
+reverse_text = read("echo_docking_allow_reverse.log")
+odom_text = read("echo_local_state_odometry.log")
+cmd_time = first_nonzero_twist_time(cmd_vel_docking_text)
+safe_time = first_nonzero_twist_time(cmd_vel_safe_text)
+base_time = first_nonzero_twist_time(cmd_vel_text)
+reverse_time = first_reverse_true_time(reverse_text)
+observed_cmd_vel_docking_nonzero_count = count_nonzero_twist(cmd_vel_docking_text)
+observed_cmd_vel_safe_nonzero_count = count_nonzero_twist(cmd_vel_safe_text)
+observed_cmd_vel_nonzero_count = count_nonzero_twist(cmd_vel_text)
+observed_reverse_enable_true_count = count_reverse_true(reverse_text)
+first_motion, final_distance, odom_samples = odom_motion(odom_text)
 docking_status_text = read("echo_docking_status.log")
 status_lines = timestamped_status_lines(docking_status_text)
 status_first = first_status_phase(status_lines)
 status_final = final_status(status_lines)
 mode_status_text = read("echo_mode_controller_status.log")
-reverse_text = read("echo_docking_allow_reverse.log")
+topic_cmd_vel_docking = topic_identity("/cmd_vel_docking")
+topic_reverse_enable = topic_identity("/ranger_mini3/docking_allow_reverse")
+topic_cmd_vel_safe = topic_identity("/cmd_vel_safe")
+topic_cmd_vel = topic_identity("/cmd_vel")
+topic_docking_status = topic_identity("/docking/status")
 
 failure_reason = None
 for _, body in status_lines:
@@ -409,11 +522,31 @@ api_status_text = "\n".join(str(v or "") for v in (
 ))
 topic_cmd_count = status_cmd_count(status_lines)
 api_cmd_count = text_cmd_count(api_status_text)
-max_cmd_count = max_optional(topic_cmd_count, api_cmd_count)
+json_cmd_count = max_optional(
+    get(docking_state, "undock_cmd_count_observed"),
+    get(docking_state, "docking.undock_cmd_count_observed"),
+    post_response.get("undock_cmd_count_observed"),
+    get(post_response, "docking.undock_cmd_count_observed") if isinstance(post_response, dict) else None,
+)
+if json_cmd_count is not None and json_cmd_count < 0:
+    json_cmd_count = None
+max_cmd_count = max_optional(topic_cmd_count, api_cmd_count, json_cmd_count)
+status_reverse_enable_count = max_optional(
+    status_int_value(docking_status_text, "reverse_enable_count"),
+    status_int_value(api_status_text, "reverse_enable_count"),
+)
+status_last_cmd_x = status_float_value(status_final or "", "last_cmd_x")
+if status_last_cmd_x is None:
+    status_last_cmd_x = status_float_value(status_final or "", "cmd_x")
+status_failure_reason = status_token_value(status_final or "", "failure_reason")
+if not status_failure_reason and failure_reason and "undock_failed" in failure_reason:
+    status_failure_reason = failure_reason.split()[0]
 if topic_cmd_count is not None:
     cmd_source_evidence = "topic_status"
 elif api_cmd_count is not None:
     cmd_source_evidence = "api_status"
+elif json_cmd_count is not None:
+    cmd_source_evidence = "api_json"
 else:
     cmd_source_evidence = "none"
 waiting_with_cmd = status_has_waiting_first_motion_with_cmd(status_lines) or text_has_waiting_first_motion_with_cmd(api_status_text)
@@ -424,6 +557,20 @@ if not execute_undock:
     pass
 elif "undock rejected" in (failure_reason or "") or "not docked" in (failure_reason or ""):
     case = "CASE_DOCKING_MANAGER_REJECTS_API_LATCH"
+elif (topic_cmd_vel_docking.get("publisher_count") in (None, 0)) and observed_cmd_vel_docking_nonzero_count == 0:
+    case = "CASE_DOCKING_MANAGER_NO_CMD_PUBLISHER"
+elif (max_cmd_count in (0, None)) and (status_failure_reason or failure_reason or "").find("motion_start_timeout") >= 0:
+    case = "CASE_STATE_MACHINE_COUNT_CONTRADICTION"
+elif max_cmd_count and max_cmd_count > 0 and observed_cmd_vel_docking_nonzero_count == 0:
+    case = "CASE_OBSERVER_MISSED_DOCKING_CMD_OR_TOPIC_MISMATCH"
+elif max_cmd_count and max_cmd_count > 0 and observed_cmd_vel_docking_nonzero_count > 0 and observed_cmd_vel_safe_nonzero_count == 0:
+    case = "CASE_SAFETY_BLOCKED_DOCKING_CMD"
+elif observed_cmd_vel_safe_nonzero_count > 0 and observed_cmd_vel_nonzero_count == 0:
+    case = "CASE_MODE_CONTROLLER_BLOCKED_REVERSE"
+elif observed_cmd_vel_nonzero_count > 0 and first_motion is None:
+    case = "CASE_CHASSIS_NO_MOTION_AFTER_CMD"
+elif first_motion is not None:
+    case = "CASE_UNDOCK_MOTION_OBSERVED"
 elif accepted and cmd_time is None and (max_cmd_count in (None, 0)):
     case = "CASE_DOCKING_MANAGER_NO_CMD"
 elif waiting_with_cmd and cmd_time is not None and first_motion is None:
@@ -470,10 +617,47 @@ print(f"- odom_samples: `{odom_samples}`")
 print(f"- final_docking_status: `{status_final}`")
 print(f"- topic_status_cmd_count_max: `{topic_cmd_count}`")
 print(f"- api_status_cmd_count_max: `{api_cmd_count}`")
+print(f"- api_json_cmd_count_max: `{json_cmd_count}`")
 print(f"- status_cmd_count_max: `{max_cmd_count}`")
 print(f"- cmd_source_evidence: `{cmd_source_evidence}`")
 print(f"- failure_reason: `{failure_reason}`")
 print(f"- case: `{case}`")
+print()
+print("## Internal Docking Status")
+print(f"- final_status: `{status_final}`")
+print(f"- status_cmd_count: `{max_cmd_count}`")
+print(f"- status_reverse_enable_count: `{status_reverse_enable_count}`")
+print(f"- status_last_cmd_x: `{status_last_cmd_x}`")
+print(f"- status_failure_reason: `{status_failure_reason}`")
+print()
+print("## External Topic Observation")
+print(f"- observed_cmd_vel_docking_nonzero_count: `{observed_cmd_vel_docking_nonzero_count}`")
+print(f"- observed_reverse_enable_true_count: `{observed_reverse_enable_true_count}`")
+print(f"- observed_cmd_vel_safe_nonzero_count: `{observed_cmd_vel_safe_nonzero_count}`")
+print(f"- observed_cmd_vel_nonzero_count: `{observed_cmd_vel_nonzero_count}`")
+print()
+print("## Topic Identity")
+for name, info in (
+    ("/cmd_vel_docking", topic_cmd_vel_docking),
+    ("/ranger_mini3/docking_allow_reverse", topic_reverse_enable),
+    ("/cmd_vel_safe", topic_cmd_vel_safe),
+    ("/cmd_vel", topic_cmd_vel),
+    ("/docking/status", topic_docking_status),
+):
+    warn = ""
+    if name == "/cmd_vel_docking":
+        publishers = set(info.get("publisher_names") or [])
+        if not publishers:
+            warn = " CASE_DOCKING_MANAGER_NO_CMD_PUBLISHER"
+        elif "robot_docking_manager" not in publishers and "docking" not in publishers:
+            warn = " WARN_CMD_VEL_DOCKING_PUBLISHER_NOT_ROBOT_DOCKING_MANAGER"
+    print(
+        f"- {name}: publishers=`{info.get('publisher_count')}` "
+        f"publisher_nodes=`{','.join(info.get('publisher_names') or [])}` "
+        f"subscribers=`{info.get('subscriber_count')}` "
+        f"subscriber_nodes=`{','.join(info.get('subscriber_names') or [])}` "
+        f"namespace_mismatch=`{info.get('namespace_mismatch')}`{warn}"
+    )
 print()
 print("## Chain Evidence")
 print(f"- docking_allow_reverse_true_observed: `{'data: true' in reverse_text}`")
@@ -507,8 +691,12 @@ start_timed_echo "echo_docking_allow_reverse" /ranger_mini3/docking_allow_revers
 start_timed_echo "echo_mode_controller_status" /ranger_mini3_mode_controller/status --field data
 start_timed_echo "echo_local_state_odometry" /local_state/odometry --field pose.pose.position
 start_timed_echo "echo_docking_status" /docking/status --field data
+start_timed_echo "echo_safety_status" /safety/status --field data
 
-sleep 1
+echo "samplers_armed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"${OUTPUT_DIR}/samplers_armed.env"
+run_logged "topic_info_armed" bash -lc \
+  'for topic in /cmd_vel_docking /cmd_vel_safe /cmd_vel /docking/status /safety/status /local_state/odometry /ranger_mini3/docking_allow_reverse /ranger_mini3_mode_controller/status; do echo "## ${topic}"; timeout 5 ros2 topic info -v "${topic}"; done'
+sleep 0.5
 {
   echo "POST ${API_URL}/api/v1/docking/undock"
   curl_json POST /api/v1/docking/undock '{"reason":"diagnose_undock_logic_and_no_motion"}' || true

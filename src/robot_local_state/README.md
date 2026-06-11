@@ -9,6 +9,15 @@ then the IMU gyro-bias filter republishes `/lidar_imu` as
 `/lidar_imu_bias_corrected`, and the EKF fuses wheel x/y/yaw pose, wheel
 forward/yaw velocity, and corrected JT128 IMU yaw-rate.
 
+The raw `/lidar_imu` stream remains high-rate for JT128 and FAST-LIO2 mapping.
+Only the EKF input branch is bounded: `imu_gyro_bias_filter` still reads every
+raw IMU sample for bias estimation, but publishes `/lidar_imu_bias_corrected` at
+100 Hz by default and `/local_state/imu_bias` at 10 Hz. The wheel odom
+preprocessor publishes `/wheel/odom_ekf` from its timer at 50 Hz with
+`publish_on_callback=false`, so it does not double-publish from both callback and
+timer. The EKF output remains 50 Hz and remains the only owner of
+`odom -> base_link`.
+
 FAST-LIO2 local-state remains available for diagnostics with
 `LOCAL_STATE_MODE=fastlio`. In that mode FAST-LIO2 consumes canonical
 `/lidar_points` and `/lidar_imu`, publishes raw `/Odometry` with its public TF

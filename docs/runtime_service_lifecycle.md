@@ -179,6 +179,18 @@ The default navigation local-state mode is wheel-odom + JT128-IMU EKF because Na
 
 Canonical local-state is owned by common services, not by Nav2 startup. In the default EKF mode, common services start the wheel-odom preprocessor, IMU bias filter, and `robot_localization` EKF process, and process existence is the startup ownership check. In explicit FAST-LIO local-state mode the common layer requires both `fastlio_odom_bridge_node` and `robot_local_state/local_state_node`. Endpoint/topic/TF validation is manual diagnostics and API admission, not a shell launch gate. Runtime graph-probe misses under Nav2 startup load must not cause the canonical `odom -> base_link` owner to kill itself.
 
+Phase 2.10 protects the local-state EKF DDS receive queues by bounding only the
+EKF input branches. `/lidar_imu` remains the high-rate raw JT128 IMU stream for
+FAST-LIO2 mapping, while `imu_gyro_bias_filter` publishes
+`/lidar_imu_bias_corrected` at 100 Hz and `/local_state/imu_bias` at 10 Hz by
+default. The wheel-odom EKF preprocessor publishes `/wheel/odom_ekf` at 50 Hz
+from its timer with callback publishing disabled, matching the EKF output rate.
+This does not change `frequency: 50.0`, PointCloud2 QoS, DDS/RMW defaults,
+FAST-LIO2 inputs, Nav2 controller/planner settings, or runtime watchdog policy.
+Use `verify_local_state_input_rates.sh` after a local-state restart to check
+topic rates, ROS graph visibility, `/tf` ownership, EKF subscribers, and UDP
+`RcvbufErrors` deltas.
+
 FAST-LIO2 itself is no longer a default navigation odom dependency and is no longer resident in normal navigation. `run_common_services.sh` defaults `NJRH_FASTLIO_AUTOSTART=false`; `run_projected_map.sh` starts a mapping-owned FAST-LIO2 frontend only while live mapping is active. FAST-LIO2 becomes a local-state dependency only when `NJRH_NAV_LOCAL_STATE_MODE=fastlio` is explicitly selected, and that mode must either enable `NJRH_FASTLIO_AUTOSTART=true` or attach to an already managed FAST-LIO runtime.
 
 Nav2 preflight is process-first. `run_nav2_navigation.sh` starts or reuses floor-manager, `robot_safety`, Ranger mode-controller, and local perception by process ownership, then launches Nav2. It does not run local-state, TF, `/safety/status`, obstacle-cloud, or local-costmap probes as startup gates, and it does not kill/restart local perception just to warm a new costmap buffer.
@@ -254,6 +266,8 @@ Phase 2.8 keeps the same docking ownership but splits undock progress timing int
 Phase 2.7c tightens the motion-start phase so it cannot wait for odometry before sending the reverse command. After `command_settle_s`, every control tick in `waiting_first_motion` publishes `/ranger_mini3/docking_allow_reverse=true` and `/cmd_vel_docking.linear.x=-0.06` while waiting for `/local_state/odometry` to move by `progress_epsilon_m`. `/docking/status` includes `cmd_x`, `cmd_count`, `reverse_enable`, and timing fields. `undock_failed_motion_start_timeout ... cmd_count>0` means commands were sent and the next diagnosis should follow `robot_safety`, mode-controller, chassis execution, and odometry. `undock_failed_no_command_published` or `cmd_count=0` means the docking-manager state machine did not publish the undock command and must be treated as a software bug. This does not change Nav2, pointcloud, DDS/RMW, EKF, FAST-LIO2, Ranger CAN, App velocity ownership, or the final `robot_safety` speed chain.
 
 Phase 2.7d keeps the same speed and ownership but makes the final safety arbiter continuous for push-in spring charging docks. Because the charging switch is mechanically engaged by pushing into the dock, undocking must drive at the controlled low speed through the switch travel rather than stopping on the DC contact. `robot_safety` stores the last fresh `/cmd_vel_docking` command and republishes it from its safety timer while `docking_cmd_priority_timeout_sec` is active; blocking states still publish zero, stale commands still expire, and ordinary Nav2 reverse remains disabled. `diagnose_undock_logic_and_no_motion.sh` now also treats API `cmd_count` evidence as command evidence, so reports with `cmd_count>0` are classified downstream of the docking manager instead of as no-command state-machine failures.
+
+Phase 2.7d observability reconciliation keeps that control behavior unchanged and only separates command evidence. `/docking/status` now carries parseable `phase`, `cmd_count`, `reverse_enable_count`, `last_cmd_x`, command-age, command-start elapsed, and first-motion fields through running and terminal undock states. `/api/v1/docking/undock` and `/api/v1/docking/state` distinguish API acceptance from the underlying `/docking/undock` Trigger response using `api_accepted`, `already_running`, `docking_service_called`, `docking_service_success`, and `docking_service_message`. The undock diagnostic script arms all topic observers before calling the API and reports internal status counts separately from externally observed `/cmd_vel_docking`, `/cmd_vel_safe`, `/cmd_vel`, reverse-enable, and odometry evidence. This is observability only: no speed, timeout, Nav2 reverse, pointcloud, DDS/RMW, EKF, FAST-LIO2, or Ranger CAN behavior is changed.
 
 Before any normal Nav2 goal is sent, `robot_api_server` waits for fresh `map -> odom`, `odom -> base_link`, and composed `map -> base_link` TF samples. If the localization bridge has accepted a new result but the TF stream has not caught up yet, the API returns a TF-not-ready admission failure rather than letting Nav2 immediately abort on future extrapolation.
 

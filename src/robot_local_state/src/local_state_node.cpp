@@ -72,6 +72,7 @@ public:
     twist_covariance_floor_vy_ = declare_parameter<double>("twist_covariance_floor_vy", 0.0);
     twist_covariance_floor_vyaw_ = declare_parameter<double>("twist_covariance_floor_vyaw", 0.0);
     publish_rate_hz_ = std::max(1.0, declare_parameter<double>("publish_rate_hz", 20.0));
+    publish_on_callback_ = declare_parameter<bool>("publish_on_callback", false);
     republish_latest_ = declare_parameter<bool>("republish_latest", true);
     republish_latest_max_age_sec_ =
       std::max(0.0, declare_parameter<double>("republish_latest_max_age_sec", 0.5));
@@ -87,6 +88,13 @@ public:
           std::chrono::duration<double>(1.0 / publish_rate_hz_)),
         std::bind(&LocalStateNode::on_mock_timer, this));
     } else {
+      if (!publish_on_callback_ && !republish_latest_) {
+        RCLCPP_WARN(
+          get_logger(),
+          "publish_on_callback=false and republish_latest=false would suppress odom output; "
+          "enabling callback publication for compatibility");
+        publish_on_callback_ = true;
+      }
       odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
         input_odom_topic_,
         rclcpp::QoS(20),
@@ -212,7 +220,9 @@ private:
     local_odom.child_frame_id = base_frame_;
     latest_local_odom_ = local_odom;
     latest_local_odom_received_sec_ = now().seconds();
-    publish_local_state(local_odom);
+    if (publish_on_callback_) {
+      publish_local_state(local_odom);
+    }
   }
 
   void on_republish_timer()
@@ -269,6 +279,7 @@ private:
   double twist_covariance_floor_vy_{0.0};
   double twist_covariance_floor_vyaw_{0.0};
   double publish_rate_hz_{20.0};
+  bool publish_on_callback_{false};
   bool republish_latest_{true};
   double republish_latest_max_age_sec_{0.5};
   std::optional<nav_msgs::msg::Odometry> latest_local_odom_;

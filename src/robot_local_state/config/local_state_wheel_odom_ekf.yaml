@@ -20,3 +20,6 @@ wheel_odom_ekf_input:
     twist_covariance_floor_vy: 0.50
     twist_covariance_floor_vyaw: 0.08
     publish_rate_hz: 50.0
+    publish_on_callback: false
+    republish_latest: true
+    republish_latest_max_age_sec: 0.5

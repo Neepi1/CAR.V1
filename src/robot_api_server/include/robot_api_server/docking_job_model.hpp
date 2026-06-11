@@ -51,7 +51,17 @@ struct DockingJob
   bool post_undock_relocalization_succeeded{false};
   bool post_undock_relocalization_required{false};
   bool active_navigation_cancel_requested{false};
+  bool api_accepted{false};
+  bool already_running{false};
   bool docking_service_called{false};
+  bool docking_service_success{false};
+  std::string docking_service_message;
+  std::string docking_status_at_request;
+  std::string docking_status_after_request;
+  bool undock_started_observed{false};
+  int undock_cmd_count_observed{-1};
+  std::string undock_failure_reason;
+  std::string docking_service_warning;
   bool cancel_requested{false};
 };
 

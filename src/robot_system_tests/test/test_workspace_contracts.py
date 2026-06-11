@@ -550,7 +550,7 @@ def test_robot_docking_manager_is_safety_chained_cpp():
     assert "undock_failed_no_progress" in node
     assert "undock_failed_no_motion" not in node
     assert "undock_failed_stale_odom" in node
-    assert "undocking waiting_for_fresh_odom" in node
+    assert 'undock_running_status("waiting_for_fresh_odom"' in node
     assert "elapsed * speed" not in node
     assert "publish_reverse_enable(true)" in node
     assert "cmd.linear.x = -speed" in node
@@ -616,8 +616,28 @@ def test_robot_docking_manager_is_safety_chained_cpp():
     assert "first_reverse_enable_true_time" in diagnose_text
     assert "status_cmd_count_max" in diagnose_text
     assert "api_status_cmd_count_max" in diagnose_text
+    assert "api_json_cmd_count_max" in diagnose_text
     assert "cmd_source_evidence" in diagnose_text
     assert "text_cmd_count" in diagnose_text
+    assert "Internal Docking Status" in diagnose_text
+    assert "External Topic Observation" in diagnose_text
+    assert "observed_cmd_vel_docking_nonzero_count" in diagnose_text
+    assert "observed_cmd_vel_safe_nonzero_count" in diagnose_text
+    assert "CASE_OBSERVER_MISSED_DOCKING_CMD_OR_TOPIC_MISMATCH" in diagnose_text
+    assert "CASE_STATE_MACHINE_COUNT_CONTRADICTION" in diagnose_text
+    assert "CASE_DOCKING_MANAGER_NO_CMD_PUBLISHER" in diagnose_text
+    assert "topic_info_armed" in diagnose_text
+    assert "samplers_armed.env" in diagnose_text
+    assert "echo_safety_status" in diagnose_text
+    assert "FAIL cannot create report directory" in diagnose_text
+    assert "FAIL report directory is not writable" in diagnose_text
+    assert ".write_probe" in diagnose_text
+    assert diagnose_text.index("start_timed_echo \"echo_docking_status\"") < diagnose_text.index(
+        "curl_json POST /api/v1/docking/undock"
+    )
+    assert diagnose_text.index("sleep 0.5") < diagnose_text.index(
+        "curl_json POST /api/v1/docking/undock"
+    )
     assert "ros2 topic pub" not in diagnose_text
 
 
@@ -644,14 +664,28 @@ def test_undock_motion_start_state_machine_publishes_before_waiting():
     assert "undock_nonzero_cmd_publish_count_ == 0U" in wait_block
     assert "undock_failed_no_command_published" in wait_block
     assert "undock_nonzero_cmd_publish_count_ > 0U && motion_wait > undock_motion_start_timeout_s_" in wait_block
-    assert "undock_failed_motion_start_timeout distance=" in wait_block
+    assert 'undock_failure_status("undock_failed_motion_start_timeout"' in wait_block
     assert "cmd_count=" in wait_block
     assert "cmd_x=" in wait_block
-    assert "undocking waiting_first_motion distance=" in wait_block
-    assert "reverse_enable=true start_elapsed=" in wait_block
+    assert "last_cmd_x=" in node
+    assert "reverse_enable_count=" in node
+    assert "last_cmd_stamp_age_s=" in node
+    assert "command_start_elapsed_s=" in node
+    assert "first_motion_started=" in node
+    assert "failure_reason=" in node
+    assert "undocking waiting_first_motion phase=waiting_first_motion" in wait_block
+    assert "phase=waiting_first_motion" in wait_block
+    assert "reverse_enable=true reverse_enable_count=" in wait_block
+    assert "command_start_elapsed_s=" in wait_block
+    assert "motion_start_timeout_s=" in wait_block
+    assert wait_block.index("undock_nonzero_cmd_publish_count_ > 0U") < wait_block.index(
+        "undock_failed_motion_start_timeout"
+    )
     assert "undock_no_progress_timeout_s_" in active_block
     assert "last_undock_progress_time_" in active_block
-    assert "undock_failed_no_progress distance=" in active_block
+    assert 'undock_failure_status("undock_failed_no_progress"' in active_block
+    assert "phase=active" in node
+    assert "no_progress_timeout_s=" in node
     assert "publish_undock_reverse_command(speed, stamp)" in node
     assert "publish_reverse_enable(true)" in node[node.index("void publish_undock_reverse_command") :]
     assert "speed_mps: 0.06" in (
@@ -1003,14 +1037,29 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     overlay_wheel_odom_cfg = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "local_state_wheel_odom_ekf.yaml"
     ).read_text(encoding="utf-8")
+    source_wheel_odom_cfg = (
+        ROOT / "src" / "robot_local_state" / "config" / "local_state_wheel_odom_ekf.yaml"
+    ).read_text(encoding="utf-8")
     fastlio_cfg = (ROOT / "src" / "robot_local_state" / "config" / "local_state_fastlio.yaml").read_text(
         encoding="utf-8"
     )
     overlay_fastlio_cfg = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "local_state_fastlio.yaml"
     ).read_text(encoding="utf-8")
+    mapping_fastlio_cfg = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "fastlio.yaml"
+    ).read_text(encoding="utf-8")
     overlay_imu_bias_cfg = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "local_state_imu_bias_filter.yaml"
+    ).read_text(encoding="utf-8")
+    source_imu_bias_cfg = (
+        ROOT / "src" / "robot_local_state" / "config" / "local_state_imu_bias_filter.yaml"
+    ).read_text(encoding="utf-8")
+    verify_local_state_rates = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "verify_local_state_input_rates.sh"
+    ).read_text(encoding="utf-8")
+    common_env = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "common_env.sh"
     ).read_text(encoding="utf-8")
     overlay_runner = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_local_state.sh"
@@ -1103,6 +1152,7 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     assert 'declare_parameter<bool>("apply_pose_covariance_floor", false)' in local_state_node
     assert 'declare_parameter<double>("pose_covariance_floor_yaw", 0.0)' in local_state_node
     assert 'declare_parameter<std::string>("input_base_frame", "base_link")' in local_state_node
+    assert 'declare_parameter<bool>("publish_on_callback", false)' in local_state_node
     assert 'declare_parameter<bool>("republish_latest", true)' in local_state_node
     assert 'declare_parameter<double>("republish_latest_max_age_sec", 0.5)' in local_state_node
     assert "apply_pose_anchor(local_odom)" in local_state_node
@@ -1110,7 +1160,9 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     assert "apply_pose_covariance_floor(local_odom)" in local_state_node
     assert "apply_twist_covariance_floor(local_odom)" in local_state_node
     assert "latest_local_odom_ = local_odom" in local_state_node
+    assert "if (publish_on_callback_)" in local_state_node
     assert "on_republish_timer" in local_state_node
+    assert "publish_on_callback=false and republish_latest=false" in local_state_node
     assert "odom.header.stamp = stamp" in local_state_node
     assert "if (publish_tf_)" in local_state_node
     assert "if (!publish_tf_ || !tf_broadcaster_)" in local_state_node
@@ -1172,6 +1224,7 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
         assert "apply_pose_covariance_floor: true" in cfg
         assert "apply_twist_covariance_floor: true" in cfg
     for cfg in (ekf_cfg, overlay_ekf_cfg):
+        assert "frequency: 50.0" in cfg
         assert "two_d_mode: true" in cfg
         assert "publish_tf: true" in cfg
         assert "world_frame: odom" in cfg
@@ -1180,32 +1233,74 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
         assert "odom0_config: [true, true, false," in cfg
         assert "false, false, true," in cfg
         assert "imu0: /lidar_imu_bias_corrected" in cfg
-    assert "output_topic: /wheel/odom_ekf" in overlay_wheel_odom_cfg
-    assert "input_odom_topic: /wheel/odom" in overlay_wheel_odom_cfg
-    assert "anchor_pose_to_first_sample: true" in overlay_wheel_odom_cfg
-    assert "apply_pose_covariance_floor: true" in overlay_wheel_odom_cfg
-    assert "pose_covariance_floor_x: 0.05" in overlay_wheel_odom_cfg
-    assert "pose_covariance_floor_y: 0.05" in overlay_wheel_odom_cfg
-    assert "pose_covariance_floor_yaw: 0.08" in overlay_wheel_odom_cfg
-    assert "apply_twist_covariance_floor: true" in overlay_wheel_odom_cfg
-    assert "twist_covariance_floor_vyaw: 0.08" in overlay_wheel_odom_cfg
-    assert "imu_topic: /lidar_imu" in overlay_imu_bias_cfg
-    assert "odom_topic: /wheel/odom_ekf" in overlay_imu_bias_cfg
-    assert "cmd_vel_topic: /cmd_vel_safe" in overlay_imu_bias_cfg
-    assert "output_imu_topic: /lidar_imu_bias_corrected" in overlay_imu_bias_cfg
-    assert "bias_topic: /local_state/imu_bias" in overlay_imu_bias_cfg
-    assert "stationary_required_sec: 1.0" in overlay_imu_bias_cfg
-    assert "accumulator_alpha: 0.02" in overlay_imu_bias_cfg
-    assert "zero_output_when_stationary: true" in overlay_imu_bias_cfg
+    for wheel_cfg in (source_wheel_odom_cfg, overlay_wheel_odom_cfg):
+        assert "output_topic: /wheel/odom_ekf" in wheel_cfg
+        assert "input_odom_topic: /wheel/odom" in wheel_cfg
+        assert "publish_rate_hz: 50.0" in wheel_cfg
+        assert "publish_on_callback: false" in wheel_cfg
+        assert "republish_latest: true" in wheel_cfg
+        assert "republish_latest_max_age_sec: 0.5" in wheel_cfg
+        assert "anchor_pose_to_first_sample: true" in wheel_cfg
+        assert "apply_pose_covariance_floor: true" in wheel_cfg
+        assert "pose_covariance_floor_x: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_y: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_yaw: 0.08" in wheel_cfg
+        assert "apply_twist_covariance_floor: true" in wheel_cfg
+        assert "twist_covariance_floor_vyaw: 0.08" in wheel_cfg
+    for imu_cfg in (source_imu_bias_cfg, overlay_imu_bias_cfg):
+        assert "imu_topic: /lidar_imu" in imu_cfg
+        assert "odom_topic: /wheel/odom_ekf" in imu_cfg
+        assert "cmd_vel_topic: /cmd_vel_safe" in imu_cfg
+        assert "output_imu_topic: /lidar_imu_bias_corrected" in imu_cfg
+        assert "bias_topic: /local_state/imu_bias" in imu_cfg
+        assert "stationary_required_sec: 1.0" in imu_cfg
+        assert "accumulator_alpha: 0.02" in imu_cfg
+        assert "zero_output_when_stationary: true" in imu_cfg
+        assert "corrected_output_rate_hz: 100.0" in imu_cfg
+        assert "bias_publish_rate_hz: 10.0" in imu_cfg
+        assert "corrected_output_latest_on_timer: true" in imu_cfg
+        assert "corrected_output_preserve_source_stamp: true" in imu_cfg
+        assert "corrected_output_max_source_age_sec: 0.20" in imu_cfg
+        assert "bias_publish_preserve_source_stamp: true" in imu_cfg
+        assert yaml_number(imu_cfg, "corrected_output_rate_hz") <= 100.0
+        assert yaml_number(imu_cfg, "bias_publish_rate_hz") <= 10.0
+    assert "lid_topic: /lidar_points" in mapping_fastlio_cfg
+    assert "imu_topic: /lidar_imu" in mapping_fastlio_cfg
+    assert "imu_topic: /lidar_imu_bias_corrected" not in mapping_fastlio_cfg
     assert 'declare_parameter<std::string>("output_imu_topic", "/lidar_imu_bias_corrected")' in imu_bias_node
     assert 'declare_parameter<std::string>("bias_topic", "/local_state/imu_bias")' in imu_bias_node
+    assert 'declare_parameter<double>("corrected_output_rate_hz", 100.0)' in imu_bias_node
+    assert 'declare_parameter<double>("bias_publish_rate_hz", 10.0)' in imu_bias_node
+    assert 'declare_parameter<bool>("corrected_output_latest_on_timer", true)' in imu_bias_node
+    assert 'declare_parameter<bool>("corrected_output_preserve_source_stamp", true)' in imu_bias_node
+    assert 'declare_parameter<double>("corrected_output_max_source_age_sec", 0.20)' in imu_bias_node
+    assert 'declare_parameter<bool>("bias_publish_preserve_source_stamp", true)' in imu_bias_node
     assert "stationary_confirmed" in imu_bias_node
     assert "sample_is_safe_for_bias_update" in imu_bias_node
     assert "create_publisher<sensor_msgs::msg::Imu>(" in imu_bias_node
     assert "rclcpp::QoS(100)" in imu_bias_node
+    assert "corrected_output_timer_" in imu_bias_node
+    assert "bias_publish_timer_" in imu_bias_node
+    assert "latest_corrected_imu_" in imu_bias_node
+    assert "corrected_source_age_sec" in imu_bias_node
+    assert "IMU bias filter rates input=" in imu_bias_node
     assert "corrected.angular_velocity.z = 0.0" in imu_bias_node
     assert "corrected.angular_velocity.z -= bias_.z" in imu_bias_node
     assert "TransformBroadcaster" not in imu_bias_node
+    assert 'export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"' in common_env
+    assert "rmw_cyclonedds_cpp" not in common_env
+    assert "record_rate /lidar_imu " in verify_local_state_rates
+    assert "record_rate /lidar_imu_bias_corrected " in verify_local_state_rates
+    assert "record_rate /local_state/imu_bias " in verify_local_state_rates
+    assert "record_rate /wheel/odom_ekf " in verify_local_state_rates
+    assert "record_rate /local_state/odometry " in verify_local_state_rates
+    assert "RcvbufErrors" in verify_local_state_rates
+    assert "robot_local_state EKF process is alive but /robot_local_state is missing" in verify_local_state_rates
+    assert "local_state_input_rates_${TIMESTAMP}.md" in verify_local_state_rates
+    assert "pkill" not in verify_local_state_rates
+    assert "ros2 param set" not in verify_local_state_rates
+    assert "ros2 bag" not in verify_local_state_rates
+    assert "set_pointcloud_accel_profile" not in verify_local_state_rates
     assert "imu0_remove_gravitational_acceleration: true" in cfg
     assert "publish_acceleration: false" in cfg
     assert "true, false, false," in cfg
@@ -3213,6 +3308,17 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "start_pre_navigation_undock" in node_cpp
     assert "wait_for_pre_navigation_undock" in node_cpp
     assert "call_undock_service_with_charging_retry" in node_cpp
+    assert "TriggerServiceObservation" in node_cpp
+    assert "call_docking_trigger_service_observed" in node_cpp
+    assert "docking_service_success" in node_cpp
+    assert "docking_service_message" in node_cpp
+    assert "docking_status_at_request" in node_cpp
+    assert "docking_status_after_request" in node_cpp
+    assert "undock_started_observed" in node_cpp
+    assert "undock_cmd_count_observed" in node_cpp
+    assert "undock_failure_reason" in node_cpp
+    assert "service_success_without_undocking_status_observed_yet" in node_cpp
+    assert "already running; no new /docking/undock service call" in node_cpp
     assert "complete_post_undock_relocalization" in node_cpp
     assert "relocalize_after_undock" in node_cpp
     assert "undock_after_success" in node_cpp

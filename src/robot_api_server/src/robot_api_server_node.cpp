@@ -621,6 +621,13 @@ private:
     std::string detail;
   };
 
+  struct TriggerServiceObservation
+  {
+    bool service_called{false};
+    bool service_success{false};
+    std::string message;
+  };
+
   struct NavigationGoalJob
   {
     std::uint64_t id{0U};
@@ -5236,6 +5243,9 @@ private:
     next_job.last_status = "undocking before navigation accepted";
     next_job.started_at = utc_timestamp_iso8601();
     next_job.resume_navigation = true;
+    next_job.api_accepted = true;
+    next_job.already_running = false;
+    next_job.docking_status_at_request = runtime.docking_status;
 
     std::uint64_t job_id = 0U;
     {
@@ -5251,17 +5261,39 @@ private:
     }
 
     std::string service_detail;
-    if (!call_undock_service_with_charging_retry(service_detail, charging_contact_at_gate)) {
+    TriggerServiceObservation service_observation;
+    if (!call_undock_service_with_charging_retry(
+        service_detail, charging_contact_at_gate, &service_observation))
+    {
+      const auto after_status = runtime_mode_snapshot().docking_status;
+      {
+        std::lock_guard<std::mutex> lock(docking_job_mutex_);
+        if (docking_job_.id == job_id) {
+          docking_job_.api_accepted = false;
+          docking_job_.docking_service_called = service_observation.service_called;
+          docking_job_.docking_service_success = service_observation.service_success;
+          docking_job_.docking_service_message = service_observation.message;
+          record_undock_status_observation(docking_job_, after_status);
+        }
+      }
       finish_docking_job(job_id, false, "failed", service_detail);
       detail = service_detail;
       return false;
     }
+    const auto after_status = runtime_mode_snapshot().docking_status;
     {
       std::lock_guard<std::mutex> lock(docking_job_mutex_);
       if (docking_job_.id == job_id && docking_job_.state == "running") {
-        docking_job_.docking_service_called = true;
+        docking_job_.docking_service_called = service_observation.service_called;
+        docking_job_.docking_service_success = service_observation.service_success;
+        docking_job_.docking_service_message = service_observation.message;
         docking_job_.detail = service_detail;
         docking_job_.last_status = service_detail;
+        record_undock_status_observation(docking_job_, after_status);
+        if (docking_job_.docking_service_success && !docking_job_.undock_started_observed) {
+          docking_job_.docking_service_warning =
+            "service_success_without_undocking_status_observed_yet";
+        }
       }
     }
     set_docking_runtime_state(true, "undocking", service_detail);
@@ -5269,13 +5301,22 @@ private:
     return true;
   }
 
-  bool call_undock_service_with_charging_retry(std::string & detail, const bool allow_charging_retry)
+  bool call_undock_service_with_charging_retry(
+    std::string & detail,
+    const bool allow_charging_retry,
+    TriggerServiceObservation * observation = nullptr)
   {
     const auto deadline = std::chrono::steady_clock::now() +
       std::chrono::duration_cast<std::chrono::steady_clock::duration>(
         std::chrono::duration<double>(docking_undock_charging_retry_sec_));
     while (true) {
-      if (call_docking_trigger_service(docking_undock_client_, docking_undock_service_, detail)) {
+      const auto observed =
+        call_docking_trigger_service_observed(docking_undock_client_, docking_undock_service_);
+      detail = observed.message;
+      if (observation != nullptr) {
+        *observation = observed;
+      }
+      if (observed.service_success) {
         return true;
       }
       const bool retryable_rejection =
@@ -6670,19 +6711,90 @@ private:
     const std::string & service_name,
     std::string & detail)
   {
+    const auto observed = call_docking_trigger_service_observed(client, service_name);
+    detail = observed.message;
+    return observed.service_success;
+  }
+
+  TriggerServiceObservation call_docking_trigger_service_observed(
+    const rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr & client,
+    const std::string & service_name)
+  {
     if (!client->wait_for_service(service_timeout())) {
-      detail = "service unavailable: " + service_name;
-      return false;
+      return {false, false, "service unavailable: " + service_name};
     }
     auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
     auto future = client->async_send_request(request);
     if (future.wait_for(service_timeout()) != std::future_status::ready) {
-      detail = "timed out waiting for service: " + service_name;
-      return false;
+      return {false, false, "timed out waiting for service: " + service_name};
     }
     const auto response = future.get();
-    detail = response->message;
-    return response->success;
+    return {true, response->success, response->message};
+  }
+
+  static std::optional<int> status_int_value(const std::string & status, const std::string & key)
+  {
+    const std::string needle = key + "=";
+    const auto pos = status.find(needle);
+    if (pos == std::string::npos) {
+      return std::nullopt;
+    }
+    const auto start = pos + needle.size();
+    std::size_t end = start;
+    while (end < status.size() && (std::isdigit(static_cast<unsigned char>(status[end])) ||
+      status[end] == '-' || status[end] == '+'))
+    {
+      ++end;
+    }
+    if (end == start) {
+      return std::nullopt;
+    }
+    try {
+      return std::stoi(status.substr(start, end - start));
+    } catch (const std::exception &) {
+      return std::nullopt;
+    }
+  }
+
+  static std::string status_failure_reason(const std::string & status)
+  {
+    if (!docking_status_is_undock_failed(status)) {
+      return "";
+    }
+    const auto pos = status.find(" failure_reason=");
+    if (pos != std::string::npos) {
+      const auto start = pos + std::string(" failure_reason=").size();
+      const auto end = status.find(' ', start);
+      return status.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    }
+    const auto end = status.find(' ');
+    return status.substr(0, end == std::string::npos ? std::string::npos : end);
+  }
+
+  static bool status_indicates_undock_started(const std::string & status)
+  {
+    return docking_status_is_undocking(status) || docking_status_is_undocked(status) ||
+      docking_status_is_undock_failed(status);
+  }
+
+  void record_undock_status_observation(DockingJob & job, const std::string & status) const
+  {
+    if (status.empty()) {
+      return;
+    }
+    job.docking_status_after_request = status;
+    if (status_indicates_undock_started(status)) {
+      job.undock_started_observed = true;
+      if (job.docking_service_success) {
+        job.docking_service_warning.clear();
+      }
+    }
+    if (const auto count = status_int_value(status, "cmd_count")) {
+      job.undock_cmd_count_observed = *count;
+    }
+    if (docking_status_is_undock_failed(status)) {
+      job.undock_failure_reason = status_failure_reason(status);
+    }
   }
 
   void handle_docking_status(const std::string & status)
@@ -6715,6 +6827,7 @@ private:
     {
       std::lock_guard<std::mutex> lock(docking_job_mutex_);
       docking_job_.last_status = status;
+      record_undock_status_observation(docking_job_, status);
       if (docking_job_.state != "running") {
         if (docking_job_.state == "failed" && docking_job_.post_undock_relocalization_required &&
           docking_job_.post_undock_relocalization_requested &&
@@ -7580,6 +7693,17 @@ private:
         if (docking_job_.phase == "undocking") {
           std::ostringstream response;
           response << "{\"ok\":true,\"accepted\":true,\"already_running\":true,"
+                   << "\"api_accepted\":true,"
+                   << "\"docking_service_called\":false,"
+                   << "\"docking_service_success\":false,"
+                   << "\"docking_service_message\":"
+                   << json_string("already running; no new /docking/undock service call") << ","
+                   << "\"docking_status_at_request\":" << json_string(docking_job_.last_status) << ","
+                   << "\"docking_status_after_request\":" << json_string(docking_job_.last_status) << ","
+                   << "\"undock_started_observed\":"
+                   << (docking_job_.undock_started_observed ? "true" : "false") << ","
+                   << "\"undock_cmd_count_observed\":" << docking_job_.undock_cmd_count_observed << ","
+                   << "\"undock_failure_reason\":" << json_string(docking_job_.undock_failure_reason) << ","
                    << "\"docking\":" << docking_job_json_locked() << "}";
           return {202, "application/json", response.str()};
         }
@@ -7622,6 +7746,9 @@ private:
     next_job.last_status = "undocking accepted";
     next_job.started_at = utc_timestamp_iso8601();
     next_job.resume_navigation = false;
+    next_job.api_accepted = true;
+    next_job.already_running = false;
+    next_job.docking_status_at_request = runtime.docking_status;
 
     std::uint64_t job_id = 0U;
     {
@@ -7638,23 +7765,71 @@ private:
     }
 
     std::string service_detail;
-    if (!call_undock_service_with_charging_retry(service_detail, charging_contact)) {
+    TriggerServiceObservation service_observation;
+    if (!call_undock_service_with_charging_retry(service_detail, charging_contact, &service_observation)) {
+      const auto after_status = runtime_mode_snapshot().docking_status;
+      {
+        std::lock_guard<std::mutex> lock(docking_job_mutex_);
+        if (docking_job_.id == job_id) {
+          docking_job_.api_accepted = false;
+          docking_job_.docking_service_called = service_observation.service_called;
+          docking_job_.docking_service_success = service_observation.service_success;
+          docking_job_.docking_service_message = service_observation.message;
+          record_undock_status_observation(docking_job_, after_status);
+        }
+      }
       finish_docking_job(job_id, false, "failed", service_detail);
-      return {409, "application/json", error_json(service_detail)};
+      std::string docking_json;
+      {
+        std::lock_guard<std::mutex> lock(docking_job_mutex_);
+        docking_json = docking_job_json_locked();
+      }
+      std::ostringstream response;
+      response << "{\"ok\":false,\"accepted\":false,\"api_accepted\":false,"
+               << "\"already_running\":false,"
+               << "\"docking_service_called\":" << (service_observation.service_called ? "true" : "false") << ","
+               << "\"docking_service_success\":" << (service_observation.service_success ? "true" : "false") << ","
+               << "\"docking_service_message\":" << json_string(service_observation.message) << ","
+               << "\"docking_status_at_request\":" << json_string(runtime.docking_status) << ","
+               << "\"docking_status_after_request\":" << json_string(after_status) << ","
+               << "\"error\":" << json_string(service_detail) << ","
+               << "\"docking\":" << docking_json << "}";
+      return {409, "application/json", response.str()};
     }
+    const auto after_status = runtime_mode_snapshot().docking_status;
     {
       std::lock_guard<std::mutex> lock(docking_job_mutex_);
       if (docking_job_.id == job_id && docking_job_.state == "running") {
-        docking_job_.docking_service_called = true;
+        docking_job_.docking_service_called = service_observation.service_called;
+        docking_job_.docking_service_success = service_observation.service_success;
+        docking_job_.docking_service_message = service_observation.message;
         docking_job_.detail = service_detail;
         docking_job_.last_status = service_detail;
+        record_undock_status_observation(docking_job_, after_status);
+        if (docking_job_.docking_service_success && !docking_job_.undock_started_observed) {
+          docking_job_.docking_service_warning =
+            "service_success_without_undocking_status_observed_yet";
+        }
       }
     }
     set_docking_runtime_state(true, "undocking", service_detail);
 
     std::lock_guard<std::mutex> lock(docking_job_mutex_);
     std::ostringstream response;
-    response << "{\"ok\":true,\"accepted\":true,\"docking\":" << docking_job_json_locked() << "}";
+    response << "{\"ok\":true,\"accepted\":true,"
+             << "\"api_accepted\":true,"
+             << "\"already_running\":false,"
+             << "\"docking_service_called\":" << (docking_job_.docking_service_called ? "true" : "false") << ","
+             << "\"docking_service_success\":" << (docking_job_.docking_service_success ? "true" : "false") << ","
+             << "\"docking_service_message\":" << json_string(docking_job_.docking_service_message) << ","
+             << "\"docking_status_at_request\":" << json_string(docking_job_.docking_status_at_request) << ","
+             << "\"docking_status_after_request\":" << json_string(docking_job_.docking_status_after_request) << ","
+             << "\"undock_started_observed\":"
+             << (docking_job_.undock_started_observed ? "true" : "false") << ","
+             << "\"undock_cmd_count_observed\":" << docking_job_.undock_cmd_count_observed << ","
+             << "\"undock_failure_reason\":" << json_string(docking_job_.undock_failure_reason) << ","
+             << "\"docking_service_warning\":" << json_string(docking_job_.docking_service_warning) << ","
+             << "\"docking\":" << docking_job_json_locked() << "}";
     return {202, "application/json", response.str()};
   }
 
@@ -7685,6 +7860,20 @@ private:
              << "\"can_auto_undock\":" << (dock_check.can_auto_undock ? "true" : "false") << ","
              << "\"auto_undock_reason\":" << json_string(dock_check.auto_undock_reason) << ","
              << "\"last_status\":" << json_string(runtime.docking_status) << ","
+             << "\"api_accepted\":" << (docking_job_.api_accepted ? "true" : "false") << ","
+             << "\"already_running\":" << (docking_job_.already_running ? "true" : "false") << ","
+             << "\"docking_service_called\":"
+             << (docking_job_.docking_service_called ? "true" : "false") << ","
+             << "\"docking_service_success\":"
+             << (docking_job_.docking_service_success ? "true" : "false") << ","
+             << "\"docking_service_message\":" << json_string(docking_job_.docking_service_message) << ","
+             << "\"docking_status_at_request\":" << json_string(docking_job_.docking_status_at_request) << ","
+             << "\"docking_status_after_request\":" << json_string(docking_job_.docking_status_after_request) << ","
+             << "\"undock_started_observed\":"
+             << (docking_job_.undock_started_observed ? "true" : "false") << ","
+             << "\"undock_cmd_count_observed\":" << docking_job_.undock_cmd_count_observed << ","
+             << "\"undock_failure_reason\":" << json_string(docking_job_.undock_failure_reason) << ","
+             << "\"docking_service_warning\":" << json_string(docking_job_.docking_service_warning) << ","
              << "\"pre_navigation_dock_check\":" << dock_check_json << ","
              << "\"docking\":" << docking_job_json_locked() << "}";
     return {200, "application/json", response.str()};
