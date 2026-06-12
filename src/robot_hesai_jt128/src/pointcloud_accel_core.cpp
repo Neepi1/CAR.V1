@@ -1686,7 +1686,9 @@ private:
            << " scan_worker_processed_hz=" << static_cast<double>(scan_processed_delta) / elapsed_sec
            << " scan_worker_scan_publish_hz=" << static_cast<double>(scan_delta) / elapsed_sec
            << " scan_worker_flatscan_publish_hz=0.000"
+           << " scan_worker_rate_hz=" << scan_worker_rate_hz_
            << " scan_worker_last_processing_ms=" << scan_worker_.last_processing_ms
+           << " scan_worker_processing_ms=" << scan_worker_.last_processing_ms
            << " scan_worker_processing_ms_avg=" << scan_processing_ms_avg
            << " scan_worker_processing_ms_max=" << scan_worker_.processing_ms_max
            << " scan_worker_start_source_age_ms=" << scan_worker_.start_source_age_ms

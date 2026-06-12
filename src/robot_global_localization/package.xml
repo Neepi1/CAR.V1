@@ -11,5 +11,6 @@
   <depend>robot_interfaces</depend>
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
+  <depend>tf2_ros</depend>
   <export/>
 </package>

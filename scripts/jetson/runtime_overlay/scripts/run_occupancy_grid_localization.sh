@@ -31,6 +31,16 @@ LOCALIZATION_POINTS_REPAIR_WAIT_SEC="${NJRH_LOCALIZATION_POINTS_REPAIR_WAIT_SEC:
 LOCALIZATION_POINTS_DRIVER_REPAIR="${NJRH_LOCALIZATION_POINTS_DRIVER_REPAIR:-true}"
 MAP_SERVER_READY_TIMEOUT="${NJRH_LOCALIZATION_MAP_SERVER_READY_TIMEOUT:-75}"
 LOCALIZATION_REUSE_READY_STACK="${NJRH_LOCALIZATION_REUSE_READY_STACK:-false}"
+ISAAC_LOCALIZATION_MODE="${NJRH_ISAAC_LOCALIZATION_MODE:-triggered}"
+case "${ISAAC_LOCALIZATION_MODE}" in
+  triggered)
+    ;;
+  *)
+    echo "[runtime-overlay] invalid NJRH_ISAAC_LOCALIZATION_MODE=${ISAAC_LOCALIZATION_MODE}; expected triggered. Isaac continuous localization has been removed; use NJRH_AMCL_LOCALIZATION_MODE=shadow|gated for continuous correction candidates." >&2
+    exit 2
+    ;;
+esac
+LOCALIZER_FLATSCAN_TOPIC="${NJRH_ISAAC_LOCALIZER_FLATSCAN_TOPIC:-/flatscan}"
 
 if [[ -n "${NJRH_FLOOR_ID:-}" || -n "${NAV2_FLOOR_ID:-}" ]]; then
   resolve_floor_assets "${NJRH_BUILDING_ID:-${NAV2_BUILDING_ID:-building_1}}" "${NJRH_FLOOR_ID:-${NAV2_FLOOR_ID:-}}"
@@ -102,6 +112,10 @@ patterns=(
   "jt128_occupancy_localization.launch.py"
   "occupancy_grid_localizer_container"
   "occupancy_grid_localizer"
+  # Stale cleanup only: these names existed before Phase A2 removed the Isaac
+  # continuous-localization path from runtime startup.
+  "continuous_flatscan_forwarder.py"
+  "isaac_continuous_flatscan_forwarder"
   "map_to_odom_tf_bridge"
   "map_server"
   "lifecycle_manager_map"
@@ -169,8 +183,9 @@ else
   launch_args+=(
     "start_map_server:=true"
     "map_frame:=map"
+    "flatscan_topic:=${LOCALIZER_FLATSCAN_TOPIC}"
   )
-  echo "[runtime-overlay] pointcloud accel profile=${NJRH_POINTCLOUD_ACCEL_PROFILE}; occupancy localization reuses /scan and /flatscan from pointcloud_accel_pipeline instead of launching /points_nav legacy sensing" >&2
+  echo "[runtime-overlay] pointcloud accel profile=${NJRH_POINTCLOUD_ACCEL_PROFILE}; occupancy localization reuses /scan and /flatscan from pointcloud_accel_pipeline instead of launching /points_nav legacy sensing; localizer_flatscan_topic=${LOCALIZER_FLATSCAN_TOPIC}" >&2
 fi
 
 wait_for_child_exit() {
@@ -298,6 +313,7 @@ fi
 ensure_resident_local_state_for_localization || exit 1
 start_canonical_helper "robot_localization_bridge" bash "${SCRIPT_DIR}/run_localization_bridge.sh"
 start_overlay_helper "global_localization_localization" bash "${SCRIPT_DIR}/run_global_localization.sh"
+echo "[runtime-overlay] Isaac localization mode=triggered; AMCL owns continuous localization candidates when NJRH_AMCL_LOCALIZATION_MODE=shadow|gated" >&2
 
 ros2 launch "${LAUNCH_FILE}" "${launch_args[@]}" &
 localization_pid=$!

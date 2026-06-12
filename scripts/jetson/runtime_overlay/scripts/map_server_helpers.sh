@@ -30,10 +30,6 @@ map_server_publishing_requested_map() {
   local map_yaml="$1"
   [[ -n "${map_yaml}" ]] || return 1
 
-  if map_server_param_matches_yaml "${map_yaml}"; then
-    return 0
-  fi
-
   map_topic_matches_yaml "${map_yaml}" >/dev/null 2>&1
 }
 

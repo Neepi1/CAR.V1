@@ -135,6 +135,7 @@ kill_navigation_patterns() {
 
 echo "[runtime-overlay] stop floor navigation requested" >&2
 publish_zero
+bash "${SCRIPT_DIR}/run_amcl_shadow_localization.sh" --stop >/dev/null 2>&1 || true
 if [[ "${NJRH_NAV_STOP_LIFECYCLE_SHUTDOWN:-false}" == "true" ]]; then
   lifecycle_shutdown_nav2
 fi

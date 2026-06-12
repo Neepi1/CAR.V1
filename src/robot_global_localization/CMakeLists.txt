@@ -7,6 +7,7 @@ find_package(rclcpp REQUIRED)
 find_package(robot_interfaces REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(tf2_ros REQUIRED)
 
 add_executable(global_localization_node
   src/global_localization_node.cpp
@@ -18,6 +19,7 @@ ament_target_dependencies(global_localization_node
   robot_interfaces
   std_msgs
   std_srvs
+  tf2_ros
 )
 
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})

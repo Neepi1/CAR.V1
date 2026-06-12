@@ -75,7 +75,7 @@ hesai_accel_driver_node:
     worker_scan_enabled: true
     scan_output_topic: /scan
     scan_worker_frame_id: lidar_level_link
-    scan_worker_rate_hz: 9.0
+    scan_worker_rate_hz: 15.0
     scan_worker_min_height: -0.75
     scan_worker_max_height: 0.35
     scan_worker_angle_min: -3.141592653589793

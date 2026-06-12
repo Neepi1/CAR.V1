@@ -7,7 +7,18 @@ robot_global_localization:
     default_floor_id: floor_1
     grid_search_trigger_service: /trigger_grid_search_localization
     service_timeout_sec: 10.0
+    service_call_timeout_sec: 10.0
+    result_wait_timeout_sec: 20.0
+    bridge_accept_timeout_sec: 8.0
+    map_to_odom_wait_timeout_sec: 8.0
+    map_to_odom_max_age_ms: 1000.0
     require_grid_search_trigger: true
+    require_bridge_acceptance: true
+    localization_result_topic: /localization_result
+    bridge_status_topic: /localization/bridge_status
+    bridge_force_accept_service: /robot_localization_bridge/force_accept_next_localization
+    map_frame: map
+    odom_frame: odom
     local_flatscan_config: D:/codespace/car/nav2_test/params/jt128_flatscan.yaml
     local_localizer_config: D:/codespace/car/nav2_test/params/jt128_occupancy_grid_localizer.yaml
     local_localizer_launch: D:/codespace/car/nav2_test/jt128_occupancy_localization.launch.py

@@ -115,6 +115,18 @@ if [[ -f "${LOCAL_STATE_EKF_PROFILE_FILE}" ]]; then
   source "${LOCAL_STATE_EKF_PROFILE_FILE}"
 fi
 
+ISAAC_LOCALIZATION_MODE_FILE="${NJRH_ISAAC_LOCALIZATION_MODE_FILE:-${OVERLAY_ROOT}/config/isaac_localization_mode.env}"
+if [[ -f "${ISAAC_LOCALIZATION_MODE_FILE}" ]]; then
+  # shellcheck source=../config/isaac_localization_mode.env
+  source "${ISAAC_LOCALIZATION_MODE_FILE}"
+fi
+
+AMCL_LOCALIZATION_PROFILE_FILE="${NJRH_AMCL_LOCALIZATION_PROFILE_FILE:-${OVERLAY_ROOT}/config/amcl_localization_profile.env}"
+if [[ -f "${AMCL_LOCALIZATION_PROFILE_FILE}" ]]; then
+  # shellcheck source=../config/amcl_localization_profile.env
+  source "${AMCL_LOCALIZATION_PROFILE_FILE}"
+fi
+
 project_overlay_missing() {
   case ":${AMENT_PREFIX_PATH:-}:" in
     *":${PROJECT_ROOT}/install:"*) return 1 ;;

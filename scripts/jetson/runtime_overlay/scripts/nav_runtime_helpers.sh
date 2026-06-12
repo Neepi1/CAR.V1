@@ -154,6 +154,8 @@ stop_existing_localization_stack() {
     "jt128_occupancy_localization.launch.py"
     "occupancy_grid_localizer_container"
     "occupancy_grid_localizer"
+    "continuous_flatscan_forwarder.py"
+    "isaac_continuous_flatscan_forwarder"
     "map_server"
     "lifecycle_manager_map"
     "laser_scan_to_flatscan"

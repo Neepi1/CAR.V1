@@ -1,5 +1,7 @@
 import importlib.util
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -1545,7 +1547,7 @@ def test_commercial_runtime_architecture_contract_is_documented():
     assert "run_nav2_navigation.sh" in resident_runtime
     assert "resident_navigation_ready" in resident_runtime
     assert "localization stack ready for initial relocalization" in resident_runtime
-    assert "initial localization accepted: localization_result and map->odom are ready" in resident_runtime
+    assert "initial localization accepted: bridge_status.has_map_to_odom=true and map->odom are ready" in resident_runtime
     assert "Nav2 lifecycle and global costmap are ready" in resident_runtime
     assert "navigation_runtime_ready_for_current_floor 3" not in resident_runtime
     assert "wait_for_resident_navigation_runtime_ready" not in resident_runtime
@@ -3085,7 +3087,7 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "navigation readiness failed: map_server_asset" not in commercial_runtime_helpers
     assert "navigation readiness failed: map_topic" not in commercial_runtime_helpers
     assert "write_runtime_map_context \"ready\" \"true\"" in resident_runtime_script
-    assert "resident navigation runtime ready after localization_result, map->odom, and Nav2 activation" in resident_runtime_script
+    assert "resident navigation runtime ready after trigger wrapper, bridge map->odom, and Nav2 activation" in resident_runtime_script
     assert "resident_navigation_ready()" in resident_runtime_script
     assert "navigation_runtime_ready_for_current_floor 3" not in resident_runtime_script
     assert "wait_for_resident_navigation_runtime_ready()" not in resident_runtime_script
@@ -3098,13 +3100,21 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert 'wait_for_ros_service "/trigger_grid_search_localization"' in resident_runtime_script
     assert 'wait_for_topic_message "/flatscan" "${flatscan_timeout}"' in resident_runtime_script
     assert 'NJRH_INITIAL_LOCALIZATION_FLATSCAN_MAX_AGE_SEC' not in resident_runtime_script
-    assert 'wait_for_fresh_header_topic_message \\' in resident_runtime_script
-    assert '"/localization_result"' in resident_runtime_script
+    assert "wait_for_bridge_has_map_to_odom()" in resident_runtime_script
+    assert "trigger_output_reports_map_to_odom_ready()" in resident_runtime_script
+    assert "wrapper already verified bridge map->odom readiness" in resident_runtime_script
+    assert "map->odom ready owner=robot_localization_bridge" in resident_runtime_script
+    assert "bridge_status.has_map_to_odom=true was not observed" in resident_runtime_script
+    assert "map->odom TF was not published after bridge acceptance" in resident_runtime_script
+    assert "BRIDGE_ACCEPT_TIMEOUT" in resident_runtime_script
+    assert "BRIDGE_REJECTED_RESULT" in resident_runtime_script
+    assert "MAP_TO_ODOM_WRONG_OWNER" in resident_runtime_script
+    assert 'wait_for_fresh_header_topic_message \\' not in resident_runtime_script
     assert 'wait_for_tf_transform "map" "odom"' in resident_runtime_script
     assert 'wait_for_global_costmap_static "${costmap_timeout}"' in resident_runtime_script
     assert "trigger_global_localization_for_navigation()" in resident_runtime_script
     assert "NJRH_GLOBAL_LOCALIZATION_TRIGGER_RECHECK_TIMEOUT:-30" not in resident_runtime_script
-    assert "NJRH_GLOBAL_LOCALIZATION_TRIGGER_CALL_TIMEOUT:-15" in resident_runtime_script
+    assert "NJRH_GLOBAL_LOCALIZATION_TRIGGER_CALL_TIMEOUT:-60" in resident_runtime_script
     assert "resident_navigation_start:${NJRH_BUILDING_ID}/${NJRH_FLOOR_ID}" in resident_runtime_script
     assert "resident localization layer already owns map/localizer loading" in resident_runtime_script
     assert (
@@ -3114,8 +3124,9 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "resume_navigation: true}" not in resident_runtime_script
     resident_runtime_startup = resident_runtime_script.split('write_runtime_map_context "starting"', 1)[1]
     assert "ensure_localization_stack_ready_for_navigation ||" in resident_runtime_startup
-    assert "localization_result was not observed after global localization trigger" in resident_runtime_script
-    assert "map->odom was not published after localization_result" in resident_runtime_script
+    assert 'ensure_map_server_active "${NAV2_MAP_YAML:-}" "${map_server_timeout}"' in resident_runtime_script
+    assert "MAP_SERVER_NOT_ACTIVE" in resident_runtime_script
+    assert "initial global localization did not pass trigger wrapper, bridge, and map->odom gates" in resident_runtime_script
     assert resident_runtime_startup.index("/floor_manager/switch_floor") < resident_runtime_startup.index(
         "trigger_global_localization_for_navigation"
     )
@@ -3198,7 +3209,7 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "mapping_state" in app_doc
     assert "resume_navigation" in app_doc
     assert "start the occupancy localization stack" in app_doc
-    assert "startup waits for the initial localization_result and map -> odom" in app_doc
+    assert "startup waits for the trigger wrapper to report a bridge-accepted `map -> odom`" in app_doc
     assert "run_occupancy_grid_localization.sh" in resident_runtime_script
     assert "run_nav2_navigation.sh" in resident_runtime_script
     assert "/floor_manager/switch_floor" in resident_runtime_script
@@ -3209,13 +3220,16 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "/trigger_grid_search_localization" in resident_runtime_script
     assert "trigger_global_localization_and_wait_for_result" not in resident_runtime_script
     assert "pre-armed localization_result subscribers" not in resident_runtime_script
-    assert 'local call_timeout="${NJRH_GLOBAL_LOCALIZATION_TRIGGER_CALL_TIMEOUT:-15}"' in resident_runtime_script
-    assert 'local result_timeout="${NJRH_INITIAL_LOCALIZATION_RESULT_WAIT_SEC:-30}"' in resident_runtime_script
-    assert "global localization trigger dispatch call did not complete" in resident_runtime_script
-    assert "still requiring localization_result/map->odom" in resident_runtime_script
-    assert "localization_result was not observed after global localization trigger" in resident_runtime_script
+    assert 'local call_timeout="${NJRH_GLOBAL_LOCALIZATION_TRIGGER_CALL_TIMEOUT:-60}"' in resident_runtime_script
+    assert 'local bridge_timeout="${NJRH_INITIAL_LOCALIZATION_BRIDGE_ACCEPT_WAIT_SEC:-25}"' in resident_runtime_script
+    assert 'local tf_timeout="${NJRH_INITIAL_LOCALIZATION_MAP_ODOM_WAIT_SEC:-20}"' in resident_runtime_script
+    assert "global localization wrapper accepted" in resident_runtime_script
+    assert "trigger_output_reports_map_to_odom_ready" in resident_runtime_script
+    assert "wrapper already verified bridge map->odom readiness" in resident_runtime_script
+    assert "bridge_status.has_map_to_odom=true was not observed" in resident_runtime_script
+    assert "map->odom TF was not published after bridge acceptance" in resident_runtime_script
     assert 'NJRH_GLOBAL_LOCALIZATION_TRIGGER_FALLBACK_TF_TIMEOUT:-20' not in resident_runtime_script
-    assert "requesting global localization and waiting for localization_result/map->odom" in resident_runtime_script
+    assert "requesting global localization through wrapper and waiting for bridge/map->odom" in resident_runtime_script
     assert "starting resident Nav2 layer" in resident_runtime_script
     assert "runtime_ready=0" in resident_runtime_script
     assert "write_runtime_map_context \"failed\" \"false\"" in resident_runtime_script
@@ -3224,7 +3238,10 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "grid_search_trigger_service" in global_localization_node
     assert "MultiThreadedExecutor" in global_localization_node
     assert "async_send_request" in global_localization_node
-    assert "grid search localization trigger dispatched" in global_localization_node
+    assert "wait_for_bridge_acceptance" in global_localization_node
+    assert "wait_for_map_to_odom" in global_localization_node
+    assert "failure_code=BRIDGE_ACCEPT_TIMEOUT" in global_localization_node
+    assert "failure_code=MAP_TO_ODOM_TIMEOUT" in global_localization_node
     assert "done.wait" not in global_localization_node
     assert "mock_localizer_ready" in global_localization_node
     assert "localizer_waiting_for_grid_search" in global_localization_node
@@ -3293,6 +3310,8 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "runtime_readiness_probe map-topic-matches-yaml" in map_server_helpers
     assert "runtime_readiness_probe occupancy-grid" in map_server_helpers
     assert "NJRH_MAP_TOPIC_MATCH_TIMEOUT_SEC:-8.0" in map_server_helpers
+    map_publishing_body = map_server_helpers.split("map_server_publishing_requested_map()", 1)[1].split("ensure_map_server_active()", 1)[0]
+    assert "map_server_param_matches_yaml" not in map_publishing_body
     assert "requested map is already published on /map; continuing without waiting for /map_server discovery" in map_server_helpers
     assert "/map_server node discovery unavailable, but requested map is being published; continuing" in map_server_helpers
     assert "timeout 3 ros2 lifecycle get /map_server" in map_server_helpers
@@ -5535,6 +5554,10 @@ def test_phase115_flatscan_lifecycle_hardening_contracts():
 
     assert "start_flatscan_helper()" in run_pipeline
     assert "flatscan_helper_running()" in run_pipeline
+    assert "restart_flatscan_helper_or_fail()" in run_pipeline
+    assert "wait_for_scan_ready()" in run_pipeline
+    assert "helper_bin=\"${helper_prefix}/lib/jt128_nav_tools/laser_scan_to_flatscan\"" in run_pipeline
+    assert "ros2 run jt128_nav_tools laser_scan_to_flatscan" not in run_pipeline
     assert "wait_for_flatscan_ready()" in run_pipeline
     assert "supervise_flatscan_helper()" in run_pipeline
     assert "stop_flatscan_helper()" in run_pipeline
@@ -5542,10 +5565,11 @@ def test_phase115_flatscan_lifecycle_hardening_contracts():
     assert "NJRH_FLATSCAN_HELPER_RESTART" in run_pipeline
     assert "NJRH_FLATSCAN_HELPER_MAX_RESTARTS" in run_pipeline
     assert "NJRH_FLATSCAN_HELPER_RESTART_BACKOFF_SEC" in run_pipeline
-    assert "NJRH_FLATSCAN_WAIT_SEC" in run_pipeline
+    assert 'FLATSCAN_WAIT_SEC="${NJRH_FLATSCAN_WAIT_SEC:-30}"' in run_pipeline
     assert "NJRH_FLATSCAN_MIN_HZ" in run_pipeline
     assert "FLATSCAN_HELPER_RESTART_COUNT" in run_pipeline
     assert "CASE_FLATSCAN_HELPER_DEAD" in run_pipeline
+    assert "standalone /scan exists but /flatscan publisher is missing while laser_scan_to_flatscan pid=" in run_pipeline
     assert "legacy_scan_pid=$!" in run_pipeline
     assert 'flatscan_helper_mode="legacy_launch"' in run_pipeline
     assert 'flatscan_helper_mode="standalone"' in run_pipeline
@@ -5583,6 +5607,253 @@ def test_phase115_flatscan_lifecycle_hardening_contracts():
 
     assert "global_frame: odom" in nav2
     assert "global_frame: base_link" not in nav2
+
+
+def test_phase_a2_amcl_replaces_isaac_continuous_localization_contracts():
+    overlay = ROOT / "scripts" / "jetson" / "runtime_overlay"
+    config_dir = overlay / "config"
+    scripts_dir = overlay / "scripts"
+    bridge_dir = ROOT / "src" / "robot_localization_bridge"
+    global_dir = ROOT / "src" / "robot_global_localization"
+
+    accel_cfg = (config_dir / "pointcloud_accel_axis.yaml").read_text(encoding="utf-8")
+    hesai_accel_cfg = (config_dir / "hesai_accel_driver.yaml").read_text(encoding="utf-8")
+    mode_env = (config_dir / "isaac_localization_mode.env").read_text(encoding="utf-8")
+    amcl_mode = (config_dir / "amcl_localization_profile.env").read_text(encoding="utf-8")
+    common_env = (scripts_dir / "common_env.sh").read_text(encoding="utf-8")
+    run_localizer = (scripts_dir / "run_occupancy_grid_localization.sh").read_text(encoding="utf-8")
+    run_bridge = (scripts_dir / "run_localization_bridge.sh").read_text(encoding="utf-8")
+    nav_runtime = (scripts_dir / "run_navigation_runtime_services.sh").read_text(encoding="utf-8")
+    commercial_helpers = (scripts_dir / "commercial_runtime_helpers.sh").read_text(encoding="utf-8")
+    nav_helpers = (scripts_dir / "nav_runtime_helpers.sh").read_text(encoding="utf-8")
+    bridge_cfg = (config_dir / "localization_bridge.yaml").read_text(encoding="utf-8")
+    bridge_src_cfg = (bridge_dir / "config" / "localization_bridge.yaml").read_text(encoding="utf-8")
+    bridge_cpp = (bridge_dir / "src" / "localization_bridge_node.cpp").read_text(encoding="utf-8")
+    global_cfg = (global_dir / "config" / "global_localization.yaml").read_text(encoding="utf-8")
+    global_cpp = (global_dir / "src" / "global_localization_node.cpp").read_text(encoding="utf-8")
+    global_cmake = (global_dir / "CMakeLists.txt").read_text(encoding="utf-8")
+    global_pkg = (global_dir / "package.xml").read_text(encoding="utf-8")
+    nav2 = (config_dir / "nav2.yaml").read_text(encoding="utf-8")
+
+    assert "scan_worker_rate_hz: 15.0" in accel_cfg
+    assert "scan_worker_rate_hz: 15.0" in hesai_accel_cfg
+    assert "output_topic: /lidar_points" in accel_cfg
+    assert "obstacle_output_topic: /perception/obstacle_points" in accel_cfg
+    assert "input_reliable: false" in accel_cfg
+    assert "output_reliable: false" in accel_cfg
+    assert "rmw_cyclonedds_cpp" not in common_env
+    assert 'export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"' in common_env
+
+    assert "NJRH_ISAAC_LOCALIZATION_MODE:-triggered" in mode_env
+    assert "NJRH_ISAAC_CONTINUOUS" not in mode_env
+    assert "NJRH_AMCL_LOCALIZATION_MODE:-gated" in amcl_mode
+    assert "NJRH_ISAAC_LOCALIZATION_MODE_FILE" in common_env
+    assert "isaac_localization_mode.env" in common_env
+    assert "amcl_localization_profile.env" in common_env
+    assert "continuous_localization_mode: triggered" in bridge_cfg
+    assert "continuous_localization_mode: triggered" in bridge_src_cfg
+    assert "triggered_max_result_age_ms: 5000.0" in bridge_cfg
+    assert "triggered_max_result_age_ms: 5000.0" in bridge_src_cfg
+    assert "continuous_max_result_age_ms:" not in bridge_cfg
+    assert "continuous_max_result_age_ms:" not in bridge_src_cfg
+    assert "triggered_allow_large_correction: true" in bridge_cfg
+    assert "continuous_allow_large_correction:" not in bridge_cfg
+
+    assert not (scripts_dir / "continuous_flatscan_forwarder.py").exists()
+    assert not (scripts_dir / "verify_isaac_continuous_localization.sh").exists()
+    assert not (ROOT / "docs" / "phase_l1_isaac_continuous_localization.md").exists()
+    assert "python3 \"${SCRIPT_DIR}/continuous_flatscan_forwarder.py\"" not in run_localizer
+    assert "starting Isaac continuous localization forwarder" not in run_localizer
+    assert "LOCALIZER_FLATSCAN_TOPIC" in run_localizer
+    assert "NJRH_ISAAC_LOCALIZER_FLATSCAN_TOPIC:-/flatscan" in run_localizer
+    assert "NJRH_ISAAC_CONTINUOUS_LOCALIZATION_INPUT_TOPIC" not in run_localizer
+    assert "flatscan_topic:=${LOCALIZER_FLATSCAN_TOPIC}" in run_localizer
+    assert "localizer_flatscan_topic=${LOCALIZER_FLATSCAN_TOPIC}" in run_localizer
+    assert "expected triggered." in run_localizer
+    assert 'DeclareLaunchArgument("flatscan_topic", default_value="/flatscan")' in (
+        overlay / "launch" / "occupancy_localization.launch.py"
+    ).read_text(encoding="utf-8")
+    assert '("flatscan", flatscan_topic)' in (overlay / "launch" / "occupancy_localization.launch.py").read_text(
+        encoding="utf-8"
+    )
+    assert "continuous_flatscan_forwarder.py" in nav_helpers
+    assert 'continuous_localization_mode:=triggered' in run_bridge
+    assert "AMCL_INPUT_ENABLED=\"true\"" in run_bridge
+    assert "amcl_input_enabled:=${AMCL_INPUT_ENABLED}" in run_bridge
+
+    assert "lookupTransform(odom_frame_, base_frame_, stamp" in bridge_cpp
+    assert "lookupTransform(odom_frame_, base_frame_, latest_tf_time" in bridge_cpp
+    assert "odom_base_latest_tf_stale_ms" in bridge_cpp
+    assert "map_to_odom_x" in bridge_cpp
+    assert "map_to_odom_y" in bridge_cpp
+    assert "continuous_localization_mode_" in bridge_cpp
+    assert "triggered_max_result_age_ms_" in bridge_cpp
+    assert "mark_latest_pose_stamp_used" in bridge_cpp
+    assert "candidate_should_retry_later" in bridge_cpp
+    assert "EXPLICIT_TRIGGERED_RELOCALIZATION" in bridge_cpp
+    assert "force_accept_next_pose_" in bridge_cpp
+    assert "map_to_odom_publisher_owner" in bridge_cpp
+    assert "robot_localization_bridge" in bridge_cpp
+    assert "isaac_background_correction_removed" in bridge_cpp
+    assert "continuous_shadow" not in bridge_cpp
+    assert "continuous_gated" not in bridge_cpp
+    assert "isaac_continuous" not in bridge_cpp
+    assert "gate_mode" in bridge_cpp
+    assert "last_result_age_ms" in bridge_cpp
+    assert "gate_result_age_limit_ms" in bridge_cpp
+    assert "last_accept_reason" in bridge_cpp
+    assert "last_result_used_original_stamp" in bridge_cpp
+    assert "last_odom_tf_history_lookup_ok" in bridge_cpp
+    assert "latest_odom_tf_age_ms" in bridge_cpp
+    assert "triggered_result_count" in bridge_cpp
+    assert "rejected_result_count" in bridge_cpp
+    assert "last_reject_reason" in bridge_cpp
+    assert "accepted_result_hz" in bridge_cpp
+    assert "on_amcl_pose" in bridge_cpp
+    assert "accept_amcl_candidate" in bridge_cpp
+
+    assert "service_call_timeout_sec: 10.0" in global_cfg
+    assert "result_wait_timeout_sec: 20.0" in global_cfg
+    assert "bridge_accept_timeout_sec: 8.0" in global_cfg
+    assert "map_to_odom_wait_timeout_sec: 8.0" in global_cfg
+    assert "bridge_status_topic: /localization/bridge_status" in global_cfg
+    assert "bridge_force_accept_service: /robot_localization_bridge/force_accept_next_localization" in global_cfg
+    assert "bridge_status_sub_" in global_cpp
+    assert "localization_result_sub_" in global_cpp
+    assert "find_package(tf2_ros REQUIRED)" in global_cmake
+    assert "tf2_ros" in global_cmake
+    assert "<depend>tf2_ros</depend>" in global_pkg
+    assert "wait_for_bridge_acceptance" in global_cpp
+    assert "wait_for_map_to_odom" in global_cpp
+    assert "failure_code=ISAAC_SERVICE_TIMEOUT" in global_cpp
+    assert "failure_code=LOCALIZATION_RESULT_TIMEOUT" in global_cpp
+    assert "failure_code=BRIDGE_ACCEPT_TIMEOUT" in global_cpp
+    assert "failure_code=MAP_TO_ODOM_TIMEOUT" in global_cpp
+    assert "failure_code=MAP_TO_ODOM_WRONG_OWNER" in global_cpp
+    assert "failure_code=TF_HISTORY_MISSING" in global_cpp
+    assert "restamp" not in global_cpp.lower()
+
+    assert "wait_for_bridge_has_map_to_odom" in nav_runtime
+    assert "start_amcl_if_enabled_for_navigation" in nav_runtime
+    assert "wait_for_fresh_header_topic_message" not in nav_runtime
+    assert "NJRH_GLOBAL_LOCALIZATION_TRIGGER_CALL_TIMEOUT:-60" in nav_runtime
+    assert "GLOBAL_LOCALIZATION_TRIGGER_TIMEOUT" in nav_runtime
+    assert "LOCALIZATION_RESULT_TIMEOUT" in nav_runtime
+    assert "MAP_TO_ODOM_TIMEOUT" in nav_runtime
+    assert "NJRH_RUNTIME_LAST_TRIGGERED_RELOCALIZATION_OK" in nav_runtime
+    assert "NJRH_RUNTIME_MAP_TO_ODOM_AGE_MS" in nav_runtime
+    assert "failure_code" in commercial_helpers
+
+    assert "MPPIController" in nav2
+    assert "SmacPlanner2D" in nav2
+    assert "global_frame: odom" in local_costmap_config_block(nav2)
+    assert "global_frame: base_link" not in local_costmap_config_block(nav2)
+    assert "FAST-LIO2" not in run_bridge
+
+
+def test_phase_a1_amcl_shadow_localization_contracts():
+    overlay = ROOT / "scripts" / "jetson" / "runtime_overlay"
+    config_dir = overlay / "config"
+    scripts_dir = overlay / "scripts"
+    bridge_dir = ROOT / "src" / "robot_localization_bridge"
+
+    amcl_cfg_path = config_dir / "amcl_shadow.yaml"
+    amcl_mode_path = config_dir / "amcl_localization_profile.env"
+    amcl_runner_path = scripts_dir / "run_amcl_shadow_localization.sh"
+    amcl_verify_path = scripts_dir / "verify_amcl_shadow_localization.sh"
+    assert amcl_cfg_path.exists()
+    assert amcl_mode_path.exists()
+    assert amcl_runner_path.exists()
+    assert amcl_verify_path.exists()
+
+    amcl_cfg = amcl_cfg_path.read_text(encoding="utf-8")
+    amcl_mode = amcl_mode_path.read_text(encoding="utf-8")
+    amcl_runner = amcl_runner_path.read_text(encoding="utf-8")
+    amcl_verify = amcl_verify_path.read_text(encoding="utf-8")
+    common_env = (scripts_dir / "common_env.sh").read_text(encoding="utf-8")
+    run_bridge = (scripts_dir / "run_localization_bridge.sh").read_text(encoding="utf-8")
+    nav_runtime = (scripts_dir / "run_navigation_runtime_services.sh").read_text(encoding="utf-8")
+    stop_nav = (scripts_dir / "stop_floor_navigation.sh").read_text(encoding="utf-8")
+    bridge_cfg = (config_dir / "localization_bridge.yaml").read_text(encoding="utf-8")
+    bridge_src_cfg = (bridge_dir / "config" / "localization_bridge.yaml").read_text(encoding="utf-8")
+    bridge_cpp = (bridge_dir / "src" / "localization_bridge_node.cpp").read_text(encoding="utf-8")
+    nav2 = (config_dir / "nav2.yaml").read_text(encoding="utf-8")
+
+    assert "tf_broadcast: false" in amcl_cfg
+    assert "scan_topic: /scan" in amcl_cfg
+    assert "scan_topic: /flatscan" not in amcl_cfg
+    assert "map_topic: /map" in amcl_cfg
+    assert "set_initial_pose: false" in amcl_cfg
+    assert "nav2_amcl::DifferentialMotionModel" in amcl_cfg
+
+    assert "NJRH_AMCL_LOCALIZATION_MODE:-gated" in amcl_mode
+    assert "disabled|shadow|gated" in amcl_runner
+    assert "ros2 run nav2_amcl amcl" in amcl_runner
+    assert "tf_broadcast=false" in amcl_verify
+    assert "AMCL has a /tf endpoint" in amcl_verify
+    assert "sensor_msgs/msg/LaserScan" in amcl_verify
+    assert "/flatscan" in amcl_verify
+    assert "verify_amcl_bridge_status_once" in amcl_verify
+    assert "rclpy.spin_once" in amcl_verify
+    assert "run_amcl_shadow_localization.sh" in stop_nav
+    assert "killall -9" not in amcl_runner
+    assert "killall -9" not in amcl_verify
+    assert "pkill -9" not in amcl_runner
+    assert "pkill -9" not in amcl_verify
+
+    assert "amcl_localization_profile.env" in common_env
+    assert "NJRH_AMCL_LOCALIZATION_MODE" in run_bridge
+    assert "amcl_input_enabled:=${AMCL_INPUT_ENABLED}" in run_bridge
+    assert "amcl_gate_mode:=${AMCL_GATE_MODE}" in run_bridge
+    assert "start_amcl_if_enabled_for_navigation" in nav_runtime
+    assert "initial localization accepted" in nav_runtime
+    assert "AMCL continuous localization candidate" in nav_runtime
+
+    for cfg in (bridge_cfg, bridge_src_cfg):
+        assert "amcl_pose_topic: /amcl_pose" in cfg
+        assert "amcl_input_enabled: false" in cfg
+        assert "amcl_gate_mode: shadow" in cfg
+        assert "amcl_max_result_age_ms: 500.0" in cfg
+        assert "amcl_small_correction_translation_m: 0.20" in cfg
+        assert "amcl_small_correction_yaw_rad: 0.20" in cfg
+        assert "amcl_max_xy_covariance: 1.0" in cfg
+        assert "amcl_max_yaw_covariance: 0.5" in cfg
+        assert "amcl_seed_service: /robot_localization_bridge/seed_amcl_initial_pose" in cfg
+
+    assert "on_amcl_pose" in bridge_cpp
+    assert "amcl_pose_topic_" in bridge_cpp
+    assert "accept_amcl_candidate" in bridge_cpp
+    assert "AMCL_SMALL_CORRECTION" in bridge_cpp
+    assert "amcl_shadow_only" in bridge_cpp
+    assert "amcl_large_consistent_requires_isaac_recovery" in bridge_cpp
+    assert "_covariance_rejected" in bridge_cpp
+    assert "on_amcl_seed_request" in bridge_cpp
+    assert "amcl_initial_pose_pub_" in bridge_cpp
+    assert "active_correction_source" in bridge_cpp
+    assert "last_accepted_source" in bridge_cpp
+    assert "last_rejected_source" in bridge_cpp
+    assert "isaac_triggered" in bridge_cpp
+    assert "amcl_gated" in bridge_cpp
+    assert "amcl_shadow" in bridge_cpp
+    assert "lookupTransform(odom_frame_, base_frame_, stamp" in bridge_cpp
+    assert "tf_broadcaster_->sendTransform(tf)" in bridge_cpp
+
+    assert "MPPIController" in nav2
+    assert "SmacPlanner2D" in nav2
+    assert "global_frame: odom" in local_costmap_config_block(nav2)
+    assert "global_frame: base_link" not in local_costmap_config_block(nav2)
+
+    bash = shutil.which("bash")
+    if bash:
+        bash_probe = subprocess.run(
+            [bash, "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if bash_probe.returncode == 0:
+            subprocess.run([bash, "-n", str(amcl_runner_path)], check=True)
+            subprocess.run([bash, "-n", str(amcl_verify_path)], check=True)
 
 
 def test_phase24a_local_costmap_timestamp_audit_contracts():

@@ -53,6 +53,24 @@ data = {
     "floor_id": os.environ.get("NJRH_MAP_CONTEXT_FLOOR_ID") or os.environ.get("NJRH_FLOOR_ID", ""),
     "updated_at": time.time(),
 }
+for key, env_key in (
+    ("failure_code", "NJRH_RUNTIME_FAILURE_CODE"),
+    ("localization_mode", "NJRH_RUNTIME_LOCALIZATION_MODE"),
+    ("last_triggered_relocalization_ok", "NJRH_RUNTIME_LAST_TRIGGERED_RELOCALIZATION_OK"),
+    ("map_to_odom_age_ms", "NJRH_RUNTIME_MAP_TO_ODOM_AGE_MS"),
+):
+    value = os.environ.get(env_key, "")
+    if value == "":
+        continue
+    if key == "last_triggered_relocalization_ok":
+        data[key] = value.lower() in ("1", "true", "yes", "on")
+    elif key == "map_to_odom_age_ms":
+        try:
+            data[key] = float(value)
+        except ValueError:
+            data[key] = value
+    else:
+        data[key] = value
 os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 tmp_path = f"{path}.{os.getpid()}.tmp"
 try:

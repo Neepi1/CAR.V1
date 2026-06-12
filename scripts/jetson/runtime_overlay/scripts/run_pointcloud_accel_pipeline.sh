@@ -17,7 +17,7 @@ FLATSCAN_HELPER_REQUIRED="${NJRH_FLATSCAN_HELPER_REQUIRED:-true}"
 FLATSCAN_HELPER_RESTART="${NJRH_FLATSCAN_HELPER_RESTART:-true}"
 FLATSCAN_HELPER_MAX_RESTARTS="${NJRH_FLATSCAN_HELPER_MAX_RESTARTS:-5}"
 FLATSCAN_HELPER_RESTART_BACKOFF_SEC="${NJRH_FLATSCAN_HELPER_RESTART_BACKOFF_SEC:-1.0}"
-FLATSCAN_WAIT_SEC="${NJRH_FLATSCAN_WAIT_SEC:-10}"
+FLATSCAN_WAIT_SEC="${NJRH_FLATSCAN_WAIT_SEC:-30}"
 FLATSCAN_MIN_HZ="${NJRH_FLATSCAN_MIN_HZ:-5.0}"
 FLATSCAN_SUPERVISE_PERIOD_SEC="${NJRH_FLATSCAN_SUPERVISE_PERIOD_SEC:-5.0}"
 FLATSCAN_STATUS_FILE="${NJRH_FLATSCAN_HELPER_STATUS_FILE:-${NJRH_RUNTIME_LOG_DIR}/flatscan_helper_status.env}"
@@ -162,17 +162,32 @@ stop_flatscan_helper() {
 }
 
 start_flatscan_helper() {
-  if ! ros2 pkg prefix jt128_nav_tools >/dev/null 2>&1; then
+  local helper_prefix
+  local helper_bin
+  if ! helper_prefix="$(ros2 pkg prefix jt128_nav_tools 2>/dev/null)"; then
     echo "[pointcloud-accel] FAIL jt128_nav_tools laser_scan_to_flatscan is unavailable; /scan may publish but /flatscan cannot be restored" >&2
+    return 1
+  fi
+  helper_bin="${helper_prefix}/lib/jt128_nav_tools/laser_scan_to_flatscan"
+  if [[ ! -x "${helper_bin}" ]]; then
+    echo "[pointcloud-accel] FAIL jt128_nav_tools laser_scan_to_flatscan binary missing or not executable: ${helper_bin}" >&2
     return 1
   fi
   echo "[pointcloud-accel] starting supervised laser_scan_to_flatscan helper" >&2
   njrh_start_affined_background flatscan_pid laser_scan_to_flatscan \
-    ros2 run jt128_nav_tools laser_scan_to_flatscan \
+    "${helper_bin}" \
     --ros-args --params-file "${FLATSCAN_PARAMS}" \
     -r scan:=/scan -r flatscan:=/flatscan
   flatscan_helper_mode="standalone"
   write_flatscan_helper_status
+}
+
+wait_for_scan_ready() {
+  if runtime_readiness_probe topic /scan "${FLATSCAN_WAIT_SEC}"; then
+    return 0
+  fi
+  echo "[pointcloud-accel] FAIL /scan publisher is not ready; /flatscan helper startup is blocked" >&2
+  return 1
 }
 
 wait_for_flatscan_ready() {
@@ -191,6 +206,21 @@ wait_for_flatscan_ready() {
   flatscan_hz_ok
 }
 
+restart_flatscan_helper_or_fail() {
+  local reason="$1"
+  flatscan_helper_restart_count=$((flatscan_helper_restart_count + 1))
+  write_flatscan_helper_status
+  if ! truthy "${FLATSCAN_HELPER_RESTART}" || [[ "${flatscan_helper_restart_count}" -gt "${FLATSCAN_HELPER_MAX_RESTARTS}" ]]; then
+    echo "[pointcloud-accel] FAIL ${reason}; restart=${FLATSCAN_HELPER_RESTART} count=${flatscan_helper_restart_count} max=${FLATSCAN_HELPER_MAX_RESTARTS}" >&2
+    return 1
+  fi
+  echo "[pointcloud-accel] WARN ${reason}; restarting laser_scan_to_flatscan count=${flatscan_helper_restart_count}/${FLATSCAN_HELPER_MAX_RESTARTS}" >&2
+  stop_flatscan_helper || true
+  sleep "${FLATSCAN_HELPER_RESTART_BACKOFF_SEC}"
+  start_flatscan_helper || return 1
+  wait_for_flatscan_ready || return 1
+}
+
 supervise_flatscan_helper() {
   if ! truthy "${FLATSCAN_HELPER_REQUIRED}"; then
     wait "${driver_pid}"
@@ -201,16 +231,14 @@ supervise_flatscan_helper() {
     case "${flatscan_helper_mode}" in
       standalone)
         if ! flatscan_helper_running; then
-          flatscan_helper_restart_count=$((flatscan_helper_restart_count + 1))
-          write_flatscan_helper_status
-          if ! truthy "${FLATSCAN_HELPER_RESTART}" || [[ "${flatscan_helper_restart_count}" -gt "${FLATSCAN_HELPER_MAX_RESTARTS}" ]]; then
-            echo "[pointcloud-accel] FAIL laser_scan_to_flatscan exited; restart=${FLATSCAN_HELPER_RESTART} count=${flatscan_helper_restart_count} max=${FLATSCAN_HELPER_MAX_RESTARTS}" >&2
+          restart_flatscan_helper_or_fail "laser_scan_to_flatscan exited" || return 1
+        elif ! flatscan_publisher_exists; then
+          if scan_publisher_exists; then
+            restart_flatscan_helper_or_fail "CASE_FLATSCAN_HELPER_DEAD: standalone /scan exists but /flatscan publisher is missing while laser_scan_to_flatscan pid=${flatscan_pid} is still alive" || return 1
+          else
+            echo "[pointcloud-accel] FAIL standalone scan chain lost /flatscan and /scan publisher is not ready" >&2
             return 1
           fi
-          echo "[pointcloud-accel] WARN laser_scan_to_flatscan exited; restarting count=${flatscan_helper_restart_count}/${FLATSCAN_HELPER_MAX_RESTARTS}" >&2
-          sleep "${FLATSCAN_HELPER_RESTART_BACKOFF_SEC}"
-          start_flatscan_helper || return 1
-          wait_for_flatscan_ready || return 1
         fi
         ;;
       legacy_launch)
@@ -326,6 +354,7 @@ case "${PROFILE}" in
         NJRH_FORCE_RESTART_DRIVER="${NJRH_FORCE_RESTART_DRIVER:-false}" \
         bash "${SCRIPT_DIR}/run_driver.sh" &
       driver_pid=$!
+      wait_for_scan_ready
       start_flatscan_helper
       echo "[pointcloud-accel] final topology: hesai_accel_driver_node decodes JT128 and feeds PointCloudAccelCore in-process; /jt128/vendor/points_raw is debug-only; /scan -> /flatscan helper remains supervised" >&2
     else
@@ -335,6 +364,7 @@ case "${PROFILE}" in
         NJRH_FORCE_RESTART_DRIVER="${NJRH_FORCE_RESTART_DRIVER:-false}" \
         bash "${SCRIPT_DIR}/run_driver.sh" &
       driver_pid=$!
+      wait_for_scan_ready
       start_flatscan_helper
       echo "[pointcloud-accel] final topology: /lidar_points full trunk; pointcloud_accel_axis_node workers publish /perception/* and /scan; /_internal/lidar_points_local and /lidar_points_nav are compact debug/compat only; /points_nav is not production" >&2
     fi
@@ -352,6 +382,7 @@ case "${PROFILE}" in
       NJRH_FORCE_RESTART_DRIVER="${NJRH_FORCE_RESTART_DRIVER:-false}" \
       bash "${SCRIPT_DIR}/run_driver.sh" &
     driver_pid=$!
+    wait_for_scan_ready
     start_flatscan_helper
     echo "[pointcloud-accel] final topology: /lidar_points full trunk; NITROS navigation-branch skeleton guarded by environment check; ROS /perception/* and /scan outputs remain compatible" >&2
     ;;

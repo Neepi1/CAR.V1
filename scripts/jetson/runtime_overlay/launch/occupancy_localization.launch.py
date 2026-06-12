@@ -32,6 +32,7 @@ def generate_launch_description():
     map_yaml = LaunchConfiguration("map_yaml")
     localizer_map_yaml = LaunchConfiguration("localizer_map_yaml")
     localizer_params = LaunchConfiguration("localizer_params")
+    flatscan_topic = LaunchConfiguration("flatscan_topic")
     use_sim_time = LaunchConfiguration("use_sim_time")
     start_map_server = LaunchConfiguration("start_map_server")
     map_frame = LaunchConfiguration("map_frame")
@@ -77,7 +78,7 @@ def generate_launch_description():
             },
         ],
         remappings=[
-            ("flatscan", "/flatscan"),
+            ("flatscan", flatscan_topic),
             ("localization_result", "/localization_result"),
         ],
     )
@@ -96,6 +97,7 @@ def generate_launch_description():
         DeclareLaunchArgument("map_yaml", default_value=str(map_yaml_default)),
         DeclareLaunchArgument("localizer_map_yaml", default_value=str(map_yaml_default)),
         DeclareLaunchArgument("localizer_params", default_value=str(localizer_params_default)),
+        DeclareLaunchArgument("flatscan_topic", default_value="/flatscan"),
         DeclareLaunchArgument("use_sim_time", default_value="false"),
         DeclareLaunchArgument("start_map_server", default_value="true"),
         DeclareLaunchArgument("map_frame", default_value="map"),
