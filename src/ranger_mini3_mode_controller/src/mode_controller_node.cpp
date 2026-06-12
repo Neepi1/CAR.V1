@@ -1,18 +1,29 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include "geometry_msgs/msg/twist.hpp"
+#include "ranger_mini3_mode_controller/ranger_motion_mode.hpp"
+#include "ranger_msgs/msg/motion_state.hpp"
+#include "ranger_msgs/msg/system_state.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/string.hpp"
 
 using namespace std::chrono_literals;
+using ranger_mini3_mode_controller::RangerMotionMode;
+using ranger_mini3_mode_controller::ranger_motion_mode_code;
+using ranger_mini3_mode_controller::ranger_motion_mode_from_code;
+using ranger_mini3_mode_controller::ranger_motion_mode_json;
+using ranger_mini3_mode_controller::ranger_motion_mode_name;
+using ranger_mini3_mode_controller::ranger_motion_mode_short_name;
 
 namespace {
 
@@ -38,11 +49,17 @@ struct ReversePermit {
   std::chrono::steady_clock::time_point stamp{};
 };
 
+struct ActualMotionMode {
+  RangerMotionMode mode{RangerMotionMode::UNKNOWN};
+  std::chrono::steady_clock::time_point stamp{};
+  std::string source;
+};
+
 double clamp(double value, double lower, double upper) {
   return std::max(lower, std::min(upper, value));
 }
 
-std::string modeName(MotionMode mode) {
+std::string legacyModeName(MotionMode mode) {
   switch (mode) {
     case MotionMode::kDualAckermann:
       return "dual_ackermann";
@@ -54,6 +71,20 @@ std::string modeName(MotionMode mode) {
       return "park";
   }
   return "unknown";
+}
+
+RangerMotionMode desiredRangerMode(MotionMode mode) {
+  switch (mode) {
+    case MotionMode::kDualAckermann:
+      return RangerMotionMode::DUAL_ACKERMAN;
+    case MotionMode::kCrab:
+      return RangerMotionMode::PARALLEL;
+    case MotionMode::kSpin:
+      return RangerMotionMode::SPINNING;
+    case MotionMode::kPark:
+      return RangerMotionMode::DUAL_ACKERMAN;
+  }
+  return RangerMotionMode::UNKNOWN;
 }
 
 double dualAckermannInnerAngleFromTwist(
@@ -156,6 +187,10 @@ class RangerMini3ModeController : public rclcpp::Node {
     declare_parameter<bool>("publish_zero_on_startup", true);
     declare_parameter<std::string>("status_topic", "/ranger_mini3_mode_controller/status");
     declare_parameter<std::string>("desired_mode_topic", "/ranger_mini3/desired_motion_mode");
+    declare_parameter<std::string>("actual_motion_state_topic", "/motion_state");
+    declare_parameter<std::string>("actual_system_state_topic", "/system_state");
+    declare_parameter<double>("actual_motion_mode_max_age_sec", 0.5);
+    declare_parameter<double>("mode_alignment_warn_after_sec", 0.25);
     declare_parameter<std::string>("forced_mode_topic", "/ranger_mini3/forced_mode");
     declare_parameter<std::string>("reverse_enable_topic", "/ranger_mini3/allow_reverse");
     declare_parameter<std::string>("docking_reverse_enable_topic", "/ranger_mini3/docking_allow_reverse");
@@ -191,6 +226,10 @@ class RangerMini3ModeController : public rclcpp::Node {
     auto_spin_max_linear_mps_ = std::max(0.0, get_parameter("auto_spin_max_linear_mps").as_double());
     spin_on_high_curvature_while_moving_ = get_parameter("spin_on_high_curvature_while_moving").as_bool();
     reverse_enable_timeout_s_ = get_parameter("reverse_enable_timeout_s").as_double();
+    actual_motion_mode_max_age_sec_ =
+      std::max(0.05, get_parameter("actual_motion_mode_max_age_sec").as_double());
+    mode_alignment_warn_after_sec_ =
+      std::max(0.0, get_parameter("mode_alignment_warn_after_sec").as_double());
     linear_eps_ = get_parameter("linear_epsilon_mps").as_double();
     lateral_eps_ = get_parameter("lateral_epsilon_mps").as_double();
     yaw_eps_ = get_parameter("yaw_epsilon_radps").as_double();
@@ -201,6 +240,20 @@ class RangerMini3ModeController : public rclcpp::Node {
       get_parameter("status_topic").as_string(), 10);
     mode_pub_ = create_publisher<std_msgs::msg::String>(
       get_parameter("desired_mode_topic").as_string(), 10);
+
+    motion_state_sub_ = create_subscription<ranger_msgs::msg::MotionState>(
+      get_parameter("actual_motion_state_topic").as_string(),
+      10,
+      [this](const ranger_msgs::msg::MotionState::SharedPtr msg) {
+        updateActualMotionMode(msg->motion_mode, "motion_state");
+      });
+
+    system_state_sub_ = create_subscription<ranger_msgs::msg::SystemState>(
+      get_parameter("actual_system_state_topic").as_string(),
+      10,
+      [this](const ranger_msgs::msg::SystemState::SharedPtr msg) {
+        updateActualMotionMode(msg->motion_mode, "system_state");
+      });
 
     cmd_sub_ = create_subscription<geometry_msgs::msg::Twist>(
       get_parameter("cmd_vel_in_topic").as_string(),
@@ -235,7 +288,7 @@ class RangerMini3ModeController : public rclcpp::Node {
 
     RCLCPP_INFO(
       get_logger(),
-      "Ranger Mini 3 C++ mode controller started: %s -> %s, policy=%s, lateral_policy=%s, allow_reverse=%s, spin_enter=%.3f rad, spin_exit=%.3f rad, auto_spin_max_vx=%.3f m/s, moving_curvature_spin=%s",
+      "Ranger Mini 3 C++ mode controller started: %s -> %s, policy=%s, lateral_policy=%s, allow_reverse=%s, spin_enter=%.3f rad, spin_exit=%.3f rad, auto_spin_max_vx=%.3f m/s, moving_curvature_spin=%s, actual topics=%s,%s",
       get_parameter("cmd_vel_in_topic").as_string().c_str(),
       get_parameter("cmd_vel_out_topic").as_string().c_str(),
       mode_policy_.c_str(),
@@ -244,10 +297,26 @@ class RangerMini3ModeController : public rclcpp::Node {
       spin_enter_steering_threshold_rad_,
       spin_exit_steering_threshold_rad_,
       auto_spin_max_linear_mps_,
-      spin_on_high_curvature_while_moving_ ? "true" : "false");
+      spin_on_high_curvature_while_moving_ ? "true" : "false",
+      get_parameter("actual_motion_state_topic").as_string().c_str(),
+      get_parameter("actual_system_state_topic").as_string().c_str());
   }
 
  private:
+  void updateActualMotionMode(const std::uint8_t code, const std::string & source) {
+    actual_motion_mode_ = ActualMotionMode{
+      ranger_motion_mode_from_code(code),
+      std::chrono::steady_clock::now(),
+      source};
+  }
+
+  std::optional<double> actualMotionModeAgeSec(const std::chrono::steady_clock::time_point now) const {
+    if (!actual_motion_mode_) {
+      return std::nullopt;
+    }
+    return std::chrono::duration<double>(now - actual_motion_mode_->stamp).count();
+  }
+
   void subscribeReversePermit(const std::string & source, const std::string & topic) {
     if (topic.empty() || subscribed_reverse_topics_.count(topic) > 0) {
       return;
@@ -267,16 +336,23 @@ class RangerMini3ModeController : public rclcpp::Node {
     const std::string mode = lowercase(input);
     if (mode.empty() || mode == "auto") {
       forced_policy_.clear();
-    } else if (mode == "dual_ackermann" || mode == "ackermann" || mode == "front_rear_ackermann") {
+    } else if (mode == "dual_ackerman" || mode == "dual_ackermann" || mode == "ackermann" ||
+      mode == "front_rear_ackermann" || mode == "motion_mode_dual_ackerman" || mode == "0")
+    {
       forced_policy_ = "dual_ackermann";
-    } else if (mode == "crab" || mode == "lateral" || mode == "sideways" || mode == "parallel") {
+    } else if (mode == "crab" || mode == "lateral" || mode == "sideways" || mode == "parallel" ||
+      mode == "motion_mode_parallel" || mode == "1")
+    {
       forced_policy_ = "crab";
-    } else if (mode == "spin" || mode == "park") {
-      forced_policy_ = mode;
+    } else if (mode == "spin" || mode == "spinning" || mode == "motion_mode_spinning" || mode == "2") {
+      forced_policy_ = "spin";
+    } else if (mode == "park") {
+      forced_policy_ = "park";
     } else {
       warnThrottled(
         "bad_mode",
-        "Unknown forced mode '" + input + "'. Use auto, dual_ackermann, crab, spin, or park.");
+        "Unknown forced mode '" + input +
+        "'. Use auto, dual_ackerman, parallel/crab, spinning/spin, park, or official enum code 0/1/2.");
       return;
     }
     RCLCPP_INFO(get_logger(), "forced mode set to %s", forced_policy_.empty() ? "auto" : forced_policy_.c_str());
@@ -526,13 +602,75 @@ class RangerMini3ModeController : public rclcpp::Node {
     const std::string & reason) {
     cmd_pub_->publish(cmd);
 
+    const auto now = std::chrono::steady_clock::now();
+    const RangerMotionMode desired_mode = desiredRangerMode(mode);
+    const auto actual_age = actualMotionModeAgeSec(now);
+    const bool actual_available = actual_motion_mode_.has_value();
+    const bool actual_fresh =
+      actual_available && actual_age.has_value() && actual_age.value() <= actual_motion_mode_max_age_sec_;
+    const bool mode_aligned =
+      actual_fresh && actual_motion_mode_->mode == desired_mode;
+    const bool motion_commanded =
+      std::abs(cmd.linear.x) > linear_eps_ || std::abs(cmd.linear.y) > lateral_eps_ ||
+      std::abs(cmd.angular.z) > yaw_eps_;
+    std::string alignment_state = "actual_unavailable";
+    if (actual_fresh) {
+      alignment_state = mode_aligned ? "aligned" : "waiting_actual_motion_mode";
+    } else if (actual_available) {
+      alignment_state = "actual_stale";
+    }
+
+    if (valid && motion_commanded && !mode_aligned && actual_fresh) {
+      const auto & actual = *actual_motion_mode_;
+      const double mismatch_age =
+        desired_mode_mismatch_since_.time_since_epoch().count() == 0 ?
+        0.0 :
+        std::chrono::duration<double>(now - desired_mode_mismatch_since_).count();
+      if (desired_mode_mismatch_since_.time_since_epoch().count() == 0 ||
+        last_desired_mode_for_mismatch_ != desired_mode ||
+        last_actual_mode_for_mismatch_ != actual.mode)
+      {
+        desired_mode_mismatch_since_ = now;
+        last_desired_mode_for_mismatch_ = desired_mode;
+        last_actual_mode_for_mismatch_ = actual.mode;
+      } else if (mismatch_age >= mode_alignment_warn_after_sec_) {
+        warnThrottled(
+          "mode_alignment",
+          std::string("desired motion mode ") + ranger_motion_mode_name(desired_mode) +
+          " but actual " + ranger_motion_mode_name(actual.mode) +
+          " from /" + actual.source + "; odom guards must use actual motion_mode");
+      }
+    } else {
+      desired_mode_mismatch_since_ = {};
+    }
+
     std_msgs::msg::String mode_msg;
-    mode_msg.data = modeName(mode);
+    mode_msg.data = ranger_motion_mode_json(desired_mode, legacyModeName(mode));
     mode_pub_->publish(mode_msg);
 
     std::ostringstream out;
     out << "{\"state\":\"" << state << "\",\"valid\":" << (valid ? "true" : "false")
-        << ",\"desired_mode\":\"" << modeName(mode) << "\",\"reason\":\"" << reason
+        << ",\"desired_mode\":\"" << legacyModeName(mode) << "\",\"reason\":\"" << reason
+        << "\",\"desired_motion_mode\":{\"code\":" << static_cast<int>(ranger_motion_mode_code(desired_mode))
+        << ",\"name\":\"" << ranger_motion_mode_name(desired_mode)
+        << "\",\"short\":\"" << ranger_motion_mode_short_name(desired_mode)
+        << "\",\"legacy\":\"" << legacyModeName(mode) << "\"}"
+        << ",\"actual_motion_mode\":{";
+    if (actual_available) {
+      out << "\"available\":true,\"fresh\":" << (actual_fresh ? "true" : "false")
+          << ",\"code\":" << static_cast<int>(ranger_motion_mode_code(actual_motion_mode_->mode))
+          << ",\"name\":\"" << ranger_motion_mode_name(actual_motion_mode_->mode)
+          << "\",\"short\":\"" << ranger_motion_mode_short_name(actual_motion_mode_->mode)
+          << "\",\"source\":\"" << actual_motion_mode_->source << "\"";
+      if (actual_age.has_value()) {
+        out << ",\"age_sec\":" << (std::round(actual_age.value() * 10.0) / 10.0);
+      }
+    } else {
+      out << "\"available\":false,\"fresh\":false,\"code\":255,\"name\":\"MOTION_MODE_UNKNOWN\","
+          << "\"short\":\"unknown\",\"source\":\"\"";
+    }
+    out << "},\"mode_aligned\":" << (mode_aligned ? "true" : "false")
+        << ",\"mode_alignment_state\":\"" << alignment_state
         << "\",\"cmd_out\":{\"linear_x\":" << cmd.linear.x << ",\"linear_y\":" << cmd.linear.y
         << ",\"angular_z\":" << cmd.angular.z << "}}";
     const std::string status = out.str();
@@ -582,10 +720,16 @@ class RangerMini3ModeController : public rclcpp::Node {
   double auto_spin_max_linear_mps_{0.08};
   bool spin_on_high_curvature_while_moving_{false};
   double reverse_enable_timeout_s_{0.75};
+  double actual_motion_mode_max_age_sec_{0.5};
+  double mode_alignment_warn_after_sec_{0.25};
   double linear_eps_{0.02};
   double lateral_eps_{0.02};
   double yaw_eps_{0.02};
   bool park_requested_{false};
+  std::optional<ActualMotionMode> actual_motion_mode_;
+  std::chrono::steady_clock::time_point desired_mode_mismatch_since_{};
+  RangerMotionMode last_desired_mode_for_mismatch_{RangerMotionMode::UNKNOWN};
+  RangerMotionMode last_actual_mode_for_mismatch_{RangerMotionMode::UNKNOWN};
   std::map<std::string, ReversePermit> reverse_permits_by_source_;
   std::set<std::string> subscribed_reverse_topics_;
   std::string forced_policy_;
@@ -601,6 +745,8 @@ class RangerMini3ModeController : public rclcpp::Node {
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr mode_pub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;
+  rclcpp::Subscription<ranger_msgs::msg::MotionState>::SharedPtr motion_state_sub_;
+  rclcpp::Subscription<ranger_msgs::msg::SystemState>::SharedPtr system_state_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr forced_mode_sub_;
   std::vector<rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr> reverse_enable_subs_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr park_sub_;

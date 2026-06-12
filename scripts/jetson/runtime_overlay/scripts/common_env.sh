@@ -109,6 +109,12 @@ export NJRH_RELEASE_ASSETS_DIR="${NJRH_RELEASE_ASSETS_DIR:-${PROJECT_ROOT}/maps_
 export NJRH_WAYPOINTS_DIR="${NJRH_WAYPOINTS_DIR:-${OVERLAY_ROOT}/waypoints}"
 export NJRH_RUNTIME_LOG_DIR="${NJRH_RUNTIME_LOG_DIR:-${OVERLAY_ROOT}/web_dashboard/runtime_logs}"
 
+LOCAL_STATE_EKF_PROFILE_FILE="${NJRH_LOCAL_STATE_EKF_PROFILE_FILE:-${OVERLAY_ROOT}/config/local_state_ekf_profile.env}"
+if [[ -f "${LOCAL_STATE_EKF_PROFILE_FILE}" ]]; then
+  # shellcheck source=../config/local_state_ekf_profile.env
+  source "${LOCAL_STATE_EKF_PROFILE_FILE}"
+fi
+
 project_overlay_missing() {
   case ":${AMENT_PREFIX_PATH:-}:" in
     *":${PROJECT_ROOT}/install:"*) return 1 ;;

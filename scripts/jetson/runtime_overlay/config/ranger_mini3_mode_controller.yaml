@@ -36,5 +36,9 @@ ranger_mini3_mode_controller:
 
     status_topic: /ranger_mini3_mode_controller/status
     desired_mode_topic: /ranger_mini3/desired_motion_mode
+    actual_motion_state_topic: /motion_state
+    actual_system_state_topic: /system_state
+    actual_motion_mode_max_age_sec: 0.5
+    mode_alignment_warn_after_sec: 0.25
     forced_mode_topic: /ranger_mini3/forced_mode
     park_topic: /ranger_mini3/park

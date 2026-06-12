@@ -337,6 +337,13 @@ struct WorkerDiagnostics
   double scan_output_source_age_ms{-1.0};
 };
 
+struct ClearingRayBin
+{
+  bool has_return{false};
+  double range_xy{0.0};
+  double angle_rad{0.0};
+};
+
 }  // namespace
 
 namespace robot_hesai_jt128
@@ -417,6 +424,15 @@ public:
     node_.declare_parameter<double>("clearing_worker_max_z", 1.40);
     node_.declare_parameter<int>("clearing_worker_point_stride", 2);
     node_.declare_parameter<int>("clearing_worker_max_points", 15000);
+    node_.declare_parameter<bool>("clearing_worker_virtual_rays_enabled", true);
+    node_.declare_parameter<double>("clearing_worker_virtual_ray_angle_resolution_deg", 1.0);
+    node_.declare_parameter<double>("clearing_worker_virtual_ray_range", 8.0);
+    node_.declare_parameter<std::vector<double>>(
+      "clearing_worker_virtual_ray_range_steps",
+      std::vector<double>{0.50, 1.00, 2.00, 3.50, 5.50, 8.00});
+    node_.declare_parameter<std::vector<double>>(
+      "clearing_worker_virtual_ray_endpoint_z_values",
+      std::vector<double>{-0.10, 0.05, 0.20, 0.40, 0.60, 0.85, 1.10, 1.30});
 
     node_.declare_parameter<bool>("worker_scan_enabled", true);
     node_.declare_parameter<bool>("scan_worker_enabled", true);
@@ -493,6 +509,20 @@ public:
     clearing_worker_max_z_ = node_.get_parameter("clearing_worker_max_z").as_double();
     clearing_worker_point_stride_ = positive_size_param("clearing_worker_point_stride", 2U);
     clearing_worker_max_points_ = positive_size_param("clearing_worker_max_points", 15000U);
+    clearing_worker_virtual_rays_enabled_ =
+      node_.get_parameter("clearing_worker_virtual_rays_enabled").as_bool();
+    clearing_worker_virtual_ray_angle_resolution_rad_ =
+      std::clamp(
+      node_.get_parameter("clearing_worker_virtual_ray_angle_resolution_deg").as_double(),
+      0.2,
+      10.0) * kPi / 180.0;
+    clearing_worker_virtual_ray_range_ =
+      std::max(clearing_worker_range_min_, node_.get_parameter("clearing_worker_virtual_ray_range").as_double());
+    clearing_worker_virtual_ray_ranges_ =
+      node_.get_parameter("clearing_worker_virtual_ray_range_steps").as_double_array();
+    clearing_worker_virtual_ray_endpoint_z_values_ =
+      node_.get_parameter("clearing_worker_virtual_ray_endpoint_z_values").as_double_array();
+    sanitize_clearing_virtual_rays();
 
     scan_output_topic_ = node_.get_parameter("scan_output_topic").as_string();
     scan_worker_frame_id_ = node_.get_parameter("scan_worker_frame_id").as_string();
@@ -1157,6 +1187,157 @@ private:
            point.z <= clearing_worker_max_z_;
   }
 
+  std::pair<double, double> clearing_virtual_ray_angle_bounds() const
+  {
+    if (local_worker_min_angle_rad_ <= local_worker_max_angle_rad_) {
+      return {local_worker_min_angle_rad_, local_worker_max_angle_rad_};
+    }
+    return {-kPi, kPi};
+  }
+
+  std::size_t clearing_virtual_ray_bin_count() const
+  {
+    const auto [min_angle, max_angle] = clearing_virtual_ray_angle_bounds();
+    const auto span = std::max(max_angle - min_angle, clearing_worker_virtual_ray_angle_resolution_rad_);
+    return static_cast<std::size_t>(std::ceil(span / clearing_worker_virtual_ray_angle_resolution_rad_)) + 1U;
+  }
+
+  void reset_clearing_virtual_ray_bins()
+  {
+    const auto [min_angle, max_angle] = clearing_virtual_ray_angle_bounds();
+    const auto count = clearing_virtual_ray_bin_count();
+    if (local_worker_clearing_bins_.size() != count) {
+      local_worker_clearing_bins_.resize(count);
+    }
+    for (std::size_t index = 0U; index < local_worker_clearing_bins_.size(); ++index) {
+      auto & bin = local_worker_clearing_bins_[index];
+      bin.has_return = false;
+      bin.range_xy = 0.0;
+      bin.angle_rad =
+        min_angle + (static_cast<double>(index) + 0.5) * clearing_worker_virtual_ray_angle_resolution_rad_;
+      if (bin.angle_rad > max_angle) {
+        bin.angle_rad = max_angle;
+      }
+    }
+  }
+
+  void update_clearing_virtual_ray_bin(const PointXYZI & point)
+  {
+    if (local_worker_clearing_bins_.empty()) {
+      return;
+    }
+    const auto [min_angle, max_angle] = clearing_virtual_ray_angle_bounds();
+    const auto angle = std::atan2(static_cast<double>(point.y), static_cast<double>(point.x));
+    if (angle < min_angle || angle > max_angle) {
+      return;
+    }
+    const auto range_xy = std::hypot(static_cast<double>(point.x), static_cast<double>(point.y));
+    const auto raw_index = static_cast<long>(
+      std::floor((angle - min_angle) / clearing_worker_virtual_ray_angle_resolution_rad_));
+    const auto clamped_index = std::clamp<long>(
+      raw_index, 0, static_cast<long>(local_worker_clearing_bins_.size() - 1U));
+    auto & bin = local_worker_clearing_bins_[static_cast<std::size_t>(clamped_index)];
+    if (!bin.has_return || range_xy > bin.range_xy) {
+      bin.has_return = true;
+      bin.range_xy = range_xy;
+      bin.angle_rad = angle;
+    }
+  }
+
+  std::size_t clearing_virtual_ray_reserve() const
+  {
+    if (!clearing_worker_virtual_rays_enabled_) {
+      return 0U;
+    }
+    const auto raw_count =
+      clearing_virtual_ray_bin_count() *
+      clearing_worker_virtual_ray_ranges_.size() *
+      clearing_worker_virtual_ray_endpoint_z_values_.size();
+    return std::min(clearing_worker_max_points_, raw_count);
+  }
+
+  void build_virtual_clearing_points()
+  {
+    local_worker_clearing_points_.clear();
+    for (const auto & bin : local_worker_clearing_bins_) {
+      const auto max_range_xy = std::clamp(
+        bin.has_return ? bin.range_xy : clearing_worker_virtual_ray_range_,
+        clearing_worker_range_min_,
+        clearing_worker_virtual_ray_range_);
+      for (const auto range_xy : clearing_worker_virtual_ray_ranges_) {
+        if (range_xy < clearing_worker_range_min_ || range_xy > max_range_xy + 1.0e-3) {
+          continue;
+        }
+        const auto x = static_cast<float>(std::cos(bin.angle_rad) * range_xy);
+        const auto y = static_cast<float>(std::sin(bin.angle_rad) * range_xy);
+        for (const auto z_value : clearing_worker_virtual_ray_endpoint_z_values_) {
+          PointXYZI endpoint;
+          endpoint.x = x;
+          endpoint.y = y;
+          endpoint.z = static_cast<float>(z_value);
+          endpoint.intensity = 0.0F;
+          if (in_self_mask(endpoint)) {
+            continue;
+          }
+          local_worker_clearing_points_.push_back(endpoint);
+          if (local_worker_clearing_points_.size() >= clearing_worker_max_points_) {
+            return;
+          }
+        }
+      }
+    }
+  }
+
+  void sanitize_clearing_virtual_rays()
+  {
+    clearing_worker_virtual_ray_range_ =
+      std::max(clearing_worker_virtual_ray_range_, clearing_worker_range_min_);
+
+    std::vector<double> sanitized_ranges;
+    sanitized_ranges.reserve(clearing_worker_virtual_ray_ranges_.size() + 1U);
+    for (const auto range_xy : clearing_worker_virtual_ray_ranges_) {
+      if (!std::isfinite(range_xy)) {
+        continue;
+      }
+      if (range_xy < clearing_worker_range_min_ || range_xy > clearing_worker_virtual_ray_range_) {
+        continue;
+      }
+      sanitized_ranges.push_back(range_xy);
+    }
+    sanitized_ranges.push_back(clearing_worker_virtual_ray_range_);
+    std::sort(sanitized_ranges.begin(), sanitized_ranges.end());
+    sanitized_ranges.erase(
+      std::unique(
+        sanitized_ranges.begin(),
+        sanitized_ranges.end(),
+        [](const double lhs, const double rhs) { return std::abs(lhs - rhs) < 1.0e-3; }),
+      sanitized_ranges.end());
+    clearing_worker_virtual_ray_ranges_ = sanitized_ranges;
+
+    std::vector<double> sanitized_z;
+    sanitized_z.reserve(clearing_worker_virtual_ray_endpoint_z_values_.size());
+    for (const auto z_value : clearing_worker_virtual_ray_endpoint_z_values_) {
+      if (!std::isfinite(z_value)) {
+        continue;
+      }
+      if (z_value < clearing_worker_min_z_ || z_value > clearing_worker_max_z_) {
+        continue;
+      }
+      sanitized_z.push_back(z_value);
+    }
+    std::sort(sanitized_z.begin(), sanitized_z.end());
+    sanitized_z.erase(
+      std::unique(
+        sanitized_z.begin(),
+        sanitized_z.end(),
+        [](const double lhs, const double rhs) { return std::abs(lhs - rhs) < 1.0e-3; }),
+      sanitized_z.end());
+    if (sanitized_z.empty()) {
+      sanitized_z.push_back(0.5 * (clearing_worker_min_z_ + clearing_worker_max_z_));
+    }
+    clearing_worker_virtual_ray_endpoint_z_values_ = sanitized_z;
+  }
+
   void process_local_obstacles_once()
   {
     ++local_worker_.tick_count;
@@ -1190,7 +1371,8 @@ private:
       (local_worker_.tick_count % std::max<std::uint64_t>(
         1U, static_cast<std::uint64_t>(std::round(local_worker_rate_hz_ / clearing_worker_rate_hz_))) == 0U);
     if (publish_clearing) {
-      const auto clearing_reserve =
+      const auto clearing_reserve = clearing_worker_virtual_rays_enabled_ ?
+        clearing_virtual_ray_reserve() :
         std::min(clearing_worker_max_points_, point_count / clearing_worker_point_stride_ + 1U);
       if (local_worker_clearing_points_.capacity() < clearing_reserve) {
         ++local_worker_.allocation_count;
@@ -1198,11 +1380,16 @@ private:
         local_worker_.reused_output_buffer = false;
       }
       local_worker_clearing_points_.clear();
+      if (clearing_worker_virtual_rays_enabled_) {
+        reset_clearing_virtual_ray_bins();
+      }
     }
     for (std::size_t i = 0U; i < point_count; ++i) {
       const auto point = transform_point(transform, buffer->points[i]);
       if (publish_clearing && i % clearing_worker_point_stride_ == 0U && passes_clearing_filter(point)) {
-        if (local_worker_clearing_points_.size() < clearing_worker_max_points_) {
+        if (clearing_worker_virtual_rays_enabled_) {
+          update_clearing_virtual_ray_bin(point);
+        } else if (local_worker_clearing_points_.size() < clearing_worker_max_points_) {
           local_worker_clearing_points_.push_back(point);
         }
       }
@@ -1236,6 +1423,9 @@ private:
     ++local_worker_.processed_count;
     ++local_worker_.obstacle_publish_count;
     if (publish_clearing) {
+      if (clearing_worker_virtual_rays_enabled_) {
+        build_virtual_clearing_points();
+      }
       fill_xyzi_cloud(local_worker_clearing_points_, header, true, clearing_output_msg_, local_worker_);
       local_worker_.last_clearing_output_bytes = clearing_output_msg_.data.size();
       const auto clearing_ready = Clock::now();
@@ -1615,6 +1805,12 @@ private:
   double clearing_worker_max_z_{1.40};
   std::size_t clearing_worker_point_stride_{2U};
   std::size_t clearing_worker_max_points_{15000U};
+  bool clearing_worker_virtual_rays_enabled_{true};
+  double clearing_worker_virtual_ray_angle_resolution_rad_{kPi / 180.0};
+  double clearing_worker_virtual_ray_range_{8.0};
+  std::vector<double> clearing_worker_virtual_ray_ranges_{0.50, 1.00, 2.00, 3.50, 5.50, 8.00};
+  std::vector<double> clearing_worker_virtual_ray_endpoint_z_values_{
+    -0.10, 0.05, 0.20, 0.40, 0.60, 0.85, 1.10, 1.30};
 
   std::string scan_output_topic_;
   std::string scan_worker_frame_id_;
@@ -1689,6 +1885,7 @@ private:
   sensor_msgs::msg::LaserScan scan_msg_;
   std::vector<PointXYZI> local_worker_obstacle_points_;
   std::vector<PointXYZI> local_worker_clearing_points_;
+  std::vector<ClearingRayBin> local_worker_clearing_bins_;
 
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;

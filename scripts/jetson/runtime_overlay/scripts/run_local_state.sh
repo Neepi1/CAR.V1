@@ -125,7 +125,23 @@ if [[ "${MODE}" == "passthrough" || "${MODE}" == "legacy" ]]; then
   njrh_exec_affined robot_local_state "${NODE_BIN}" --ros-args --params-file "${PARAMS_FILE}"
 fi
 
-EKF_PARAMS_FILE="${LOCAL_STATE_EKF_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/local_state_ekf.yaml}"
+EKF_PROFILE="${LOCAL_STATE_EKF_PROFILE:-${NJRH_LOCAL_STATE_EKF_PROFILE:-wheel_imu}}"
+case "${EKF_PROFILE}" in
+  wheel_imu|default)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_only)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf_wheel_only.yaml"
+    EKF_USES_IMU=false
+    ;;
+  *)
+    echo "[runtime-overlay] invalid LOCAL_STATE_EKF_PROFILE=${EKF_PROFILE}; expected wheel_imu or wheel_only" >&2
+    exit 1
+    ;;
+esac
+
+EKF_PARAMS_FILE="${LOCAL_STATE_EKF_PARAMS_FILE:-${DEFAULT_EKF_PARAMS_FILE}}"
 [[ -f "${EKF_PARAMS_FILE}" ]] || {
   echo "[runtime-overlay] local state EKF params file missing: ${EKF_PARAMS_FILE}" >&2
   exit 1
@@ -135,11 +151,13 @@ WHEEL_ODOM_EKF_PARAMS_FILE="${LOCAL_STATE_WHEEL_ODOM_EKF_PARAMS_FILE:-${NJRH_OVE
   echo "[runtime-overlay] local state wheel odom EKF params file missing: ${WHEEL_ODOM_EKF_PARAMS_FILE}" >&2
   exit 1
 }
-IMU_BIAS_FILTER_PARAMS_FILE="${LOCAL_STATE_IMU_BIAS_FILTER_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/local_state_imu_bias_filter.yaml}"
-[[ -f "${IMU_BIAS_FILTER_PARAMS_FILE}" ]] || {
-  echo "[runtime-overlay] local state IMU bias filter params file missing: ${IMU_BIAS_FILTER_PARAMS_FILE}" >&2
-  exit 1
-}
+if [[ "${EKF_USES_IMU}" == "true" ]]; then
+  IMU_BIAS_FILTER_PARAMS_FILE="${LOCAL_STATE_IMU_BIAS_FILTER_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/local_state_imu_bias_filter.yaml}"
+  [[ -f "${IMU_BIAS_FILTER_PARAMS_FILE}" ]] || {
+    echo "[runtime-overlay] local state IMU bias filter params file missing: ${IMU_BIAS_FILTER_PARAMS_FILE}" >&2
+    exit 1
+  }
+fi
 
 if ! ros2 pkg prefix robot_localization >/dev/null 2>&1; then
   echo "[runtime-overlay] ROS package missing: robot_localization" >&2
@@ -198,21 +216,26 @@ if ! kill -0 "${wheel_odom_pid}" 2>/dev/null; then
   exit 1
 fi
 
-IMU_BIAS_NODE_BIN="${NJRH_PROJECT_ROOT}/install/robot_local_state/lib/robot_local_state/imu_gyro_bias_filter_node"
-[[ -x "${IMU_BIAS_NODE_BIN}" ]] || {
-  echo "[runtime-overlay] compiled IMU gyro bias filter missing or not executable: ${IMU_BIAS_NODE_BIN}" >&2
-  exit 1
-}
+if [[ "${EKF_USES_IMU}" == "true" ]]; then
+  IMU_BIAS_NODE_BIN="${NJRH_PROJECT_ROOT}/install/robot_local_state/lib/robot_local_state/imu_gyro_bias_filter_node"
+  [[ -x "${IMU_BIAS_NODE_BIN}" ]] || {
+    echo "[runtime-overlay] compiled IMU gyro bias filter missing or not executable: ${IMU_BIAS_NODE_BIN}" >&2
+    exit 1
+  }
 
-njrh_start_affined_background imu_bias_pid robot_local_state_imu_bias_filter "${IMU_BIAS_NODE_BIN}" --ros-args \
-  --params-file "${IMU_BIAS_FILTER_PARAMS_FILE}" \
-  -r __node:=imu_gyro_bias_filter
-sleep 1
-if ! kill -0 "${imu_bias_pid}" 2>/dev/null; then
-  echo "[runtime-overlay] IMU gyro bias filter failed to stay alive" >&2
-  exit 1
+  njrh_start_affined_background imu_bias_pid robot_local_state_imu_bias_filter "${IMU_BIAS_NODE_BIN}" --ros-args \
+    --params-file "${IMU_BIAS_FILTER_PARAMS_FILE}" \
+    -r __node:=imu_gyro_bias_filter
+  sleep 1
+  if ! kill -0 "${imu_bias_pid}" 2>/dev/null; then
+    echo "[runtime-overlay] IMU gyro bias filter failed to stay alive" >&2
+    exit 1
+  fi
+else
+  echo "[runtime-overlay] LOCAL_STATE_EKF_PROFILE=wheel_only; skipping IMU gyro bias filter and EKF imu0 fusion" >&2
 fi
 
+echo "[runtime-overlay] starting robot_local_state EKF profile=${EKF_PROFILE} params=${EKF_PARAMS_FILE}" >&2
 njrh_start_affined_background ekf_pid robot_local_state ros2 run robot_localization ekf_node --ros-args \
   --params-file "${EKF_PARAMS_FILE}" \
   -r __node:=robot_local_state \

@@ -8,6 +8,7 @@ TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 REPORT_FILE="${REPORT_DIR}/local_state_input_rates_${TIMESTAMP}.md"
 HZ_TIMEOUT_SEC="${NJRH_LOCAL_STATE_RATE_HZ_TIMEOUT_SEC:-5}"
 UDP_WINDOW_SEC="${NJRH_LOCAL_STATE_RATE_UDP_WINDOW_SEC:-2}"
+EKF_PROFILE="${LOCAL_STATE_EKF_PROFILE:-${NJRH_LOCAL_STATE_EKF_PROFILE:-wheel_imu}}"
 
 if [[ -f "${SCRIPT_DIR}/common_env.sh" ]]; then
   # shellcheck source=/dev/null
@@ -164,9 +165,13 @@ classify_rates() {
 
 udp_before="$(udp_rcvbuf_errors)"
 
-record_rate /lidar_imu 50
-record_rate /lidar_imu_bias_corrected 30
-record_rate /local_state/imu_bias 20
+if [[ "${EKF_PROFILE}" == "wheel_only" ]]; then
+  add_pass "LOCAL_STATE_EKF_PROFILE=wheel_only skips IMU rate checks"
+else
+  record_rate /lidar_imu 50
+  record_rate /lidar_imu_bias_corrected 30
+  record_rate /local_state/imu_bias 20
+fi
 record_rate /wheel/odom 20
 record_rate /wheel/odom_ekf 20
 record_rate /local_state/odometry 20
@@ -224,10 +229,18 @@ else
 fi
 
 imu_info="$(topic_info_text /lidar_imu_bias_corrected)"
-if contains_node_name "${imu_info}" "robot_local_state"; then
-  add_pass "/lidar_imu_bias_corrected has EKF subscriber"
+if [[ "${EKF_PROFILE}" == "wheel_only" ]]; then
+  if contains_node_name "${imu_info}" "robot_local_state"; then
+    add_fail "wheel_only profile must not have EKF subscriber on /lidar_imu_bias_corrected"
+  else
+    add_pass "wheel_only profile has no EKF subscriber on /lidar_imu_bias_corrected"
+  fi
 else
-  add_fail "/lidar_imu_bias_corrected is missing EKF subscriber"
+  if contains_node_name "${imu_info}" "robot_local_state"; then
+    add_pass "/lidar_imu_bias_corrected has EKF subscriber"
+  else
+    add_fail "/lidar_imu_bias_corrected is missing EKF subscriber"
+  fi
 fi
 
 if [[ "${udp_delta}" == "missing" ]]; then
@@ -248,6 +261,7 @@ ss_snapshot="$(ss -u -a -n -p 2>/dev/null | grep -E "ekf|robot_local_state|local
   echo "- timestamp_utc: ${TIMESTAMP}"
   echo "- hz_timeout_sec: ${HZ_TIMEOUT_SEC}"
   echo "- udp_window_sec: ${UDP_WINDOW_SEC}"
+  echo "- local_state_ekf_profile: ${EKF_PROFILE}"
   echo "- udp_rcvbuf_errors_before: ${udp_before:-missing}"
   echo "- udp_rcvbuf_errors_after: ${udp_after:-missing}"
   echo "- udp_rcvbuf_errors_delta: ${udp_delta}"

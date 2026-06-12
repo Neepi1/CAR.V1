@@ -120,6 +120,14 @@ may stay as an optional debug/compat topic, but it must not be the production
 input to AccelCore. Typed decoded-frame input remains the next optimization
 step.
 
+In both `ipc_worker` and `driver_integrated`, `PointCloudAccelCore` owns the
+accel local worker outputs. `/perception/obstacle_points` remains the VoxelLayer
+marking source, and `/perception/clearing_points` is generated as bounded
+virtual clearing rays by default. The clearing rays are in `base_link`, keep the
+source cloud stamp, and are only a local costmap clearing input; they do not
+change `/lidar_points`, TF ownership, DDS/QoS, Nav2 planner/controller settings,
+or FAST-LIO2 mapping inputs.
+
 Switch and rollback:
 
 ```bash

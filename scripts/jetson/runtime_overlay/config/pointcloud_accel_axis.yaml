@@ -55,6 +55,11 @@ pointcloud_accel_axis_node:
     clearing_worker_max_z: 1.40
     clearing_worker_point_stride: 2
     clearing_worker_max_points: 15000
+    clearing_worker_virtual_rays_enabled: true
+    clearing_worker_virtual_ray_angle_resolution_deg: 1.0
+    clearing_worker_virtual_ray_range: 8.00
+    clearing_worker_virtual_ray_range_steps: [0.50, 1.00, 2.00, 3.50, 5.50, 8.00]
+    clearing_worker_virtual_ray_endpoint_z_values: [-0.10, 0.05, 0.20, 0.40, 0.60, 0.85, 1.10, 1.30]
 
     scan_worker_enabled: true
     worker_scan_enabled: true

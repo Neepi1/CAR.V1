@@ -9,6 +9,15 @@ then the IMU gyro-bias filter republishes `/lidar_imu` as
 `/lidar_imu_bias_corrected`, and the EKF fuses wheel x/y/yaw pose, wheel
 forward/yaw velocity, and corrected JT128 IMU yaw-rate.
 
+For temporary chassis-odom isolation, keep `LOCAL_STATE_MODE=ekf` and set
+`LOCAL_STATE_EKF_PROFILE=wheel_only`. That profile uses
+`local_state_ekf_wheel_only.yaml`, starts the wheel odom preprocessor, skips the
+IMU gyro-bias filter, and runs `robot_localization` from `/wheel/odom_ekf` only.
+It preserves `/local_state/odometry` and the single canonical
+`odom -> base_link` TF owner. Return to the default fusion profile with
+`LOCAL_STATE_EKF_PROFILE=wheel_imu`. The Jetson runtime override lives in
+`scripts/jetson/runtime_overlay/config/local_state_ekf_profile.env`.
+
 The raw `/lidar_imu` stream remains high-rate for JT128 and FAST-LIO2 mapping.
 Only the EKF input branch is bounded: `imu_gyro_bias_filter` still reads every
 raw IMU sample for bias estimation, but publishes `/lidar_imu_bias_corrected` at
@@ -32,6 +41,9 @@ that odom as `/local_state/odometry` and remains the only canonical owner of
 - FAST-LIO local-state config: `local_state_fastlio.yaml`
 - EKF output topic: `/local_state/odometry` via `/odometry/filtered` remap
 - `odom0`: `/wheel/odom_ekf`, using planar `x`, `y`, `yaw`, `vx`, and `vyaw`
+- Wheel-only EKF config: `local_state_ekf_wheel_only.yaml`, selected by
+  `LOCAL_STATE_EKF_PROFILE=wheel_only`, removes `imu0` entirely for temporary
+  chassis odom isolation
 - `local_state_wheel_odom_ekf.yaml`: applies nonzero pose covariance floors,
   including a bounded yaw covariance floor, so zero-covariance Ranger odometry
   anchors heading without completely dominating IMU yaw-rate smoothing
@@ -76,6 +88,8 @@ that odom as `/local_state/odometry` and remains the only canonical owner of
   and EKF fallback children with bounded INT/TERM/KILL waits so a ROS shutdown
   hang cannot leave a process alive after its ROS endpoints have disappeared.
 - To run the wheel+IMU EKF default explicitly, set `LOCAL_STATE_MODE=ekf`
+- To run EKF from chassis odometry only, set
+  `LOCAL_STATE_MODE=ekf LOCAL_STATE_EKF_PROFILE=wheel_only`
 - To run FAST-LIO local-state for diagnostics, set `LOCAL_STATE_MODE=fastlio`
 - To run the wheel-only passthrough wrapper for diagnostics, set `LOCAL_STATE_MODE=passthrough`
 - The upstream Ranger driver is started with `base_frame=base_link` and does

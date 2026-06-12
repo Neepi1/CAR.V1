@@ -1031,8 +1031,14 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     ekf_cfg = (ROOT / "src" / "robot_local_state" / "config" / "local_state_ekf.yaml").read_text(
         encoding="utf-8"
     )
+    wheel_only_ekf_cfg = (
+        ROOT / "src" / "robot_local_state" / "config" / "local_state_ekf_wheel_only.yaml"
+    ).read_text(encoding="utf-8")
     overlay_ekf_cfg = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "local_state_ekf.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_wheel_only_ekf_cfg = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "local_state_ekf_wheel_only.yaml"
     ).read_text(encoding="utf-8")
     overlay_wheel_odom_cfg = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "local_state_wheel_odom_ekf.yaml"
@@ -1060,6 +1066,9 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     ).read_text(encoding="utf-8")
     common_env = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "common_env.sh"
+    ).read_text(encoding="utf-8")
+    local_state_ekf_profile_env = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "local_state_ekf_profile.env"
     ).read_text(encoding="utf-8")
     overlay_runner = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_local_state.sh"
@@ -1111,6 +1120,11 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     assert "-r __node:=robot_local_state" in overlay_runner
     assert "LOCAL_STATE_WHEEL_ODOM_EKF_PARAMS_FILE" in overlay_runner
     assert "-r __node:=wheel_odom_ekf_input" in overlay_runner
+    assert "LOCAL_STATE_EKF_PROFILE" in overlay_runner
+    assert "NJRH_LOCAL_STATE_EKF_PROFILE" in overlay_runner
+    assert "local_state_ekf_wheel_only.yaml" in overlay_runner
+    assert 'invalid LOCAL_STATE_EKF_PROFILE=${EKF_PROFILE}; expected wheel_imu or wheel_only' in overlay_runner
+    assert 'LOCAL_STATE_EKF_PROFILE=wheel_only; skipping IMU gyro bias filter' in overlay_runner
     assert "LOCAL_STATE_IMU_BIAS_FILTER_PARAMS_FILE" in overlay_runner
     assert "imu_gyro_bias_filter_node" in overlay_runner
     assert "-r __node:=imu_gyro_bias_filter" in overlay_runner
@@ -1145,6 +1159,8 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     assert "robot_local_state failed to stay alive" in overlay_runner
     assert "-r /odometry/filtered:=/local_state/odometry" in overlay_runner
     assert "LOCAL_STATE_MODE=ekf" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_only" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_imu" in readme
     assert "LOCAL_STATE_MODE=passthrough" in readme
     assert 'declare_parameter<double>("odom_yaw_offset_rad", 0.0)' in local_state_node
     assert 'declare_parameter<bool>("rotate_odom_position_with_yaw_offset", true)' in local_state_node
@@ -1233,6 +1249,17 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
         assert "odom0_config: [true, true, false," in cfg
         assert "false, false, true," in cfg
         assert "imu0: /lidar_imu_bias_corrected" in cfg
+    for cfg in (wheel_only_ekf_cfg, overlay_wheel_only_ekf_cfg):
+        assert "frequency: 50.0" in cfg
+        assert "two_d_mode: true" in cfg
+        assert "publish_tf: true" in cfg
+        assert "world_frame: odom" in cfg
+        assert "base_link_frame: base_link" in cfg
+        assert "odom0: /wheel/odom_ekf" in cfg
+        assert "odom0_config: [true, true, false," in cfg
+        assert "false, false, true," in cfg
+        assert "imu0:" not in cfg
+        assert "/lidar_imu_bias_corrected" not in cfg
     for wheel_cfg in (source_wheel_odom_cfg, overlay_wheel_odom_cfg):
         assert "output_topic: /wheel/odom_ekf" in wheel_cfg
         assert "input_odom_topic: /wheel/odom" in wheel_cfg
@@ -1289,9 +1316,17 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     assert "TransformBroadcaster" not in imu_bias_node
     assert 'export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"' in common_env
     assert "rmw_cyclonedds_cpp" not in common_env
+    assert "LOCAL_STATE_EKF_PROFILE_FILE" in common_env
+    assert "local_state_ekf_profile.env" in common_env
+    assert 'source "${LOCAL_STATE_EKF_PROFILE_FILE}"' in common_env
+    assert 'export NJRH_LOCAL_STATE_EKF_PROFILE="${NJRH_LOCAL_STATE_EKF_PROFILE:-wheel_only}"' in local_state_ekf_profile_env
+    assert "wheel_imu" in local_state_ekf_profile_env
     assert "record_rate /lidar_imu " in verify_local_state_rates
     assert "record_rate /lidar_imu_bias_corrected " in verify_local_state_rates
     assert "record_rate /local_state/imu_bias " in verify_local_state_rates
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_only skips IMU rate checks" in verify_local_state_rates
+    assert "wheel_only profile must not have EKF subscriber on /lidar_imu_bias_corrected" in verify_local_state_rates
+    assert "wheel_only profile has no EKF subscriber on /lidar_imu_bias_corrected" in verify_local_state_rates
     assert "record_rate /wheel/odom_ekf " in verify_local_state_rates
     assert "record_rate /local_state/odometry " in verify_local_state_rates
     assert "RcvbufErrors" in verify_local_state_rates
@@ -1301,10 +1336,11 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     assert "ros2 param set" not in verify_local_state_rates
     assert "ros2 bag" not in verify_local_state_rates
     assert "set_pointcloud_accel_profile" not in verify_local_state_rates
-    assert "imu0_remove_gravitational_acceleration: true" in cfg
-    assert "publish_acceleration: false" in cfg
-    assert "true, false, false," in cfg
-    assert "false, false, true," in cfg
+    for cfg in (ekf_cfg, overlay_ekf_cfg):
+        assert "imu0_remove_gravitational_acceleration: true" in cfg
+        assert "publish_acceleration: false" in cfg
+        assert "true, false, false," in cfg
+        assert "false, false, true," in cfg
     assert "use_timestamp_type" in driver_script
     assert "use_timestamp_type: 1" in driver_script
     assert "override_angular_velocity_covariance: true" in imu_remap_cfg
@@ -3333,6 +3369,9 @@ def test_ranger_mini3_mode_controller_is_cpp_and_rejects_lateral_reverse():
     package_root = ROOT / "src" / "ranger_mini3_mode_controller"
     cmake = (package_root / "CMakeLists.txt").read_text(encoding="utf-8")
     package_xml = (package_root / "package.xml").read_text(encoding="utf-8")
+    mode_header = (
+        package_root / "include" / "ranger_mini3_mode_controller" / "ranger_motion_mode.hpp"
+    ).read_text(encoding="utf-8")
     node_cpp = (package_root / "src" / "mode_controller_node.cpp").read_text(encoding="utf-8")
     config = (package_root / "config" / "ranger_mini3_mode_controller.yaml").read_text(encoding="utf-8")
     overlay_config = (
@@ -3343,8 +3382,20 @@ def test_ranger_mini3_mode_controller_is_cpp_and_rejects_lateral_reverse():
     ).read_text(encoding="utf-8")
     assert "ament_cmake" in cmake
     assert "rclcpp" in package_xml
+    assert "ranger_msgs" in package_xml
     assert "ament_python" not in package_xml
+    assert "find_package(ranger_msgs REQUIRED)" in cmake
     assert "add_executable(mode_controller_node src/mode_controller_node.cpp)" in cmake
+    assert "target_include_directories(mode_controller_node PRIVATE include)" in cmake
+    assert "ament_target_dependencies(mode_controller_node geometry_msgs ranger_msgs rclcpp std_msgs)" in cmake
+    assert "enum class RangerMotionMode" in mode_header
+    assert "DUAL_ACKERMAN = 0" in mode_header
+    assert "PARALLEL = 1" in mode_header
+    assert "SPINNING = 2" in mode_header
+    assert "SIDE_SLIP = 3" in mode_header
+    assert "UNKNOWN = 255" in mode_header
+    assert "ranger_motion_mode_from_code" in mode_header
+    assert "ranger_motion_mode_json" in mode_header
     assert "lateral_policy: reject" in config
     assert "max_lateral_mps: 0.08" in config
     assert "max_crab_yaw_radps: 0.15" in config
@@ -3357,6 +3408,11 @@ def test_ranger_mini3_mode_controller_is_cpp_and_rejects_lateral_reverse():
     assert "spin_enter_steering_threshold_rad: 0.698" in config
     assert "auto_spin_max_linear_mps: 0.08" in config
     assert "spin_on_high_curvature_while_moving: false" in config
+    assert "desired_mode_topic: /ranger_mini3/desired_motion_mode" in config
+    assert "actual_motion_state_topic: /motion_state" in config
+    assert "actual_system_state_topic: /system_state" in config
+    assert "actual_motion_mode_max_age_sec: 0.5" in config
+    assert "mode_alignment_warn_after_sec: 0.25" in config
     assert "lateral_policy: reject" in overlay_config
     assert "max_lateral_mps: 0.08" in overlay_config
     assert "max_crab_yaw_radps: 0.15" in overlay_config
@@ -3367,7 +3423,24 @@ def test_ranger_mini3_mode_controller_is_cpp_and_rejects_lateral_reverse():
     assert "spin_enter_steering_threshold_rad: 0.698" in overlay_config
     assert "auto_spin_max_linear_mps: 0.08" in overlay_config
     assert "spin_on_high_curvature_while_moving: false" in overlay_config
+    assert "desired_mode_topic: /ranger_mini3/desired_motion_mode" in overlay_config
+    assert "actual_motion_state_topic: /motion_state" in overlay_config
+    assert "actual_system_state_topic: /system_state" in overlay_config
+    assert "actual_motion_mode_max_age_sec: 0.5" in overlay_config
+    assert "mode_alignment_warn_after_sec: 0.25" in overlay_config
     assert "Lateral / crab commands are disabled" in node_cpp
+    assert '#include "ranger_msgs/msg/motion_state.hpp"' in node_cpp
+    assert '#include "ranger_msgs/msg/system_state.hpp"' in node_cpp
+    assert "create_subscription<ranger_msgs::msg::MotionState>" in node_cpp
+    assert "create_subscription<ranger_msgs::msg::SystemState>" in node_cpp
+    assert "desiredRangerMode" in node_cpp
+    assert "RangerMotionMode::SPINNING" in node_cpp
+    assert "ranger_motion_mode_json(desired_mode" in node_cpp
+    assert "desired_motion_mode" in node_cpp
+    assert "actual_motion_mode" in node_cpp
+    assert "mode_aligned" in node_cpp
+    assert "waiting_actual_motion_mode" in node_cpp
+    assert "odom guards must use actual motion_mode" in node_cpp
     assert "forced_policy_ = \"crab\"" in node_cpp
     assert "msg.linear.y = command.lateral_mps" in node_cpp
     assert "spin_on_high_curvature_while_moving_ || low_speed_spin_allowed" in node_cpp
@@ -5349,6 +5422,11 @@ def test_phase_d1_pointcloud_driver_integrated_ingress_contracts():
     assert "driver_integrated_process" in accel_core
     assert "accel_core_process_pointcloud2_count" in accel_core
     assert "accel_core_process_decoded_view_count" in accel_core
+    assert 'declare_parameter<bool>("clearing_worker_virtual_rays_enabled", true)' in accel_core
+    assert 'declare_parameter<double>("clearing_worker_virtual_ray_angle_resolution_deg", 1.0)' in accel_core
+    assert "struct ClearingRayBin" in accel_core
+    assert "build_virtual_clearing_points()" in accel_core
+    assert "update_clearing_virtual_ray_bin(point)" in accel_core
 
     for script in (run_driver, run_pipeline, verify_profile, ab_runner, set_profile):
         assert "NJRH_POINTCLOUD_INGRESS_PROFILE" in script
@@ -5379,6 +5457,15 @@ def test_phase_d1_pointcloud_driver_integrated_ingress_contracts():
     assert "publish_vendor_raw_debug: false" in hesai_accel_cfg
     assert "publish_vendor_imu_raw_debug: true" in hesai_accel_cfg
     assert "vendor_raw_ros_hop_required: false" in hesai_accel_cfg
+    for cfg in (accel_cfg, hesai_accel_cfg):
+        assert "clearing_worker_virtual_rays_enabled: true" in cfg
+        assert "clearing_worker_virtual_ray_angle_resolution_deg: 1.0" in cfg
+        assert "clearing_worker_virtual_ray_range: 8.00" in cfg
+        assert "clearing_worker_virtual_ray_range_steps: [0.50, 1.00, 2.00, 3.50, 5.50, 8.00]" in cfg
+        assert (
+            "clearing_worker_virtual_ray_endpoint_z_values: "
+            "[-0.10, 0.05, 0.20, 0.40, 0.60, 0.85, 1.10, 1.30]"
+        ) in cfg
 
     status_topics = {
         "/lidar/axis_remap_status",
