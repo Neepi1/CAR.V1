@@ -8,15 +8,20 @@ MODE="${NJRH_AMCL_LOCALIZATION_MODE:-disabled}"
 DURATION_SEC="${NJRH_VERIFY_AMCL_DURATION_SEC:-30}"
 SET_MODE="false"
 RESTART="false"
+SEED="false"
+TF_WARMUP_SEC="${NJRH_AMCL_TF_WARMUP_SEC:-3.0}"
+CHECK_LOGS="false"
+SCAN_ADMISSION="${NJRH_AMCL_SCAN_ADMISSION_ENABLED:-true}"
 FAILURES=()
 WARNS=()
 PASSES=()
 
 usage() {
   cat <<'USAGE'
-Usage: verify_amcl_shadow_localization.sh [--mode disabled|shadow|gated] [--duration-sec N] [--set-mode] [--restart]
+Usage: verify_amcl_shadow_localization.sh [--mode disabled|shadow|gated] [--duration-sec N] [--set-mode] [--restart] [--seed] [--tf-warmup-sec N] [--scan-admission] [--check-logs]
 
-Read-only by default. With --restart it restarts only the AMCL helper.
+Read-only by default. With --restart it restarts only the AMCL helper. With
+--seed it calls the bridge seed service and verifies AMCL readiness.
 USAGE
 }
 
@@ -36,6 +41,22 @@ while [[ $# -gt 0 ]]; do
       ;;
     --restart)
       RESTART="true"
+      shift
+      ;;
+    --seed)
+      SEED="true"
+      shift
+      ;;
+    --tf-warmup-sec)
+      TF_WARMUP_SEC="${2:-3.0}"
+      shift 2
+      ;;
+    --scan-admission)
+      SCAN_ADMISSION="true"
+      shift
+      ;;
+    --check-logs)
+      CHECK_LOGS="true"
       shift
       ;;
     -h|--help)
@@ -64,7 +85,8 @@ if [[ "${SET_MODE}" == "true" ]]; then
 fi
 
 if [[ "${RESTART}" == "true" ]]; then
-  bash "${SCRIPT_DIR}/run_amcl_shadow_localization.sh" --mode "${MODE}" --restart
+  NJRH_AMCL_TF_WARMUP_SEC="${TF_WARMUP_SEC}" \
+    bash "${SCRIPT_DIR}/run_amcl_shadow_localization.sh" --mode "${MODE}" --restart
 fi
 
 topic_info() {
@@ -145,18 +167,88 @@ process_exists() {
   pgrep -af "${pattern}" >/dev/null 2>&1
 }
 
+seed_amcl_for_verify() {
+  local service="${NJRH_AMCL_SEED_SERVICE:-/robot_localization_bridge/seed_amcl_initial_pose}"
+  local retry_count="${NJRH_AMCL_SEED_RETRY_COUNT:-5}"
+  local retry_period_ms="${NJRH_AMCL_SEED_RETRY_PERIOD_MS:-300}"
+  local attempt
+  for ((attempt = 1; attempt <= retry_count; attempt += 1)); do
+    if ! timeout 5 ros2 service type "${service}" >/dev/null 2>&1; then
+      WARNS+=("AMCL seed service not visible yet attempt=${attempt}/${retry_count}")
+    else
+      local output
+      output="$(timeout 8 ros2 service call "${service}" std_srvs/srv/Trigger "{}" 2>&1 || true)"
+      echo "[verify-amcl] seed attempt=${attempt}/${retry_count}: ${output}"
+      if grep -Eiq "success[:=][[:space:]]*true|success=True" <<<"${output}"; then
+        PASSES+=("AMCL seed service succeeded")
+        return 0
+      fi
+    fi
+    sleep "$(awk -v ms="${retry_period_ms}" 'BEGIN {printf "%.3f", ms / 1000.0}')"
+  done
+  FAILURES+=("AMCL seed service unavailable or failed after retry")
+}
+
+fresh_pose_check() {
+  local topic="${1:-/amcl_pose}"
+  local timeout_sec="${NJRH_AMCL_POSE_FRESH_TIMEOUT_SEC:-5.0}"
+  local max_age_sec="${NJRH_AMCL_POSE_MAX_AGE_SEC:-1.0}"
+  timeout "$(( ${timeout_sec%.*} + 3 ))" python3 - "${topic}" "${timeout_sec}" "${max_age_sec}" <<'PY' 2>/dev/null
+import sys
+import rclpy
+from geometry_msgs.msg import PoseWithCovarianceStamped
+
+topic = sys.argv[1]
+timeout_sec = float(sys.argv[2])
+max_age_sec = float(sys.argv[3])
+rclpy.init()
+node = rclpy.create_node("verify_amcl_pose_fresh")
+state = {"fresh": False, "age": None}
+
+def stamp_to_sec(stamp):
+    return float(stamp.sec) + float(stamp.nanosec) * 1.0e-9
+
+def on_msg(msg):
+    now_sec = node.get_clock().now().nanoseconds * 1.0e-9
+    age = now_sec - stamp_to_sec(msg.header.stamp)
+    state["age"] = age
+    if 0.0 <= age <= max_age_sec:
+        state["fresh"] = True
+
+sub = node.create_subscription(PoseWithCovarianceStamped, topic, on_msg, 10)
+deadline = node.get_clock().now().nanoseconds + int(timeout_sec * 1.0e9)
+while rclpy.ok() and not state["fresh"] and node.get_clock().now().nanoseconds < deadline:
+    rclpy.spin_once(node, timeout_sec=0.2)
+node.destroy_node()
+rclpy.shutdown()
+if not state["fresh"]:
+    print(f"stale_or_missing age={state['age']}")
+    raise SystemExit(1)
+print(f"fresh age={state['age']}")
+PY
+}
+
 check_config_contract() {
   local params_file="${NJRH_AMCL_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/amcl_shadow.yaml}"
   if [[ -f "${params_file}" ]]; then
     grep -Eq 'tf_broadcast:[[:space:]]*false' "${params_file}" &&
       PASSES+=("AMCL config tf_broadcast=false") ||
       FAILURES+=("AMCL config does not force tf_broadcast=false")
-    grep -Eq 'scan_topic:[[:space:]]*/scan' "${params_file}" &&
-      PASSES+=("AMCL config scan_topic=/scan") ||
-      FAILURES+=("AMCL config does not use /scan")
+    if [[ "${SCAN_ADMISSION}" == "true" ]]; then
+      grep -Eq 'scan_topic:[[:space:]]*/scan_amcl' "${params_file}" &&
+        PASSES+=("AMCL config scan_topic=/scan_amcl") ||
+        FAILURES+=("AMCL config does not use /scan_amcl while scan admission is enabled")
+    else
+      grep -Eq 'scan_topic:[[:space:]]*/scan' "${params_file}" &&
+        PASSES+=("AMCL config scan_topic=/scan") ||
+        FAILURES+=("AMCL config does not use /scan")
+    fi
     if grep -Eq 'scan_topic:[[:space:]]*/flatscan' "${params_file}"; then
       FAILURES+=("AMCL config uses /flatscan")
     fi
+    grep -Eq 'transform_tolerance:[[:space:]]*0.2' "${params_file}" &&
+      PASSES+=("AMCL transform_tolerance kept at current default 0.2") ||
+      WARNS+=("AMCL transform_tolerance differs from current default; record A/B evidence")
   else
     FAILURES+=("AMCL params file missing: ${params_file}")
   fi
@@ -171,6 +263,16 @@ check_runtime_contract() {
     WARNS+=("/scan type unavailable or unexpected: ${scan_type:-missing}")
   fi
 
+  if [[ "${SCAN_ADMISSION}" == "true" && "${MODE}" != "disabled" ]]; then
+    local scan_amcl_type
+    scan_amcl_type="$(topic_type "${NJRH_AMCL_SCAN_OUTPUT_TOPIC:-/scan_amcl}")"
+    if [[ "${scan_amcl_type}" == "sensor_msgs/msg/LaserScan" ]]; then
+      PASSES+=("/scan_amcl type is sensor_msgs/msg/LaserScan")
+    else
+      FAILURES+=("/scan_amcl type unavailable or unexpected: ${scan_amcl_type:-missing}")
+    fi
+  fi
+
   local tf_info
   tf_info="$(topic_info /tf)"
   if grep -q "Node name: robot_localization_bridge" <<<"${tf_info}"; then
@@ -179,9 +281,14 @@ check_runtime_contract() {
     WARNS+=("/tf publisher info missing robot_localization_bridge")
   fi
   if grep -q "Node name: ${AMCL_NODE_NAME:-amcl}" <<<"${tf_info}"; then
-    WARNS+=("AMCL has a /tf endpoint; runtime tf_broadcast parameter is checked separately")
+    FAILURES+=("AMCL is publishing /tf; tf_broadcast must remain false")
   else
     PASSES+=("AMCL is not a /tf publisher")
+  fi
+  if grep -q "Node name: robot_local_state" <<<"${tf_info}"; then
+    PASSES+=("/tf has robot_local_state for odom->base_link")
+  else
+    WARNS+=("/tf publisher info missing robot_local_state")
   fi
 
   local status
@@ -192,13 +299,24 @@ check_runtime_contract() {
     [[ "${owner}" == "robot_localization_bridge" || -z "${owner}" ]] &&
       PASSES+=("bridge_status owner is robot_localization_bridge or pending") ||
       FAILURES+=("bridge_status map->odom owner is not robot_localization_bridge: ${owner}")
-    for field in amcl_input_enabled amcl_gate_mode amcl_pose_count active_correction_source last_accepted_source last_rejected_source; do
+    for field in \
+      amcl_input_enabled amcl_gate_mode amcl_pose_count amcl_seed_requested \
+      amcl_seed_succeeded amcl_seed_attempt_count amcl_seed_source \
+      amcl_seed_last_error amcl_initial_pose_published_count \
+      amcl_last_pose_age_ms amcl_pose_hz amcl_ready \
+      amcl_scan_admission_enabled amcl_scan_admission_hz \
+      amcl_scan_admission_dropped_age_count amcl_scan_admission_dropped_tf_count \
+      amcl_scan_frame_id amcl_scan_last_age_ms amcl_message_filter_drop_detected \
+      active_correction_source last_accepted_source last_rejected_source; do
       if [[ -n "$(bridge_status_field "${status}" "${field}")" ]]; then
         PASSES+=("bridge_status has ${field}")
       else
         FAILURES+=("bridge_status missing ${field}")
       fi
     done
+    if [[ "${MODE}" != "disabled" && "$(bridge_status_field "${status}" amcl_ready)" != "true" ]]; then
+      WARNS+=("bridge_status amcl_ready is not true yet")
+    fi
   else
     FAILURES+=("/localization/bridge_status unavailable")
   fi
@@ -236,10 +354,14 @@ check_amcl_runtime() {
 
   local scan_topic
   scan_topic="$(param_value "/${AMCL_NODE_NAME:-amcl}" scan_topic)"
-  if [[ "${scan_topic}" == *"/scan"* ]]; then
-    PASSES+=("AMCL runtime scan_topic=/scan")
+  if [[ "${SCAN_ADMISSION}" == "true" ]]; then
+    [[ "${scan_topic}" == *"/scan_amcl"* ]] &&
+      PASSES+=("AMCL runtime scan_topic=/scan_amcl") ||
+      FAILURES+=("AMCL runtime scan_topic is not /scan_amcl: ${scan_topic:-missing}")
   else
-    FAILURES+=("AMCL runtime scan_topic is not /scan: ${scan_topic:-missing}")
+    [[ "${scan_topic}" == *"/scan"* ]] &&
+      PASSES+=("AMCL runtime scan_topic=/scan") ||
+      FAILURES+=("AMCL runtime scan_topic is not /scan: ${scan_topic:-missing}")
   fi
 
   local amcl_info
@@ -250,16 +372,48 @@ check_amcl_runtime() {
     PASSES+=("/amcl_pose has publisher")
   fi
 
+  if [[ "${SEED}" == "true" ]]; then
+    sleep "${TF_WARMUP_SEC}"
+    seed_amcl_for_verify
+  fi
+
+  if fresh_pose_check /amcl_pose; then
+    PASSES+=("/amcl_pose is fresh")
+  else
+    FAILURES+=("/amcl_pose is stale or missing")
+  fi
+
   local sample_window=5
   if [[ "${DURATION_SEC}" =~ ^[0-9]+$ && "${DURATION_SEC}" -lt 12 ]]; then
     sample_window="${DURATION_SEC}"
   fi
   local scan_hz
+  local scan_amcl_hz=""
   local amcl_hz
   scan_hz="$(topic_hz /scan "${sample_window}")"
+  if [[ "${SCAN_ADMISSION}" == "true" ]]; then
+    scan_amcl_hz="$(topic_hz "${NJRH_AMCL_SCAN_OUTPUT_TOPIC:-/scan_amcl}" "${sample_window}")"
+  fi
   amcl_hz="$(topic_hz /amcl_pose "${sample_window}")"
   echo "[verify-amcl] /scan hz=${scan_hz:-unavailable}"
+  [[ "${SCAN_ADMISSION}" == "true" ]] && echo "[verify-amcl] /scan_amcl hz=${scan_amcl_hz:-unavailable}"
   echo "[verify-amcl] /amcl_pose hz=${amcl_hz:-unavailable}"
+}
+
+check_logs() {
+  [[ "${CHECK_LOGS}" == "true" ]] || return 0
+  local log_file="${NJRH_AMCL_LOG_FILE:-${NJRH_RUNTIME_LOG_DIR}/amcl_shadow_localization.log}"
+  [[ -f "${log_file}" ]] || {
+    WARNS+=("AMCL log file missing: ${log_file}")
+    return 0
+  }
+  local tail_text
+  tail_text="$(tail -n "${NJRH_AMCL_VERIFY_LOG_TAIL_LINES:-300}" "${log_file}" 2>/dev/null || true)"
+  if grep -Eq "Please set the initial pose|Message Filter dropping message|earlier than all (the )?data|transform timeout" <<<"${tail_text}"; then
+    FAILURES+=("AMCL log tail still contains seed or MessageFilter drop errors")
+  else
+    PASSES+=("AMCL log tail has no persistent seed/MessageFilter errors")
+  fi
 }
 
 check_nav2_context() {
@@ -285,10 +439,20 @@ check_nav2_context() {
   fi
 }
 
-echo "[verify-amcl] mode=${MODE} duration_sec=${DURATION_SEC}"
+echo "[verify-amcl] mode=${MODE} duration_sec=${DURATION_SEC} scan_admission=${SCAN_ADMISSION}"
 check_config_contract
 check_runtime_contract
 check_amcl_runtime
+
+if [[ "${MODE}" != "disabled" && "${DURATION_SEC}" =~ ^[0-9]+$ && "${DURATION_SEC}" -gt 0 ]]; then
+  echo "[verify-amcl] observing AMCL for ${DURATION_SEC}s"
+  sleep "${DURATION_SEC}"
+  fresh_pose_check /amcl_pose >/dev/null 2>&1 &&
+    PASSES+=("/amcl_pose remained fresh after observation") ||
+    FAILURES+=("/amcl_pose became stale during observation")
+fi
+
+check_logs
 check_nav2_context
 
 if ((${#PASSES[@]} > 0)); then

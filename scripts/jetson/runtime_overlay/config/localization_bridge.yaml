@@ -40,3 +40,8 @@ robot_localization_bridge:
     amcl_initial_pose_xy_covariance: 0.25
     amcl_initial_pose_yaw_covariance: 0.25
     amcl_seed_service: /robot_localization_bridge/seed_amcl_initial_pose
+    amcl_pose_max_age_ms: 1000.0
+    amcl_initial_pose_publish_repetitions: 3
+    amcl_initial_pose_repeat_period_ms: 100
+    amcl_scan_admission_enabled: false
+    amcl_scan_admission_status_topic: /amcl_scan_admission/status

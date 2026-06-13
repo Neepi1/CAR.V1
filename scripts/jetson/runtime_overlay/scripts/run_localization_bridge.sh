@@ -30,9 +30,11 @@ case "${AMCL_LOCALIZATION_MODE}" in
 esac
 AMCL_INPUT_ENABLED="false"
 AMCL_GATE_MODE="shadow"
+AMCL_SCAN_ADMISSION_ENABLED="false"
 if [[ "${AMCL_LOCALIZATION_MODE}" == "shadow" || "${AMCL_LOCALIZATION_MODE}" == "gated" ]]; then
   AMCL_INPUT_ENABLED="true"
   AMCL_GATE_MODE="${AMCL_LOCALIZATION_MODE}"
+  AMCL_SCAN_ADMISSION_ENABLED="${NJRH_AMCL_SCAN_ADMISSION_ENABLED:-true}"
 fi
 
 NODE_BIN="${NJRH_PROJECT_ROOT}/install/robot_localization_bridge/lib/robot_localization_bridge/localization_bridge_node"
@@ -48,4 +50,6 @@ njrh_exec_affined robot_localization_bridge "${NODE_BIN}" --ros-args \
   -p "amcl_input_enabled:=${AMCL_INPUT_ENABLED}" \
   -p "amcl_gate_mode:=${AMCL_GATE_MODE}" \
   -p "amcl_pose_topic:=${NJRH_AMCL_POSE_TOPIC:-/amcl_pose}" \
-  -p "amcl_initial_pose_topic:=${NJRH_AMCL_INITIAL_POSE_TOPIC:-/initialpose}"
+  -p "amcl_initial_pose_topic:=${NJRH_AMCL_INITIAL_POSE_TOPIC:-/initialpose}" \
+  -p "amcl_scan_admission_enabled:=${AMCL_SCAN_ADMISSION_ENABLED}" \
+  -p "amcl_scan_admission_status_topic:=${NJRH_AMCL_SCAN_ADMISSION_STATUS_TOPIC:-/amcl_scan_admission/status}"

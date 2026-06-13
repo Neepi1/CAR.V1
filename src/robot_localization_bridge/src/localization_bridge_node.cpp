@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -7,6 +8,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 
 #include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 #include "geometry_msgs/msg/quaternion.hpp"
@@ -75,6 +77,95 @@ std::string json_escape(const std::string & input)
     }
   }
   return output;
+}
+
+std::string json_field_value(const std::string & json, const std::string & key)
+{
+  const std::string quoted_key = "\"" + key + "\"";
+  const auto key_pos = json.find(quoted_key);
+  if (key_pos == std::string::npos) {
+    return "";
+  }
+  const auto colon_pos = json.find(':', key_pos + quoted_key.size());
+  if (colon_pos == std::string::npos) {
+    return "";
+  }
+  auto value_pos = colon_pos + 1;
+  while (value_pos < json.size() && std::isspace(static_cast<unsigned char>(json[value_pos]))) {
+    ++value_pos;
+  }
+  if (value_pos >= json.size()) {
+    return "";
+  }
+  if (json[value_pos] == '"') {
+    ++value_pos;
+    std::string value;
+    bool escaped = false;
+    for (; value_pos < json.size(); ++value_pos) {
+      const char c = json[value_pos];
+      if (escaped) {
+        value.push_back(c);
+        escaped = false;
+      } else if (c == '\\') {
+        escaped = true;
+      } else if (c == '"') {
+        break;
+      } else {
+        value.push_back(c);
+      }
+    }
+    return value;
+  }
+  auto end_pos = value_pos;
+  while (end_pos < json.size() && json[end_pos] != ',' && json[end_pos] != '}') {
+    ++end_pos;
+  }
+  auto value = json.substr(value_pos, end_pos - value_pos);
+  while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) {
+    value.pop_back();
+  }
+  return value;
+}
+
+double json_double_field(const std::string & json, const std::string & key, const double fallback)
+{
+  const auto value = json_field_value(json, key);
+  if (value.empty()) {
+    return fallback;
+  }
+  try {
+    return std::stod(value);
+  } catch (const std::exception &) {
+    return fallback;
+  }
+}
+
+std::uint64_t json_uint64_field(
+  const std::string & json,
+  const std::string & key,
+  const std::uint64_t fallback)
+{
+  const auto value = json_field_value(json, key);
+  if (value.empty()) {
+    return fallback;
+  }
+  try {
+    return static_cast<std::uint64_t>(std::stoull(value));
+  } catch (const std::exception &) {
+    return fallback;
+  }
+}
+
+bool json_bool_field(const std::string & json, const std::string & key, const bool fallback)
+{
+  const auto value = json_field_value(json, key);
+  if (value == "true" || value == "True" || value == "1") {
+    return true;
+  }
+  if (value == "false" || value == "False" || value == "0") {
+    return false;
+  }
+  return fallback;
 }
 
 struct MapToOdom
@@ -172,6 +263,15 @@ public:
       "amcl_initial_pose_yaw_covariance", 0.25);
     amcl_seed_service_ = declare_parameter<std::string>(
       "amcl_seed_service", "/robot_localization_bridge/seed_amcl_initial_pose");
+    amcl_pose_max_age_ms_ = declare_parameter<double>("amcl_pose_max_age_ms", 1000.0);
+    amcl_initial_pose_publish_repetitions_ = declare_parameter<int>(
+      "amcl_initial_pose_publish_repetitions", 3);
+    amcl_initial_pose_repeat_period_ms_ = declare_parameter<int>(
+      "amcl_initial_pose_repeat_period_ms", 100);
+    amcl_scan_admission_enabled_ = declare_parameter<bool>(
+      "amcl_scan_admission_enabled", false);
+    amcl_scan_admission_status_topic_ = declare_parameter<std::string>(
+      "amcl_scan_admission_status_topic", "/amcl_scan_admission/status");
     status_publish_period_sec_ = declare_parameter<double>("status_publish_period_sec", 1.0);
     require_result_frame_match_ = declare_parameter<bool>("require_result_frame_match", true);
 
@@ -226,6 +326,11 @@ public:
     amcl_initial_pose_xy_covariance_ = std::max(0.0, amcl_initial_pose_xy_covariance_);
     amcl_initial_pose_yaw_covariance_ =
       std::max(0.0, amcl_initial_pose_yaw_covariance_);
+    amcl_pose_max_age_ms_ = std::max(1.0, amcl_pose_max_age_ms_);
+    amcl_initial_pose_publish_repetitions_ =
+      std::clamp(amcl_initial_pose_publish_repetitions_, 1, 5);
+    amcl_initial_pose_repeat_period_ms_ =
+      std::clamp(amcl_initial_pose_repeat_period_ms_, 0, 1000);
     status_publish_period_sec_ = std::max(0.2, status_publish_period_sec_);
 
     pose_sub_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
@@ -237,6 +342,15 @@ public:
         amcl_pose_topic_,
         rclcpp::QoS(20),
         std::bind(&LocalizationBridgeNode::on_amcl_pose, this, std::placeholders::_1));
+      if (amcl_scan_admission_enabled_) {
+        amcl_scan_admission_status_sub_ = create_subscription<std_msgs::msg::String>(
+          amcl_scan_admission_status_topic_,
+          rclcpp::QoS(10),
+          std::bind(
+            &LocalizationBridgeNode::on_amcl_scan_admission_status,
+            this,
+            std::placeholders::_1));
+      }
     }
     odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
       local_odom_topic_,
@@ -280,6 +394,22 @@ private:
     refresh_state("pose");
   }
 
+  void on_amcl_scan_admission_status(const std_msgs::msg::String::SharedPtr msg)
+  {
+    last_amcl_scan_admission_status_received_sec_ = now().seconds();
+    last_amcl_scan_admission_status_ = msg->data;
+    amcl_scan_admission_hz_ = json_double_field(msg->data, "hz", amcl_scan_admission_hz_);
+    amcl_scan_admission_dropped_age_count_ =
+      json_uint64_field(msg->data, "dropped_age_count", amcl_scan_admission_dropped_age_count_);
+    amcl_scan_admission_dropped_tf_count_ =
+      json_uint64_field(msg->data, "dropped_tf_count", amcl_scan_admission_dropped_tf_count_);
+    amcl_scan_frame_id_ = json_field_value(msg->data, "frame_id");
+    amcl_scan_last_age_ms_ = json_double_field(msg->data, "last_age_ms", amcl_scan_last_age_ms_);
+    amcl_message_filter_drop_detected_ =
+      json_bool_field(msg->data, "message_filter_drop_detected", amcl_message_filter_drop_detected_);
+    amcl_scan_admission_last_error_ = json_field_value(msg->data, "last_error");
+  }
+
   void on_amcl_pose(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
   {
     ++amcl_pose_count_;
@@ -298,6 +428,22 @@ private:
       return;
     }
     const double now_sec = now().seconds();
+    if (!amcl_seed_succeeded_) {
+      last_amcl_state_ = "not_seeded";
+      reject_candidate("AMCL_NOT_SEEDED", "amcl_pose", false);
+      return;
+    }
+    const double amcl_pose_age_ms = (now_sec - stamp_to_sec(msg->header.stamp)) * 1000.0;
+    if (amcl_pose_age_ms > amcl_pose_max_age_ms_) {
+      last_amcl_state_ = "pose_stale";
+      reject_candidate("AMCL_POSE_STALE", "amcl_pose", false);
+      return;
+    }
+    if (!amcl_scan_admission_ready(now_sec)) {
+      last_amcl_state_ = "scan_admission_not_ready";
+      reject_candidate(amcl_scan_admission_reject_reason(), "amcl_pose", false);
+      return;
+    }
     if (
       last_isaac_triggered_accept_sec_ > 0.0 &&
       now_sec - last_isaac_triggered_accept_sec_ < amcl_accept_after_isaac_delay_sec_)
@@ -375,12 +521,19 @@ private:
     if (!current_map_base_pose(seed_pose)) {
       response->success = false;
       response->message = "cannot seed AMCL: map->odom or local odom is not available";
+      amcl_seed_requested_ = true;
+      amcl_seed_succeeded_ = false;
+      ++amcl_seed_attempt_count_;
+      amcl_seed_source_ = "current_map_base";
+      amcl_seed_last_error_ = response->message;
       RCLCPP_WARN(get_logger(), "%s", response->message.c_str());
       return;
     }
-    publish_amcl_initial_pose(seed_pose, "current_map_base");
-    response->success = true;
-    response->message = "published AMCL /initialpose from current map->base_link";
+    const bool seeded = publish_amcl_initial_pose(seed_pose, "current_map_base");
+    response->success = seeded;
+    response->message = seeded ?
+      "published AMCL /initialpose from current map->base_link" :
+      "AMCL /initialpose has no visible subscribers or seed is disabled";
   }
 
   bool is_new_pose_stamp() const
@@ -460,6 +613,55 @@ private:
   {
     (void)gate_mode;
     return triggered_max_result_age_ms_;
+  }
+
+  bool amcl_scan_admission_ready(const double now_sec) const
+  {
+    if (!amcl_scan_admission_enabled_) {
+      return true;
+    }
+    if (last_amcl_scan_admission_status_received_sec_ <= 0.0) {
+      return false;
+    }
+    if (now_sec - last_amcl_scan_admission_status_received_sec_ > 2.5) {
+      return false;
+    }
+    if (amcl_scan_admission_hz_ <= 0.0) {
+      return false;
+    }
+    return amcl_scan_admission_last_error_.empty() ||
+           amcl_scan_admission_last_error_ == "none";
+  }
+
+  std::string amcl_scan_admission_reject_reason() const
+  {
+    if (amcl_scan_admission_last_error_.find("AMCL_SCAN_TF_UNAVAILABLE") != std::string::npos) {
+      return "AMCL_SCAN_TF_UNAVAILABLE";
+    }
+    if (last_amcl_scan_admission_status_received_sec_ <= 0.0) {
+      return "AMCL_SCAN_ADMISSION_STATUS_MISSING";
+    }
+    return "AMCL_SCAN_TF_UNAVAILABLE";
+  }
+
+  std::string normalize_amcl_reject_reason(const std::string & reason) const
+  {
+    if (reason.find("pose_stale") != std::string::npos) {
+      return "AMCL_POSE_STALE";
+    }
+    if (reason.find("tf_history_missing") != std::string::npos) {
+      return "AMCL_TF_LOOKUP_FAILED";
+    }
+    if (reason.find("odom_base_latest_tf_stale") != std::string::npos) {
+      return "AMCL_TF_LOOKUP_FAILED";
+    }
+    if (reason.find("covariance") != std::string::npos) {
+      return "AMCL_COVARIANCE_TOO_LARGE";
+    }
+    if (reason.find("frame_mismatch") != std::string::npos) {
+      return "AMCL_TF_LOOKUP_FAILED";
+    }
+    return reason.empty() ? "AMCL_TF_LOOKUP_FAILED" : reason;
   }
 
   CandidateCorrection build_candidate(
@@ -677,7 +879,7 @@ private:
 
     if (!candidate.valid) {
       last_amcl_state_ = "rejected";
-      reject_candidate(candidate.reject_reason, source, false);
+      reject_candidate(normalize_amcl_reject_reason(candidate.reject_reason), source, false);
       return false;
     }
 
@@ -685,7 +887,7 @@ private:
       ++amcl_shadow_candidate_count_;
       ++shadow_candidate_count_;
       last_amcl_state_ = "shadow_candidate";
-      last_reject_reason_ = "amcl_shadow_only";
+      last_reject_reason_ = "AMCL_SHADOW_ONLY";
       last_rejected_source_ = candidate.source;
       return false;
     }
@@ -708,18 +910,18 @@ private:
         amcl_hard_reject_yaw_rad_))
     {
       last_amcl_state_ = "hard_reject";
-      reject_candidate("amcl_hard_reject_threshold", source, false);
+      reject_candidate("AMCL_CORRECTION_TOO_LARGE", source, false);
       return false;
     }
 
     if (amcl_candidate_agrees_with_previous_large(candidate)) {
       last_amcl_state_ = "large_consistent_requires_isaac_recovery";
-      reject_candidate("amcl_large_consistent_requires_isaac_recovery", source, false);
+      reject_candidate("AMCL_CORRECTION_TOO_LARGE", source, false);
       return false;
     }
 
     last_amcl_state_ = "large_correction_waiting_for_consistency";
-    reject_candidate("amcl_large_correction_waiting_for_consistency", source, false);
+    reject_candidate("AMCL_CORRECTION_TOO_LARGE", source, false);
     return false;
   }
 
@@ -761,7 +963,7 @@ private:
     if (candidate.source == "isaac_triggered") {
       last_isaac_triggered_accept_sec_ = last_accepted_sec_;
       if (amcl_initial_pose_seed_enabled_) {
-        publish_amcl_initial_pose(candidate.map_base_pose, "isaac_triggered_accept");
+        (void)publish_amcl_initial_pose(candidate.map_base_pose, "isaac_triggered_accept");
       }
     }
     RCLCPP_INFO(
@@ -784,12 +986,17 @@ private:
     pose.pose.covariance[35] = amcl_initial_pose_yaw_covariance_;
   }
 
-  void publish_amcl_initial_pose(
+  bool publish_amcl_initial_pose(
     const geometry_msgs::msg::PoseWithCovarianceStamped & seed_pose,
     const std::string & reason)
   {
+    amcl_seed_requested_ = true;
+    ++amcl_seed_attempt_count_;
+    amcl_seed_source_ = reason;
     if (!amcl_initial_pose_seed_enabled_ || !amcl_initial_pose_pub_) {
-      return;
+      amcl_seed_succeeded_ = false;
+      amcl_seed_last_error_ = "SEED_DISABLED";
+      return false;
     }
     auto msg = seed_pose;
     msg.header.frame_id = map_frame_;
@@ -800,11 +1007,23 @@ private:
         get_logger(),
         "publishing AMCL initial pose reason=%s but no /initialpose subscribers are visible",
         reason.c_str());
+      amcl_seed_succeeded_ = false;
+      amcl_seed_last_error_ = "NO_INITIALPOSE_SUBSCRIBERS";
+      return false;
     }
-    amcl_initial_pose_pub_->publish(msg);
+    for (int i = 0; i < amcl_initial_pose_publish_repetitions_; ++i) {
+      amcl_initial_pose_pub_->publish(msg);
+      ++amcl_initial_pose_published_count_;
+      if (i + 1 < amcl_initial_pose_publish_repetitions_ && amcl_initial_pose_repeat_period_ms_ > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(amcl_initial_pose_repeat_period_ms_));
+      }
+    }
     last_amcl_initial_pose_seed_sec_ = now().seconds();
     last_amcl_initial_pose_reason_ = reason;
     ++amcl_initial_pose_seed_count_;
+    amcl_seed_succeeded_ = true;
+    amcl_seed_last_error_ = "none";
+    return true;
   }
 
   bool current_map_base_pose(geometry_msgs::msg::PoseWithCovarianceStamped & pose) const
@@ -925,6 +1144,8 @@ private:
       rate_since_last_status(localization_result_count_, previous_localization_result_count_, elapsed);
     const double accepted_hz =
       rate_since_last_status(accepted_result_count_, previous_accepted_result_count_, elapsed);
+    const double amcl_pose_hz =
+      rate_since_last_status(amcl_pose_count_, previous_amcl_pose_count_, elapsed);
 
     const double map_to_odom_age_ms = last_accepted_sec_ > 0.0 ?
       (now_sec - last_accepted_sec_) * 1000.0 : -1.0;
@@ -932,6 +1153,12 @@ private:
       (now_sec - last_amcl_pose_received_sec_) * 1000.0 : -1.0;
     const double amcl_initial_pose_age_ms = last_amcl_initial_pose_seed_sec_ > 0.0 ?
       (now_sec - last_amcl_initial_pose_seed_sec_) * 1000.0 : -1.0;
+    const bool amcl_ready =
+      amcl_input_enabled_ &&
+      amcl_seed_succeeded_ &&
+      last_amcl_pose_age_ms >= 0.0 &&
+      last_amcl_pose_age_ms <= amcl_pose_max_age_ms_ &&
+      amcl_scan_admission_ready(now_sec);
     std::ostringstream out;
     out << std::fixed << std::setprecision(3)
         << "{\"localization_mode\":\"" << continuous_localization_mode_
@@ -961,6 +1188,7 @@ private:
         << ",\"amcl_gate_mode\":\"" << json_escape(amcl_gate_mode_)
         << "\",\"amcl_pose_topic\":\"" << json_escape(amcl_pose_topic_)
         << "\",\"amcl_max_result_age_ms\":" << amcl_max_result_age_ms_
+        << ",\"amcl_pose_max_age_ms\":" << amcl_pose_max_age_ms_
         << ",\"amcl_small_correction_translation_m\":" << amcl_small_correction_translation_m_
         << ",\"amcl_small_correction_yaw_rad\":" << amcl_small_correction_yaw_rad_
         << ",\"amcl_hard_reject_translation_m\":" << amcl_hard_reject_translation_m_
@@ -975,13 +1203,30 @@ private:
         << ",\"amcl_shadow_candidate_count\":" << amcl_shadow_candidate_count_
         << ",\"amcl_suppressed_after_isaac_count\":" << amcl_suppressed_after_isaac_count_
         << ",\"last_amcl_pose_age_ms\":" << last_amcl_pose_age_ms
+        << ",\"amcl_last_pose_age_ms\":" << last_amcl_pose_age_ms
+        << ",\"amcl_pose_hz\":" << amcl_pose_hz
+        << ",\"amcl_ready\":" << (amcl_ready ? "true" : "false")
         << ",\"last_amcl_xy_covariance\":" << last_amcl_xy_covariance_
         << ",\"last_amcl_yaw_covariance\":" << last_amcl_yaw_covariance_
-        << ",\"amcl_initial_pose_seed_count\":" << amcl_initial_pose_seed_count_
+        << ",\"amcl_seed_requested\":" << (amcl_seed_requested_ ? "true" : "false")
+        << ",\"amcl_seed_succeeded\":" << (amcl_seed_succeeded_ ? "true" : "false")
+        << ",\"amcl_seed_attempt_count\":" << amcl_seed_attempt_count_
+        << ",\"amcl_seed_source\":\"" << json_escape(amcl_seed_source_)
+        << "\",\"amcl_seed_last_error\":\"" << json_escape(amcl_seed_last_error_)
+        << "\",\"amcl_initial_pose_seed_count\":" << amcl_initial_pose_seed_count_
+        << ",\"amcl_initial_pose_published_count\":" << amcl_initial_pose_published_count_
         << ",\"amcl_initial_pose_age_ms\":" << amcl_initial_pose_age_ms
         << ",\"amcl_initial_pose_reason\":\"" << json_escape(last_amcl_initial_pose_reason_)
         << "\",\"amcl_initial_pose_subscribers\":" << last_amcl_initial_pose_subscribers_
-        << ",\"last_accept_reason\":\"" << json_escape(last_accept_reason_)
+        << ",\"amcl_scan_admission_enabled\":" << (amcl_scan_admission_enabled_ ? "true" : "false")
+        << ",\"amcl_scan_admission_hz\":" << amcl_scan_admission_hz_
+        << ",\"amcl_scan_admission_dropped_age_count\":" << amcl_scan_admission_dropped_age_count_
+        << ",\"amcl_scan_admission_dropped_tf_count\":" << amcl_scan_admission_dropped_tf_count_
+        << ",\"amcl_scan_frame_id\":\"" << json_escape(amcl_scan_frame_id_)
+        << "\",\"amcl_scan_last_age_ms\":" << amcl_scan_last_age_ms_
+        << ",\"amcl_message_filter_drop_detected\":" << (amcl_message_filter_drop_detected_ ? "true" : "false")
+        << ",\"amcl_scan_admission_last_error\":\"" << json_escape(amcl_scan_admission_last_error_)
+        << "\",\"last_accept_reason\":\"" << json_escape(last_accept_reason_)
         << "\",\"last_reject_reason\":\"" << json_escape(last_reject_reason_)
         << "\",\"last_candidate_correction_translation_m\":" << last_candidate_correction_translation_m_
         << ",\"last_candidate_correction_yaw_rad\":" << last_candidate_correction_yaw_rad_
@@ -1002,8 +1247,14 @@ private:
   bool amcl_input_enabled_{false};
   bool amcl_covariance_gate_enabled_{true};
   bool amcl_initial_pose_seed_enabled_{true};
+  bool amcl_scan_admission_enabled_{false};
+  bool amcl_seed_requested_{false};
+  bool amcl_seed_succeeded_{false};
+  bool amcl_message_filter_drop_detected_{false};
   int amcl_large_correction_consistency_count_{3};
   int amcl_large_candidate_agreement_count_{0};
+  int amcl_initial_pose_publish_repetitions_{3};
+  int amcl_initial_pose_repeat_period_ms_{100};
   double jump_threshold_m_{1.0};
   double forced_jump_threshold_m_{20.0};
   double timeout_sec_{1.0};
@@ -1023,6 +1274,10 @@ private:
   double amcl_accept_after_isaac_delay_sec_{2.0};
   double amcl_initial_pose_xy_covariance_{0.25};
   double amcl_initial_pose_yaw_covariance_{0.25};
+  double amcl_pose_max_age_ms_{1000.0};
+  double amcl_scan_admission_hz_{0.0};
+  double amcl_scan_last_age_ms_{-1.0};
+  double last_amcl_scan_admission_status_received_sec_{0.0};
   double status_publish_period_sec_{1.0};
   double latest_pose_received_sec_{0.0};
   double last_amcl_pose_received_sec_{0.0};
@@ -1055,9 +1310,14 @@ private:
   std::uint64_t amcl_shadow_candidate_count_{0U};
   std::uint64_t amcl_suppressed_after_isaac_count_{0U};
   std::uint64_t amcl_initial_pose_seed_count_{0U};
+  std::uint64_t amcl_initial_pose_published_count_{0U};
+  std::uint64_t amcl_seed_attempt_count_{0U};
+  std::uint64_t amcl_scan_admission_dropped_age_count_{0U};
+  std::uint64_t amcl_scan_admission_dropped_tf_count_{0U};
   std::size_t last_amcl_initial_pose_subscribers_{0U};
   std::uint64_t previous_localization_result_count_{0U};
   std::uint64_t previous_accepted_result_count_{0U};
+  std::uint64_t previous_amcl_pose_count_{0U};
   std::string map_frame_;
   std::string odom_frame_;
   std::string base_frame_;
@@ -1070,6 +1330,7 @@ private:
   std::string amcl_gate_mode_{"shadow"};
   std::string amcl_initial_pose_topic_;
   std::string amcl_seed_service_;
+  std::string amcl_scan_admission_status_topic_;
   std::string continuous_localization_mode_{"triggered"};
   std::string last_gate_mode_{"triggered"};
   std::string active_correction_source_{"none"};
@@ -1078,6 +1339,11 @@ private:
   std::string last_rejected_source_{"none"};
   std::string last_amcl_state_{"disabled"};
   std::string last_amcl_initial_pose_reason_{"none"};
+  std::string amcl_seed_source_{"none"};
+  std::string amcl_seed_last_error_{"none"};
+  std::string amcl_scan_frame_id_;
+  std::string amcl_scan_admission_last_error_{"none"};
+  std::string last_amcl_scan_admission_status_;
 
   bool has_pose_{false};
   bool has_odom_{false};
@@ -1104,6 +1370,7 @@ private:
   tf2_ros::TransformListener tf_listener_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr amcl_pose_sub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr amcl_scan_admission_status_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr health_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;

@@ -4,7 +4,10 @@ amcl:
     global_frame_id: map
     odom_frame_id: odom
     base_frame_id: base_link
-    scan_topic: /scan
+    # Phase A1.2: /scan_amcl is the AMCL production admission input. The relay
+    # preserves /scan header.stamp/frame_id/ranges and only forwards recent
+    # scans whose odom<-scan_frame TF exists at the original scan stamp.
+    scan_topic: /scan_amcl
     map_topic: /map
     tf_broadcast: false
     set_initial_pose: false

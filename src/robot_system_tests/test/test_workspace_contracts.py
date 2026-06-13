@@ -5680,6 +5680,8 @@ def test_phase_a2_amcl_replaces_isaac_continuous_localization_contracts():
     assert 'continuous_localization_mode:=triggered' in run_bridge
     assert "AMCL_INPUT_ENABLED=\"true\"" in run_bridge
     assert "amcl_input_enabled:=${AMCL_INPUT_ENABLED}" in run_bridge
+    assert "amcl_scan_admission_enabled:=${AMCL_SCAN_ADMISSION_ENABLED}" in run_bridge
+    assert "amcl_scan_admission_status_topic:=${NJRH_AMCL_SCAN_ADMISSION_STATUS_TOPIC" in run_bridge
 
     assert "lookupTransform(odom_frame_, base_frame_, stamp" in bridge_cpp
     assert "lookupTransform(odom_frame_, base_frame_, latest_tf_time" in bridge_cpp
@@ -5761,15 +5763,18 @@ def test_phase_a1_amcl_shadow_localization_contracts():
     amcl_mode_path = config_dir / "amcl_localization_profile.env"
     amcl_runner_path = scripts_dir / "run_amcl_shadow_localization.sh"
     amcl_verify_path = scripts_dir / "verify_amcl_shadow_localization.sh"
+    amcl_scan_relay_path = scripts_dir / "amcl_scan_admission_relay.py"
     assert amcl_cfg_path.exists()
     assert amcl_mode_path.exists()
     assert amcl_runner_path.exists()
     assert amcl_verify_path.exists()
+    assert amcl_scan_relay_path.exists()
 
     amcl_cfg = amcl_cfg_path.read_text(encoding="utf-8")
     amcl_mode = amcl_mode_path.read_text(encoding="utf-8")
     amcl_runner = amcl_runner_path.read_text(encoding="utf-8")
     amcl_verify = amcl_verify_path.read_text(encoding="utf-8")
+    amcl_scan_relay = amcl_scan_relay_path.read_text(encoding="utf-8")
     common_env = (scripts_dir / "common_env.sh").read_text(encoding="utf-8")
     run_bridge = (scripts_dir / "run_localization_bridge.sh").read_text(encoding="utf-8")
     nav_runtime = (scripts_dir / "run_navigation_runtime_services.sh").read_text(encoding="utf-8")
@@ -5780,21 +5785,53 @@ def test_phase_a1_amcl_shadow_localization_contracts():
     nav2 = (config_dir / "nav2.yaml").read_text(encoding="utf-8")
 
     assert "tf_broadcast: false" in amcl_cfg
-    assert "scan_topic: /scan" in amcl_cfg
+    assert "scan_topic: /scan_amcl" in amcl_cfg
     assert "scan_topic: /flatscan" not in amcl_cfg
     assert "map_topic: /map" in amcl_cfg
     assert "set_initial_pose: false" in amcl_cfg
     assert "nav2_amcl::DifferentialMotionModel" in amcl_cfg
 
     assert "NJRH_AMCL_LOCALIZATION_MODE:-gated" in amcl_mode
+    assert "NJRH_AMCL_TF_WARMUP_SEC" in amcl_mode
+    assert "NJRH_AMCL_LIFECYCLE_TRANSITION_TIMEOUT_SEC" in amcl_mode
+    assert "NJRH_AMCL_SEED_RETRY_COUNT" in amcl_mode
+    assert "NJRH_AMCL_SCAN_ADMISSION_ENABLED" in amcl_mode
+    assert "NJRH_AMCL_SCAN_OUTPUT_TOPIC" in amcl_mode
+    assert "NJRH_AMCL_SCAN_MAX_AGE_MS:-250.0" in amcl_mode
+    assert "NJRH_AMCL_SCAN_WAIT_FOR_TF_TIMEOUT_MS:-20.0" in amcl_mode
     assert "disabled|shadow|gated" in amcl_runner
     assert "ros2 run nav2_amcl amcl" in amcl_runner
+    assert "complete_amcl_readiness_sequence" in amcl_runner
+    assert "wait_for_amcl_tf_warmup" in amcl_runner
+    assert 'source "${SCRIPT_DIR}/map_server_helpers.sh"' in amcl_runner
+    assert 'wait_for_occupancy_grid "/map" "${map_timeout}"' in amcl_runner
+    assert 'wait_for_topic_message "/map" "${map_timeout}"' not in amcl_runner
+    assert '"/${AMCL_NODE_NAME}/change_state"' in amcl_runner
+    assert "lifecycle_msgs/srv/ChangeState" in amcl_runner
+    assert '"/${AMCL_NODE_NAME}/get_state"' in amcl_runner
+    assert "lifecycle_msgs/srv/GetState" in amcl_runner
+    assert '[[ "${state}" != active* && "${state}" != inactive* ]]' in amcl_runner
+    assert 'ros2 lifecycle set "/${AMCL_NODE_NAME}" configure' not in amcl_runner
+    assert 'ros2 lifecycle set "/${AMCL_NODE_NAME}" activate' not in amcl_runner
+    assert "seed_amcl_initial_pose" in amcl_runner
+    assert "start_scan_admission_relay" in amcl_runner
+    assert "scan_max_age_ms" in amcl_runner
+    assert '-p "max_age_ms:=${scan_max_age_ms}"' in amcl_runner
+    assert '-p "wait_for_tf_timeout_ms:=${scan_wait_for_tf_timeout_ms}"' in amcl_runner
+    assert "wait_for_amcl_pose_fresh" in amcl_runner
+    assert "scan_topic:=$(effective_scan_topic)" in amcl_runner
     assert "tf_broadcast=false" in amcl_verify
-    assert "AMCL has a /tf endpoint" in amcl_verify
+    assert "AMCL is publishing /tf" in amcl_verify
     assert "sensor_msgs/msg/LaserScan" in amcl_verify
-    assert "/flatscan" in amcl_verify
+    assert "/scan_amcl" in amcl_verify
+    assert "--seed" in amcl_verify
+    assert "--tf-warmup-sec" in amcl_verify
+    assert "--scan-admission" in amcl_verify
+    assert "--check-logs" in amcl_verify
     assert "verify_amcl_bridge_status_once" in amcl_verify
     assert "rclpy.spin_once" in amcl_verify
+    assert "Please set the initial pose" in amcl_verify
+    assert "Message Filter dropping message" in amcl_verify
     assert "run_amcl_shadow_localization.sh" in stop_nav
     assert "killall -9" not in amcl_runner
     assert "killall -9" not in amcl_verify
@@ -5805,6 +5842,7 @@ def test_phase_a1_amcl_shadow_localization_contracts():
     assert "NJRH_AMCL_LOCALIZATION_MODE" in run_bridge
     assert "amcl_input_enabled:=${AMCL_INPUT_ENABLED}" in run_bridge
     assert "amcl_gate_mode:=${AMCL_GATE_MODE}" in run_bridge
+    assert "amcl_scan_admission_enabled:=${AMCL_SCAN_ADMISSION_ENABLED}" in run_bridge
     assert "start_amcl_if_enabled_for_navigation" in nav_runtime
     assert "initial localization accepted" in nav_runtime
     assert "AMCL continuous localization candidate" in nav_runtime
@@ -5819,16 +5857,30 @@ def test_phase_a1_amcl_shadow_localization_contracts():
         assert "amcl_max_xy_covariance: 1.0" in cfg
         assert "amcl_max_yaw_covariance: 0.5" in cfg
         assert "amcl_seed_service: /robot_localization_bridge/seed_amcl_initial_pose" in cfg
+        assert "amcl_pose_max_age_ms: 1000.0" in cfg
+        assert "amcl_initial_pose_publish_repetitions: 3" in cfg
+        assert "amcl_scan_admission_enabled: false" in cfg
+        assert "amcl_scan_admission_status_topic: /amcl_scan_admission/status" in cfg
 
     assert "on_amcl_pose" in bridge_cpp
     assert "amcl_pose_topic_" in bridge_cpp
     assert "accept_amcl_candidate" in bridge_cpp
     assert "AMCL_SMALL_CORRECTION" in bridge_cpp
-    assert "amcl_shadow_only" in bridge_cpp
-    assert "amcl_large_consistent_requires_isaac_recovery" in bridge_cpp
+    assert "AMCL_SHADOW_ONLY" in bridge_cpp
+    assert "AMCL_CORRECTION_TOO_LARGE" in bridge_cpp
+    assert "AMCL_NOT_SEEDED" in bridge_cpp
+    assert "AMCL_POSE_STALE" in bridge_cpp
+    assert "AMCL_SCAN_TF_UNAVAILABLE" in bridge_cpp
+    assert "AMCL_TF_LOOKUP_FAILED" in bridge_cpp
+    assert "AMCL_COVARIANCE_TOO_LARGE" in bridge_cpp
     assert "_covariance_rejected" in bridge_cpp
     assert "on_amcl_seed_request" in bridge_cpp
     assert "amcl_initial_pose_pub_" in bridge_cpp
+    assert "amcl_seed_succeeded_" in bridge_cpp
+    assert '",\\"amcl_initial_pose_seed_count\\":" << amcl_initial_pose_seed_count_' in bridge_cpp
+    assert "amcl_ready" in bridge_cpp
+    assert "amcl_scan_admission_hz" in bridge_cpp
+    assert '",\\"last_accept_reason\\":\\"" << json_escape(last_accept_reason_)' in bridge_cpp
     assert "active_correction_source" in bridge_cpp
     assert "last_accepted_source" in bridge_cpp
     assert "last_rejected_source" in bridge_cpp
@@ -5837,6 +5889,16 @@ def test_phase_a1_amcl_shadow_localization_contracts():
     assert "amcl_shadow" in bridge_cpp
     assert "lookupTransform(odom_frame_, base_frame_, stamp" in bridge_cpp
     assert "tf_broadcaster_->sendTransform(tf)" in bridge_cpp
+
+    assert "class AmclScanAdmissionRelay" in amcl_scan_relay
+    assert "ParameterDescriptor(dynamic_typing=True)" in amcl_scan_relay
+    assert "self.pub.publish(msg)" in amcl_scan_relay
+    assert "Preserve the original header.stamp" in amcl_scan_relay
+    assert "self.max_age_ms" in amcl_scan_relay
+    assert "can_transform" in amcl_scan_relay
+    assert "dropped_age_count" in amcl_scan_relay
+    assert "dropped_tf_count" in amcl_scan_relay
+    assert "message_filter_drop_detected" in amcl_scan_relay
 
     assert "MPPIController" in nav2
     assert "SmacPlanner2D" in nav2
