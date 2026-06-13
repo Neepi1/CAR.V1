@@ -41,7 +41,55 @@ The default 8-core split reserves CPU0 for lightweight API/map-filter work plus 
 bash scripts/jetson/runtime_overlay/scripts/apply_cpu_affinity.sh
 ```
 
+AMCL scan admission is part of the localization CPU budget. `NJRH_CPUSET_AMCL`
+and `NJRH_CPUSET_AMCL_SCAN_ADMISSION` default to CPU6 through
+`NJRH_CPUSET_LOCALIZATION`. Phase A1.4 keeps AMCL itself unchanged and starts
+the C++ `robot_localization_bridge/amcl_scan_admission_node` by default through
+`NJRH_AMCL_SCAN_ADMISSION_IMPL=cpp`. The node is launched with
+`taskset -c ${NJRH_CPUSET_AMCL_SCAN_ADMISSION}` and startup fails if Linux
+reports a different `Cpus_allowed_list`. This keeps `/scan -> /scan_amcl`
+admission off EKF CPU2, Nav2 controller CPU3, and `robot_localization_bridge`
+CPU7 without changing AMCL TF tolerance, bridge future-stamp gates, Nav2
+controller/planner plugins, PointCloud2 QoS, DDS, Ranger odom, or EKF fusion.
+The Python relay remains a rollback-only path selected explicitly with
+`NJRH_AMCL_SCAN_ADMISSION_IMPL=python`; a missing C++ binary is a hard startup
+failure, not a silent fallback. Use:
+
+```bash
+bash scripts/jetson/runtime_overlay/scripts/inspect_runtime_cpu_affinity.sh
+bash scripts/jetson/runtime_overlay/scripts/observe_navigation_tf_jitter_180s.sh --duration-sec 180 --label nav_tf_jitter
+```
+
 Hardware validation still needs a loaded navigation run after a full restart to confirm `taskset -pc <pid>` matches the intended service groups: JT128 driver on CPU4, standalone pointcloud remap on CPU5, IMU remap/localization/local perception on CPU6, `robot_localization_bridge` on CPU7, planner/BT on CPU0, and both Nav2 lifecycle managers on CPU0/CPU1. Also confirm no `fastlio_mapping` process is resident during navigation, `/jt128/vendor/points_raw`, `/lidar_points`, `/_internal/lidar_points_local`, `/points_nav`, and `/perception/obstacle_points` remain close to the target cadence, `/perception/clearing_points` runs at the configured decimated cadence, the filter lifecycle manager reaches active before the core navigation lifecycle manager, `controller_server` no longer misses 12 Hz under JT128 load, and `/perception/obstacle_points` is still subscribed by local costmap plus collision monitor. Use `set_local_perception_input_profile.sh` for explicit `local_branch`/`trunk` switching, `verify_pointcloud_rates.sh` for sequential field rate checks, `verify_lidar_trunk_jitter.sh` for source-side trunk jitter checks, `diagnose_lidar_points_jitter.sh` for `/lidar_points` publish-side versus CLI subscriber-side classification, `diagnose_local_perception_pipeline.sh` for local obstacle CASE classification, `diagnose_nav_scan_pipeline.sh` for `/points_nav` and scan-chain CASE classification, `diagnose_pointcloud_cpu_pressure.sh` for CPU/thermal/fan-out pressure, `run_pointcloud_cpu_affinity_ab.sh --print` for reversible CPU A/B plans, `check_runtime_process_freshness.sh` after sync/build/restart, `inspect_pointcloud_subscribers.sh` for ROS graph fan-out checks without a PointCloud2 subscription, `verify_pointcloud_delivery_matrix.sh` for profile acceptance, `inspect_pointcloud_cpu_affinity.sh` for observation-only CPU/TID/thermal placement, `record_pointcloud_nav_acceptance.sh --duration-sec 1200` for the 20-minute lightweight report, `run_pointcloud_dds_transport_ab.sh` for controlled DDS transport A/B commands, and `run_lidar_trunk_pure_ab.sh --execute` only as a stationary diagnostic that temporarily disables derived branches and then restores production driver settings; they are manual verification tools, not background monitors.
+
+Phase C1 adds a controller/local-costmap CPU-set A/B profile for the specific
+case where external `/tf` still publishes at the expected rate but
+`controller_server` reports a stale in-process TF buffer. The default
+`NJRH_NAV2_CONTROLLER_CPU_PROFILE=current` keeps `controller_server` on CPU3.
+`control_wide` sets only `controller_server` to CPU3,5, matching the fact that
+Nav2 hosts the local costmap inside that process. Startup logs the selected
+profile, CPU set, and PID, then fails if `/proc/<pid>/status` or any controller
+thread does not match the expected CPU set. EKF/local-state CPU2, JT128 CPU4,
+AMCL scan admission CPU6, and `robot_localization_bridge` CPU7 remain reserved.
+Run the A/B as:
+
+```bash
+export NJRH_NAV2_CONTROLLER_CPU_PROFILE=current
+bash scripts/jetson/runtime_overlay/scripts/run_nav2_controller_cpu_ab.sh \
+  --profile current --duration-sec 180 --apply --restart-nav2
+
+export NJRH_NAV2_CONTROLLER_CPU_PROFILE=control_wide
+bash scripts/jetson/runtime_overlay/scripts/run_nav2_controller_cpu_ab.sh \
+  --profile control_wide --duration-sec 180 --apply --restart-nav2
+```
+
+The reports compare controller requested/latest TF lag, local-costmap
+MessageFilter drops, `map -> odom` and `odom -> base_link` gaps, command-chain
+activity, and controller thread placement. This phase deliberately does not
+change `transform_tolerance`, `max_odom_tf_age_ms`, Nav2 plugins, MPPI/progress
+checker parameters, pointcloud QoS/DDS, FAST-LIO2, Ranger odom, or EKF fusion.
+Rollback is `export NJRH_NAV2_CONTROLLER_CPU_PROFILE=current` followed by a
+Nav2 restart.
 
 Phase 1.12 extends the manual CPU diagnosis into IRQ/softirq placement without
 making IRQ policy a default runtime setting. Use
@@ -274,7 +322,7 @@ Normal point navigation also treats dock/contact state and localization freshnes
 
 Phase 2.5 adds a non-position dock-contact latch as a second dock-state source. The latch is written by explicit events only: BMS contact, `/docking/status` docked/charging, docking success, and undock success. It is not inferred from the robot's current map pose. `pre_navigation_dock_check` exposes the latch as `dock_contact_snapshot`; if it is docked, normal navigation must run `/docking/undock` before Nav2. `final_yaw_align` rechecks the same gate and exits with `DOCKED_OR_CHARGING_CONTACT` instead of rotating. `robot_safety` also subscribes BMS and `/docking/status`, reads the same latch, and reports `DOCKED_CONTACT_BLOCK` while zeroing normal commands; `/cmd_vel_docking` remains allowed for controlled docking/undocking, including between watchdog timer ticks while the docking command is fresh. `/api/v1/status` and `/api/v1/navigation/state` expose safety status and `normal_motion_blocked_reason` so the App can display the blocker without inferring dock state from position.
 
-Phase 2.6 extends that latch for full-charge and missing-contact recovery. `docking_contact_latch.json` now carries `latched_docked`, source, map/floor context, timestamps, clear reason, and note fields while retaining the old `docked` field for compatibility. Maintenance endpoints/scripts can confirm or clear the latch without sending velocity. BMS contact false does not clear the latch, because a full or signal-missing charger state can report no current/contact. `pre_navigation_dock_check.docked_state_class` reports `DOCKED_CONFIRMED`, `DOCKED_LATCHED`, `NOT_DOCKED`, or `UNKNOWN`; ordinary navigation auto-undocks for confirmed and latched docked states.
+Phase 2.6 extends that latch for full-charge and missing-contact recovery. `docking_contact_latch.json` now carries `latched_docked`, source, map/floor context, timestamps, clear reason, and note fields while retaining the old `docked` field for compatibility. Maintenance endpoints/scripts can confirm or clear the latch without sending velocity. Phase D2 narrows BMS-derived latch use: a `source=bms` latch has a TTL, is written only after stable BMS contact, and cannot singly trigger pre-navigation auto-undock unless explicitly allowed by parameter. BMS contact false alone is not navigation permission, but the combined live contradiction of `/docking/state=undocked`, `/docking/status` not docked/charging, and stable BMS no-contact clears stale `source=bms` latch evidence with `clear_reason=stale_bms_latch_cleared_live_undocked_no_contact`. `pre_navigation_dock_check` reports `strong_live_docked`, `latch_valid_for_auto_undock`, latch source/age/stale/contradiction, and `docked_state_class`; ordinary navigation auto-undocks only for strong live dock evidence or valid non-stale latch evidence.
 
 Phase 2.8 keeps the same docking ownership but splits undock progress timing into explicit phases. `robot_docking_manager` still owns near-field docking and controlled undocking; return-to-dock travel remains Nav2 up to the pre-dock pose. The undock path remains `/cmd_vel_docking -> robot_safety -> /cmd_vel_safe -> ranger_mini3_mode_controller -> /cmd_vel`, and ordinary Nav2 reverse remains disabled (`vx_min` non-negative). The retained calibrated speed is `undock.speed_mps=0.06`. `undock.command_settle_s` allows the Ranger park/forced-mode/reverse-enable state to settle before nonzero undock commands, `undock.motion_start_timeout_s` waits for first odometry-confirmed motion, and `undock.no_progress_timeout_s` is used only after first motion to detect a mid-undock stall. The total `undock.timeout_s` must cover command settle, first-motion wait, `distance / speed`, and margin. Use `scripts/jetson/runtime_overlay/scripts/diagnose_undock_logic_and_no_motion.sh --dry-run` for static/API checks, and `--execute-undock` only for a supervised controlled undock diagnostic.
 
@@ -345,7 +393,7 @@ docker exec -it NJRH-car bash -lc \
 
 `run_navigation_runtime_services.sh` resolves the selected floor assets, starts the resident occupancy-localization layer, starts or reuses the floor-manager process, then sends one `/global_localization/trigger` request. The wrapper calls Isaac's direct grid-search service but startup success is judged by `robot_localization_bridge` accepting the result, `/localization/bridge_status.has_map_to_odom=true`, and a live `map -> odom` TF owned by `robot_localization_bridge`. Resident startup trusts the wrapper's `map->odom ready owner=robot_localization_bridge` success detail and then still performs a live `map -> odom` TF check; if that strong detail is absent, it falls back to the older `/localization/bridge_status` wait. It no longer rejects triggered startup only because `/localization_result.header.stamp` is a few seconds older than receive time; triggered mode uses `triggered_max_result_age_ms` and the original stamp for historical TF lookup. The runtime context records `failure_code`, `localization_mode`, `last_triggered_relocalization_ok`, and `map_to_odom_age_ms` when available. It marks the runtime context ready only after Nav2 lifecycle activation and the global costmap are available. `run_nav2_navigation.sh` still starts or reuses floor-manager, robot_safety, ranger mode controller, and local perception by process ownership only, then launches the repository-owned standard Nav2 stack without blocking on `/safety/status`, `/perception/obstacle_points`, or local-costmap observation probes.
 
-If `NJRH_AMCL_LOCALIZATION_MODE=shadow` or `gated`, the resident navigation runtime starts `run_amcl_shadow_localization.sh` only after the initial Isaac triggered relocalization has passed the bridge and `map -> odom` gates. AMCL is not part of the Nav2 controller/planner lifecycle and does not publish TF. The runner activates AMCL through the standard `/amcl/change_state` lifecycle service and still requires `/amcl` to report `active`. Startup waits for `/map`, `/scan`, `map -> odom`, `odom -> base_link`, and `base_link -> scan_frame`, then warms AMCL's process-local TF buffer before seeding `/initialpose` through `/robot_localization_bridge/seed_amcl_initial_pose`. The runner starts `/scan_amcl` only after seed and TF warmup; `/scan_amcl` is an AMCL production admission input derived from `/scan`, preserves the original stamp/frame/ranges, drops stale or non-TF-transformable scans, and defaults to 5 Hz. AMCL readiness requires seed success, fresh `/amcl_pose`, and healthy scan admission. `shadow` reports bridge candidates only, while `gated` accepts only small corrections. If AMCL is not ready, navigation continues on Isaac triggered plus odom baseline and exposes AMCL as WARN/not-ready rather than claiming continuous correction. Navigation stop calls the AMCL stop helper, which also stops the scan admission relay, before stopping the rest of the navigation stack.
+If `NJRH_AMCL_LOCALIZATION_MODE=shadow` or `gated`, the resident navigation runtime starts AMCL as part of the localization layer before it sends the initial Isaac triggered relocalization. AMCL is not part of the Nav2 controller/planner lifecycle and does not publish TF. The runner activates AMCL through the standard `/amcl/change_state` lifecycle service, warms AMCL's process-local TF buffer from `/map`, `/scan`, `odom -> base_link`, and `base_link -> scan_frame`, and starts the C++ `/scan_amcl` admission relay before `map -> odom` is available. After `/global_localization/trigger` is accepted by `robot_localization_bridge` and `map -> odom` is live, the runner completes AMCL readiness by seeding `/initialpose` through `/robot_localization_bridge/seed_amcl_initial_pose`, waiting for `/amcl_pose`, and calling `/request_nomotion_update` when the robot is stationary. `/scan_amcl` is an AMCL production admission input derived from `/scan`, preserves the original stamp/frame/ranges, drops stale or non-TF-transformable scans, defaults to 5 Hz, and is bound to `NJRH_CPUSET_AMCL_SCAN_ADMISSION` by `taskset` when started. AMCL readiness requires AMCL active, seed success, at least one AMCL pose sample, and healthy scan admission; while stopped or docked, stale `/amcl_pose` is not fatal and is exposed as `amcl_not_moving_no_update_ok`. During motion, stale `/amcl_pose` makes AMCL not tracking. `gated` is the production default and accepts only small corrections through `robot_localization_bridge`; `shadow` reports bridge candidates only for rollback/diagnostics. If AMCL is not ready, navigation continues on Isaac triggered plus odom baseline and exposes AMCL as WARN/not-ready rather than claiming continuous correction. Navigation stop calls the AMCL stop helper, which also stops the scan admission relay, before stopping the rest of the navigation stack.
 
 `run_floor_navigation.sh` is compatibility-only and delegates to `run_navigation_runtime_services.sh`.
 

@@ -10,15 +10,22 @@ removes the earlier Isaac continuous replacement path.
 2. Start Isaac Occupancy Grid Localizer in `triggered` mode only.
 3. Start `robot_localization_bridge`; it remains the only `map -> odom`
    publisher.
-4. Call `/global_localization/trigger` and require bridge acceptance plus a live
+4. Start AMCL resident when `NJRH_AMCL_LOCALIZATION_MODE=shadow` or `gated`,
+   activate the lifecycle node, warm its local TF buffer without requiring
+   `map -> odom`, and start the C++ `/scan_amcl` admission relay.
+5. Call `/global_localization/trigger` and require bridge acceptance plus a live
    `map -> odom`.
-5. Start AMCL when `NJRH_AMCL_LOCALIZATION_MODE=shadow` or `gated`.
-6. Wait for `/map`, `/scan`, and the canonical TF chain, then warm AMCL's local
-   TF buffer before admitting scans.
-7. Seed AMCL through `/robot_localization_bridge/seed_amcl_initial_pose`, which
+6. Complete AMCL readiness by waiting for `map -> odom`, then seed AMCL through
+   `/robot_localization_bridge/seed_amcl_initial_pose`, which
    publishes `/initialpose` from the current bridge-approved `map -> base_link`.
-8. Start the `/scan_amcl` admission relay and require a fresh `/amcl_pose`
-   before reporting AMCL continuous localization as ready.
+7. Wait for a fresh `/amcl_pose`; if the robot is stationary, request one
+   `/request_nomotion_update` so the bridge sees an AMCL candidate without
+   moving the chassis.
+8. Report shadow readiness only after AMCL is active, seeded, scan admission is
+   healthy, and AMCL has produced at least one pose sample. During motion, that
+   sample must remain fresh; while stopped or docked, stale `/amcl_pose` is
+   reported as `amcl_not_moving_no_update_ok` rather than a fatal localization
+   failure.
 
 ## Topic Ownership
 
@@ -29,11 +36,17 @@ removes the earlier Isaac continuous replacement path.
 - AMCL TF: disabled with `tf_broadcast=false`
 - Canonical TF: `map -> odom` from `robot_localization_bridge` only
 
-The `/scan_amcl` relay does not restamp scans and does not change ranges. It
-drops stale scans and scans without `odom <- scan_frame` at the original scan
-stamp, reducing AMCL MessageFilter pressure without hiding TF delay. If seed,
-fresh `/amcl_pose`, or scan admission fails, the navigation runtime keeps the
-Isaac triggered plus odom baseline active and exposes AMCL as not ready.
+The `/scan_amcl` relay is C++ by default:
+`robot_localization_bridge/amcl_scan_admission_node`. It does not restamp scans
+and does not change ranges, intensities, frame id, angular metadata, or scan
+timing fields. It drops stale scans and scans without `odom <- scan_frame` at
+the original scan stamp, reducing AMCL MessageFilter pressure without hiding TF
+delay. Python `amcl_scan_admission_relay.py` remains an explicit fallback with
+`NJRH_AMCL_SCAN_ADMISSION_IMPL=python`; the default C++ path fails fast if the
+binary is missing. If seed, moving-state fresh `/amcl_pose`, or scan admission
+fails, the navigation runtime keeps the Isaac triggered plus odom baseline
+active and exposes AMCL as not ready or degraded rather than pretending
+continuous correction is active.
 
 The removed Isaac continuous path no longer starts a repository flatscan
 forwarder. Isaac may still expose internal `/flatscan_localization` endpoints,
@@ -44,11 +57,33 @@ background localization.
 
 `NJRH_AMCL_LOCALIZATION_MODE` controls AMCL:
 
-- `shadow`: AMCL runs and bridge reports candidates, but AMCL cannot change
-  `map -> odom`.
-- `gated`: default active Phase A2 mode. Bridge accepts only small
+- `gated`: production correction mode. Bridge accepts only small
   covariance-gated AMCL corrections.
+- `shadow`: rollback/diagnostic mode. AMCL runs and bridge reports candidates,
+  but AMCL cannot change `map -> odom`.
 - `disabled`: AMCL is stopped; only Isaac triggered relocalization is active.
 
-Use `shadow` as the one-command rollback when field data shows AMCL candidates
-are too sparse or too large for active correction.
+The runtime profile defaults to `gated` so AMCL corrects small accumulated odom
+error continuously through `robot_localization_bridge`. Large AMCL offsets still
+require Isaac triggered relocalization; `shadow` disables active correction while
+preserving AMCL candidate diagnostics, and `disabled` rolls back to
+Isaac-triggered-only localization.
+
+## Verification
+
+Use the resident readiness check without moving the robot:
+
+```bash
+export NJRH_AMCL_LOCALIZATION_MODE=gated
+bash scripts/jetson/runtime_overlay/scripts/verify_amcl_runtime_readiness.sh \
+  --mode gated --seed --duration-sec 60 --check-triggered --check-amcl --check-owner
+```
+
+For a dynamic navigation window, start the observer and then send a short
+operator-selected goal:
+
+```bash
+export NJRH_AMCL_LOCALIZATION_MODE=gated
+bash scripts/jetson/runtime_overlay/scripts/observe_amcl_navigation_shadow_180s.sh \
+  --duration-sec 180
+```

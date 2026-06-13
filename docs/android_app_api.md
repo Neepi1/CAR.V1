@@ -743,7 +743,7 @@ Server-side safety contract:
 
 - Published topic: `/cmd_vel_collision_checked`
 - Final chain: `/cmd_vel_collision_checked -> robot_safety -> /cmd_vel_safe -> ranger_mini3_mode_controller -> /cmd_vel -> ranger_base_node`
-- Default limits: `linear_x <= 0.30 m/s`, `abs(angular_z) <= 0.55 rad/s`
+- Default limits: `abs(linear_x) <= 1.00 m/s`, `abs(angular_z) <= 0.55 rad/s`
 - Mapping teleop allows low-speed reverse. The API server enables `/ranger_mini3/teleop_allow_reverse` only during an active WebSocket mapping teleop session.
 - Navigation still cannot reverse by default because `ranger_mini3_mode_controller.allow_reverse` remains `false`; reverse permission expires if the App stops sending commands.
 - Teleop is accepted only while 2D mapping is active by default. If mapping is not active, the WebSocket upgrade returns `409`.

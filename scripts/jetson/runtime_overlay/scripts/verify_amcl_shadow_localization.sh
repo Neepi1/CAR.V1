@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common_env.sh"
 
 MODE="${NJRH_AMCL_LOCALIZATION_MODE:-disabled}"
+EXPECTED_SCAN_ADMISSION_IMPL="${NJRH_AMCL_SCAN_ADMISSION_IMPL:-cpp}"
 DURATION_SEC="${NJRH_VERIFY_AMCL_DURATION_SEC:-30}"
 SET_MODE="false"
 RESTART="false"
@@ -86,6 +87,7 @@ fi
 
 if [[ "${RESTART}" == "true" ]]; then
   NJRH_AMCL_TF_WARMUP_SEC="${TF_WARMUP_SEC}" \
+  NJRH_AMCL_SCAN_ADMISSION_IMPL="${EXPECTED_SCAN_ADMISSION_IMPL}" \
     bash "${SCRIPT_DIR}/run_amcl_shadow_localization.sh" --mode "${MODE}" --restart
 fi
 
@@ -165,6 +167,92 @@ node_exists() {
 process_exists() {
   local pattern="$1"
   pgrep -af "${pattern}" >/dev/null 2>&1
+}
+
+process_pids() {
+  local pattern="$1"
+  ps -eo pid=,args= |
+    awk -v pat="${pattern}" 'index($0, pat) > 0 && index($0, "verify_amcl_shadow_localization") == 0 && index($0, "awk -v pat") == 0 {print $1}' || true
+}
+
+pid_allowed_cpus() {
+  local pid="$1"
+  awk '/^Cpus_allowed_list:/ {print $2; exit}' "/proc/${pid}/status" 2>/dev/null || true
+}
+
+scan_admission_status_once() {
+  local topic="${NJRH_AMCL_SCAN_ADMISSION_STATUS_TOPIC:-/amcl_scan_admission/status}"
+  timeout 8 python3 - "${topic}" <<'PY' 2>/dev/null || true
+import sys
+import rclpy
+from std_msgs.msg import String
+
+topic = sys.argv[1]
+rclpy.init()
+node = rclpy.create_node("verify_amcl_scan_admission_status_once")
+result = {"data": ""}
+
+def on_msg(msg):
+    result["data"] = msg.data
+
+sub = node.create_subscription(String, topic, on_msg, 10)
+deadline = node.get_clock().now().nanoseconds + 7_000_000_000
+while rclpy.ok() and not result["data"] and node.get_clock().now().nanoseconds < deadline:
+    rclpy.spin_once(node, timeout_sec=0.2)
+print(result["data"])
+node.destroy_node()
+rclpy.shutdown()
+PY
+}
+
+scan_admission_sample_json() {
+  local input_topic="${NJRH_AMCL_SCAN_INPUT_TOPIC:-/scan}"
+  local output_topic="${NJRH_AMCL_SCAN_OUTPUT_TOPIC:-/scan_amcl}"
+  timeout 12 python3 - "${input_topic}" "${output_topic}" <<'PY' 2>/dev/null || true
+import json
+import sys
+import rclpy
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import LaserScan
+
+input_topic = sys.argv[1]
+output_topic = sys.argv[2]
+rclpy.init()
+node = rclpy.create_node("verify_amcl_scan_admission_samples")
+state = {"scan": None, "scan_amcl": None}
+
+def stamp_sec(stamp):
+    return float(stamp.sec) + float(stamp.nanosec) * 1.0e-9
+
+def on_scan(msg):
+    state["scan"] = msg
+
+def on_scan_amcl(msg):
+    state["scan_amcl"] = msg
+
+node.create_subscription(LaserScan, input_topic, on_scan, qos_profile_sensor_data)
+node.create_subscription(LaserScan, output_topic, on_scan_amcl, qos_profile_sensor_data)
+deadline = node.get_clock().now().nanoseconds + 10_000_000_000
+while rclpy.ok() and (state["scan"] is None or state["scan_amcl"] is None) and node.get_clock().now().nanoseconds < deadline:
+    rclpy.spin_once(node, timeout_sec=0.2)
+now_sec = node.get_clock().now().nanoseconds * 1.0e-9
+scan = state["scan"]
+scan_amcl = state["scan_amcl"]
+result = {"ok": scan is not None and scan_amcl is not None}
+if scan is not None:
+    result["scan_stamp"] = stamp_sec(scan.header.stamp)
+    result["scan_age_ms"] = (now_sec - result["scan_stamp"]) * 1000.0
+    result["scan_frame_id"] = scan.header.frame_id
+if scan_amcl is not None:
+    result["scan_amcl_stamp"] = stamp_sec(scan_amcl.header.stamp)
+    result["scan_amcl_age_ms"] = (now_sec - result["scan_amcl_stamp"]) * 1000.0
+    result["scan_amcl_frame_id"] = scan_amcl.header.frame_id
+if scan is not None and scan_amcl is not None:
+    result["stamp_delta_ms"] = (result["scan_amcl_stamp"] - result["scan_stamp"]) * 1000.0
+print(json.dumps(result, sort_keys=True))
+node.destroy_node()
+rclpy.shutdown()
+PY
 }
 
 seed_amcl_for_verify() {
@@ -281,7 +369,7 @@ check_runtime_contract() {
     WARNS+=("/tf publisher info missing robot_localization_bridge")
   fi
   if grep -q "Node name: ${AMCL_NODE_NAME:-amcl}" <<<"${tf_info}"; then
-    FAILURES+=("AMCL is publishing /tf; tf_broadcast must remain false")
+    WARNS+=("AMCL has a /tf publisher endpoint; tf_broadcast parameter and bridge owner decide whether it emits map->odom")
   else
     PASSES+=("AMCL is not a /tf publisher")
   fi
@@ -319,6 +407,99 @@ check_runtime_contract() {
     fi
   else
     FAILURES+=("/localization/bridge_status unavailable")
+  fi
+}
+
+check_scan_admission_runtime() {
+  [[ "${SCAN_ADMISSION}" == "true" && "${MODE}" != "disabled" ]] || return 0
+
+  case "${EXPECTED_SCAN_ADMISSION_IMPL}" in
+    cpp|python)
+      ;;
+    *)
+      FAILURES+=("invalid expected scan admission impl: ${EXPECTED_SCAN_ADMISSION_IMPL}")
+      return 0
+      ;;
+  esac
+
+  local cpp_pids python_pids expected_cpuset
+  cpp_pids="$(process_pids "amcl_scan_admission_node")"
+  python_pids="$(process_pids "amcl_scan_admission_relay.py")"
+  expected_cpuset="${NJRH_CPUSET_AMCL_SCAN_ADMISSION:-${NJRH_CPUSET_LOCALIZATION:-6}}"
+
+  if [[ "${EXPECTED_SCAN_ADMISSION_IMPL}" == "cpp" ]]; then
+    if [[ -n "${cpp_pids}" ]]; then
+      PASSES+=("AMCL scan admission implementation=cpp")
+    else
+      FAILURES+=("expected C++ amcl_scan_admission_node but process is missing")
+    fi
+    if [[ -n "${python_pids}" ]]; then
+      FAILURES+=("Python AMCL scan admission fallback is running while expected impl=cpp: ${python_pids}")
+    fi
+  else
+    if [[ -n "${python_pids}" ]]; then
+      WARNS+=("AMCL scan admission implementation=python fallback explicitly selected")
+    else
+      FAILURES+=("expected Python amcl_scan_admission_relay.py fallback but process is missing")
+    fi
+  fi
+
+  local pid allowed
+  for pid in ${cpp_pids} ${python_pids}; do
+    allowed="$(pid_allowed_cpus "${pid}")"
+    if [[ "${allowed}" == "${expected_cpuset}" ]]; then
+      PASSES+=("AMCL scan admission pid=${pid} Cpus_allowed_list=${allowed}")
+    else
+      FAILURES+=("AMCL scan admission pid=${pid} Cpus_allowed_list=${allowed:-missing}, expected=${expected_cpuset}")
+    fi
+    if [[ "${allowed}" == "0-7" || "${allowed}" == *"2"* || "${allowed}" == *"3"* || "${allowed}" == *"7"* ]]; then
+      FAILURES+=("AMCL scan admission pid=${pid} allows CPU2/CPU3/CPU7 or all cores: ${allowed}")
+    fi
+  done
+
+  local status
+  status="$(scan_admission_status_once)"
+  if [[ -n "${status}" ]]; then
+    local impl
+    impl="$(bridge_status_field "${status}" implementation)"
+    if [[ -n "${impl}" ]]; then
+      [[ "${impl}" == "${EXPECTED_SCAN_ADMISSION_IMPL}" ]] &&
+        PASSES+=("scan admission status implementation=${impl}") ||
+        FAILURES+=("scan admission status implementation=${impl}, expected=${EXPECTED_SCAN_ADMISSION_IMPL}")
+    else
+      WARNS+=("scan admission status has no implementation field; likely legacy Python fallback")
+    fi
+    for field in dropped_rate_count dropped_age_count dropped_tf_count last_age_ms frame_id preserve_stamp; do
+      if [[ -n "$(bridge_status_field "${status}" "${field}")" ]]; then
+        PASSES+=("scan admission status has ${field}")
+      else
+        WARNS+=("scan admission status missing ${field}")
+      fi
+    done
+  else
+    WARNS+=("/amcl_scan_admission/status unavailable; counters unavailable")
+  fi
+
+  local sample sample_ok frame_id age_ms delta_ms
+  sample="$(scan_admission_sample_json)"
+  sample_ok="$(bridge_status_field "${sample}" ok)"
+  if [[ "${sample_ok}" == "true" ]]; then
+    frame_id="$(bridge_status_field "${sample}" scan_amcl_frame_id)"
+    age_ms="$(bridge_status_field "${sample}" scan_amcl_age_ms)"
+    delta_ms="$(bridge_status_field "${sample}" stamp_delta_ms)"
+    PASSES+=("/scan_amcl frame_id=${frame_id}")
+    if awk -v age="${age_ms:-0}" 'BEGIN {exit !(age >= 1.0)}'; then
+      PASSES+=("/scan_amcl stamp is not now-restamped age_ms=${age_ms}")
+    else
+      FAILURES+=("/scan_amcl stamp age suspiciously close to now; possible restamp age_ms=${age_ms:-missing}")
+    fi
+    if awk -v delta="${delta_ms:-999999}" 'BEGIN {if (delta < 0) delta = -delta; exit !(delta <= 500.0)}'; then
+      PASSES+=("/scan and /scan_amcl stamps are from the same source stream delta_ms=${delta_ms}")
+    else
+      WARNS+=("/scan and /scan_amcl latest stamps differ more than expected delta_ms=${delta_ms:-missing}")
+    fi
+  else
+    FAILURES+=("could not sample both /scan and /scan_amcl")
   fi
 }
 
@@ -380,7 +561,11 @@ check_amcl_runtime() {
   if fresh_pose_check /amcl_pose; then
     PASSES+=("/amcl_pose is fresh")
   else
-    FAILURES+=("/amcl_pose is stale or missing")
+    if [[ "${MODE}" == "gated" ]]; then
+      FAILURES+=("/amcl_pose is stale or missing")
+    else
+      WARNS+=("/amcl_pose is stale or missing; static shadow runs may need movement to trigger AMCL updates")
+    fi
   fi
 
   local sample_window=5
@@ -442,14 +627,19 @@ check_nav2_context() {
 echo "[verify-amcl] mode=${MODE} duration_sec=${DURATION_SEC} scan_admission=${SCAN_ADMISSION}"
 check_config_contract
 check_runtime_contract
+check_scan_admission_runtime
 check_amcl_runtime
 
 if [[ "${MODE}" != "disabled" && "${DURATION_SEC}" =~ ^[0-9]+$ && "${DURATION_SEC}" -gt 0 ]]; then
   echo "[verify-amcl] observing AMCL for ${DURATION_SEC}s"
   sleep "${DURATION_SEC}"
-  fresh_pose_check /amcl_pose >/dev/null 2>&1 &&
-    PASSES+=("/amcl_pose remained fresh after observation") ||
+  if fresh_pose_check /amcl_pose >/dev/null 2>&1; then
+    PASSES+=("/amcl_pose remained fresh after observation")
+  elif [[ "${MODE}" == "gated" ]]; then
     FAILURES+=("/amcl_pose became stale during observation")
+  else
+    WARNS+=("/amcl_pose became stale during observation; repeat during user-started navigation")
+  fi
 fi
 
 check_logs

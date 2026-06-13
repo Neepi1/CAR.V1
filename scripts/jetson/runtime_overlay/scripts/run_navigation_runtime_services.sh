@@ -269,23 +269,45 @@ trigger_global_localization_for_navigation() {
   echo "[runtime-overlay] initial localization accepted: bridge_status.has_map_to_odom=true and map->odom are ready" >&2
 }
 
-start_amcl_if_enabled_for_navigation() {
+amcl_mode_for_navigation() {
   local mode="${NJRH_AMCL_LOCALIZATION_MODE:-disabled}"
   case "${mode}" in
-    disabled)
-      echo "[runtime-overlay] AMCL continuous localization disabled" >&2
-      return 0
-      ;;
-    shadow|gated)
+    disabled|shadow|gated)
+      printf '%s\n' "${mode}"
       ;;
     *)
       set_localization_ready_failure "AMCL_MODE_INVALID" "invalid NJRH_AMCL_LOCALIZATION_MODE=${mode}"
       return 1
       ;;
   esac
-  echo "[runtime-overlay] starting AMCL continuous localization candidate mode=${mode}" >&2
+}
+
+start_amcl_resident_if_enabled_for_navigation() {
+  local mode="${NJRH_AMCL_LOCALIZATION_MODE:-disabled}"
+  mode="$(amcl_mode_for_navigation)" || return 1
+  case "${mode}" in
+    disabled)
+      echo "[runtime-overlay] AMCL continuous localization disabled" >&2
+      return 0
+      ;;
+  esac
+  echo "[runtime-overlay] starting resident AMCL localization candidate mode=${mode} before triggered relocalization" >&2
   NJRH_AMCL_LOCALIZATION_MODE="${mode}" \
-    bash "${SCRIPT_DIR}/run_amcl_shadow_localization.sh" --mode "${mode}" --restart
+    bash "${SCRIPT_DIR}/run_amcl_shadow_localization.sh" --mode "${mode}" --start-resident
+  amcl_runtime_started=1
+}
+
+complete_amcl_readiness_if_enabled_for_navigation() {
+  local mode="${NJRH_AMCL_LOCALIZATION_MODE:-disabled}"
+  mode="$(amcl_mode_for_navigation)" || return 1
+  case "${mode}" in
+    disabled)
+      return 0
+      ;;
+  esac
+  echo "[runtime-overlay] completing AMCL readiness from accepted triggered localization mode=${mode}" >&2
+  NJRH_AMCL_LOCALIZATION_MODE="${mode}" \
+    bash "${SCRIPT_DIR}/run_amcl_shadow_localization.sh" --mode "${mode}" --complete-readiness
   amcl_runtime_started=1
 }
 
@@ -446,12 +468,16 @@ timeout "${NJRH_FLOOR_MANAGER_SWITCH_CALL_TIMEOUT:-8}" ros2 service call /floor_
   echo "[runtime-overlay] floor switch request did not complete; continuing because selected floor assets were already resolved by runtime" >&2
 }
 
+start_amcl_resident_if_enabled_for_navigation || {
+  write_runtime_map_context "failed" "false" "AMCL resident localization failed to start before initial global localization"
+  exit 1
+}
 trigger_global_localization_for_navigation || {
   write_runtime_map_context "failed" "false" "initial global localization did not pass trigger wrapper, bridge, and map->odom gates"
   exit 1
 }
-start_amcl_if_enabled_for_navigation || {
-  write_runtime_map_context "failed" "false" "AMCL candidate localization failed to start after initial global localization"
+complete_amcl_readiness_if_enabled_for_navigation || {
+  write_runtime_map_context "failed" "false" "AMCL candidate localization failed to complete readiness after initial global localization"
   exit 1
 }
 ensure_localization_layer_alive || {

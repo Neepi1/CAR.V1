@@ -993,7 +993,8 @@ def test_phase26_persistent_docked_latch_contract():
     assert "current_robot_pose_snapshot" not in gate_block
     assert "find_floor_catalog_pose" not in gate_block
     assert "std::hypot" not in gate_block
-    assert "bms.contact ||" in gate_block
+    assert "strong_live_docked" in gate_block
+    assert "latch_valid_for_auto_undock" in gate_block
     assert "dock_latch_indicates_docked" in gate_block
 
     assert "latched_docked" in docking_cpp
@@ -1022,6 +1023,69 @@ def test_phase26_persistent_docked_latch_contract():
     assert "present_voltage_valid" in bms_cpp
     assert "full_soc_present_voltage_valid" in bms_cpp
     assert "no_contact status=" in bms_cpp
+
+
+def test_phase_d2_bms_dock_contact_latch_expiry_contract():
+    api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    api_cfg = (ROOT / "src" / "robot_api_server" / "config" / "robot_api_server.yaml").read_text(
+        encoding="utf-8"
+    )
+    overlay_api_cfg = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "robot_api_server.yaml"
+    ).read_text(encoding="utf-8")
+    verify_script_path = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "verify_dock_contact_latch_gate.sh"
+    )
+    verify_script = verify_script_path.read_text(encoding="utf-8")
+
+    for text in (api_cpp, api_cfg, overlay_api_cfg):
+        assert "dock_contact_latch_bms_ttl_sec" in text
+        assert "dock_contact_latch_bms_require_contact_sec" in text
+        assert "dock_contact_latch_bms_clear_no_contact_sec" in text
+        assert "dock_contact_latch_allow_bms_stale_auto_undock" in text
+        assert "dock_contact_latch_clear_when_live_undocked_no_contact" in text
+        assert "dock_contact_latch_max_age_warn_sec" in text
+
+    gate_block = api_cpp[
+        api_cpp.index("PreNavigationDockCheck pre_navigation_dock_check_snapshot") : api_cpp.index(
+            "std::string bms_charging_contact_snapshot_json"
+        )
+    ]
+    assert "check.strong_live_docked" in gate_block
+    assert "check.latch_valid_for_auto_undock" in gate_block
+    assert "check.final_is_docked_or_charging = check.strong_live_docked || check.latch_valid_for_auto_undock" in gate_block
+    assert "stale_bms_latch_cleared_live_undocked_no_contact" in gate_block
+    assert "check.dock_contact_latch_contradicted_by_live_state" in gate_block
+    assert "check.live_bms_charging_contact_stable" in gate_block
+    assert "check.bms.contact ||" not in gate_block
+
+    handle_bms_block = api_cpp[
+        api_cpp.index("void handle_bms_state") : api_cpp.index("void handle_localization_result")
+    ]
+    assert "maybe_update_bms_dock_contact_latch" in api_cpp
+    assert "contact_stable_duration_sec >= dock_contact_latch_bms_require_contact_sec_" in handle_bms_block
+    assert 'update_dock_contact_latch(\n        true,\n        "bms"' not in handle_bms_block
+    assert "runtime.navigation_active && navigation_goal_job_running()" in api_cpp
+
+    assert "dock_contact_latch_age_sec" in api_cpp
+    assert "dock_contact_latch_stale" in api_cpp
+    assert "dock_contact_latch_contradicted_by_live_state" in api_cpp
+    assert "dock_contact_latch_auto_cleared" in api_cpp
+    assert "strong_live_docked" in api_cpp
+    assert "latch_valid_for_auto_undock" in api_cpp
+    assert "navigation_relocalize_before_goal_always: false" in api_cfg
+    assert "navigation_relocalize_before_goal_always: false" in overlay_api_cfg
+
+    assert verify_script_path.exists()
+    assert "Read-only by default" in verify_script
+    assert "--clear-stale-bms-latch" in verify_script
+    assert "/api/v1/docking/clear_docked_latch" in verify_script
+    assert "source=bms stale latch alone" in verify_script
+    assert "live undocked/no_contact" in verify_script
+    assert "topic_once /docking/status" in verify_script
+    assert "topic_once /battery_state" in verify_script
 
 
 def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
@@ -2971,6 +3035,7 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "teleop_cmd_topic: \"/cmd_vel_collision_checked\"" in config
     assert "teleop_reverse_enable_topic: \"/ranger_mini3/teleop_allow_reverse\"" in config
     assert "teleop_pose_topic: \"/local_state/odometry\"" in config
+    assert "teleop_max_linear_x_mps: 1.00" in config
     assert "teleop_allow_reverse: true" in config
     assert "teleop_require_mapping_active: true" in config
     assert "teleop_watchdog_timeout_sec: 0.5" in config
@@ -3062,6 +3127,7 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "docking_undock_charging_retry_sec: 3.0" in overlay_config
     assert "teleop_cmd_topic: \"/cmd_vel_collision_checked\"" in overlay_config
     assert "teleop_reverse_enable_topic: \"/ranger_mini3/teleop_allow_reverse\"" in overlay_config
+    assert "teleop_max_linear_x_mps: 1.00" in overlay_config
     assert "teleop_socket_idle_timeout_sec: 5.0" in overlay_config
     assert "teleop_repeat_rate_hz: 20.0" in overlay_config
     assert "ROBOT_API_TOKEN" in overlay_script
@@ -5736,7 +5802,8 @@ def test_phase_a2_amcl_replaces_isaac_continuous_localization_contracts():
     assert "restamp" not in global_cpp.lower()
 
     assert "wait_for_bridge_has_map_to_odom" in nav_runtime
-    assert "start_amcl_if_enabled_for_navigation" in nav_runtime
+    assert "start_amcl_resident_if_enabled_for_navigation" in nav_runtime
+    assert "complete_amcl_readiness_if_enabled_for_navigation" in nav_runtime
     assert "wait_for_fresh_header_topic_message" not in nav_runtime
     assert "NJRH_GLOBAL_LOCALIZATION_TRIGGER_CALL_TIMEOUT:-60" in nav_runtime
     assert "GLOBAL_LOCALIZATION_TRIGGER_TIMEOUT" in nav_runtime
@@ -5821,7 +5888,7 @@ def test_phase_a1_amcl_shadow_localization_contracts():
     assert "wait_for_amcl_pose_fresh" in amcl_runner
     assert "scan_topic:=$(effective_scan_topic)" in amcl_runner
     assert "tf_broadcast=false" in amcl_verify
-    assert "AMCL is publishing /tf" in amcl_verify
+    assert "AMCL has a /tf publisher endpoint" in amcl_verify
     assert "sensor_msgs/msg/LaserScan" in amcl_verify
     assert "/scan_amcl" in amcl_verify
     assert "--seed" in amcl_verify
@@ -5843,9 +5910,10 @@ def test_phase_a1_amcl_shadow_localization_contracts():
     assert "amcl_input_enabled:=${AMCL_INPUT_ENABLED}" in run_bridge
     assert "amcl_gate_mode:=${AMCL_GATE_MODE}" in run_bridge
     assert "amcl_scan_admission_enabled:=${AMCL_SCAN_ADMISSION_ENABLED}" in run_bridge
-    assert "start_amcl_if_enabled_for_navigation" in nav_runtime
+    assert "start_amcl_resident_if_enabled_for_navigation" in nav_runtime
+    assert "complete_amcl_readiness_if_enabled_for_navigation" in nav_runtime
     assert "initial localization accepted" in nav_runtime
-    assert "AMCL continuous localization candidate" in nav_runtime
+    assert "resident AMCL localization candidate" in nav_runtime
 
     for cfg in (bridge_cfg, bridge_src_cfg):
         assert "amcl_pose_topic: /amcl_pose" in cfg
@@ -5916,6 +5984,460 @@ def test_phase_a1_amcl_shadow_localization_contracts():
         if bash_probe.returncode == 0:
             subprocess.run([bash, "-n", str(amcl_runner_path)], check=True)
             subprocess.run([bash, "-n", str(amcl_verify_path)], check=True)
+
+
+def test_phase_a13_amcl_scan_admission_cpu_affinity_contracts():
+    overlay = ROOT / "scripts" / "jetson" / "runtime_overlay"
+    config_dir = overlay / "config"
+    scripts_dir = overlay / "scripts"
+
+    affinity_cfg = (config_dir / "cpu_affinity.env").read_text(encoding="utf-8")
+    amcl_runner_path = scripts_dir / "run_amcl_shadow_localization.sh"
+    amcl_runner = amcl_runner_path.read_text(encoding="utf-8")
+    inspect_path = scripts_dir / "inspect_runtime_cpu_affinity.sh"
+    observe_path = scripts_dir / "observe_navigation_tf_jitter_180s.sh"
+    bridge_cfg = (config_dir / "localization_bridge.yaml").read_text(encoding="utf-8")
+    nav2 = (config_dir / "nav2.yaml").read_text(encoding="utf-8")
+    amcl_cfg = (config_dir / "amcl_shadow.yaml").read_text(encoding="utf-8")
+    relay = (scripts_dir / "amcl_scan_admission_relay.py").read_text(encoding="utf-8")
+
+    assert 'export NJRH_CPUSET_AMCL="${NJRH_CPUSET_AMCL:-${NJRH_CPUSET_LOCALIZATION}}"' in affinity_cfg
+    assert (
+        'export NJRH_CPUSET_AMCL_SCAN_ADMISSION="${NJRH_CPUSET_AMCL_SCAN_ADMISSION:-${NJRH_CPUSET_LOCALIZATION}}"'
+        in affinity_cfg
+    )
+    assert 'source "${SCRIPT_DIR}/cpu_affinity.sh"' in amcl_runner
+    assert "njrh_cpuset_for amcl_scan_admission" in amcl_runner
+    assert 'export NJRH_CPUSET_AMCL_SCAN_ADMISSION="${relay_cpuset}"' in amcl_runner
+    assert 'taskset -c "${relay_cpuset}" true' in amcl_runner
+    assert 'nohup taskset -c "${relay_cpuset}" "${relay_cmd[@]}"' in amcl_runner
+    assert 'nohup python3 "${SCAN_RELAY_SCRIPT}"' not in amcl_runner
+    assert "AMCL scan admission relay started implementation=${SCAN_RELAY_IMPL}" in amcl_runner
+    assert "input_topic=${scan_input_topic}" in amcl_runner
+    assert "output_topic=${scan_output_topic}" in amcl_runner
+    assert "rate_hz=${scan_rate_hz}" in amcl_runner
+    assert "scan_relay_allowed_cpus" in amcl_runner
+    assert "njrh_apply_affinity_to_pids amcl_scan_admission" in amcl_runner
+    assert "killall -9" not in amcl_runner
+    assert "pkill -9" not in amcl_runner
+
+    assert inspect_path.exists()
+    inspect = inspect_path.read_text(encoding="utf-8")
+    assert "amcl_scan_admission_node" in inspect
+    assert "amcl_scan_admission_relay.py" in inspect
+    assert "Cpus_allowed_list" in inspect
+    assert "allows_forbidden_${forbidden}" in inspect
+    assert '"2,3,7"' in inspect
+    assert "robot_localization_bridge" in inspect
+    assert "robot_local_state_ekf" in inspect
+    assert "wheel_odom_ekf_input" in inspect
+    assert "controller_server" in inspect
+    assert "hesai_accel_driver_node" in inspect
+    assert "robot_safety" in inspect
+    assert "ranger_base_node" in inspect
+
+    assert observe_path.exists()
+    observe = observe_path.read_text(encoding="utf-8")
+    assert "does not send navigation goals" in observe
+    assert "/local_state/odometry" in observe
+    assert "/wheel/odom" in observe
+    assert "/wheel/odom_ekf" in observe
+    assert "/scan_amcl" in observe
+    assert "/amcl_pose" in observe
+    assert "/localization/bridge_status" in observe
+    assert "tf:odom->base_link" in observe
+    assert "tf:map->odom" in observe
+    assert "tf:base_link->lidar_level_link" in observe
+    assert "tf_future_extrapolation_count" in observe
+    assert "message_filter_drop_count" in observe
+    assert "failed_to_make_progress_count" in observe
+    assert "admission_relay" in observe
+    assert "amcl_scan_admission_node" in observe
+    assert "PointCloud2" not in observe
+    assert "ros2 action send_goal" not in observe
+    assert "ros2 topic pub" not in observe
+
+    assert "max_odom_tf_age_ms: 100.0" in bridge_cfg
+    assert "tf_future_stamp_offset_sec: 0.10" in bridge_cfg
+    assert "transform_tolerance: 0.10" in nav2
+    assert "global_frame: odom" in local_costmap_config_block(nav2)
+    assert "global_frame: base_link" not in local_costmap_config_block(nav2)
+    assert "tf_broadcast: false" in amcl_cfg
+    assert "scan_topic: /scan_amcl" in amcl_cfg
+    assert "self.pub.publish(msg)" in relay
+    assert "Preserve the original header.stamp" in relay
+    assert "msg.header.stamp =" not in relay
+    assert "MPPIController" in nav2
+    assert "SmacPlanner2D" in nav2
+
+    bash = shutil.which("bash")
+    if bash:
+        bash_probe = subprocess.run(
+            [bash, "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if bash_probe.returncode == 0:
+            subprocess.run([bash, "-n", str(amcl_runner_path)], check=True)
+            subprocess.run([bash, "-n", str(inspect_path)], check=True)
+            subprocess.run([bash, "-n", str(observe_path)], check=True)
+
+
+def test_phase_a14_cpp_amcl_scan_admission_contracts():
+    overlay = ROOT / "scripts" / "jetson" / "runtime_overlay"
+    config_dir = overlay / "config"
+    scripts_dir = overlay / "scripts"
+    bridge_dir = ROOT / "src" / "robot_localization_bridge"
+
+    cpp_path = bridge_dir / "src" / "amcl_scan_admission_node.cpp"
+    assert cpp_path.exists()
+    cpp = cpp_path.read_text(encoding="utf-8")
+    cmake = (bridge_dir / "CMakeLists.txt").read_text(encoding="utf-8")
+    package = (bridge_dir / "package.xml").read_text(encoding="utf-8")
+    profile = (config_dir / "amcl_localization_profile.env").read_text(encoding="utf-8")
+    runner_path = scripts_dir / "run_amcl_shadow_localization.sh"
+    runner = runner_path.read_text(encoding="utf-8")
+    verify_path = scripts_dir / "verify_amcl_shadow_localization.sh"
+    verify = verify_path.read_text(encoding="utf-8")
+    inspect_path = scripts_dir / "inspect_runtime_cpu_affinity.sh"
+    inspect = inspect_path.read_text(encoding="utf-8")
+    observe_path = scripts_dir / "observe_navigation_tf_jitter_180s.sh"
+    observe = observe_path.read_text(encoding="utf-8")
+    amcl_cfg = (config_dir / "amcl_shadow.yaml").read_text(encoding="utf-8")
+    bridge_cfg = (config_dir / "localization_bridge.yaml").read_text(encoding="utf-8")
+    nav2 = (config_dir / "nav2.yaml").read_text(encoding="utf-8")
+    python_relay = (scripts_dir / "amcl_scan_admission_relay.py").read_text(encoding="utf-8")
+
+    assert "add_executable(amcl_scan_admission_node src/amcl_scan_admission_node.cpp)" in cmake
+    assert "install(TARGETS localization_bridge_node amcl_scan_admission_node" in cmake
+    for dep in ("sensor_msgs", "tf2", "tf2_ros", "geometry_msgs", "rclcpp"):
+        assert dep in cmake
+        assert f"<depend>{dep}</depend>" in package
+
+    assert 'export NJRH_AMCL_SCAN_ADMISSION_IMPL="${NJRH_AMCL_SCAN_ADMISSION_IMPL:-cpp}"' in profile
+    assert 'SCAN_RELAY_IMPL="${NJRH_AMCL_SCAN_ADMISSION_IMPL:-cpp}"' in runner
+    assert "SCAN_RELAY_CPP_BIN" in runner
+    assert "ros2 run robot_localization_bridge amcl_scan_admission_node" in runner
+    assert "python3 \"${SCAN_RELAY_SCRIPT}\"" in runner
+    assert "explicitly set NJRH_AMCL_SCAN_ADMISSION_IMPL=python" in runner
+    assert "implementation=${SCAN_RELAY_IMPL}" in runner
+    assert "max_scan_age_ms=${scan_max_age_ms}" in runner
+    assert "tf_wait_timeout_ms=${scan_wait_for_tf_timeout_ms}" in runner
+    assert "nohup taskset -c \"${relay_cpuset}\" \"${relay_cmd[@]}\"" in runner
+    assert "killall -9" not in runner
+    assert "pkill -9" not in runner
+
+    assert "declare_parameter<std::string>(\"input_topic\", \"/scan\")" in cpp
+    assert "declare_parameter<std::string>(\"output_topic\", \"/scan_amcl\")" in cpp
+    assert "declare_parameter<std::string>(\"target_frame\", \"odom\")" in cpp
+    assert "declare_parameter<double>(\"max_rate_hz\", 5.0)" in cpp
+    assert "declare_parameter<double>(\"max_scan_age_ms\", 250.0)" in cpp
+    assert "declare_parameter<double>(\"tf_wait_timeout_ms\", 20.0)" in cpp
+    assert "declare_parameter<bool>(\"require_tf_available\", true)" in cpp
+    assert "declare_parameter<bool>(\"preserve_stamp\", true)" in cpp
+    assert "declare_parameter<bool>(\"drop_if_future_stamp\", true)" in cpp
+    assert "declare_parameter<double>(\"max_future_stamp_ms\", 50.0)" in cpp
+    assert "declare_parameter<double>(\"rate_hz\", max_rate_hz_)" in cpp
+    assert "declare_parameter<double>(\"max_age_ms\", max_scan_age_ms_)" in cpp
+    assert "declare_parameter<double>(\"wait_for_tf_timeout_ms\", tf_wait_timeout_ms_)" in cpp
+    assert "declare_parameter<bool>(\"drop_if_tf_unavailable\", require_tf_available_)" in cpp
+    assert "lookupTransform(\n        target_frame_, msg.header.frame_id, msg.header.stamp" in cpp
+    assert "pub_->publish(*msg)" in cpp
+    assert "header.stamp =" not in cpp
+    assert "header.frame_id =" not in cpp
+    assert "ranges" not in cpp
+    assert "\\\"implementation\\\":\\\"cpp\\\"" in cpp
+    assert "dropped_age_count" in cpp
+    assert "dropped_tf_count" in cpp
+    assert "dropped_rate_count" in cpp
+    assert "dropped_future_count" in cpp
+    assert "AMCL scan admission status implementation=cpp" in cpp
+
+    assert "EXPECTED_SCAN_ADMISSION_IMPL=\"${NJRH_AMCL_SCAN_ADMISSION_IMPL:-cpp}\"" in verify
+    assert "amcl_scan_admission_node" in verify
+    assert "amcl_scan_admission_relay.py" in verify
+    assert "Python AMCL scan admission fallback is running while expected impl=cpp" in verify
+    assert "scan_amcl_age_ms" in verify
+    assert "possible restamp" in verify
+    assert "scan admission status has ${field}" in verify
+    assert "tf_broadcast=false" in verify
+    assert "bridge_status owner is robot_localization_bridge" in verify
+
+    assert "expected_amcl_scan_impl=\"${NJRH_AMCL_SCAN_ADMISSION_IMPL:-cpp}\"" in inspect
+    assert "amcl_scan_admission_node" in inspect
+    assert "python_fallback_running_by_default" in inspect
+    assert '"2,3,7"' in inspect
+
+    assert "admission_relay" in observe
+    assert "amcl_scan_admission_node" in observe
+    assert "Cpus_allowed_list" in observe
+    assert "pcpu" in observe
+    assert "does not send navigation goals" in observe
+    assert "PointCloud2" not in observe
+
+    assert "scan_topic: /scan_amcl" in amcl_cfg
+    assert "tf_broadcast: false" in amcl_cfg
+    assert "max_odom_tf_age_ms: 100.0" in bridge_cfg
+    assert "tf_future_stamp_offset_sec: 0.10" in bridge_cfg
+    assert "MPPIController" in nav2
+    assert "SmacPlanner2D" in nav2
+    assert "global_frame: odom" in local_costmap_config_block(nav2)
+    assert "global_frame: base_link" not in local_costmap_config_block(nav2)
+
+    assert "self.pub.publish(msg)" in python_relay
+    assert "Preserve the original header.stamp" in python_relay
+
+    bash = shutil.which("bash")
+    if bash:
+        bash_probe = subprocess.run(
+            [bash, "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if bash_probe.returncode == 0:
+            subprocess.run([bash, "-n", str(runner_path)], check=True)
+            subprocess.run([bash, "-n", str(verify_path)], check=True)
+            subprocess.run([bash, "-n", str(inspect_path)], check=True)
+            subprocess.run([bash, "-n", str(observe_path)], check=True)
+
+
+def test_phase_a2_always_on_amcl_runtime_contracts():
+    overlay = ROOT / "scripts" / "jetson" / "runtime_overlay"
+    config_dir = overlay / "config"
+    scripts_dir = overlay / "scripts"
+
+    profile = (config_dir / "amcl_localization_profile.env").read_text(encoding="utf-8")
+    amcl_cfg = (config_dir / "amcl_shadow.yaml").read_text(encoding="utf-8")
+    bridge_cfg = (config_dir / "localization_bridge.yaml").read_text(encoding="utf-8")
+    nav2 = (config_dir / "nav2.yaml").read_text(encoding="utf-8")
+    bridge_cpp = (ROOT / "src" / "robot_localization_bridge" / "src" / "localization_bridge_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    runtime_path = scripts_dir / "run_navigation_runtime_services.sh"
+    runtime = runtime_path.read_text(encoding="utf-8")
+    amcl_runner_path = scripts_dir / "run_amcl_shadow_localization.sh"
+    amcl_runner = amcl_runner_path.read_text(encoding="utf-8")
+    verify_path = scripts_dir / "verify_amcl_runtime_readiness.sh"
+    observe_path = scripts_dir / "observe_amcl_navigation_shadow_180s.sh"
+    verify = verify_path.read_text(encoding="utf-8")
+    observe = observe_path.read_text(encoding="utf-8")
+
+    assert 'export NJRH_AMCL_LOCALIZATION_MODE="${NJRH_AMCL_LOCALIZATION_MODE:-gated}"' in profile
+    assert "shadow starts AMCL and lets robot_localization_bridge compute/report AMCL" in profile
+    assert "gated starts AMCL and lets robot_localization_bridge accept only small" in profile
+    assert "disabled|shadow|gated" in amcl_runner
+    assert "--start-resident" in amcl_runner
+    assert "--complete-readiness" in amcl_runner
+    assert "wait_for_amcl_tf_warmup false" in amcl_runner
+    assert "wait_for_amcl_tf_warmup true" in amcl_runner
+    assert "start_scan_admission_relay || return 2" in amcl_runner
+    assert "wait_for_scan_admission_status_ready || return 3" in amcl_runner
+    assert "seed_amcl_initial_pose || return 4" in amcl_runner
+    assert 'status_log_period_sec:=${NJRH_AMCL_SCAN_ADMISSION_STATUS_LOG_PERIOD_SEC:-1.0}' in amcl_runner
+    assert "request_amcl_nomotion_update" in amcl_runner
+    assert "/request_nomotion_update" in amcl_runner
+    assert "wait_for_amcl_pose_fresh_or_nomotion_update" in amcl_runner
+    assert "AMCL_RESIDENT mode=${MODE}" in amcl_runner
+    assert "AMCL_READY mode=${MODE}" in amcl_runner
+
+    assert "start_amcl_resident_if_enabled_for_navigation" in runtime
+    assert "complete_amcl_readiness_if_enabled_for_navigation" in runtime
+    main_flow = runtime.split('if resident_navigation_ready; then', 1)[1]
+    assert main_flow.index("start_amcl_resident_if_enabled_for_navigation") < main_flow.index(
+        "trigger_global_localization_for_navigation"
+    )
+    assert main_flow.index("trigger_global_localization_for_navigation") < main_flow.index(
+        "complete_amcl_readiness_if_enabled_for_navigation"
+    )
+    assert "--start-resident" in runtime
+    assert "--complete-readiness" in runtime
+    assert "--mode \"${mode}\" --restart" not in runtime
+
+    assert "amcl_input_enabled" in bridge_cpp
+    assert "amcl_gate_mode" in bridge_cpp
+    assert "amcl_source_name" in bridge_cpp
+    assert "AMCL_NOT_SEEDED" in bridge_cpp
+    assert "AMCL_SHADOW_ONLY" in bridge_cpp
+    assert "AMCL_SMALL_CORRECTION" in bridge_cpp
+    assert "AMCL_CORRECTION_TOO_LARGE" in bridge_cpp
+    assert "amcl_shadow_ready" in bridge_cpp
+    assert "amcl_gated_ready" in bridge_cpp
+    assert "amcl_pose_age_ms" in bridge_cpp
+    assert "amcl_pose_fresh" in bridge_cpp
+    assert "amcl_not_moving_no_update_ok" in bridge_cpp
+    assert "localization_degraded" in bridge_cpp
+    assert "expected_map_to_odom_owner" in bridge_cpp
+    assert "candidate.source == \"isaac_triggered\"" in bridge_cpp
+    assert "publish_amcl_initial_pose(candidate.map_base_pose, \"isaac_triggered_accept\")" in bridge_cpp
+    assert "tf_broadcaster_->sendTransform(tf)" in bridge_cpp
+
+    assert "tf_broadcast: false" in amcl_cfg
+    assert "scan_topic: /scan_amcl" in amcl_cfg
+    assert "map_topic: /map" in amcl_cfg
+    assert "update_min_d: 0.05" in amcl_cfg
+    assert "update_min_a: 0.05" in amcl_cfg
+    assert "robot_model_type: nav2_amcl::DifferentialMotionModel" in amcl_cfg
+    assert "amcl_input_enabled: false" in bridge_cfg
+    assert "amcl_gate_mode: shadow" in bridge_cfg
+    assert "amcl_small_correction_translation_m: 0.20" in bridge_cfg
+    assert "amcl_hard_reject_translation_m: 1.0" in bridge_cfg
+    assert "amcl_scan_admission_status_topic: /amcl_scan_admission/status" in bridge_cfg
+    assert "max_odom_tf_age_ms: 100.0" in bridge_cfg
+    assert "transform_tolerance: 0.10" in nav2
+    assert "MPPIController" in nav2
+    assert "SmacPlanner2D" in nav2
+    assert "global_frame: odom" in local_costmap_config_block(nav2)
+
+    assert verify_path.exists()
+    assert observe_path.exists()
+    assert "--mode disabled|shadow|gated" in verify
+    assert 'MODE="${NJRH_AMCL_LOCALIZATION_MODE:-gated}"' in verify
+    assert "--seed" in verify
+    assert "--check-triggered" in verify
+    assert "--check-owner" in verify
+    assert "tf_broadcast=false" in verify
+    assert "/scan_amcl hz" in verify
+    assert "AMCL is not a /tf publisher" in verify
+    assert "/global_localization/trigger" in verify
+    assert "ros2 action send_goal" not in verify
+    assert "ros2 topic pub" not in verify
+    assert "PointCloud2" not in verify
+
+    assert "does not send goals" in observe
+    assert "observe_navigation_tf_jitter_180s.sh" in observe
+    assert "reports/amcl_navigation_shadow_${timestamp}.md" in observe
+    assert "amcl_shadow_ready" in observe
+    assert "amcl_gated_ready" in observe
+    assert "localization_degraded" in observe
+    assert "ros2 action send_goal" not in observe
+    assert "ros2 topic pub" not in observe
+    assert "PointCloud2" not in observe
+
+    for text in (amcl_runner, verify, observe):
+        assert "pkill -9" not in text
+        assert "killall -9" not in text
+
+    bash = shutil.which("bash")
+    if bash:
+        bash_probe = subprocess.run(
+            [bash, "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if bash_probe.returncode == 0:
+            for path in (runtime_path, amcl_runner_path, verify_path, observe_path):
+                subprocess.run([bash, "-n", str(path)], check=True)
+
+
+def test_phase_c1_nav2_controller_cpu_profile_contracts():
+    overlay = ROOT / "scripts" / "jetson" / "runtime_overlay"
+    config_dir = overlay / "config"
+    scripts_dir = overlay / "scripts"
+
+    affinity_cfg = (config_dir / "cpu_affinity.env").read_text(encoding="utf-8")
+    affinity_helper = (scripts_dir / "cpu_affinity.sh").read_text(encoding="utf-8")
+    nav_runner_path = scripts_dir / "run_nav2_navigation.sh"
+    nav_runner = nav_runner_path.read_text(encoding="utf-8")
+    inspect_path = scripts_dir / "inspect_nav2_controller_threads.sh"
+    observe_path = scripts_dir / "observe_controller_tf_backlog_180s.sh"
+    ab_path = scripts_dir / "run_nav2_controller_cpu_ab.sh"
+    cleanup_path = scripts_dir / "cleanup_stale_ros2_cli.sh"
+    inspect = inspect_path.read_text(encoding="utf-8")
+    observe = observe_path.read_text(encoding="utf-8")
+    ab = ab_path.read_text(encoding="utf-8")
+    cleanup = cleanup_path.read_text(encoding="utf-8")
+    nav2 = (config_dir / "nav2.yaml").read_text(encoding="utf-8")
+    bridge_cfg = (config_dir / "localization_bridge.yaml").read_text(encoding="utf-8")
+    amcl_cfg = (config_dir / "amcl_shadow.yaml").read_text(encoding="utf-8")
+
+    assert 'export NJRH_NAV2_CONTROLLER_CPU_PROFILE="${NJRH_NAV2_CONTROLLER_CPU_PROFILE:-current}"' in affinity_cfg
+    assert 'export NJRH_CPUSET_NAV2_CONTROLLER_CURRENT="${NJRH_CPUSET_NAV2_CONTROLLER_CURRENT:-3}"' in affinity_cfg
+    assert 'export NJRH_CPUSET_NAV2_CONTROLLER_WIDE="${NJRH_CPUSET_NAV2_CONTROLLER_WIDE:-3,5}"' in affinity_cfg
+    assert "control_wide)" in affinity_cfg
+    assert 'export NJRH_CPUSET_CONTROLLER_SERVER="${NJRH_CPUSET_NAV2_CONTROLLER_CURRENT}"' in affinity_cfg
+    assert 'export NJRH_CPUSET_CONTROLLER_SERVER="${NJRH_CPUSET_NAV2_CONTROLLER_WIDE}"' in affinity_cfg
+    assert 'export NJRH_CPUSET_LOCAL_COSTMAP="${NJRH_CPUSET_LOCAL_COSTMAP:-${NJRH_CPUSET_CONTROLLER_SERVER}}"' in affinity_cfg
+    assert "njrh_resolve_nav2_controller_cpuset_profile" in affinity_helper
+
+    assert "Nav2 controller CPU profile=${NJRH_NAV2_CONTROLLER_CPU_PROFILE:-current}" in nav_runner
+    assert "wait_for_controller_server_affinity" in nav_runner
+    assert "controller_threads_match_cpuset" in nav_runner
+    assert "NJRH_SKIP_PRESTART_NAV2_STOP" in nav_runner
+    assert "controller_server affinity check failed" in nav_runner
+
+    for path in (inspect_path, observe_path, ab_path, cleanup_path):
+        assert path.exists()
+    assert "controller_server_pid" in inspect
+    assert "Cpus_allowed_list" in inspect
+    assert "ps -L -p" in inspect
+    assert "local_costmap_same_pid=expected_yes_controller_server_hosts_local_costmap" in inspect
+    assert "robot_localization_bridge" in inspect
+    assert "robot_local_state_ekf" in inspect
+    assert "amcl_scan_admission_node" in inspect
+    assert "hesai_accel_driver_node" in inspect
+
+    assert "does not send navigation goals" in observe
+    assert "REQUESTED_LATEST_RE" in observe
+    assert "Requested time" in observe
+    assert "/cmd_vel_nav_raw" in observe
+    assert "/cmd_vel_nav" in observe
+    assert "/cmd_vel_collision_checked" in observe
+    assert "/cmd_vel_safe" in observe
+    assert "/cmd_vel" in observe
+    assert "tf:map->odom" in observe
+    assert "tf:odom->base_link" in observe
+    assert "local_costmap_message_filter_drop" in observe
+    assert "PointCloud2" not in observe
+    assert "ros2 action send_goal" not in observe
+    assert "ros2 topic pub" not in observe
+
+    assert "--profile current|control_wide" in ab
+    assert "--restart-nav2" in ab
+    assert "--apply" in ab
+    assert "safe_stop_nav2_stack" in ab
+    assert "NJRH_SKIP_PRESTART_NAV2_STOP=true" in ab
+    assert "changed_tf_gate: no" in ab
+    assert "changed_nav2_controller_or_planner_params: no" in ab
+    assert "changed_pointcloud_qos_or_dds: no" in ab
+    assert "changed_fastlio: no" in ab
+    assert "changed_ranger_odom_or_ekf: no" in ab
+    assert "pkill -9" not in ab
+    assert "killall -9" not in ab
+    assert "kill -KILL" not in ab
+
+    assert "Dry-run by default" in cleanup
+    assert "ros2 run" in cleanup
+    assert "ros2 launch" in cleanup
+    assert "kill -TERM" in cleanup
+    assert "kill -KILL" not in cleanup
+    assert "pkill -9" not in cleanup
+    assert "killall -9" not in cleanup
+
+    assert "max_odom_tf_age_ms: 100.0" in bridge_cfg
+    assert "tf_future_stamp_offset_sec: 0.10" in bridge_cfg
+    assert "transform_tolerance: 0.10" in nav2
+    assert "transform_tolerance: 0.15" in local_costmap_config_block(nav2)
+    assert "tf_filter_tolerance" not in nav2
+    assert "global_frame: odom" in local_costmap_config_block(nav2)
+    assert "global_frame: base_link" not in local_costmap_config_block(nav2)
+    assert "MPPIController" in nav2
+    assert "SmacPlanner2D" in nav2
+    assert "tf_broadcast: false" in amcl_cfg
+
+    bash = shutil.which("bash")
+    if bash:
+        bash_probe = subprocess.run(
+            [bash, "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if bash_probe.returncode == 0:
+            for path in (nav_runner_path, inspect_path, observe_path, ab_path, cleanup_path):
+                subprocess.run([bash, "-n", str(path)], check=True)
 
 
 def test_phase24a_local_costmap_timestamp_audit_contracts():

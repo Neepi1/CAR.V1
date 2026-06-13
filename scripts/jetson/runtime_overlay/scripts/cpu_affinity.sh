@@ -16,6 +16,9 @@ if [[ -f "${NJRH_CPU_AFFINITY_RUNTIME_OVERRIDE}" ]]; then
   # shellcheck source=../config/cpu_affinity_runtime_override.env
   source "${NJRH_CPU_AFFINITY_RUNTIME_OVERRIDE}"
 fi
+if declare -F njrh_resolve_nav2_controller_cpuset_profile >/dev/null 2>&1; then
+  njrh_resolve_nav2_controller_cpuset_profile
+fi
 
 njrh_affinity_truthy() {
   case "${1:-}" in

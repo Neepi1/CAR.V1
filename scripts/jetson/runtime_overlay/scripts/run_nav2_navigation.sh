@@ -14,6 +14,73 @@ LAUNCH_FILE="${NJRH_PROJECT_ROOT}/src/robot_bringup/launch/standard_navigation.l
 map_server_ready_timeout_sec="${NJRH_NAV_MAP_SERVER_READY_TIMEOUT:-75}"
 global_costmap_ready_timeout_sec="${NJRH_NAV_GLOBAL_COSTMAP_READY_TIMEOUT:-90}"
 
+controller_server_pids() {
+  ps -eo pid=,args= | awk '
+    /controller_server/ &&
+    (/nav2_controller/ || /__node:=controller_server/ || /\/controller_server/) &&
+    $0 !~ /ros2 lifecycle|get \/controller_server|ros2 param|awk/ {
+      print $1
+    }
+  '
+}
+
+read_proc_cpuset() {
+  local pid="$1"
+  awk -F: '/^Cpus_allowed_list:/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' "/proc/${pid}/status" 2>/dev/null || true
+}
+
+controller_threads_match_cpuset() {
+  local pid="$1"
+  local expected="$2"
+  local task_path
+  local tid
+  local allowed
+  for task_path in /proc/"${pid}"/task/*; do
+    [[ -e "${task_path}" ]] || continue
+    tid="${task_path##*/}"
+    allowed="$(awk -F: '/^Cpus_allowed_list:/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' "${task_path}/status" 2>/dev/null || true)"
+    if [[ "${allowed}" != "${expected}" ]]; then
+      echo "[runtime-overlay] controller_server affinity mismatch tid=${tid} expected=${expected} actual=${allowed:-missing}" >&2
+      return 1
+    fi
+  done
+  return 0
+}
+
+wait_for_controller_server_affinity() {
+  local expected="${NJRH_CPUSET_CONTROLLER_SERVER:-}"
+  local profile="${NJRH_NAV2_CONTROLLER_CPU_PROFILE:-current}"
+  local timeout_sec="${NJRH_NAV2_CONTROLLER_AFFINITY_CHECK_TIMEOUT_SEC:-15}"
+  local deadline=$((SECONDS + timeout_sec))
+  local pid=""
+  local allowed=""
+
+  if ! njrh_affinity_enabled; then
+    echo "[runtime-overlay] controller_server affinity check skipped because CPU affinity is disabled" >&2
+    return 0
+  fi
+  if [[ -z "${expected}" ]]; then
+    echo "[runtime-overlay] controller_server expected CPU set is empty for profile=${profile}" >&2
+    return 1
+  fi
+
+  while (( SECONDS <= deadline )); do
+    pid="$(controller_server_pids | tail -n 1 || true)"
+    if [[ -n "${pid}" && -r "/proc/${pid}/status" ]]; then
+      allowed="$(read_proc_cpuset "${pid}")"
+      if [[ "${allowed}" == "${expected}" ]] && controller_threads_match_cpuset "${pid}" "${expected}"; then
+        echo "[runtime-overlay] controller_server cpu profile=${profile} cpuset=${expected} pid=${pid} allowed=${allowed}" >&2
+        return 0
+      fi
+      echo "[runtime-overlay] waiting for controller_server affinity profile=${profile} expected=${expected} pid=${pid} actual=${allowed:-missing}" >&2
+    fi
+    sleep 0.5
+  done
+
+  echo "[runtime-overlay] controller_server affinity check failed profile=${profile} expected=${expected} pid=${pid:-missing} actual=${allowed:-missing}" >&2
+  return 1
+}
+
 if [[ -n "${NJRH_FLOOR_ID:-}" || -n "${NAV2_FLOOR_ID:-}" ]]; then
   resolve_floor_assets "${NJRH_BUILDING_ID:-${NAV2_BUILDING_ID:-building_1}}" "${NJRH_FLOOR_ID:-${NAV2_FLOOR_ID:-}}"
 fi
@@ -36,9 +103,14 @@ if standard_nav_stack_ready; then
 fi
 
 stop_existing_overlay_nav_helpers
-stop_existing_standard_nav_stack
+if [[ "${NJRH_SKIP_PRESTART_NAV2_STOP:-false}" != "true" ]]; then
+  stop_existing_standard_nav_stack
+else
+  echo "[runtime-overlay] skipping pre-start Nav2 stop because NJRH_SKIP_PRESTART_NAV2_STOP=true" >&2
+fi
 
 echo "[runtime-overlay] starting Nav2 without blocking map/topic/TF readiness probes" >&2
+echo "[runtime-overlay] Nav2 controller CPU profile=${NJRH_NAV2_CONTROLLER_CPU_PROFILE:-current} cpuset=${NJRH_CPUSET_CONTROLLER_SERVER:-unset}" >&2
 
 ensure_costmap_filter_masks() {
   local generator="${SCRIPT_DIR}/ensure_costmap_filter_masks.py"
@@ -147,6 +219,7 @@ if ! kill -0 "${nav_pid}" 2>/dev/null; then
   echo "[runtime-overlay] Nav2 launch exited during initial settle with ${nav_exit_code}" >&2
   exit "${nav_exit_code}"
 fi
+wait_for_controller_server_affinity || exit 1
 echo "[runtime-overlay] Nav2 launch process is running; blocking readiness probes are disabled" >&2
 
 wait "${nav_pid}" || nav_exit_code=$?

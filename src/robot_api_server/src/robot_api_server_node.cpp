@@ -206,6 +206,47 @@ bool starts_with(const std::string & value, const std::string & prefix)
   return value.rfind(prefix, 0) == 0;
 }
 
+std::optional<double> parse_utc_iso8601_seconds(const std::string & text)
+{
+  if (text.empty()) {
+    return std::nullopt;
+  }
+  std::tm tm{};
+  std::istringstream input(text);
+  input >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
+  if (input.fail()) {
+    return std::nullopt;
+  }
+#if defined(_WIN32)
+  const auto epoch = _mkgmtime(&tm);
+#else
+  const auto epoch = timegm(&tm);
+#endif
+  if (epoch < 0) {
+    return std::nullopt;
+  }
+  return static_cast<double>(epoch);
+}
+
+bool latch_source_is_bms(const std::string & source)
+{
+  return lower_copy(source) == "bms";
+}
+
+bool latch_source_is_docking_evidence(const std::string & source)
+{
+  const auto normalized = lower_copy(source);
+  return normalized == "docking_job" || normalized == "docking_status";
+}
+
+bool latch_source_is_manual_evidence(const std::string & source)
+{
+  const auto normalized = lower_copy(source);
+  return normalized == "manual" ||
+    normalized == "manual_confirm" ||
+    normalized == "manual_clear";
+}
+
 }  // namespace
 
 class RobotApiServerNode : public rclcpp::Node
@@ -295,6 +336,18 @@ public:
     docking_contact_latch_file_ = declare_parameter<std::string>(
       "docking_contact_latch_file",
       "/workspaces/njrh-v3/workspace1/maps_release/docking_contact_latch.json");
+    dock_contact_latch_bms_ttl_sec_ =
+      std::max(0.0, declare_parameter<double>("dock_contact_latch_bms_ttl_sec", 300.0));
+    dock_contact_latch_bms_require_contact_sec_ =
+      std::max(0.0, declare_parameter<double>("dock_contact_latch_bms_require_contact_sec", 2.0));
+    dock_contact_latch_bms_clear_no_contact_sec_ =
+      std::max(0.0, declare_parameter<double>("dock_contact_latch_bms_clear_no_contact_sec", 3.0));
+    dock_contact_latch_allow_bms_stale_auto_undock_ =
+      declare_parameter<bool>("dock_contact_latch_allow_bms_stale_auto_undock", false);
+    dock_contact_latch_clear_when_live_undocked_no_contact_ =
+      declare_parameter<bool>("dock_contact_latch_clear_when_live_undocked_no_contact", true);
+    dock_contact_latch_max_age_warn_sec_ =
+      std::max(0.0, declare_parameter<double>("dock_contact_latch_max_age_warn_sec", 600.0));
     docking_pre_dock_distance_m_ =
       std::max(0.05, declare_parameter<double>("docking_pre_dock_distance_m", 0.60));
     mapping_2d_live_map_topic_ = declare_parameter<std::string>("mapping_2d_live_map_topic", "/map");
@@ -321,7 +374,7 @@ public:
       declare_parameter<std::string>("teleop_reverse_enable_topic", "/ranger_mini3/teleop_allow_reverse");
     teleop_pose_topic_ = declare_parameter<std::string>("teleop_pose_topic", "/local_state/odometry");
     teleop_max_linear_x_mps_ =
-      std::max(0.0, declare_parameter<double>("teleop_max_linear_x_mps", 0.30));
+      std::max(0.0, declare_parameter<double>("teleop_max_linear_x_mps", 1.00));
     teleop_max_angular_z_radps_ =
       std::max(0.0, declare_parameter<double>("teleop_max_angular_z_radps", 0.55));
     teleop_allow_reverse_ = declare_parameter<bool>("teleop_allow_reverse", false);
@@ -554,8 +607,11 @@ private:
     bool have_soc{false};
     bool fresh{false};
     bool contact{false};
+    bool contact_stable{false};
     std::string reason{"no_bms_state"};
     double age_sec{-1.0};
+    double contact_stable_duration_sec{0.0};
+    double no_contact_duration_sec{0.0};
     double soc{0.0};
     double voltage{0.0};
     double current{0.0};
@@ -583,6 +639,10 @@ private:
     std::string clear_reason;
     std::string note;
     std::string updated_at;
+    double age_sec{-1.0};
+    bool source_bms{false};
+    bool stale{false};
+    bool contradicted_by_live_state{false};
   };
 
   struct PreNavigationDockCheck
@@ -597,6 +657,19 @@ private:
     bool docking_status_indicates_charging{false};
     bool docking_status_indicates_undocking{false};
     bool dock_latch_indicates_docked{false};
+    bool dock_contact_latch_present{false};
+    bool dock_contact_latch_latched_docked{false};
+    std::string dock_contact_latch_source;
+    std::string dock_contact_latch_reason;
+    double dock_contact_latch_age_sec{-1.0};
+    bool dock_contact_latch_stale{false};
+    bool dock_contact_latch_contradicted_by_live_state{false};
+    bool dock_contact_latch_auto_cleared{false};
+    std::string dock_contact_latch_clear_reason;
+    bool live_docking_state_undocked{false};
+    bool live_bms_charging_contact_stable{false};
+    bool strong_live_docked{false};
+    bool latch_valid_for_auto_undock{false};
     bool inferred_docked{false};
     bool final_is_docked_or_charging{false};
     bool final_auto_undock_required{false};
@@ -1096,6 +1169,29 @@ private:
     return snapshot;
   }
 
+  double dock_contact_latch_age_sec(const DockContactLatchSnapshot & snapshot) const
+  {
+    const auto stamp = !snapshot.latched_at.empty() ? snapshot.latched_at : snapshot.updated_at;
+    const auto stamp_seconds = parse_utc_iso8601_seconds(stamp);
+    if (!stamp_seconds) {
+      return -1.0;
+    }
+    return std::max(0.0, wall_time_seconds() - *stamp_seconds);
+  }
+
+  void refresh_dock_contact_latch_derived_fields(DockContactLatchSnapshot & snapshot) const
+  {
+    snapshot.source_bms = latch_source_is_bms(snapshot.source);
+    snapshot.age_sec = dock_contact_latch_age_sec(snapshot);
+    snapshot.stale =
+      snapshot.valid &&
+      snapshot.latched_docked &&
+      snapshot.source_bms &&
+      snapshot.age_sec >= 0.0 &&
+      dock_contact_latch_bms_ttl_sec_ > 0.0 &&
+      snapshot.age_sec > dock_contact_latch_bms_ttl_sec_;
+  }
+
   DockContactLatchSnapshot read_dock_contact_latch() const
   {
     DockContactLatchSnapshot snapshot;
@@ -1124,6 +1220,7 @@ private:
       snapshot.clear_reason = json_string_value(text, "clear_reason").value_or("");
       snapshot.note = json_string_value(text, "note").value_or("");
       snapshot.updated_at = json_string_value(text, "updated_at").value_or("");
+      refresh_dock_contact_latch_derived_fields(snapshot);
       return snapshot;
     } catch (const std::exception & exc) {
       snapshot.reason = std::string("latch_read_failed:") + exc.what();
@@ -1196,11 +1293,57 @@ private:
     }
   }
 
+  bool bms_latch_write_allowed_by_runtime()
+  {
+    const auto runtime = runtime_mode_snapshot();
+    const auto docking_state = lower_copy(runtime.docking_state);
+    const auto docking_status = lower_copy(runtime.docking_status);
+    const bool docking_context =
+      runtime.docking_active ||
+      docking_state == "docked" ||
+      docking_state == "charging" ||
+      docking_state == "docking" ||
+      docking_state == "undocking" ||
+      starts_with(docking_status, "docked") ||
+      starts_with(docking_status, "charging") ||
+      docking_status_is_undocking(docking_status);
+    if (docking_context) {
+      return true;
+    }
+    return !(runtime.navigation_active && navigation_goal_job_running());
+  }
+
+  void maybe_update_bms_dock_contact_latch(
+    const BatteryContactEvaluation & charging_contact,
+    const bool contact_stable,
+    const double stable_duration_sec)
+  {
+    if (!charging_contact.contact || !contact_stable) {
+      return;
+    }
+    if (!bms_latch_write_allowed_by_runtime()) {
+      return;
+    }
+    (void)stable_duration_sec;
+    update_dock_contact_latch(
+      true,
+      "bms",
+      "bms_charging_contact:" + charging_contact.reason,
+      "",
+      "",
+      "",
+      "",
+      "stable_bms_contact");
+  }
+
   void handle_bms_state(const sensor_msgs::msg::BatteryState::SharedPtr msg)
   {
     const auto charging_contact = battery_charging_contact(*msg);
+    bool contact_stable = false;
+    double contact_stable_duration_sec = 0.0;
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
+      const auto now = std::chrono::steady_clock::now();
       if (std::isfinite(msg->percentage)) {
         latest_bms_soc_ = normalized_soc_percent(msg->percentage);
         have_bms_soc_ = true;
@@ -1216,16 +1359,32 @@ private:
       latest_bms_present_ = msg->present;
       latest_bms_charging_contact_ = charging_contact.contact;
       latest_bms_charging_contact_reason_ = charging_contact.reason;
-      latest_bms_received_at_ = std::chrono::steady_clock::now();
+      if (charging_contact.contact) {
+        if (!have_latest_bms_contact_started_at_) {
+          latest_bms_contact_started_at_ = now;
+          have_latest_bms_contact_started_at_ = true;
+        }
+        have_latest_bms_no_contact_started_at_ = false;
+        latest_bms_contact_stable_duration_sec_ =
+          std::chrono::duration<double>(now - latest_bms_contact_started_at_).count();
+        latest_bms_no_contact_duration_sec_ = 0.0;
+      } else {
+        if (!have_latest_bms_no_contact_started_at_) {
+          latest_bms_no_contact_started_at_ = now;
+          have_latest_bms_no_contact_started_at_ = true;
+        }
+        have_latest_bms_contact_started_at_ = false;
+        latest_bms_no_contact_duration_sec_ =
+          std::chrono::duration<double>(now - latest_bms_no_contact_started_at_).count();
+        latest_bms_contact_stable_duration_sec_ = 0.0;
+      }
+      contact_stable_duration_sec = latest_bms_contact_stable_duration_sec_;
+      contact_stable = charging_contact.contact &&
+        contact_stable_duration_sec >= dock_contact_latch_bms_require_contact_sec_;
+      latest_bms_received_at_ = now;
       have_bms_state_ = true;
     }
-    if (charging_contact.contact) {
-      update_dock_contact_latch(
-        true,
-        "bms",
-        "bms_charging_contact:" + charging_contact.reason,
-        "");
-    }
+    maybe_update_bms_dock_contact_latch(charging_contact, contact_stable, contact_stable_duration_sec);
     if (charging_contact.contact && teleop_stop_on_charging_ && teleop_session_active()) {
       clear_teleop_command();
     }
@@ -4875,14 +5034,22 @@ private:
     RCLCPP_INFO(
       get_logger(),
       "pre_navigation dock gate source=%s pose_id=%s auto_undock_required=%s can_auto_undock=%s reason=%s "
-      "bms_contact=%s latch_docked=%s docking_state=%s docking_status=%s",
+      "bms_contact=%s bms_stable=%s latch_docked=%s latch_source=%s latch_age=%.3f latch_stale=%s "
+      "latch_contradicted=%s latch_valid=%s strong_live_docked=%s docking_state=%s docking_status=%s",
       by_pose_id ? "pose_id" : "direct_pose",
       pose_id.c_str(),
       pre_navigation_dock_check.final_auto_undock_required ? "true" : "false",
       pre_navigation_dock_check.can_auto_undock ? "true" : "false",
       pre_navigation_dock_check.auto_undock_reason.c_str(),
       pre_navigation_dock_check.bms.contact ? "true" : "false",
+      pre_navigation_dock_check.live_bms_charging_contact_stable ? "true" : "false",
       pre_navigation_dock_check.dock_latch_indicates_docked ? "true" : "false",
+      pre_navigation_dock_check.dock_contact_latch_source.c_str(),
+      pre_navigation_dock_check.dock_contact_latch_age_sec,
+      pre_navigation_dock_check.dock_contact_latch_stale ? "true" : "false",
+      pre_navigation_dock_check.dock_contact_latch_contradicted_by_live_state ? "true" : "false",
+      pre_navigation_dock_check.latch_valid_for_auto_undock ? "true" : "false",
+      pre_navigation_dock_check.strong_live_docked ? "true" : "false",
       pre_navigation_dock_check.runtime.docking_state.c_str(),
       pre_navigation_dock_check.runtime.docking_status.c_str());
     auto pre_navigation_dock_check_payload = [&]() {
@@ -8130,11 +8297,16 @@ private:
     snapshot.age_sec = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - latest_bms_received_at_).count();
     snapshot.fresh = snapshot.age_sec <= bms_state_max_age_sec_;
+    snapshot.contact_stable_duration_sec = latest_bms_contact_stable_duration_sec_;
+    snapshot.no_contact_duration_sec = latest_bms_no_contact_duration_sec_;
     if (!snapshot.fresh) {
       snapshot.reason = "stale_bms_state";
       return snapshot;
     }
     snapshot.contact = latest_bms_charging_contact_;
+    snapshot.contact_stable =
+      snapshot.contact &&
+      snapshot.contact_stable_duration_sec >= dock_contact_latch_bms_require_contact_sec_;
     snapshot.reason = latest_bms_charging_contact_reason_;
     return snapshot;
   }
@@ -8151,10 +8323,74 @@ private:
     check.runtime_state_docked = docking_state == "docked";
     check.runtime_state_charging = docking_state == "charging";
     check.runtime_state_undocking = docking_state == "undocking";
+    check.live_docking_state_undocked =
+      docking_state == "undocked" || docking_status_is_undocked(docking_status);
     check.docking_status_indicates_docked = starts_with(docking_status, "docked");
     check.docking_status_indicates_charging = starts_with(docking_status, "charging");
     check.docking_status_indicates_undocking = docking_status_is_undocking(docking_status);
     check.dock_latch_indicates_docked = check.dock_latch.valid && check.dock_latch.docked;
+    check.dock_contact_latch_present = check.dock_latch.valid;
+    check.dock_contact_latch_latched_docked = check.dock_latch_indicates_docked;
+    check.dock_contact_latch_source = check.dock_latch.source;
+    check.dock_contact_latch_reason = check.dock_latch.reason;
+    check.dock_contact_latch_age_sec = check.dock_latch.age_sec;
+    check.dock_contact_latch_stale = check.dock_latch.stale;
+    check.live_bms_charging_contact_stable = check.bms.have_state && check.bms.fresh && check.bms.contact_stable;
+    const bool live_bms_no_contact_stable =
+      check.bms.have_state &&
+      check.bms.fresh &&
+      !check.bms.contact &&
+      check.bms.no_contact_duration_sec >= dock_contact_latch_bms_clear_no_contact_sec_;
+    const bool live_not_docked_or_charging =
+      !check.runtime_state_docked &&
+      !check.runtime_state_charging &&
+      !check.docking_status_indicates_docked &&
+      !check.docking_status_indicates_charging &&
+      !check.bms.contact;
+    check.dock_contact_latch_contradicted_by_live_state =
+      dock_contact_latch_clear_when_live_undocked_no_contact_ &&
+      check.dock_latch_indicates_docked &&
+      check.dock_latch.source_bms &&
+      check.live_docking_state_undocked &&
+      live_not_docked_or_charging &&
+      live_bms_no_contact_stable;
+    if (check.dock_contact_latch_contradicted_by_live_state) {
+      check.dock_contact_latch_auto_cleared = true;
+      check.dock_contact_latch_clear_reason = "stale_bms_latch_cleared_live_undocked_no_contact";
+      update_dock_contact_latch(
+        false,
+        "auto_clear",
+        check.dock_contact_latch_clear_reason,
+        check.dock_latch.dock_id,
+        check.dock_latch.building_id,
+        check.dock_latch.floor_id,
+        check.dock_latch.map_id,
+        "source=bms live_undocked_no_contact");
+      check.dock_latch = read_dock_contact_latch();
+      check.dock_latch.contradicted_by_live_state = true;
+      check.dock_latch_indicates_docked = check.dock_latch.valid && check.dock_latch.docked;
+      check.dock_contact_latch_present = check.dock_latch.valid;
+      check.dock_contact_latch_latched_docked = check.dock_latch_indicates_docked;
+      check.dock_contact_latch_source = check.dock_latch.source;
+      check.dock_contact_latch_reason = check.dock_latch.reason;
+      check.dock_contact_latch_age_sec = check.dock_latch.age_sec;
+      check.dock_contact_latch_stale = check.dock_latch.stale;
+    }
+    const bool latch_source_valid_for_auto_undock =
+      latch_source_is_docking_evidence(check.dock_latch.source) ||
+      latch_source_is_manual_evidence(check.dock_latch.source) ||
+      (check.dock_latch.source_bms && dock_contact_latch_allow_bms_stale_auto_undock_);
+    check.latch_valid_for_auto_undock =
+      check.dock_latch_indicates_docked &&
+      !check.dock_contact_latch_stale &&
+      !check.dock_contact_latch_contradicted_by_live_state &&
+      latch_source_valid_for_auto_undock;
+    check.strong_live_docked =
+      check.runtime_state_docked ||
+      check.runtime_state_charging ||
+      check.docking_status_indicates_docked ||
+      check.docking_status_indicates_charging ||
+      check.live_bms_charging_contact_stable;
     if (check.runtime_state_docked) {
       check.docked_evidence.push_back("runtime_state:docked");
     }
@@ -8167,11 +8403,17 @@ private:
     if (check.docking_status_indicates_charging) {
       check.docked_evidence.push_back("docking_status:charging");
     }
-    if (check.bms.contact) {
+    if (check.live_bms_charging_contact_stable) {
       check.docked_evidence.push_back("bms:" + check.bms.reason);
+    } else if (check.bms.contact) {
+      check.docked_warnings.push_back(
+        "bms_contact_unstable:" + check.bms.reason);
     }
-    if (check.dock_latch_indicates_docked) {
+    if (check.latch_valid_for_auto_undock) {
       check.docked_evidence.push_back("latch:" + check.dock_latch.source + ":" + check.dock_latch.reason);
+    } else if (check.dock_latch_indicates_docked) {
+      check.docked_warnings.push_back(
+        "dock_latch_ignored:" + check.dock_latch.source + ":" + check.dock_latch.reason);
     }
     if (!check.bms.have_state) {
       check.docked_warnings.push_back("no_bms_state");
@@ -8182,16 +8424,22 @@ private:
     }
     if (!check.dock_latch.valid) {
       check.docked_warnings.push_back("dock_latch_unavailable:" + check.dock_latch.reason);
+    } else if (check.dock_contact_latch_stale) {
+      check.docked_warnings.push_back("stale_bms_dock_latch");
+    } else if (
+      check.dock_latch.source_bms &&
+      check.dock_latch.age_sec >= 0.0 &&
+      dock_contact_latch_max_age_warn_sec_ > 0.0 &&
+      check.dock_latch.age_sec > dock_contact_latch_max_age_warn_sec_)
+    {
+      check.docked_warnings.push_back("old_bms_dock_latch");
+    }
+    if (check.dock_contact_latch_auto_cleared) {
+      check.docked_warnings.push_back(check.dock_contact_latch_clear_reason);
     }
     check.inferred_docked =
-      !check.runtime_state_docked && (check.bms.contact || check.dock_latch_indicates_docked);
-    check.final_is_docked_or_charging =
-      check.runtime_state_docked ||
-      check.runtime_state_charging ||
-      check.docking_status_indicates_docked ||
-      check.docking_status_indicates_charging ||
-      check.bms.contact ||
-      check.dock_latch_indicates_docked;
+      !check.runtime_state_docked && (check.strong_live_docked || check.latch_valid_for_auto_undock);
+    check.final_is_docked_or_charging = check.strong_live_docked || check.latch_valid_for_auto_undock;
     check.final_auto_undock_required =
       check.final_is_docked_or_charging ||
       check.runtime_state_undocking ||
@@ -8203,18 +8451,13 @@ private:
       !check.docking_status_indicates_undocking;
     check.can_auto_undock = check.final_auto_undock_required && !check.docking_active_not_docked_block;
 
-    const bool live_confirmed = check.runtime_state_docked ||
-      check.runtime_state_charging ||
-      check.docking_status_indicates_docked ||
-      check.docking_status_indicates_charging ||
-      check.bms.contact;
-    if (live_confirmed) {
+    if (check.strong_live_docked) {
       check.docked_state_class = "DOCKED_CONFIRMED";
-    } else if (check.dock_latch_indicates_docked) {
+    } else if (check.latch_valid_for_auto_undock) {
       check.docked_state_class = "DOCKED_LATCHED";
     } else if (check.docking_active_not_docked_block) {
       check.docked_state_class = "UNKNOWN";
-    } else if (check.runtime.docking_state == "undocked" || docking_status_is_undocked(docking_status)) {
+    } else if (check.live_docking_state_undocked) {
       check.docked_state_class = "NOT_DOCKED";
     } else {
       check.docked_state_class = "UNKNOWN";
@@ -8230,10 +8473,14 @@ private:
       check.auto_undock_reason = "docking_status_charging";
     } else if (check.docking_status_indicates_docked) {
       check.auto_undock_reason = "docking_status_docked";
-    } else if (check.bms.contact) {
+    } else if (check.live_bms_charging_contact_stable) {
       check.auto_undock_reason = "bms_charging_contact:" + check.bms.reason;
-    } else if (check.dock_latch_indicates_docked) {
+    } else if (check.latch_valid_for_auto_undock) {
       check.auto_undock_reason = "dock_contact_latch:" + check.dock_latch.source + ":" + check.dock_latch.reason;
+    } else if (check.dock_contact_latch_auto_cleared) {
+      check.auto_undock_reason = check.dock_contact_latch_clear_reason;
+    } else if (check.dock_contact_latch_stale) {
+      check.auto_undock_reason = "stale_bms_latch_ignored";
     } else if (check.docking_active_not_docked_block) {
       check.auto_undock_reason = "docking_active_not_docked:" + check.runtime.docking_state;
     } else {
@@ -8249,6 +8496,11 @@ private:
          << "\"fresh\":" << (bms.fresh ? "true" : "false") << ","
          << "\"age_sec\":" << json_nullable_number(bms.have_state, bms.age_sec) << ","
          << "\"contact\":" << (bms.contact ? "true" : "false") << ","
+         << "\"contact_stable\":" << (bms.contact_stable ? "true" : "false") << ","
+         << "\"contact_stable_duration_sec\":"
+         << json_nullable_number(bms.have_state, bms.contact_stable_duration_sec) << ","
+         << "\"no_contact_duration_sec\":"
+         << json_nullable_number(bms.have_state, bms.no_contact_duration_sec) << ","
          << "\"reason\":" << json_string(bms.reason) << ","
          << "\"soc\":" << json_nullable_number(bms.have_soc, bms.soc) << ","
          << "\"soc_valid\":" << (bms.have_soc && bms.fresh ? "true" : "false") << ","
@@ -8280,6 +8532,11 @@ private:
          << "\"cleared_at\":" << json_string(latch.cleared_at) << ","
          << "\"clear_reason\":" << json_string(latch.clear_reason) << ","
          << "\"note\":" << json_string(latch.note) << ","
+         << "\"age_sec\":" << json_nullable_number(latch.age_sec >= 0.0, latch.age_sec) << ","
+         << "\"source_bms\":" << (latch.source_bms ? "true" : "false") << ","
+         << "\"stale\":" << (latch.stale ? "true" : "false") << ","
+         << "\"contradicted_by_live_state\":"
+         << (latch.contradicted_by_live_state ? "true" : "false") << ","
          << "\"updated_at\":" << json_string(latch.updated_at) << "}";
     return body.str();
   }
@@ -8303,9 +8560,27 @@ private:
          << "\"frame_id\":" << json_string(frame_id) << ","
          << "\"direct_pose\":" << (direct_pose ? "true" : "false") << ","
          << "\"api_bms_charging_contact\":" << (check.bms.contact ? "true" : "false") << ","
+         << "\"api_bms_charging_contact_stable\":"
+         << (check.live_bms_charging_contact_stable ? "true" : "false") << ","
          << "\"api_bms_charging_contact_reason\":" << json_string(check.bms.reason) << ","
          << "\"bms\":{" << bms_charging_contact_snapshot_json(check.bms) << "},"
          << "\"dock_contact_snapshot\":" << dock_contact_latch_snapshot_json(check.dock_latch) << ","
+         << "\"dock_contact_latch_present\":"
+         << (check.dock_contact_latch_present ? "true" : "false") << ","
+         << "\"dock_contact_latch_latched_docked\":"
+         << (check.dock_contact_latch_latched_docked ? "true" : "false") << ","
+         << "\"dock_contact_latch_source\":" << json_string(check.dock_contact_latch_source) << ","
+         << "\"dock_contact_latch_reason\":" << json_string(check.dock_contact_latch_reason) << ","
+         << "\"dock_contact_latch_age_sec\":"
+         << json_nullable_number(check.dock_contact_latch_age_sec >= 0.0, check.dock_contact_latch_age_sec) << ","
+         << "\"dock_contact_latch_stale\":"
+         << (check.dock_contact_latch_stale ? "true" : "false") << ","
+         << "\"dock_contact_latch_contradicted_by_live_state\":"
+         << (check.dock_contact_latch_contradicted_by_live_state ? "true" : "false") << ","
+         << "\"dock_contact_latch_auto_cleared\":"
+         << (check.dock_contact_latch_auto_cleared ? "true" : "false") << ","
+         << "\"dock_contact_latch_clear_reason\":"
+         << json_string(check.dock_contact_latch_clear_reason) << ","
          << "\"docking\":{"
          << "\"state\":" << json_string(check.runtime.docking_state) << ","
          << "\"active\":" << (check.runtime.docking_active ? "true" : "false") << ","
@@ -8318,6 +8593,8 @@ private:
          << "\"status_indicates_docked\":" << (check.docking_status_indicates_docked ? "true" : "false") << ","
          << "\"status_indicates_charging\":"
          << (check.docking_status_indicates_charging ? "true" : "false") << ","
+         << "\"live_docking_state_undocked\":"
+         << (check.live_docking_state_undocked ? "true" : "false") << ","
          << "\"status_indicates_undocking\":"
          << (check.docking_status_indicates_undocking ? "true" : "false") << ","
          << "\"dock_latch_indicates_docked\":"
@@ -8325,7 +8602,20 @@ private:
          << "\"inferred_docked\":" << (check.inferred_docked ? "true" : "false") << ","
          << "\"latched_docked\":" << (check.dock_latch_indicates_docked ? "true" : "false") << ","
          << "\"latched_docked_source\":" << json_string(check.dock_latch.source) << ","
-         << "\"latched_docked_age_sec\":null,"
+         << "\"latched_docked_age_sec\":"
+         << json_nullable_number(check.dock_latch.age_sec >= 0.0, check.dock_latch.age_sec) << ","
+         << "\"live_docking_state\":" << json_string(check.runtime.docking_state) << ","
+         << "\"live_docking_status_indicates_docked\":"
+         << (check.docking_status_indicates_docked ? "true" : "false") << ","
+         << "\"live_docking_status_indicates_charging\":"
+         << (check.docking_status_indicates_charging ? "true" : "false") << ","
+         << "\"live_bms_charging_contact\":"
+         << (check.bms.contact ? "true" : "false") << ","
+         << "\"live_bms_charging_contact_stable\":"
+         << (check.live_bms_charging_contact_stable ? "true" : "false") << ","
+         << "\"strong_live_docked\":" << (check.strong_live_docked ? "true" : "false") << ","
+         << "\"latch_valid_for_auto_undock\":"
+         << (check.latch_valid_for_auto_undock ? "true" : "false") << ","
          << "\"docked_state_class\":" << json_string(check.docked_state_class) << ","
          << "\"docked_evidence\":" << json_string_array_fragment(check.docked_evidence) << ","
          << "\"docked_warnings\":" << json_string_array_fragment(check.docked_warnings) << ","
@@ -8336,7 +8626,8 @@ private:
          << "\"can_auto_undock\":" << (check.can_auto_undock ? "true" : "false") << ","
          << "\"docking_active_not_docked_block\":"
          << (check.docking_active_not_docked_block ? "true" : "false") << ","
-         << "\"auto_undock_reason\":" << json_string(check.auto_undock_reason)
+         << "\"auto_undock_reason\":" << json_string(check.auto_undock_reason) << ","
+         << "\"final_auto_undock_reason\":" << json_string(check.auto_undock_reason)
          << "}";
     return body.str();
   }
@@ -8718,6 +9009,12 @@ private:
   std::string docking_undock_service_;
   std::string docking_status_topic_;
   std::string docking_contact_latch_file_;
+  double dock_contact_latch_bms_ttl_sec_{300.0};
+  double dock_contact_latch_bms_require_contact_sec_{2.0};
+  double dock_contact_latch_bms_clear_no_contact_sec_{3.0};
+  bool dock_contact_latch_allow_bms_stale_auto_undock_{false};
+  bool dock_contact_latch_clear_when_live_undocked_no_contact_{true};
+  double dock_contact_latch_max_age_warn_sec_{600.0};
   bool have_last_dock_contact_latch_write_{false};
   bool last_dock_contact_latch_docked_{false};
   std::string last_dock_contact_latch_source_;
@@ -8762,7 +9059,7 @@ private:
   std::string teleop_cmd_topic_;
   std::string teleop_reverse_enable_topic_;
   std::string teleop_pose_topic_;
-  double teleop_max_linear_x_mps_{0.30};
+  double teleop_max_linear_x_mps_{1.00};
   double teleop_max_angular_z_radps_{0.55};
   bool teleop_allow_reverse_{false};
   bool teleop_require_mapping_active_{true};
@@ -8772,6 +9069,12 @@ private:
   double bms_charging_contact_voltage_max_v_{1000.0};
   double bms_full_soc_threshold_pct_{99.0};
   bool bms_full_soc_voltage_contact_enable_{true};
+  bool have_latest_bms_contact_started_at_{false};
+  bool have_latest_bms_no_contact_started_at_{false};
+  std::chrono::steady_clock::time_point latest_bms_contact_started_at_;
+  std::chrono::steady_clock::time_point latest_bms_no_contact_started_at_;
+  double latest_bms_contact_stable_duration_sec_{0.0};
+  double latest_bms_no_contact_duration_sec_{0.0};
   double teleop_watchdog_timeout_sec_{0.5};
   double teleop_socket_idle_timeout_sec_{5.0};
   double teleop_repeat_rate_hz_{20.0};

@@ -42,6 +42,12 @@ robot_api_server:
     docking_undock_service: "/docking/undock"
     docking_status_topic: "/docking/status"
     docking_contact_latch_file: "/workspaces/njrh-v3/workspace1/maps_release/docking_contact_latch.json"
+    dock_contact_latch_bms_ttl_sec: 300.0
+    dock_contact_latch_bms_require_contact_sec: 2.0
+    dock_contact_latch_bms_clear_no_contact_sec: 3.0
+    dock_contact_latch_allow_bms_stale_auto_undock: false
+    dock_contact_latch_clear_when_live_undocked_no_contact: true
+    dock_contact_latch_max_age_warn_sec: 600.0
     docking_pre_dock_distance_m: 0.60
     docking_navigation_start_wait_sec: 45.0
     docking_predock_nav_timeout_sec: 180.0
@@ -80,7 +86,7 @@ robot_api_server:
     teleop_cmd_topic: "/cmd_vel_collision_checked"
     teleop_reverse_enable_topic: "/ranger_mini3/teleop_allow_reverse"
     teleop_pose_topic: "/local_state/odometry"
-    teleop_max_linear_x_mps: 0.30
+    teleop_max_linear_x_mps: 1.00
     teleop_max_angular_z_radps: 0.55
     teleop_allow_reverse: true
     teleop_require_mapping_active: true

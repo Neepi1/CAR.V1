@@ -15,10 +15,12 @@ Supported values:
 
 - `disabled`: AMCL is not started and the existing Isaac triggered path is unchanged.
 - `shadow`: AMCL runs on `/scan_amcl` and publishes `/amcl_pose`; `robot_localization_bridge` computes candidate corrections but does not update `map -> odom`.
-- `gated`: default active integration mode. AMCL runs on `/scan_amcl`; `robot_localization_bridge` accepts only small, covariance-gated corrections into `map -> odom`.
+- `gated`: opt-in active integration mode. AMCL runs on `/scan_amcl`; `robot_localization_bridge` accepts only small, covariance-gated corrections into `map -> odom`.
 
-`AMCL gated` is the active Phase A2 default. Use `shadow` to observe without
-correction, or `disabled` to return to Isaac-triggered-only localization.
+`shadow` is the Phase A1.2 default so field runs can prove stable seed, scan
+admission, and fresh `/amcl_pose` before AMCL affects `map -> odom`. Use
+`gated` only after shadow evidence is acceptable, or `disabled` to return to
+Isaac-triggered-only localization.
 
 ## TF Contract
 
@@ -73,13 +75,64 @@ bash scripts/jetson/runtime_overlay/scripts/run_amcl_shadow_localization.sh --re
 bash scripts/jetson/runtime_overlay/scripts/verify_amcl_shadow_localization.sh --mode shadow --seed --tf-warmup-sec 3 --scan-admission --duration-sec 60 --check-logs
 ```
 
-For gated observation:
+For production gated correction:
 
 ```bash
 export NJRH_AMCL_LOCALIZATION_MODE=gated
 bash scripts/jetson/runtime_overlay/scripts/run_amcl_shadow_localization.sh --restart
 bash scripts/jetson/runtime_overlay/scripts/verify_amcl_shadow_localization.sh --mode gated --seed --tf-warmup-sec 3 --scan-admission --duration-sec 120 --check-logs
 ```
+
+## CPU Affinity And TF Jitter
+
+Phase A1.4 keeps Nav2 AMCL itself as the upstream C++ lifecycle node and changes
+only the `/scan -> /scan_amcl` admission relay. The default runtime policy is:
+
+```bash
+export NJRH_CPUSET_AMCL=6
+export NJRH_CPUSET_AMCL_SCAN_ADMISSION=6
+export NJRH_AMCL_SCAN_ADMISSION_IMPL=cpp
+```
+
+`run_amcl_shadow_localization.sh` starts the C++
+`robot_localization_bridge/amcl_scan_admission_node` with
+`taskset -c ${NJRH_CPUSET_AMCL_SCAN_ADMISSION}` and verifies the resulting
+`Cpus_allowed_list`. AMCL itself is audited but not forcibly moved in this
+phase. The intent is to keep `/scan -> /scan_amcl` admission off CPU2
+(EKF/local odom), CPU3 (controller/collision), and CPU7
+(`robot_localization_bridge` timers). If the C++ binary is missing, startup
+fails fast; it does not silently start Python. Python
+`amcl_scan_admission_relay.py` remains only as an explicit fallback:
+
+```bash
+export NJRH_AMCL_SCAN_ADMISSION_IMPL=python
+bash scripts/jetson/runtime_overlay/scripts/run_amcl_shadow_localization.sh --restart
+```
+
+The C++ relay preserves the original `LaserScan` stamp, frame id, ranges,
+intensities, angle metadata, range metadata, and scan timing fields. It does not
+restamp and does not modify scan data. It only applies rate, age, and
+`odom <- scan_frame` availability gates before publishing `/scan_amcl`.
+
+Inspect live placement:
+
+```bash
+bash scripts/jetson/runtime_overlay/scripts/inspect_runtime_cpu_affinity.sh
+```
+
+Record a lightweight 180 second window while a user-started navigation is
+running:
+
+```bash
+bash scripts/jetson/runtime_overlay/scripts/observe_navigation_tf_jitter_180s.sh --duration-sec 180 --label nav_test
+```
+
+The observer subscribes only to odom, TF, `/scan_amcl`, `/amcl_pose`,
+`/localization/bridge_status`, `/rosout`, and Linux CPU snapshots. It does not
+send navigation goals, publish velocity, or subscribe to PointCloud2 topics.
+This phase deliberately keeps `max_odom_tf_age_ms`,
+`tf_future_stamp_offset_sec`, AMCL `transform_tolerance`, Nav2
+planner/controller plugins, PointCloud2 QoS, and DDS defaults unchanged.
 
 Rollback:
 
@@ -90,8 +143,8 @@ bash scripts/jetson/runtime_overlay/scripts/run_amcl_shadow_localization.sh --st
 
 ## Field Notes
 
-AMCL may be unstable on oversized or highly symmetric maps. In that case keep
-the mode at `shadow`, inspect covariance and candidate corrections from
+AMCL may be unstable on oversized or highly symmetric maps. In that case switch
+the mode to `shadow`, inspect covariance and candidate corrections from
 `/localization/bridge_status`, and use Isaac triggered relocalization for large
 pose recovery.
 

@@ -1153,12 +1153,36 @@ private:
       (now_sec - last_amcl_pose_received_sec_) * 1000.0 : -1.0;
     const double amcl_initial_pose_age_ms = last_amcl_initial_pose_seed_sec_ > 0.0 ?
       (now_sec - last_amcl_initial_pose_seed_sec_) * 1000.0 : -1.0;
-    const bool amcl_ready =
+    const bool amcl_scan_ready = amcl_scan_admission_ready(now_sec);
+    const bool amcl_pose_seen = last_amcl_pose_age_ms >= 0.0;
+    const bool amcl_pose_fresh =
+      amcl_pose_seen && last_amcl_pose_age_ms <= amcl_pose_max_age_ms_;
+    const double amcl_linear_speed_mps = has_odom_ ?
+      std::hypot(
+        latest_odom_.twist.twist.linear.x,
+        latest_odom_.twist.twist.linear.y) : 0.0;
+    const double amcl_angular_speed_rps = has_odom_ ?
+      std::abs(latest_odom_.twist.twist.angular.z) : 0.0;
+    const bool amcl_robot_moving =
+      amcl_linear_speed_mps > 0.02 || amcl_angular_speed_rps > 0.02;
+    const bool amcl_not_moving_no_update_ok =
+      amcl_input_enabled_ && !amcl_robot_moving && amcl_pose_seen && !amcl_pose_fresh;
+    const bool amcl_tracking_ok =
+      amcl_pose_fresh || amcl_not_moving_no_update_ok;
+    const bool amcl_shadow_ready =
       amcl_input_enabled_ &&
       amcl_seed_succeeded_ &&
-      last_amcl_pose_age_ms >= 0.0 &&
-      last_amcl_pose_age_ms <= amcl_pose_max_age_ms_ &&
-      amcl_scan_admission_ready(now_sec);
+      amcl_tracking_ok &&
+      amcl_scan_ready;
+    const bool amcl_gated_ready = amcl_shadow_ready && amcl_gate_mode_ == "gated";
+    const bool amcl_ready =
+      amcl_gate_mode_ == "gated" ? amcl_gated_ready : amcl_shadow_ready;
+    const bool amcl_correction_suppressed_after_seed =
+      last_isaac_triggered_accept_sec_ > 0.0 &&
+      now_sec - last_isaac_triggered_accept_sec_ < amcl_accept_after_isaac_delay_sec_;
+    const bool localization_degraded =
+      amcl_input_enabled_ &&
+      ((amcl_robot_moving && !amcl_pose_fresh) || (amcl_gate_mode_ == "gated" && !amcl_gated_ready));
     std::ostringstream out;
     out << std::fixed << std::setprecision(3)
         << "{\"localization_mode\":\"" << continuous_localization_mode_
@@ -1204,8 +1228,14 @@ private:
         << ",\"amcl_suppressed_after_isaac_count\":" << amcl_suppressed_after_isaac_count_
         << ",\"last_amcl_pose_age_ms\":" << last_amcl_pose_age_ms
         << ",\"amcl_last_pose_age_ms\":" << last_amcl_pose_age_ms
+        << ",\"amcl_pose_age_ms\":" << last_amcl_pose_age_ms
         << ",\"amcl_pose_hz\":" << amcl_pose_hz
+        << ",\"amcl_pose_fresh\":" << (amcl_pose_fresh ? "true" : "false")
+        << ",\"amcl_robot_moving\":" << (amcl_robot_moving ? "true" : "false")
+        << ",\"amcl_not_moving_no_update_ok\":" << (amcl_not_moving_no_update_ok ? "true" : "false")
         << ",\"amcl_ready\":" << (amcl_ready ? "true" : "false")
+        << ",\"amcl_shadow_ready\":" << (amcl_shadow_ready ? "true" : "false")
+        << ",\"amcl_gated_ready\":" << (amcl_gated_ready ? "true" : "false")
         << ",\"last_amcl_xy_covariance\":" << last_amcl_xy_covariance_
         << ",\"last_amcl_yaw_covariance\":" << last_amcl_yaw_covariance_
         << ",\"amcl_seed_requested\":" << (amcl_seed_requested_ ? "true" : "false")
@@ -1228,12 +1258,17 @@ private:
         << ",\"amcl_scan_admission_last_error\":\"" << json_escape(amcl_scan_admission_last_error_)
         << "\",\"last_accept_reason\":\"" << json_escape(last_accept_reason_)
         << "\",\"last_reject_reason\":\"" << json_escape(last_reject_reason_)
-        << "\",\"last_candidate_correction_translation_m\":" << last_candidate_correction_translation_m_
+        << "\",\"amcl_last_reject_reason\":\"" << json_escape(last_reject_reason_)
+        << "\",\"amcl_correction_suppressed_after_seed\":"
+        << (amcl_correction_suppressed_after_seed ? "true" : "false")
+        << ",\"localization_degraded\":" << (localization_degraded ? "true" : "false")
+        << ",\"last_candidate_correction_translation_m\":" << last_candidate_correction_translation_m_
         << ",\"last_candidate_correction_yaw_rad\":" << last_candidate_correction_yaw_rad_
         << ",\"last_accepted_correction_translation_m\":" << last_accepted_correction_translation_m_
         << ",\"last_accepted_correction_yaw_rad\":" << last_accepted_correction_yaw_rad_
         << ",\"map_to_odom_age_ms\":" << map_to_odom_age_ms
         << ",\"map_to_odom_publisher_owner\":\"robot_localization_bridge\""
+        << ",\"expected_map_to_odom_owner\":\"robot_localization_bridge\""
         << ",\"has_map_to_odom\":" << (has_map_to_odom_ ? "true" : "false")
         << "}";
     std_msgs::msg::String msg;
