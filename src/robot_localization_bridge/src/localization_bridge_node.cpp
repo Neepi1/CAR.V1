@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -16,9 +17,11 @@
 #include "geometry_msgs/msg/quaternion.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "nav_msgs/msg/odometry.hpp"
+#include "rclcpp/executors/multi_threaded_executor.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/string.hpp"
+#include "std_srvs/srv/set_bool.hpp"
 #include "std_srvs/srv/trigger.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_broadcaster.h"
@@ -282,6 +285,20 @@ struct CandidateCorrection
   bool valid{false};
 };
 
+struct MapOdomState
+{
+  MapToOdom transform;
+  double z{0.0};
+  std::uint64_t sequence{0U};
+  double accepted_time_sec{0.0};
+  std::string source{"none"};
+  double correction_translation_m{0.0};
+  double correction_yaw_rad{0.0};
+  bool valid{false};
+  bool correction_paused{false};
+  bool frozen_due_to_pause{false};
+};
+
 struct AmclRuntimeStatus
 {
   bool available{false};
@@ -342,6 +359,8 @@ public:
     status_topic_ = declare_parameter<std::string>("status_topic", "/localization/bridge_status");
     force_accept_service_ = declare_parameter<std::string>(
       "force_accept_service", "/robot_localization_bridge/force_accept_next_localization");
+    correction_pause_service_ = declare_parameter<std::string>(
+      "correction_pause_service", "/robot_localization_bridge/set_correction_paused");
     two_d_mode_ = declare_parameter<bool>("two_d_mode", true);
     const bool deprecated_continuous_localization_enabled = declare_parameter<bool>(
       "continuous_localization_enabled", false);
@@ -406,6 +425,10 @@ public:
     amcl_scan_admission_status_topic_ = declare_parameter<std::string>(
       "amcl_scan_admission_status_topic", "/amcl_scan_admission/status");
     status_publish_period_sec_ = declare_parameter<double>("status_publish_period_sec", 1.0);
+    map_odom_publish_gap_warn_ms_ =
+      declare_parameter<double>("map_odom_publish_gap_warn_ms", 100.0);
+    map_odom_publish_gap_fail_ms_ =
+      declare_parameter<double>("map_odom_publish_gap_fail_ms", 250.0);
     require_result_frame_match_ = declare_parameter<bool>("require_result_frame_match", true);
 
     if (continuous_localization_mode_ != "triggered") {
@@ -470,6 +493,9 @@ public:
       std::clamp(amcl_initial_pose_repeat_period_ms_, 0, 1000);
     status_publish_period_sec_ = std::max(0.2, status_publish_period_sec_);
     amcl_runtime_status_ttl_sec_ = std::max(0.0, amcl_runtime_status_ttl_sec_);
+    map_odom_publish_gap_warn_ms_ = std::max(1.0, map_odom_publish_gap_warn_ms_);
+    map_odom_publish_gap_fail_ms_ =
+      std::max(map_odom_publish_gap_warn_ms_, map_odom_publish_gap_fail_ms_);
 
     pose_sub_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
       localization_topic_,
@@ -506,6 +532,13 @@ public:
         this,
         std::placeholders::_1,
         std::placeholders::_2));
+    correction_pause_srv_ = create_service<std_srvs::srv::SetBool>(
+      correction_pause_service_,
+      std::bind(
+        &LocalizationBridgeNode::on_correction_pause_request,
+        this,
+        std::placeholders::_1,
+        std::placeholders::_2));
     amcl_seed_srv_ = create_service<std_srvs::srv::Trigger>(
       amcl_seed_service_,
       std::bind(
@@ -515,9 +548,23 @@ public:
         std::placeholders::_2));
     const auto period_ms = std::max<std::int64_t>(
       1, static_cast<std::int64_t>(std::llround(1000.0 / publish_rate_hz_)));
+    map_odom_publisher_callback_group_ =
+      create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     timer_ = create_wall_timer(
       std::chrono::milliseconds(period_ms),
-      std::bind(&LocalizationBridgeNode::on_timer, this));
+      std::bind(&LocalizationBridgeNode::on_timer, this),
+      map_odom_publisher_callback_group_);
+    const auto status_period_ms = std::max<std::int64_t>(
+      1, static_cast<std::int64_t>(std::llround(status_publish_period_sec_ * 1000.0)));
+    status_timer_ = create_wall_timer(
+      std::chrono::milliseconds(status_period_ms),
+      std::bind(&LocalizationBridgeNode::on_status_timer, this));
+    RCLCPP_INFO(
+      get_logger(),
+      "map->odom publisher decoupled from correction callbacks: rate=%.1fHz warn_gap=%.1fms fail_gap=%.1fms",
+      publish_rate_hz_,
+      map_odom_publish_gap_warn_ms_,
+      map_odom_publish_gap_fail_ms_);
   }
 
 private:
@@ -615,7 +662,12 @@ private:
 
   void on_timer()
   {
-    refresh_state("timer");
+    publish_map_to_odom_from_state();
+  }
+
+  void on_status_timer()
+  {
+    refresh_state("status_timer");
     publish_status_if_due();
   }
 
@@ -649,6 +701,24 @@ private:
       get_logger(),
       "force accepting next localization_result up to %.3f m map->odom jump",
       forced_jump_threshold_m_);
+  }
+
+  void on_correction_pause_request(
+    const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+    const std::shared_ptr<std_srvs::srv::SetBool::Response> response)
+  {
+    correction_paused_ = request->data;
+    correction_pause_reason_ = correction_paused_ ? "docking_fine" : "none";
+    update_map_odom_pause_state();
+    response->success = true;
+    response->message = correction_paused_ ?
+      "global localization corrections are paused" :
+      "global localization corrections are enabled";
+    RCLCPP_WARN(
+      get_logger(),
+      "global localization correction pause=%s reason=%s",
+      correction_paused_ ? "true" : "false",
+      correction_pause_reason_.c_str());
   }
 
   void on_amcl_seed_request(
@@ -969,6 +1039,11 @@ private:
     }
     mark_latest_pose_stamp_used();
 
+    if (correction_paused_) {
+      reject_candidate("GLOBAL_CORRECTION_PAUSED:" + correction_pause_reason_, source, false);
+      return false;
+    }
+
     if (!has_map_to_odom_) {
       if (force_accept_next_pose_) {
         force_accept_next_pose_ = false;
@@ -1024,6 +1099,12 @@ private:
     if (!candidate.valid) {
       last_amcl_state_ = "rejected";
       reject_candidate(normalize_amcl_reject_reason(candidate.reject_reason), source, false);
+      return false;
+    }
+
+    if (correction_paused_) {
+      last_amcl_state_ = "paused";
+      reject_candidate("GLOBAL_CORRECTION_PAUSED:" + correction_pause_reason_, source, false);
       return false;
     }
 
@@ -1096,6 +1177,32 @@ private:
     }
   }
 
+  void update_map_odom_state_from_candidate(const CandidateCorrection & candidate)
+  {
+    MapOdomState state;
+    state.transform = candidate.transform;
+    state.z = (!two_d_mode_ && has_odom_) ?
+      candidate.map_base_pose.pose.pose.position.z - latest_odom_.pose.pose.position.z : 0.0;
+    state.sequence = accepted_result_count_;
+    state.accepted_time_sec = last_accepted_sec_;
+    state.source = candidate.source;
+    state.correction_translation_m = candidate.correction_translation_m;
+    state.correction_yaw_rad = candidate.correction_yaw_rad;
+    state.valid = true;
+    state.correction_paused = correction_paused_;
+    state.frozen_due_to_pause = correction_paused_;
+
+    std::lock_guard<std::mutex> lock(map_odom_state_mutex_);
+    map_odom_state_ = state;
+  }
+
+  void update_map_odom_pause_state()
+  {
+    std::lock_guard<std::mutex> lock(map_odom_state_mutex_);
+    map_odom_state_.correction_paused = correction_paused_;
+    map_odom_state_.frozen_due_to_pause = correction_paused_ && map_odom_state_.valid;
+  }
+
   void apply_candidate(
     const CandidateCorrection & candidate,
     const char * source,
@@ -1120,6 +1227,7 @@ private:
     if (candidate.source == "amcl_gated") {
       ++amcl_accepted_count_;
     }
+    update_map_odom_state_from_candidate(candidate);
     if (candidate.source == "isaac_triggered") {
       last_isaac_triggered_accept_sec_ = last_accepted_sec_;
       if (amcl_initial_pose_seed_enabled_) {
@@ -1210,6 +1318,70 @@ private:
     return true;
   }
 
+  void publish_map_to_odom_from_state()
+  {
+    const auto callback_start = std::chrono::steady_clock::now();
+    MapOdomState state;
+    {
+      std::lock_guard<std::mutex> lock(map_odom_state_mutex_);
+      state = map_odom_state_;
+    }
+
+    bool published = false;
+    if (publish_tf_ && state.valid) {
+      geometry_msgs::msg::TransformStamped tf;
+      auto tf_stamp = now();
+      if (tf_future_stamp_offset_sec_ > 0.0) {
+        tf_stamp = tf_stamp + rclcpp::Duration::from_seconds(tf_future_stamp_offset_sec_);
+      }
+      tf.header.stamp = tf_stamp;
+      tf.header.frame_id = map_frame_;
+      tf.child_frame_id = odom_frame_;
+      tf.transform.translation.x = state.transform.x;
+      tf.transform.translation.y = state.transform.y;
+      tf.transform.translation.z = state.z;
+      tf.transform.rotation = quaternion_from_yaw(state.transform.yaw);
+      tf_broadcaster_->sendTransform(tf);
+      published = true;
+    }
+
+    const auto callback_end = std::chrono::steady_clock::now();
+    const double callback_duration_us =
+      std::chrono::duration<double, std::micro>(callback_end - callback_start).count();
+    const double wall_sec = now().seconds();
+    std::lock_guard<std::mutex> lock(map_odom_publish_stats_mutex_);
+    map_odom_publish_callback_duration_us_ = callback_duration_us;
+    map_odom_state_valid_snapshot_ = state.valid;
+    map_odom_latest_source_ = state.source;
+    map_odom_latest_accepted_sequence_ = state.sequence;
+    map_odom_correction_paused_snapshot_ = state.correction_paused;
+    map_odom_frozen_due_to_pause_snapshot_ = state.frozen_due_to_pause;
+    if (!published) {
+      return;
+    }
+    if (map_odom_last_publish_wall_sec_ > 0.0) {
+      map_odom_last_publish_gap_ms_ = std::max(
+        0.0, (wall_sec - map_odom_last_publish_wall_sec_) * 1000.0);
+      map_odom_publish_gap_max_ms_ =
+        std::max(map_odom_publish_gap_max_ms_, map_odom_last_publish_gap_ms_);
+      if (map_odom_last_publish_gap_ms_ > map_odom_publish_gap_warn_ms_) {
+        ++map_odom_publish_missed_count_;
+      }
+      if (map_odom_last_publish_gap_ms_ > map_odom_publish_gap_fail_ms_) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(),
+          *get_clock(),
+          2000,
+          "map->odom publish gap %.1f ms exceeds fail threshold %.1f ms",
+          map_odom_last_publish_gap_ms_,
+          map_odom_publish_gap_fail_ms_);
+      }
+    }
+    map_odom_last_publish_wall_sec_ = wall_sec;
+    map_odom_last_published_sequence_ = state.sequence;
+    ++map_odom_publish_count_;
+  }
+
   void refresh_state(const char * source)
   {
     if (!has_odom_) {
@@ -1260,25 +1432,6 @@ private:
     }
 
     publish_health(true, std::string("bridge map->odom active (") + source + ")");
-    if (!publish_tf_) {
-      return;
-    }
-
-    geometry_msgs::msg::TransformStamped tf;
-    auto tf_stamp = now();
-    if (tf_future_stamp_offset_sec_ > 0.0) {
-      tf_stamp = tf_stamp + rclcpp::Duration::from_seconds(tf_future_stamp_offset_sec_);
-    }
-    tf.header.stamp = tf_stamp;
-    tf.header.frame_id = map_frame_;
-    tf.child_frame_id = odom_frame_;
-    tf.transform.translation.x = map_to_odom_.x;
-    tf.transform.translation.y = map_to_odom_.y;
-    if (!two_d_mode_ && has_pose_) {
-      tf.transform.translation.z = latest_pose_.pose.pose.position.z - latest_odom_.pose.pose.position.z;
-    }
-    tf.transform.rotation = quaternion_from_yaw(map_to_odom_.yaw);
-    tf_broadcaster_->sendTransform(tf);
   }
 
   double rate_since_last_status(
@@ -1383,6 +1536,34 @@ private:
       rate_since_last_status(accepted_result_count_, previous_accepted_result_count_, elapsed);
     const double amcl_pose_hz =
       rate_since_last_status(amcl_pose_count_, previous_amcl_pose_count_, elapsed);
+    double map_odom_publish_loop_hz = 0.0;
+    double map_odom_publish_gap_ms = -1.0;
+    double map_odom_publish_gap_max_ms = 0.0;
+    double map_odom_publish_callback_duration_us = 0.0;
+    std::uint64_t map_odom_latest_accepted_sequence = 0U;
+    std::uint64_t map_odom_last_published_sequence = 0U;
+    std::uint64_t map_odom_publish_missed_count = 0U;
+    std::string map_odom_latest_source{"none"};
+    bool map_odom_state_valid = false;
+    bool map_odom_correction_paused = false;
+    bool map_odom_frozen_due_to_pause = false;
+    {
+      std::lock_guard<std::mutex> lock(map_odom_publish_stats_mutex_);
+      const auto publish_delta = map_odom_publish_count_ - previous_map_odom_publish_count_;
+      previous_map_odom_publish_count_ = map_odom_publish_count_;
+      map_odom_publish_loop_hz =
+        elapsed > 0.0 ? static_cast<double>(publish_delta) / elapsed : 0.0;
+      map_odom_publish_gap_ms = map_odom_last_publish_gap_ms_;
+      map_odom_publish_gap_max_ms = map_odom_publish_gap_max_ms_;
+      map_odom_publish_callback_duration_us = map_odom_publish_callback_duration_us_;
+      map_odom_latest_accepted_sequence = map_odom_latest_accepted_sequence_;
+      map_odom_last_published_sequence = map_odom_last_published_sequence_;
+      map_odom_publish_missed_count = map_odom_publish_missed_count_;
+      map_odom_latest_source = map_odom_latest_source_;
+      map_odom_state_valid = map_odom_state_valid_snapshot_;
+      map_odom_correction_paused = map_odom_correction_paused_snapshot_;
+      map_odom_frozen_due_to_pause = map_odom_frozen_due_to_pause_snapshot_;
+    }
 
     const double map_to_odom_age_ms = last_accepted_sec_ > 0.0 ?
       (now_sec - last_accepted_sec_) * 1000.0 : -1.0;
@@ -1593,6 +1774,10 @@ private:
         << ",\"amcl_rejected_count\":" << amcl_rejected_count_
         << ",\"amcl_shadow_candidate_count\":" << amcl_shadow_candidate_count_
         << ",\"amcl_suppressed_after_isaac_count\":" << amcl_suppressed_after_isaac_count_
+        << ",\"global_correction_paused\":" << (correction_paused_ ? "true" : "false")
+        << ",\"correction_paused\":" << (correction_paused_ ? "true" : "false")
+        << ",\"correction_pause_reason\":\"" << json_escape(correction_pause_reason_) << "\""
+        << ",\"correction_pause_service\":\"" << json_escape(correction_pause_service_) << "\""
         << ",\"last_amcl_pose_age_ms\":" << last_amcl_pose_age_ms
         << ",\"amcl_last_pose_age_ms\":" << last_amcl_pose_age_ms
         << ",\"amcl_pose_age_ms\":" << last_amcl_pose_age_ms
@@ -1647,6 +1832,25 @@ private:
         << ",\"last_accepted_correction_translation_m\":" << last_accepted_correction_translation_m_
         << ",\"last_accepted_correction_yaw_rad\":" << last_accepted_correction_yaw_rad_
         << ",\"map_to_odom_age_ms\":" << map_to_odom_age_ms
+        << ",\"map_odom_publish_loop_hz\":" << map_odom_publish_loop_hz
+        << ",\"map_odom_publish_gap_ms\":" << map_odom_publish_gap_ms
+        << ",\"map_odom_publish_gap_max_ms\":" << map_odom_publish_gap_max_ms
+        << ",\"map_odom_publish_callback_duration_us\":"
+        << map_odom_publish_callback_duration_us
+        << ",\"map_odom_latest_accepted_sequence\":"
+        << map_odom_latest_accepted_sequence
+        << ",\"map_odom_last_published_sequence\":"
+        << map_odom_last_published_sequence
+        << ",\"map_odom_latest_source\":\"" << json_escape(map_odom_latest_source)
+        << "\",\"map_odom_state_valid\":" << (map_odom_state_valid ? "true" : "false")
+        << ",\"map_odom_correction_paused\":"
+        << (map_odom_correction_paused ? "true" : "false")
+        << ",\"map_odom_frozen_due_to_pause\":"
+        << (map_odom_frozen_due_to_pause ? "true" : "false")
+        << ",\"map_odom_publish_missed_count\":" << map_odom_publish_missed_count
+        << ",\"publisher_decoupled_from_correction\":true"
+        << ",\"map_odom_publish_gap_warn_ms\":" << map_odom_publish_gap_warn_ms_
+        << ",\"map_odom_publish_gap_fail_ms\":" << map_odom_publish_gap_fail_ms_
         << ",\"map_to_odom_publisher_owner\":\"robot_localization_bridge\""
         << ",\"expected_map_to_odom_owner\":\"robot_localization_bridge\""
         << ",\"has_map_to_odom\":" << (has_map_to_odom_ ? "true" : "false")
@@ -1703,6 +1907,8 @@ private:
   double amcl_scan_last_age_ms_{-1.0};
   double last_amcl_scan_admission_status_received_sec_{0.0};
   double status_publish_period_sec_{1.0};
+  double map_odom_publish_gap_warn_ms_{100.0};
+  double map_odom_publish_gap_fail_ms_{250.0};
   double amcl_runtime_status_ttl_sec_{5.0};
   double latest_pose_received_sec_{0.0};
   double last_amcl_pose_received_sec_{0.0};
@@ -1745,6 +1951,19 @@ private:
   std::uint64_t previous_localization_result_count_{0U};
   std::uint64_t previous_accepted_result_count_{0U};
   std::uint64_t previous_amcl_pose_count_{0U};
+  std::uint64_t map_odom_publish_count_{0U};
+  std::uint64_t previous_map_odom_publish_count_{0U};
+  std::uint64_t map_odom_publish_missed_count_{0U};
+  std::uint64_t map_odom_latest_accepted_sequence_{0U};
+  std::uint64_t map_odom_last_published_sequence_{0U};
+  double map_odom_last_publish_wall_sec_{0.0};
+  double map_odom_last_publish_gap_ms_{-1.0};
+  double map_odom_publish_gap_max_ms_{0.0};
+  double map_odom_publish_callback_duration_us_{0.0};
+  bool map_odom_state_valid_snapshot_{false};
+  bool map_odom_correction_paused_snapshot_{false};
+  bool map_odom_frozen_due_to_pause_snapshot_{false};
+  std::string map_odom_latest_source_{"none"};
   std::string map_frame_;
   std::string odom_frame_;
   std::string base_frame_;
@@ -1753,6 +1972,7 @@ private:
   std::string health_topic_;
   std::string status_topic_;
   std::string force_accept_service_;
+  std::string correction_pause_service_;
   std::string amcl_pose_topic_;
   std::string amcl_runtime_status_file_;
   std::string amcl_gate_mode_{"shadow"};
@@ -1773,6 +1993,7 @@ private:
   std::string amcl_scan_frame_id_;
   std::string amcl_scan_admission_last_error_{"none"};
   std::string last_amcl_scan_admission_status_;
+  std::string correction_pause_reason_{"none"};
 
   bool has_pose_{false};
   bool has_odom_{false};
@@ -1783,6 +2004,7 @@ private:
   bool last_health_state_{false};
   bool force_accept_next_pose_{false};
   bool force_accept_next_pose_explicit_trigger_{false};
+  bool correction_paused_{false};
   bool triggered_allow_large_correction_{true};
   bool last_odom_tf_history_lookup_ok_{false};
   bool latest_odom_tf_fresh_{false};
@@ -1794,6 +2016,9 @@ private:
   nav_msgs::msg::Odometry latest_odom_;
   MapToOdom map_to_odom_;
   MapToOdom last_amcl_medium_candidate_;
+  MapOdomState map_odom_state_;
+  mutable std::mutex map_odom_state_mutex_;
+  mutable std::mutex map_odom_publish_stats_mutex_;
 
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
@@ -1805,15 +2030,21 @@ private:
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr amcl_initial_pose_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr force_accept_srv_;
+  rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr correction_pause_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr amcl_seed_srv_;
   rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::TimerBase::SharedPtr status_timer_;
+  rclcpp::CallbackGroup::SharedPtr map_odom_publisher_callback_group_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 };
 
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<LocalizationBridgeNode>());
+  auto node = std::make_shared<LocalizationBridgeNode>();
+  rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 2);
+  executor.add_node(node);
+  executor.spin();
   rclcpp::shutdown();
   return 0;
 }

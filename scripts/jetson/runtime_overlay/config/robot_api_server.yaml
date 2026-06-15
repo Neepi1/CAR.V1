@@ -44,6 +44,7 @@ robot_api_server:
     docking_stop_service: "/docking/stop"
     docking_undock_service: "/docking/undock"
     docking_status_topic: "/docking/status"
+    docking_gs2_scan_topic: "/dock/gs2_scan"
     docking_contact_latch_file: "/workspaces/njrh-v3/workspace1/maps_release/docking_contact_latch.json"
     dock_contact_latch_bms_ttl_sec: 300.0
     dock_contact_latch_bms_require_contact_sec: 2.0
@@ -73,6 +74,38 @@ robot_api_server:
     docking_cancel_active_goal_before_predock: true
     navigation_auto_undock_timeout_sec: 28.0
     docking_undock_charging_retry_sec: 3.0
+    docking_framework_state_machine_enabled: true
+    docking_default_dock_profile_id: "gs2_rear_charging_dock"
+    docking_default_dock_profile_type: "gs2_near_field"
+    docking_default_approach_direction: "reverse"
+    docking_default_contact_frame: "charge_contact_link"
+    docking_default_sensor_frame: "gs2_link"
+    docking_max_retries: 2
+    predock_yaw_align_enabled: true
+    predock_yaw_align_cmd_topic: "/cmd_vel_docking"
+    predock_yaw_align_tolerance_rad: 0.035
+    predock_yaw_align_trigger_rad: 0.08
+    predock_yaw_align_hard_fail_rad: 0.80
+    predock_yaw_align_timeout_sec: 10.0
+    predock_yaw_align_min_speed_radps: 0.05
+    predock_yaw_align_max_speed_radps: 0.20
+    predock_yaw_align_kp: 1.2
+    predock_yaw_align_success_hold_count: 3
+    predock_yaw_align_period_ms: 67
+    predock_yaw_align_zero_cmd_count: 5
+    predock_yaw_align_require_actual_spin: true
+    predock_yaw_align_mode_switch_timeout_sec: 2.0
+    predock_yaw_align_no_yaw_motion_timeout_sec: 2.0
+    predock_yaw_align_motion_epsilon_rad: 0.01
+    fine_docking_entry_require_gs2_fresh: true
+    fine_docking_entry_require_predock_yaw_aligned: true
+    fine_docking_entry_max_distance_m: 0.35
+    fine_docking_entry_max_lateral_m: 0.12
+    fine_docking_entry_max_yaw_rad: 0.12
+    fine_docking_retry_on_yaw_reject: true
+    docking_pause_global_correction_during_fine: true
+    localization_bridge_correction_pause_service: "/robot_localization_bridge/set_correction_paused"
+    mode_controller_status_topic: "/ranger_mini3_mode_controller/status"
     mapping_2d_live_map_topic: "/map"
     mapping_2d_live_map_max_age_sec: 3.0
     scan_topic: "/scan"
@@ -97,6 +130,16 @@ robot_api_server:
     post_relocalization_require_local_costmap_update: true
     post_relocalization_required_local_costmap_updates: 2
     post_relocalization_reject_if_new_message_filter_drop: true
+    post_relocalization_map_odom_publish_gap_warn_ms: 100.0
+    post_relocalization_map_odom_publish_gap_fail_ms: 250.0
+    post_undock_relocalization_settle_enabled: true
+    post_undock_relocalization_settle_min_ms: 800
+    post_undock_relocalization_settle_max_ms: 3000
+    post_undock_stable_tf_samples: 5
+    post_undock_tf_sample_period_ms: 100
+    post_undock_required_local_costmap_updates: 2
+    post_undock_reject_if_new_message_filter_drop: true
+    post_undock_zero_cmd_during_settle: true
     post_relocalization_large_correction_translation_m: 0.5
     post_relocalization_large_correction_yaw_rad: 0.3
     post_relocalization_large_correction_min_ms: 1500

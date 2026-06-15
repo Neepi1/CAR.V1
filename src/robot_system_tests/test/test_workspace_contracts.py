@@ -277,6 +277,13 @@ def test_nav2_rotation_progress_scripts_contract():
     assert "Default mode only records existing topics" in diagnose
     assert "--execute-goal" in diagnose
     assert "--bag" in diagnose
+    assert "--capture-tf true|false" in diagnose
+    assert "CAPTURE_TF=false" in diagnose
+    assert "timeout --kill-after" in diagnose
+    assert "setsid bash -c" in diagnose
+    assert "write_dds_env_log" in diagnose
+    assert 'if [[ "${CAPTURE_TF}" == "true" ]]' in diagnose
+    assert "skipped; rerun with --capture-tf true" in diagnose
     assert "reports/nav2_zero_linear_progress_" in diagnose
     assert "/cmd_vel_nav_raw" in diagnose
     assert "/cmd_vel_nav" in diagnose
@@ -287,6 +294,7 @@ def test_nav2_rotation_progress_scripts_contract():
     assert "/local_state/odometry" in diagnose
     assert "ros2 topic hz /perception/obstacle_points" in diagnose
     assert "ros2 topic hz /local_costmap/costmap" in diagnose
+    assert "timeout --signal=INT" not in diagnose
     assert "CASE_A_CONTROLLER_ZERO_LINEAR" in diagnose
     assert "CASE_B_COLLISION_ZERO_LINEAR" in diagnose
     assert "CASE_C_SAFETY_ZERO_LINEAR" in diagnose
@@ -4840,12 +4848,13 @@ def test_localization_bridge_latches_one_shot_localizer_pose():
     ).read_text(encoding="utf-8")
     assert "has_last_pose_stamp_used_" in bridge_code
     assert 'refresh_state("pose")' in bridge_code
-    assert 'refresh_state("timer")' in bridge_code
+    assert 'refresh_state("status_timer")' in bridge_code
+    assert "publish_map_to_odom_from_state()" in bridge_code
     assert 'bridge waiting for localization_result' in bridge_code
     assert "else if (!has_map_to_odom_)" in bridge_code
     assert "if (!has_map_to_odom_)" in bridge_code
-    assert "tf.transform.translation.x = map_to_odom_.x" in bridge_code
-    assert "tf.transform.rotation = quaternion_from_yaw(map_to_odom_.yaw)" in bridge_code
+    assert "tf.transform.translation.x = state.transform.x" in bridge_code
+    assert "tf.transform.rotation = quaternion_from_yaw(state.transform.yaw)" in bridge_code
     assert '#include "std_srvs/srv/trigger.hpp"' in bridge_code
     assert "forced_jump_threshold_m" in bridge_code
     assert "force_accept_next_pose_" in bridge_code
@@ -6360,6 +6369,9 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "wait_for_amcl_pose_fresh_or_nomotion_update" in amcl_runner
     assert "AMCL_RESIDENT mode=${MODE}" in amcl_runner
     assert "AMCL_READY mode=${MODE}" in amcl_runner
+    assert "wait_for_amcl_tf_broadcast_false" in amcl_runner
+    assert "NJRH_AMCL_PARAM_READY_TIMEOUT_SEC" in amcl_runner
+    assert "did not become readable as false" in amcl_runner
     assert "NJRH_AMCL_RUNTIME_STATUS_FILE" in amcl_runner
     assert "/tmp/njrh_amcl_runtime_status.env" in amcl_runner
     assert "AMCL_EXIT_DEGRADED=10" in amcl_runner
@@ -6726,6 +6738,9 @@ def test_phase_c1_nav2_controller_cpu_profile_contracts():
     assert "kill -KILL" not in ab
 
     assert "Dry-run by default" in cleanup
+    assert "lifecycle/doctor/bag and tf2_echo" in cleanup
+    assert "lifecycle|doctor|bag" in cleanup
+    assert "tf2_echo" in cleanup
     assert "ros2 run" in cleanup
     assert "ros2 launch" in cleanup
     assert "kill -TERM" in cleanup
@@ -6757,6 +6772,163 @@ def test_phase_c1_nav2_controller_cpu_profile_contracts():
                 subprocess.run([bash, "-n", str(path)], check=True)
 
 
+def test_phase_d3_docking_framework_state_machine_contracts():
+    overlay = ROOT / "scripts" / "jetson" / "runtime_overlay"
+    scripts_dir = overlay / "scripts"
+    config_dir = overlay / "config"
+
+    api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    job_hpp = (ROOT / "src" / "robot_api_server" / "include" / "robot_api_server" / "docking_job_model.hpp").read_text(
+        encoding="utf-8"
+    )
+    job_cpp = (ROOT / "src" / "robot_api_server" / "src" / "docking_job_model.cpp").read_text(encoding="utf-8")
+    bridge_cpp = (
+        ROOT / "src" / "robot_localization_bridge" / "src" / "localization_bridge_node.cpp"
+    ).read_text(encoding="utf-8")
+    api_cfg = (config_dir / "robot_api_server.yaml").read_text(encoding="utf-8")
+    docking_cfg = (config_dir / "docking.yaml").read_text(encoding="utf-8")
+    bridge_cfg = (config_dir / "localization_bridge.yaml").read_text(encoding="utf-8")
+    verify_path = scripts_dir / "verify_docking_framework_state_machine.sh"
+    observe_path = scripts_dir / "observe_docking_predock_yaw_align.sh"
+    ab_path = scripts_dir / "run_docking_framework_ab.sh"
+    verify = verify_path.read_text(encoding="utf-8")
+    observe = observe_path.read_text(encoding="utf-8")
+    ab = ab_path.read_text(encoding="utf-8")
+    phase_doc = (ROOT / "docs" / "phase_d3_docking_framework_state_machine.md").read_text(encoding="utf-8")
+
+    for phase in (
+        "DOCK_REQUESTED",
+        "RESOLVE_DOCK_PROFILE",
+        "BEFORE_PREDOCK_RELOCALIZE",
+        "BEFORE_PREDOCK_SETTLE",
+        "NAV_TO_STAGING",
+        "STAGING_NAV_SUCCEEDED",
+        "PREDOCK_POSE_VERIFY",
+        "PREDOCK_YAW_ALIGN",
+        "PREDOCK_YAW_ALIGN_SETTLE",
+        "AFTER_PREDOCK_RELOCALIZE",
+        "AFTER_PREDOCK_SETTLE",
+        "GS2_DOCK_DETECT",
+        "FINE_DOCKING_ENTRY_CHECK",
+        "FINE_ALIGN",
+        "RESTAGE_RETRY",
+    ):
+        assert phase in api_cpp
+        assert phase in verify
+
+    for symbol in (
+        "computeExpectedStagingYaw",
+        "computePredockYawError",
+        "computeContactYawError",
+        "normalizeYawError",
+        "run_predock_yaw_align",
+        "evaluate_fine_docking_entry",
+    ):
+        assert symbol in api_cpp
+
+    assert 'predock_yaw_align_cmd_topic_ != "/cmd_vel_docking"' in api_cpp
+    assert "create_publisher<geometry_msgs::msg::Twist>(predock_yaw_align_cmd_topic_" in api_cpp
+    assert "actual_motion_mode_code == 2" in api_cpp
+    assert "mode_controller_status_topic_" in api_cpp
+    assert "docking_gs2_scan_topic_" in api_cpp
+    assert "set_global_correction_paused_for_docking(job_id, true, \"docking_fine\"" in api_cpp
+    assert "std_srvs::srv::SetBool" in api_cpp
+
+    for code in (
+        "DOCK_FAILED_PREDOCK_NAV",
+        "DOCK_FAILED_PREDOCK_RELOCALIZATION",
+        "DOCK_FAILED_PREDOCK_SETTLE",
+        "PREDOCK_YAW_NOT_ALIGNED",
+        "PREDOCK_YAW_HARD_FAIL",
+        "PREDOCK_YAW_ALIGN_TIMEOUT",
+        "PREDOCK_YAW_ALIGN_MODE_SWITCHING_TIMEOUT",
+        "PREDOCK_YAW_ALIGN_NO_YAW_MOTION",
+        "GS2_DOCK_DETECT_TIMEOUT",
+        "FINE_DOCKING_ENTRY_CONDITION_FAILED",
+        "FINE_DOCKING_REJECTED_YAW_TOO_LARGE",
+        "FINE_DOCKING_REJECTED_LATERAL_TOO_LARGE",
+        "FINE_DOCKING_TIMEOUT",
+        "FINAL_INSERTION_NO_CONTACT",
+        "DOCK_FAILED_SAFETY_BLOCKED",
+    ):
+        assert code in api_cpp
+
+    for field in (
+        "dock_profile_id",
+        "approach_direction",
+        "contact_frame",
+        "sensor_frame",
+        "max_retries",
+        "retry_count",
+        "predock_yaw_aligned",
+        "fine_entry_checked",
+        "global_correction_paused",
+        "pause_reason",
+        "display_pose_source",
+    ):
+        assert field in job_hpp
+        assert field in job_cpp
+
+    assert "correction_pause_service" in bridge_cpp
+    assert "GLOBAL_CORRECTION_PAUSED" in bridge_cpp
+    assert "global_correction_paused" in bridge_cpp
+    assert "correction_pause_service: /robot_localization_bridge/set_correction_paused" in bridge_cfg
+
+    for key in (
+        "docking_framework_state_machine_enabled: true",
+        "predock_yaw_align_enabled: true",
+        'predock_yaw_align_cmd_topic: "/cmd_vel_docking"',
+        "predock_yaw_align_require_actual_spin: true",
+        "fine_docking_entry_require_gs2_fresh: true",
+        "fine_docking_entry_require_predock_yaw_aligned: true",
+        "docking_pause_global_correction_during_fine: true",
+        'localization_bridge_correction_pause_service: "/robot_localization_bridge/set_correction_paused"',
+        'mode_controller_status_topic: "/ranger_mini3_mode_controller/status"',
+    ):
+        assert key in api_cfg
+
+    assert "dock_types:" in docking_cfg
+    assert "gs2_rear_charging_dock:" in docking_cfg
+    assert "staging_offset_m: 0.60" in docking_cfg
+    assert "approach_direction: reverse" in docking_cfg
+
+    for path in (verify_path, observe_path, ab_path):
+        assert path.exists()
+    assert "ros2 topic pub" not in observe
+    assert "write_dds_env_log" in observe
+    assert "setsid bash -c" in observe
+    assert "timeout --kill-after" in observe
+    assert "start_api_poll" in observe
+    assert "select_docking_state" in observe
+    assert 'bash -lc \'' in observe
+    assert "timeout 1 ros2 topic echo /localization/bridge_status" not in observe
+    assert 'printf \',"bridge_status":null}\\n\'' in observe
+    assert "matches = re.findall" in observe
+    assert "transformPose" in observe
+    assert "Message Filter" in observe
+    assert "ActionServer" in observe
+    assert "Aborting" in observe
+    assert "kill -KILL" in observe
+    assert "ros2 topic pub" not in ab
+    assert "opennav_docking" not in api_cpp
+    assert "robot_docking_manager" in phase_doc
+    assert "/cmd_vel_docking -> robot_safety" in phase_doc
+
+    bash = shutil.which("bash")
+    if bash:
+        bash_probe = subprocess.run(
+            [bash, "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if bash_probe.returncode == 0:
+            for path in (verify_path, observe_path, ab_path):
+                subprocess.run([bash, "-n", str(path)], check=True)
+
+
 def test_phase_l2_post_relocalization_settle_barrier_contracts():
     overlay = ROOT / "scripts" / "jetson" / "runtime_overlay"
     config_dir = overlay / "config"
@@ -6774,10 +6946,17 @@ def test_phase_l2_post_relocalization_settle_barrier_contracts():
     overlay_api_cfg = (config_dir / "robot_api_server.yaml").read_text(encoding="utf-8")
     nav2_cfg = (config_dir / "nav2.yaml").read_text(encoding="utf-8")
     bridge_cfg = (config_dir / "localization_bridge.yaml").read_text(encoding="utf-8")
+    bridge_src_cfg = (
+        ROOT / "src" / "robot_localization_bridge" / "config" / "localization_bridge.yaml"
+    ).read_text(encoding="utf-8")
     verify_script_path = scripts_dir / "verify_post_relocalization_settle_barrier.sh"
     observe_script_path = scripts_dir / "observe_relocalization_to_next_stage.sh"
+    bridge_verify_script_path = scripts_dir / "verify_bridge_map_odom_publisher.sh"
+    tf_stability_script_path = scripts_dir / "observe_tf_stability_after_relocalization.sh"
     verify_script = verify_script_path.read_text(encoding="utf-8")
     observe_script = observe_script_path.read_text(encoding="utf-8")
+    bridge_verify_script = bridge_verify_script_path.read_text(encoding="utf-8")
+    tf_stability_script = tf_stability_script_path.read_text(encoding="utf-8")
 
     for cfg in (api_cfg, overlay_api_cfg):
         assert "localization_bridge_status_topic: \"/localization/bridge_status\"" in cfg
@@ -6788,14 +6967,39 @@ def test_phase_l2_post_relocalization_settle_barrier_contracts():
         assert "post_relocalization_stable_tf_samples: 5" in cfg
         assert "post_relocalization_tf_sample_period_ms: 100" in cfg
         assert "post_relocalization_required_local_costmap_updates: 2" in cfg
+        assert "post_relocalization_map_odom_publish_gap_warn_ms: 100.0" in cfg
+        assert "post_relocalization_map_odom_publish_gap_fail_ms: 250.0" in cfg
         assert "post_relocalization_large_correction_translation_m: 0.5" in cfg
         assert "post_relocalization_large_correction_yaw_rad: 0.3" in cfg
         assert "post_relocalization_large_correction_min_ms: 1500" in cfg
+
+    for cfg in (bridge_cfg, bridge_src_cfg):
+        assert "map_odom_publish_gap_warn_ms: 100.0" in cfg
+        assert "map_odom_publish_gap_fail_ms: 250.0" in cfg
 
     assert 'candidate.source == "isaac_triggered" && candidate.explicit_trigger' in bridge_cpp
     assert "last_explicit_relocalization_sequence_" in bridge_cpp
     assert "last_explicit_relocalization_accept_time" in bridge_cpp
     assert "localization_settle_required" in bridge_cpp
+    assert "struct MapOdomState" in bridge_cpp
+    assert "update_map_odom_state_from_candidate" in bridge_cpp
+    assert "publish_map_to_odom_from_state" in bridge_cpp
+    assert "map_odom_publisher_callback_group_" in bridge_cpp
+    assert "publisher_decoupled_from_correction" in bridge_cpp
+    assert "map_odom_publish_loop_hz" in bridge_cpp
+    assert bridge_cpp.count("tf_broadcaster_->sendTransform(tf)") == 1
+    publish_start = bridge_cpp.index("void publish_map_to_odom_from_state")
+    publish_fn = bridge_cpp[
+        publish_start:
+        bridge_cpp.index("void refresh_state", publish_start)
+    ]
+    assert "tf_broadcaster_->sendTransform(tf)" in publish_fn
+    refresh_start = bridge_cpp.index("void refresh_state")
+    refresh_fn = bridge_cpp[
+        refresh_start:
+        bridge_cpp.index("double rate_since_last_status", refresh_start)
+    ]
+    assert "tf_broadcaster_->sendTransform(tf)" not in refresh_fn
 
     assert "wait_for_post_relocalization_settle_barrier(" in api_cpp
     assert '"post_undock"' in api_cpp
@@ -6809,6 +7013,9 @@ def test_phase_l2_post_relocalization_settle_barrier_contracts():
     assert "post_relocalization_settle_state_json()" in api_cpp
     assert "publish_teleop_zero_burst()" in api_cpp
     assert "publish_final_yaw_align_zero_burst()" in api_cpp
+    assert "map_odom_publish_gap_ms" in api_cpp
+    assert "publisher_decoupled_from_correction" in api_cpp
+    assert "map_odom_last_published_sequence" in api_cpp
 
     for code in [
         "POST_RELOCALIZATION_SETTLE_TIMEOUT",
@@ -6817,6 +7024,9 @@ def test_phase_l2_post_relocalization_settle_barrier_contracts():
         "POST_RELOCALIZATION_TF_CHAIN_UNSTABLE",
         "POST_RELOCALIZATION_LOCAL_COSTMAP_NOT_UPDATED",
         "POST_RELOCALIZATION_LOCAL_COSTMAP_TF_DROPS",
+        "POST_RELOCALIZATION_MAP_ODOM_PUBLISH_GAP",
+        "POST_RELOCALIZATION_MAP_ODOM_PUBLISHER_NOT_DECOUPLED",
+        "POST_RELOCALIZATION_MAP_ODOM_PUBLISH_SEQUENCE_LAG",
         "POST_RELOCALIZATION_SCAN_ADMISSION_TF_ERROR",
         "POST_RELOCALIZATION_WRONG_MAP_ODOM_OWNER",
         "POST_RELOCALIZATION_SEQUENCE_MISMATCH",
@@ -6826,12 +7036,20 @@ def test_phase_l2_post_relocalization_settle_barrier_contracts():
 
     assert verify_script_path.exists()
     assert observe_script_path.exists()
+    assert bridge_verify_script_path.exists()
+    assert tf_stability_script_path.exists()
     assert "never sends" in verify_script
+    assert "publisher_decoupled_from_correction" in verify_script
     assert "ros2 action send_goal" not in verify_script
     assert "ros2 topic pub" not in verify_script
     assert "does not send goals or velocity" in observe_script
     assert "ros2 action send_goal" not in observe_script
     assert "ros2 topic pub" not in observe_script
+    assert "decoupled map->odom publisher" in bridge_verify_script
+    assert "ros2 topic echo" not in bridge_verify_script
+    assert "does not subscribe to pointcloud topics" in tf_stability_script
+    assert "ros2 topic echo" not in tf_stability_script
+    assert "PointCloud2" not in bridge_verify_script + tf_stability_script
 
     assert "transform_tolerance: 0.10" in nav2_cfg
     assert "transform_tolerance: 0.15" in local_costmap_config_block(nav2_cfg)
@@ -6840,8 +7058,8 @@ def test_phase_l2_post_relocalization_settle_barrier_contracts():
     assert "SmacPlanner2D" in nav2_cfg
     assert "PointCloud2" not in api_cpp
     assert "FAST-LIO" not in api_cpp
-    assert "pkill -9" not in verify_script + observe_script
-    assert "killall -9" not in verify_script + observe_script
+    assert "pkill -9" not in verify_script + observe_script + bridge_verify_script + tf_stability_script
+    assert "killall -9" not in verify_script + observe_script + bridge_verify_script + tf_stability_script
 
     bash = shutil.which("bash")
     if bash:
@@ -6854,6 +7072,127 @@ def test_phase_l2_post_relocalization_settle_barrier_contracts():
         if bash_probe.returncode == 0:
             subprocess.run([bash, "-n", str(verify_script_path)], check=True)
             subprocess.run([bash, "-n", str(observe_script_path)], check=True)
+            subprocess.run([bash, "-n", str(bridge_verify_script_path)], check=True)
+            subprocess.run([bash, "-n", str(tf_stability_script_path)], check=True)
+
+
+def test_phase_u1_post_undock_settle_before_pending_nav_goal_contracts():
+    overlay = ROOT / "scripts" / "jetson" / "runtime_overlay"
+    scripts_dir = overlay / "scripts"
+
+    api_cpp_path = ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp"
+    api_cpp = api_cpp_path.read_text(encoding="utf-8")
+    docking_job_hpp = (
+        ROOT / "src" / "robot_api_server" / "include" / "robot_api_server" / "docking_job_model.hpp"
+    ).read_text(encoding="utf-8")
+    docking_job_cpp = (ROOT / "src" / "robot_api_server" / "src" / "docking_job_model.cpp").read_text(
+        encoding="utf-8"
+    )
+    api_cfg = (ROOT / "src" / "robot_api_server" / "config" / "robot_api_server.yaml").read_text(
+        encoding="utf-8"
+    )
+    overlay_api_cfg = (overlay / "config" / "robot_api_server.yaml").read_text(encoding="utf-8")
+    nav2_cfg = (overlay / "config" / "nav2.yaml").read_text(encoding="utf-8")
+    bridge_cfg = (overlay / "config" / "localization_bridge.yaml").read_text(encoding="utf-8")
+    observe_path = scripts_dir / "observe_post_undock_to_nav_goal.sh"
+    observe_script = observe_path.read_text(encoding="utf-8")
+
+    for cfg in (api_cfg, overlay_api_cfg):
+        assert "post_undock_relocalization_settle_enabled: true" in cfg
+        assert "post_undock_relocalization_settle_min_ms: 800" in cfg
+        assert "post_undock_relocalization_settle_max_ms: 3000" in cfg
+        assert "post_undock_stable_tf_samples: 5" in cfg
+        assert "post_undock_tf_sample_period_ms: 100" in cfg
+        assert "post_undock_required_local_costmap_updates: 2" in cfg
+        assert "post_undock_reject_if_new_message_filter_drop: true" in cfg
+        assert "post_undock_zero_cmd_during_settle: true" in cfg
+
+    complete_start = api_cpp.index("void complete_post_undock_relocalization")
+    complete_end = api_cpp.index("std::string docking_job_json_locked", complete_start)
+    complete_block = api_cpp[complete_start:complete_end]
+    wait_start = api_cpp.index("bool wait_for_pre_navigation_undock")
+    wait_end = api_cpp.index("bool cancel_active_navigation_goal", wait_start)
+    wait_block = api_cpp[wait_start:wait_end]
+    goal_start = api_cpp.index("HttpResponse handle_navigation_goal")
+    goal_end = api_cpp.index("bool undock_before_navigation_if_needed", goal_start)
+    goal_handler = api_cpp[goal_start:goal_end]
+    barrier_idx = complete_block.find("wait_for_post_relocalization_settle_barrier(")
+    finish_success_idx = complete_block.find('finish_docking_job_locked(\n        true,\n        "undocked"')
+    assert barrier_idx != -1
+    assert finish_success_idx != -1
+    assert barrier_idx < finish_success_idx
+    assert '"post_undock"' in complete_block
+    assert '"nav2_goal"' in complete_block
+    assert "post_undock_failure_code_from_settle_failure" in complete_block
+    assert "post_undock_relocalization_succeeded" in wait_block
+    assert "pending_goal_released_after_post_undock_settle = true" in wait_block
+    assert "undock_before_navigation_if_needed" in goal_handler
+    assert goal_handler.find("undock_before_navigation_if_needed") < goal_handler.find("async_send_goal(goal)")
+
+    for field in [
+        "post_undock_relocalization_started",
+        "post_undock_relocalization_accepted",
+        "post_undock_settle_started",
+        "post_undock_settle_complete",
+        "post_undock_settle_failure_reason",
+        "pending_goal_held_for_post_undock_settle",
+        "pending_goal_released_after_post_undock_settle",
+        "using_triggered_baseline_only",
+        "amcl_ready",
+        "localization_degraded",
+    ]:
+        assert field in docking_job_hpp
+        assert field in docking_job_cpp
+        assert field in api_cpp
+
+    for code in [
+        "POST_UNDOCK_RELOCALIZATION_FAILED",
+        "POST_UNDOCK_SETTLE_TIMEOUT",
+        "POST_UNDOCK_MAP_ODOM_NOT_FRESH",
+        "POST_UNDOCK_ODOM_BASE_NOT_FRESH",
+        "POST_UNDOCK_TF_CHAIN_UNSTABLE",
+        "POST_UNDOCK_LOCAL_COSTMAP_NOT_UPDATED",
+        "POST_UNDOCK_LOCAL_COSTMAP_TF_DROPS",
+        "POST_UNDOCK_MAP_ODOM_PUBLISH_GAP",
+        "POST_UNDOCK_MAP_ODOM_PUBLISHER_NOT_DECOUPLED",
+        "POST_UNDOCK_MAP_ODOM_PUBLISH_SEQUENCE_LAG",
+        "POST_UNDOCK_WRONG_MAP_ODOM_OWNER",
+        "POST_UNDOCK_RELOCALIZATION_SEQUENCE_MISMATCH",
+    ]:
+        assert code in api_cpp
+
+    assert "post_undock_settle_state_json_locked()" in api_cpp
+    assert '\\"post_undock_settle\\":' in api_cpp
+    assert observe_path.exists()
+    assert "Read-only observer for Phase U1" in observe_script
+    assert "does not send goals" in observe_script
+    assert "does not subscribe to heavy point clouds" in observe_script
+    assert "ros2 action send_goal" not in observe_script
+    assert "ros2 topic pub" not in observe_script
+    assert "PointCloud2" not in observe_script
+    assert "reports/post_undock_to_nav_goal_" in observe_script
+
+    assert "transform_tolerance: 0.10" in nav2_cfg
+    assert "transform_tolerance: 0.15" in local_costmap_config_block(nav2_cfg)
+    assert "max_odom_tf_age_ms: 100.0" in bridge_cfg
+    assert "MPPIController" in nav2_cfg
+    assert "SmacPlanner2D" in nav2_cfg
+    assert "PointCloud2" not in api_cpp
+    assert "FAST-LIO" not in api_cpp
+    assert "ranger_base_node" not in complete_block
+    assert "pkill -9" not in observe_script
+    assert "killall -9" not in observe_script
+
+    bash = shutil.which("bash")
+    if bash:
+        bash_probe = subprocess.run(
+            [bash, "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if bash_probe.returncode == 0:
+            subprocess.run([bash, "-n", str(observe_path)], check=True)
 
 
 def test_phase24a_local_costmap_timestamp_audit_contracts():

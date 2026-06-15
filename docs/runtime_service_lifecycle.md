@@ -34,6 +34,22 @@ for rollback and A/B observation only; it is not the default runtime model.
 
 The API server treats `/tf` as a process-level localization input, not as page-scoped telemetry. It creates the `/tf` subscription once at startup and keeps it resident so high-rate `/api/v1/robot/pose` polling cannot repeatedly add and remove reliable Fast DDS endpoints on `/tf`; that endpoint churn can backpressure `robot_localization_bridge` while the bridge process still appears alive.
 
+`robot_localization_bridge` now separates accepted global corrections from the
+fixed `map -> odom` publisher. Isaac trigger results, AMCL gated candidates, and
+manual force-accept relocalization only update an internal `MapOdomState`; the
+independent 50 Hz publisher callback group is the only code path that broadcasts
+`map -> odom`. This keeps AMCL seed work, runtime status-file reads, service
+callbacks, and correction logging off the transform broadcast path. The bridge
+status topic exposes `map_odom_publish_loop_hz`,
+`map_odom_publish_gap_ms`, accepted/published state sequence, pause/frozen
+state, and `publisher_decoupled_from_correction=true`. The API
+post-relocalization settle barrier refuses to release the next Nav2 goal or GS2
+fine-docking stage until that publisher heartbeat is stable, the accepted state
+has been published, `odom -> base_link` is fresh, local costmap has updated, and
+no new local-costmap MessageFilter drop was seen. This is a runtime readiness
+barrier; it does not change `transform_tolerance`, `max_odom_tf_age_ms`, Nav2
+plugins, PointCloud2 QoS/DDS, FAST-LIO2, Ranger odom, or EKF fusion.
+
 The API server's BMS charging-contact policy lives in `robot_api_server/bms_contact.hpp` and `src/bms_contact.cpp`, separate from HTTP routing. UTC timestamp formatting and generated map/current-pose IDs live in `robot_api_server/api_time_utils.hpp` and `src/api_time_utils.cpp`. Docking job state formatting lives in `robot_api_server/docking_job_model.hpp` and `src/docking_job_model.cpp`; docking/undocking status string classification lives in `robot_api_server/docking_status_utils.hpp` and `src/docking_status_utils.cpp`. Common text/binary file reads and writes, PGM output, and map YAML image-file rewrites live in `robot_api_server/file_utils.hpp` and `src/file_utils.cpp`. Floor asset completeness checks, active `current/` selection, `poses.yaml` fallback, and stored pose lookup live in `robot_api_server/floor_asset_resolver.hpp` and `src/floor_asset_resolver.cpp`. HTTP request/response structs, WebSocket accept-key helpers, and lightweight JSON parsing live in `robot_api_server/http_common.hpp` and `src/http_common.cpp`; localization result snapshots and relocalization diagnostic text live in `robot_api_server/localization_result_model.hpp` and `src/localization_result_model.cpp`. Map/pose models plus safe ID/name validation live in `robot_api_server/storage_models.hpp` and `src/storage_models.cpp`; grayscale PNG encoding, PGM dimension reads, and Nav map YAML metadata extraction live in `robot_api_server/map_asset_io.hpp` and `src/map_asset_io.cpp`; OccupancyGrid-to-image conversion, saved map YAML text, neutral costmap filter assets, and asset reports live in `robot_api_server/map_asset_writer.hpp` and `src/map_asset_writer.cpp`; released map directory paths, manifest traversal, and active/name/id lookup live in `robot_api_server/map_catalog.hpp` and `src/map_catalog.cpp`; `MapManifest` path derivation and `manifest.json` read/write formatting live in `robot_api_server/map_manifest_io.hpp` and `src/map_manifest_io.cpp`; navigation-cancel job state formatting lives in `robot_api_server/navigation_cancel_job_model.hpp` and `src/navigation_cancel_job_model.cpp`; `poses.yaml` parsing/writing lives in `robot_api_server/poses_io.hpp` and `src/poses_io.cpp`; runtime map context file formatting lives in `robot_api_server/runtime_map_context_io.hpp` and `src/runtime_map_context_io.cpp`; saved 2D PNG lookup and runtime flat-map companion file paths live in `robot_api_server/runtime_map_lookup.hpp` and `src/runtime_map_lookup.cpp`; robot pose snapshots and `/api/v1/robot/pose` response payloads live in `robot_api_server/robot_pose_model.hpp` and `src/robot_pose_model.cpp`; Linux child-process setup and pid/pgid helpers live in `robot_api_server/runtime_process_utils.hpp` and `src/runtime_process_utils.cpp`; keepout semantic JSON paths and response fragments live in `robot_api_server/semantic_layer_io.hpp` and `src/semantic_layer_io.cpp`; App subscription request parsing lives in `robot_api_server/subscription_api.hpp` and `src/subscription_api.cpp`; App page-scoped subscription leases and TTL expiry live in `robot_api_server/subscription_manager.hpp` and `src/subscription_manager.cpp`; frame ID normalization, yaw extraction, angle wrapping, and ROS timestamp helpers live in `robot_api_server/tf_pose_utils.hpp` and `src/tf_pose_utils.cpp`. These pure modules keep full-SOC dock-contact inference, timestamp/ID generation, docking job state formatting, docking status classification, file asset IO, floor asset resolution, gateway parsing, localization result diagnostics, map asset validation, saved-map asset generation, manifest catalog lookup, navigation-cancel state formatting, saved PNG lookup, robot pose payload formatting, semantic layer formatting, TF pose math, runtime process helpers, and subscription lease behavior testable without touching navigation, docking, or socket-loop code.
 
 The Web dashboard is not part of the production runtime. It is only a manual observation/debug window.
@@ -426,6 +442,8 @@ API-local TF readiness is not the same as controller/local-costmap readiness aft
 
 Default parameters live in `robot_api_server.yaml`: `post_relocalization_settle_min_ms=800`, `post_relocalization_settle_max_ms=3000`, `post_relocalization_stable_tf_samples=5`, `post_relocalization_tf_sample_period_ms=100`, `post_relocalization_required_local_costmap_updates=2`, and large-correction minimum settle time `1500 ms`. Failure codes are explicit: `POST_RELOCALIZATION_SETTLE_TIMEOUT`, `POST_RELOCALIZATION_MAP_ODOM_NOT_FRESH`, `POST_RELOCALIZATION_ODOM_BASE_NOT_FRESH`, `POST_RELOCALIZATION_TF_CHAIN_UNSTABLE`, `POST_RELOCALIZATION_LOCAL_COSTMAP_NOT_UPDATED`, `POST_RELOCALIZATION_LOCAL_COSTMAP_TF_DROPS`, `POST_RELOCALIZATION_SCAN_ADMISSION_TF_ERROR`, `POST_RELOCALIZATION_WRONG_MAP_ODOM_OWNER`, `POST_RELOCALIZATION_SEQUENCE_MISMATCH`, and `CANCELLED_BY_APP`. Roll back by setting `post_relocalization_settle_enabled: false` and restarting `robot_api_server`; no Nav2 controller/planner, TF tolerance, pointcloud, FAST-LIO2, Ranger odom, or EKF parameter is changed by this barrier.
 
+Phase U1 adds post-undock aliases for the same barrier so auto-undock can hold the pending point-navigation goal until the controller/local-costmap side is ready: `post_undock_relocalization_settle_enabled=true`, `post_undock_relocalization_settle_min_ms=800`, `post_undock_relocalization_settle_max_ms=3000`, `post_undock_stable_tf_samples=5`, `post_undock_tf_sample_period_ms=100`, `post_undock_required_local_costmap_updates=2`, `post_undock_reject_if_new_message_filter_drop=true`, and `post_undock_zero_cmd_during_settle=true`. A post-undock localization result accepted by `robot_localization_bridge` does not by itself prove that `controller_server` and the local costmap have consumed a stable TF chain. During this barrier the API keeps zero velocity active and exposes `post_undock_settle` in `/api/v1/navigation/state` plus post-undock fields in `/api/v1/docking/state`. If the barrier fails, the API reports `POST_UNDOCK_*` failure codes and does not send the original `NavigateToPose` goal, avoiding a one-second Nav2 abort. Observe without sending goals with `scripts/jetson/runtime_overlay/scripts/observe_post_undock_to_nav_goal.sh --duration-sec 180`.
+
 `run_floor_navigation.sh` is compatibility-only and delegates to `run_navigation_runtime_services.sh`.
 
 If resident navigation startup exits before the runtime context reaches confirmed `ready`, `run_navigation_runtime_services.sh` writes the context as `failed` with the resume log path and tears down both Nav2 and the occupancy-localization helper layer. The App should show that failed state instead of waiting forever on `starting`.
@@ -445,6 +463,16 @@ They refresh local process/context caches only and do not synchronously probe
 Nav2 lifecycle services on every poll. Blocking lifecycle checks remain on
 runtime resume, navigation goal admission, and explicit readiness diagnostics so
 mobile polling cannot exhaust the API connection limit.
+
+Explicit readiness and field diagnostics must use the same DDS environment as
+the production runtime. Every diagnostic script that starts a ROS participant
+sources `common_env.sh`, records `RMW_IMPLEMENTATION`,
+`FASTDDS_BUILTIN_TRANSPORTS`, and the Fast DDS profile path, and runs temporary
+CLI probes in bounded process groups. Scripts must not leave naked `ros2`
+inspection processes in the production domain. High-churn `/tf` and
+`tf2_echo` captures are opt-in only; default field reports prefer API status,
+topic metadata, low-rate status topics, and existing logs. This is a diagnostic
+containment rule, not a replacement for fixing a half-dead TF owner.
 
 Default field mapping requires navigation mode services to be stopped first,
 keeps common services alive, clears the transient runtime map context, then

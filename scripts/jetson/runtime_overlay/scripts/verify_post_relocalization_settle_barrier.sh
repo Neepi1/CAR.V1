@@ -154,6 +154,18 @@ else
     last_accepted_correction_translation_m \
     last_accepted_correction_yaw_rad \
     map_to_odom_age_ms \
+    map_odom_publish_loop_hz \
+    map_odom_publish_gap_ms \
+    map_odom_publish_gap_max_ms \
+    map_odom_publish_callback_duration_us \
+    map_odom_latest_accepted_sequence \
+    map_odom_last_published_sequence \
+    map_odom_latest_source \
+    map_odom_state_valid \
+    map_odom_correction_paused \
+    map_odom_frozen_due_to_pause \
+    map_odom_publish_missed_count \
+    publisher_decoupled_from_correction \
     map_to_odom_publisher_owner \
     localization_settle_required \
     localization_settle_in_progress \
@@ -173,6 +185,10 @@ else
   [[ "${owner}" == "robot_localization_bridge" ]] && pass "map->odom owner is robot_localization_bridge" || fail "map->odom owner is ${owner:-missing}"
   has_map="$(json_field "${status}" has_map_to_odom)"
   [[ "${has_map}" == "true" ]] && pass "bridge has_map_to_odom=true" || fail "bridge has_map_to_odom=${has_map:-missing}"
+  decoupled="$(json_field "${status}" publisher_decoupled_from_correction)"
+  [[ "${decoupled}" == "true" ]] && pass "bridge publisher is decoupled from correction callbacks" || fail "bridge publisher_decoupled_from_correction=${decoupled:-missing}"
+  state_valid="$(json_field "${status}" map_odom_state_valid)"
+  [[ "${state_valid}" == "true" ]] && pass "bridge map_odom_state_valid=true" || fail "bridge map_odom_state_valid=${state_valid:-missing}"
 fi
 
 api_status="$(api_status_once)"

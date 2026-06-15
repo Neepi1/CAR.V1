@@ -11,6 +11,8 @@ API_URL="${API_URL:-http://127.0.0.1:8080}"
 DURATION_SEC=20
 EXECUTE_GOAL=false
 BAG=false
+CAPTURE_TF=false
+CLI_KILL_AFTER_SEC="${NJRH_DIAG_CLI_KILL_AFTER_SEC:-5}"
 GOAL_JSON=""
 BUILDING_ID=""
 FLOOR_ID=""
@@ -35,6 +37,10 @@ from the App. It does not publish a goal unless --execute-goal is provided.
 Options:
   --duration-sec N       Capture duration. Default: 20.
   --bag true|false       Record a small rosbag. Default: false.
+  --capture-tf true|false
+                         Capture /tf, /tf_static, and tf2_echo streams.
+                         Default: false because these create high-churn DDS
+                         inspection participants on production systems.
   --execute-goal         POST /api/v1/navigation/goal after recorders start.
   --goal-json JSON       Explicit navigation goal JSON for --execute-goal.
   --building-id ID       Goal building_id when building JSON from fields.
@@ -53,6 +59,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --bag)
       BAG="${2:-false}"
+      shift 2
+      ;;
+    --capture-tf)
+      CAPTURE_TF="${2:-false}"
       shift 2
       ;;
     --execute-goal)
@@ -102,10 +112,54 @@ fi
 
 mkdir -p "${REPORT_DIR}" "$(dirname "${REPORT_FILE}")"
 
+write_dds_env_log() {
+  {
+    echo "RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-}"
+    echo "FASTDDS_BUILTIN_TRANSPORTS=${FASTDDS_BUILTIN_TRANSPORTS:-}"
+    echo "FASTRTPS_DEFAULT_PROFILES_FILE=${FASTRTPS_DEFAULT_PROFILES_FILE:-}"
+    echo "FASTDDS_DEFAULT_PROFILES_FILE=${FASTDDS_DEFAULT_PROFILES_FILE:-}"
+    echo "NJRH_FASTDDS_PROFILE_ENABLED=${NJRH_FASTDDS_PROFILE_ENABLED:-}"
+    echo "NJRH_FASTDDS_ALLOWED_ADDRESSES=${NJRH_FASTDDS_ALLOWED_ADDRESSES:-}"
+    echo "NJRH_FASTDDS_ALLOWED_INTERFACES=${NJRH_FASTDDS_ALLOWED_INTERFACES:-}"
+    if [[ -n "${FASTDDS_DEFAULT_PROFILES_FILE:-}" && -f "${FASTDDS_DEFAULT_PROFILES_FILE}" ]]; then
+      echo "FASTDDS_DEFAULT_PROFILES_FILE_EXISTS=true"
+    else
+      echo "FASTDDS_DEFAULT_PROFILES_FILE_EXISTS=false"
+    fi
+    ip -br addr 2>/dev/null || true
+  } >"${REPORT_DIR}/dds_env.log" 2>&1
+}
+
+terminate_process_group() {
+  local pid="$1"
+  [[ -n "${pid}" ]] || return 0
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -TERM "-${pid}" >/dev/null 2>&1 || kill -TERM "${pid}" >/dev/null 2>&1 || true
+  fi
+}
+
+wait_process_group_exit() {
+  local pid="$1"
+  local deadline=$((SECONDS + CLI_KILL_AFTER_SEC))
+  while [[ "${SECONDS}" -lt "${deadline}" ]]; do
+    if ! kill -0 "${pid}" 2>/dev/null && ! pgrep -g "${pid}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
 cleanup() {
   local pid
   for pid in "${PIDS[@]:-}"; do
-    kill "${pid}" >/dev/null 2>&1 || true
+    terminate_process_group "${pid}"
+  done
+  for pid in "${PIDS[@]:-}"; do
+    wait_process_group_exit "${pid}" || {
+      echo "${PREFIX} WARN diagnostic process group ${pid} did not exit after TERM; sending targeted KILL" >>"${REPORT_DIR}/cleanup.log"
+      kill -KILL "-${pid}" >/dev/null 2>&1 || kill -KILL "${pid}" >/dev/null 2>&1 || true
+    }
   done
 }
 trap cleanup EXIT INT TERM
@@ -113,10 +167,17 @@ trap cleanup EXIT INT TERM
 start_timeout_logged() {
   local name="$1"
   shift
-  {
-    echo "\$ timeout --signal=INT ${DURATION_SEC} $*"
-    timeout --signal=INT "${DURATION_SEC}" "$@"
-  } >"${REPORT_DIR}/${name}.log" 2>&1 &
+  local log_file="${REPORT_DIR}/${name}.log"
+  setsid bash -c '
+    log_file="$1"
+    duration="$2"
+    kill_after="$3"
+    shift 3
+    {
+      echo "$ timeout --kill-after=${kill_after}s --signal=TERM ${duration} $*"
+      timeout --kill-after="${kill_after}s" --signal=TERM "${duration}" "$@"
+    } >"${log_file}" 2>&1
+  ' _ "${log_file}" "${DURATION_SEC}" "${CLI_KILL_AFTER_SEC}" "$@" &
   PIDS+=("$!")
 }
 
@@ -165,8 +226,10 @@ api_poll_loop() {
 echo "${PREFIX} report=${REPORT_FILE}"
 echo "${PREFIX} logs=${REPORT_DIR}"
 echo "${PREFIX} duration_sec=${DURATION_SEC}"
+echo "${PREFIX} capture_tf=${CAPTURE_TF}"
 echo "${PREFIX} CAPTURE ACTIVE: send a short App goal now if --execute-goal is not used"
 
+write_dds_env_log
 run_logged "api_before" bash -lc "curl -fsS '${API_URL}/api/v1/navigation/state'; echo; curl -fsS '${API_URL}/api/v1/robot/pose'; echo"
 start_timeout_logged "api_navigation_state_poll" bash -lc "$(declare -f api_poll_loop); API_URL='${API_URL}'; DURATION_SEC='${DURATION_SEC}'; api_poll_loop"
 
@@ -178,10 +241,17 @@ start_timeout_logged "echo_cmd_vel" ros2 topic echo /cmd_vel
 start_timeout_logged "echo_wheel_odom" ros2 topic echo /wheel/odom
 start_timeout_logged "echo_local_state_odometry" ros2 topic echo /local_state/odometry
 start_timeout_logged "echo_safety_status" ros2 topic echo /safety/status
-start_timeout_logged "echo_tf" ros2 topic echo /tf
-start_timeout_logged "echo_tf_static" ros2 topic echo /tf_static
-start_timeout_logged "tf_odom_base_link" ros2 run tf2_ros tf2_echo odom base_link
-start_timeout_logged "tf_map_base_link" ros2 run tf2_ros tf2_echo map base_link
+if [[ "${CAPTURE_TF}" == "true" ]]; then
+  start_timeout_logged "echo_tf" ros2 topic echo /tf
+  start_timeout_logged "echo_tf_static" ros2 topic echo /tf_static
+  start_timeout_logged "tf_odom_base_link" ros2 run tf2_ros tf2_echo odom base_link
+  start_timeout_logged "tf_map_base_link" ros2 run tf2_ros tf2_echo map base_link
+else
+  printf 'skipped; rerun with --capture-tf true when this high-churn capture is explicitly needed\n' >"${REPORT_DIR}/echo_tf.log"
+  printf 'skipped; rerun with --capture-tf true when this high-churn capture is explicitly needed\n' >"${REPORT_DIR}/echo_tf_static.log"
+  printf 'skipped; rerun with --capture-tf true when this high-churn capture is explicitly needed\n' >"${REPORT_DIR}/tf_odom_base_link.log"
+  printf 'skipped; rerun with --capture-tf true when this high-churn capture is explicitly needed\n' >"${REPORT_DIR}/tf_map_base_link.log"
+fi
 
 start_timeout_logged "hz_obstacle_points" ros2 topic hz /perception/obstacle_points --window 20
 start_timeout_logged "hz_local_costmap" ros2 topic hz /local_costmap/costmap --window 20

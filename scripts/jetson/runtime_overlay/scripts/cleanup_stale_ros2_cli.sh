@@ -9,7 +9,8 @@ usage() {
 Usage: cleanup_stale_ros2_cli.sh [--min-age-sec N] [--execute]
 
 Dry-run by default. Finds long-running ros2 CLI inspection commands such as
-topic/param/service/action/node/interface/doctor/bag and, with --execute,
+topic/param/service/action/node/interface/lifecycle/doctor/bag and tf2_echo,
+and, with --execute,
 sends TERM only to those exact PIDs. It intentionally excludes ros2 run and
 ros2 launch so formal runtime nodes are not cleaned.
 USAGE
@@ -52,8 +53,8 @@ collect_stale_cli_pids() {
       pcpu=$3
       command=substr($0, index($0, $4))
       if (age < min_age) next
-      if (command !~ /(^|[[:space:]])(ros2|\/opt\/ros\/humble\/bin\/ros2)([[:space:]]|$)/) next
-      if (command !~ /(^|[[:space:]])(ros2|\/opt\/ros\/humble\/bin\/ros2)[[:space:]]+(topic|param|service|action|node|interface|doctor|bag)([[:space:]]|$)/) next
+      if (command !~ /(^|[[:space:]])(ros2|\/opt\/ros\/humble\/bin\/ros2)([[:space:]]|$)/ && command !~ /(^|[[:space:]])tf2_echo([[:space:]]|$)/) next
+      if (command !~ /(^|[[:space:]])(ros2|\/opt\/ros\/humble\/bin\/ros2)[[:space:]]+(topic|param|service|action|node|interface|lifecycle|doctor|bag)([[:space:]]|$)/ && command !~ /(^|[[:space:]])tf2_echo([[:space:]]|$)/) next
       if (command ~ /(^|[[:space:]])(ros2|\/opt\/ros\/humble\/bin\/ros2)[[:space:]]+(run|launch)([[:space:]]|$)/) next
       if (command ~ /cleanup_stale_ros2_cli|awk/) next
       print pid "|" age "|" pcpu "|" command

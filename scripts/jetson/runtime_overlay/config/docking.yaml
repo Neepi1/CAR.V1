@@ -13,6 +13,15 @@ docking:
     charging_state_topic: /battery_state
     docking_contact_latch_file: /workspaces/njrh-v3/workspace1/maps_release/docking_contact_latch.json
 
+    dock_types:
+      gs2_rear_charging_dock:
+        type: gs2_near_field
+        sensor_frame: gs2_link
+        contact_frame: charge_contact_link
+        staging_offset_m: 0.60
+        approach_direction: reverse
+        max_retries: 2
+
     mode:
       forced_mode_topic: /ranger_mini3/forced_mode
       park_topic: /ranger_mini3/park

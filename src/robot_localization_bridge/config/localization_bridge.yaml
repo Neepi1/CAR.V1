@@ -8,12 +8,15 @@ robot_localization_bridge:
     forced_jump_threshold_m: 20.0
     timeout_sec: 1.0
     publish_rate_hz: 50.0
+    map_odom_publish_gap_warn_ms: 100.0
+    map_odom_publish_gap_fail_ms: 250.0
     tf_future_stamp_offset_sec: 0.10
     localization_topic: /global_localization/pose
     local_odom_topic: /local_state/odometry
     health_topic: /localization/health
     status_topic: /localization/bridge_status
     force_accept_service: /robot_localization_bridge/force_accept_next_localization
+    correction_pause_service: /robot_localization_bridge/set_correction_paused
     two_d_mode: true
     # Legacy compatibility knob. Phase A2 removed Isaac continuous localization;
     # any non-triggered value is ignored by the bridge.

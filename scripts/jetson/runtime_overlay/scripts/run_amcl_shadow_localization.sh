@@ -537,6 +537,34 @@ amcl_param_value() {
   timeout 5 ros2 param get "/${AMCL_NODE_NAME}" "${param}" 2>/dev/null || true
 }
 
+wait_for_amcl_tf_broadcast_false() {
+  local timeout_sec="${NJRH_AMCL_PARAM_READY_TIMEOUT_SEC:-15}"
+  local timeout_int="${timeout_sec%.*}"
+  [[ -n "${timeout_int}" ]] || timeout_int=15
+  local deadline=$(( $(date +%s) + timeout_int ))
+  local tf_broadcast=""
+  local last_tf_broadcast=""
+
+  while true; do
+    tf_broadcast="$(amcl_param_value tf_broadcast)"
+    if [[ "${tf_broadcast}" == *"False"* || "${tf_broadcast}" == *"false"* ]]; then
+      return 0
+    fi
+    last_tf_broadcast="${tf_broadcast}"
+    if [[ "${tf_broadcast}" == *"True"* || "${tf_broadcast}" == *"true"* ]]; then
+      echo "[runtime-overlay] AMCL tf_broadcast is true, expected false: ${tf_broadcast}" >&2
+      return 1
+    fi
+    if [[ "$(date +%s)" -ge "${deadline}" ]]; then
+      break
+    fi
+    sleep "${NJRH_AMCL_PARAM_READY_POLL_SEC:-0.25}"
+  done
+
+  echo "[runtime-overlay] AMCL tf_broadcast did not become readable as false within ${timeout_sec}s: ${last_tf_broadcast:-missing}" >&2
+  return 1
+}
+
 request_amcl_lifecycle_transition() {
   local transition_id="$1"
   local transition_label="$2"
@@ -601,12 +629,7 @@ activate_amcl_lifecycle() {
     echo "[runtime-overlay] /${AMCL_NODE_NAME} lifecycle is not active yet: ${state:-unknown}" >&2
     return 1
   fi
-  local tf_broadcast
-  tf_broadcast="$(amcl_param_value tf_broadcast)"
-  if [[ "${tf_broadcast}" != *"False"* && "${tf_broadcast}" != *"false"* ]]; then
-    echo "[runtime-overlay] AMCL tf_broadcast is not false: ${tf_broadcast:-missing}" >&2
-    return 1
-  fi
+  wait_for_amcl_tf_broadcast_false || return 1
 }
 
 amcl_warn() {
