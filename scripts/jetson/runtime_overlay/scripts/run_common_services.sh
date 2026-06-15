@@ -62,8 +62,61 @@ pointcloud_accel_pipeline_aux_running() {
   pgrep -f "run_pointcloud_accel_pipeline.sh|laser_scan_to_flatscan" >/dev/null 2>&1
 }
 
+process_count_for_pattern() {
+  { pgrep -f "$1" 2>/dev/null || true; } | wc -l | tr -d '[:space:]'
+}
+
+pointcloud_accel_pipeline_aux_unique() {
+  [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" != "legacy" ]] || return 0
+  local pipeline_count
+  local flatscan_count
+  pipeline_count="$(process_count_for_pattern "[r]un_pointcloud_accel_pipeline.sh")"
+  flatscan_count="$(process_count_for_pattern "[l]aser_scan_to_flatscan")"
+  [[ "${pipeline_count:-0}" -eq 1 && "${flatscan_count:-0}" -eq 1 ]]
+}
+
+pointcloud_accel_pipeline_aux_complete() {
+  [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" != "legacy" ]] || return 0
+  pointcloud_accel_pipeline_aux_running && pointcloud_accel_pipeline_aux_unique
+}
+
 canonical_jt128_runtime_complete() {
-  canonical_jt128_ingress_running && pointcloud_accel_pipeline_aux_running
+  canonical_jt128_ingress_running && pointcloud_accel_pipeline_aux_complete
+}
+
+stop_stale_pointcloud_accel_pipeline_processes() {
+  [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" != "legacy" ]] || return 0
+  local pipeline_count
+  local flatscan_count
+  pipeline_count="$(process_count_for_pattern "[r]un_pointcloud_accel_pipeline.sh")"
+  flatscan_count="$(process_count_for_pattern "[l]aser_scan_to_flatscan")"
+  if [[ "${pipeline_count:-0}" -eq 0 && "${flatscan_count:-0}" -eq 0 ]]; then
+    return 0
+  fi
+  echo "[runtime-overlay] stopping stale pointcloud accel pipeline before restart: run_pointcloud_accel_pipeline=${pipeline_count:-0} laser_scan_to_flatscan=${flatscan_count:-0}" >&2
+  local patterns=(
+    "[r]un_pointcloud_accel_pipeline.sh"
+    "[h]esai_ros_driver_node"
+    "[p]ointcloud_accel_axis_node"
+    "[h]esai_accel_driver_node"
+    "[j]t128_accel_driver_node"
+    "[p]ointcloud_axis_remap_node"
+    "[p]ointcloud_axis_remap"
+    "[n]av_cloud_preprocessor"
+    "[p]ointcloud_to_laserscan_node"
+    "[p]ointcloud_to_laserscan"
+    "[s]can_republisher_node"
+    "[l]aser_scan_to_flatscan"
+  )
+  local pattern
+  for pattern in "${patterns[@]}"; do
+    pkill -INT -f "${pattern}" 2>/dev/null || true
+  done
+  sleep "${NJRH_POINTCLOUD_ACCEL_STOP_INT_WAIT_SEC:-1}"
+  for pattern in "${patterns[@]}"; do
+    pkill -TERM -f "${pattern}" 2>/dev/null || true
+  done
+  sleep "${NJRH_POINTCLOUD_ACCEL_STOP_TERM_WAIT_SEC:-1}"
 }
 
 fastlio_runtime_running() {
@@ -264,6 +317,7 @@ else
     start_common_process "jt128_driver" "__njrh_force_start_jt128_driver_chain__" \
       bash "${SCRIPT_DIR}/run_driver.sh"
   else
+    stop_stale_pointcloud_accel_pipeline_processes
     start_common_process "pointcloud_accel_pipeline" "__njrh_force_start_pointcloud_accel_pipeline__" \
       bash "${SCRIPT_DIR}/run_pointcloud_accel_pipeline.sh"
   fi
@@ -308,6 +362,12 @@ fi
 start_overlay_helper "floor_manager_common" bash "${SCRIPT_DIR}/run_floor_manager.sh"
 start_overlay_helper "robot_safety_common" bash "${SCRIPT_DIR}/run_robot_safety.sh"
 start_overlay_helper "ranger_mini3_mode_controller_common" bash "${SCRIPT_DIR}/run_ranger_mini3_mode_controller.sh"
+if [[ "${NJRH_DOCKING_MANAGER_AUTOSTART:-true}" == "true" ]]; then
+  start_common_process "docking_manager" "robot_docking_manager/docking_manager_node|docking_manager_node --ros-args|run_docking_manager.sh" \
+    bash "${SCRIPT_DIR}/run_docking_manager.sh"
+else
+  echo "[runtime-overlay] docking_manager autostart disabled; set NJRH_DOCKING_MANAGER_AUTOSTART=true for resident /docking services" >&2
+fi
 start_common_process "robot_api_server" "run_robot_api_server.sh|run_robot_api_server_supervised.sh|robot_api_server/robot_api_server_node|robot_api_server_node --ros-args" \
   bash "${SCRIPT_DIR}/run_robot_api_server_supervised.sh"
 

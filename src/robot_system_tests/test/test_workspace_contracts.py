@@ -911,6 +911,12 @@ def test_phase25_docked_motion_interlock_contract():
     assert "battery_state_topic" in safety_cpp
     assert "docking_status_topic" in safety_cpp
     assert "dock_contact_latch_is_docked" in safety_cpp
+    assert "fresh_battery_sample()" in safety_cpp
+    assert "docking_status_indicates_docked()" in safety_cpp
+    assert "const bool bms_contradicts_latch" in safety_cpp
+    assert "const bool status_allows_latch_clear" in safety_cpp
+    assert "const bool live_no_contact = bms_contradicts_latch && status_allows_latch_clear" in safety_cpp
+    assert "return !live_no_contact" in safety_cpp
     assert "dock_contact_active()" in safety_cpp
     assert "publish_checked_command(*msg, true)" in safety_cpp
     assert "publish_checked_command(*msg);" in safety_cpp
@@ -1273,6 +1279,15 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     assert "canonical_helper_start_ready()" in overlay_tf_helpers
     assert "forget_canonical_helper_pid()" in overlay_tf_helpers
     assert 'runtime_readiness_probe local-state-endpoint "${timeout_sec}" "${mode}"' in overlay_tf_helpers
+    assert "local_state_tf_ready()" in overlay_tf_helpers
+    assert "local_state_runtime_ready()" in overlay_tf_helpers
+    assert 'runtime_health_fresh_tf_ready "odom" "base_link" "${max_age_sec}"' in overlay_tf_helpers
+    assert "runtime_readiness_probe_bin" in overlay_tf_helpers
+    assert 'fresh-tf "odom" "base_link" "${timeout_sec}" "${max_age_sec}"' in overlay_tf_helpers
+    assert "NJRH_RUNTIME_READINESS_PROBE_EXIT_GRACE_SEC" in overlay_tf_helpers
+    assert "fresh TF probe did not exit after success" in overlay_tf_helpers
+    assert 'local_state_runtime_ready "${LOCAL_STATE_REUSE_READY_TIMEOUT_SEC:-3}"' in overlay_tf_helpers
+    assert 'local_state_runtime_ready "${LOCAL_STATE_START_READY_TIMEOUT_SEC:-12}"' in overlay_tf_helpers
     assert "helper endpoint readiness failed" not in overlay_tf_helpers
     assert "existing ${helper_name} process is stale" not in overlay_tf_helpers
     assert "existing ${helper_name} process will be restarted" in overlay_tf_helpers
@@ -1689,6 +1704,7 @@ def test_project_runtime_helpers_are_wired():
     overlay_robot_safety = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_robot_safety.sh").read_text(encoding="utf-8")
     overlay_common_services = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_common_services.sh").read_text(encoding="utf-8")
     overlay_nav_runtime_helpers = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "nav_runtime_helpers.sh").read_text(encoding="utf-8")
+    overlay_stop_navigation = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "stop_floor_navigation.sh").read_text(encoding="utf-8")
     overlay_canonical_helpers = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "canonical_tf_helpers.sh").read_text(encoding="utf-8")
     overlay_driver = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_driver.sh").read_text(encoding="utf-8")
     overlay_robot_description = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_robot_description.sh").read_text(encoding="utf-8")
@@ -1890,6 +1906,8 @@ def test_project_runtime_helpers_are_wired():
     assert "NJRH_FORCE_RESTART_NAV_HELPERS:-false" in overlay_nav_runtime_helpers
     assert "reusing existing ${helper_name}" in overlay_nav_runtime_helpers
     assert "stop_existing_standard_nav_stack()" in overlay_nav_runtime_helpers
+    assert '"laser_scan_to_flatscan"' not in overlay_stop_navigation
+    assert '"laser_scan_to_flatscan"' not in overlay_nav_runtime_helpers
 
     assert "__node:=lifecycle_manager_costmap_filters" in overlay_nav_runtime_helpers
     assert "__node:=lifecycle_manager_navigation" in overlay_nav_runtime_helpers
@@ -1933,6 +1951,9 @@ def test_project_runtime_helpers_are_wired():
     assert "run_gs2_driver.sh" in overlay_common_services
     assert "NJRH_GS2_AUTOSTART" in overlay_common_services
     assert "robot_eai_gs2/gs2_driver_node" in overlay_common_services
+    assert "NJRH_DOCKING_MANAGER_AUTOSTART:-true" in overlay_common_services
+    assert "run_docking_manager.sh" in overlay_common_services
+    assert "robot_docking_manager/docking_manager_node" in overlay_common_services
     assert "LAST_NAVIGATION_MAP_FILE" in overlay_common_services
     assert "load_last_navigation_map_selection()" in overlay_common_services
     assert "NJRH_RESIDENT_NAVIGATION_AUTOSTART:-auto" in overlay_common_services
@@ -1986,6 +2007,8 @@ def test_project_runtime_helpers_are_wired():
     assert "It does not start:" in autostart_doc
     assert "gs2_driver_node" in autostart_doc
     assert "NJRH_GS2_AUTOSTART=false" in autostart_doc
+    assert "docking_manager_node" in autostart_doc
+    assert "NJRH_DOCKING_MANAGER_AUTOSTART=false" in autostart_doc
 
 
 def test_runtime_overlay_cpu_affinity_policy_is_wired():
@@ -3465,6 +3488,15 @@ def test_ranger_mini3_mode_controller_is_cpp_and_rejects_lateral_reverse():
     overlay_runner = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_ranger_mini3_mode_controller.sh"
     ).read_text(encoding="utf-8")
+    set_profile = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "set_ranger_mode_controller_profile.sh"
+    ).read_text(encoding="utf-8")
+    verify_passthrough = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "verify_ranger_official_passthrough.sh"
+    ).read_text(encoding="utf-8")
+    ab_runner = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_ranger_official_passthrough_ab.sh"
+    ).read_text(encoding="utf-8")
     assert "ament_cmake" in cmake
     assert "rclcpp" in package_xml
     assert "ranger_msgs" in package_xml
@@ -3481,6 +3513,25 @@ def test_ranger_mini3_mode_controller_is_cpp_and_rejects_lateral_reverse():
     assert "UNKNOWN = 255" in mode_header
     assert "ranger_motion_mode_from_code" in mode_header
     assert "ranger_motion_mode_json" in mode_header
+    assert "mode_controller_profile: official_passthrough" in config
+    assert "mode_controller_profile: official_passthrough" in overlay_config
+    assert 'declare_parameter<std::string>("mode_controller_profile", "official_passthrough")' in node_cpp
+    assert 'mode_controller_profile_ == "official_passthrough"' in node_cpp
+    assert 'mode_controller_profile_ == "custom"' in node_cpp
+    assert "computeOfficialPassthrough" in node_cpp
+    assert "cmdVelPassthrough()" in node_cpp
+    assert "customAckermannEnabled()" in node_cpp
+    assert "custom_ackermann_enabled" in node_cpp
+    assert "custom_ackermann_diagnostic_only" in node_cpp
+    assert "cmd_vel_passthrough" in node_cpp
+    assert "passthrough_preserves_twist" in node_cpp
+    assert "output_diff_from_input" in node_cpp
+    assert "diff_reason" in node_cpp
+    assert "predicted_from_cmd_vel_safe" in node_cpp
+    assert "reverse_not_allowed" in node_cpp
+    assert "lateral_not_allowed" in node_cpp
+    assert "park_requested" in node_cpp
+    assert "timeout_zero" in node_cpp
     assert "lateral_policy: reject" in config
     assert "max_lateral_mps: 0.08" in config
     assert "max_crab_yaw_radps: 0.15" in config
@@ -3530,6 +3581,17 @@ def test_ranger_mini3_mode_controller_is_cpp_and_rejects_lateral_reverse():
     assert "msg.linear.y = command.lateral_mps" in node_cpp
     assert "spin_on_high_curvature_while_moving_ || low_speed_spin_allowed" in node_cpp
     assert "auto_spin_max_linear_mps_" in node_cpp
+    assert node_cpp.index("computeOfficialPassthrough") < node_cpp.index("RangerCommand computeCommand")
+    official_branch = node_cpp[
+        node_cpp.index("PublishDecision computeOfficialPassthrough"):
+        node_cpp.index("RangerCommand computeCommand")
+    ]
+    assert "dualAckermannInnerAngleFromTwist" not in official_branch
+    assert "dualAckermannVirtualAngleFromTwist" not in official_branch
+    assert "maxInnerAckermannYawRate" not in official_branch
+    assert "maxVirtualAckermannYawRate" not in official_branch
+    assert "speedLimitForAngle" not in official_branch
+    assert "rawAckermannAngle" not in official_branch
     assert "effectiveAllowReverse" in node_cpp
     assert "reverse_permits_by_source_" in node_cpp
     assert "subscribeReversePermit(\"docking\"" in node_cpp
@@ -3541,6 +3603,24 @@ def test_ranger_mini3_mode_controller_is_cpp_and_rejects_lateral_reverse():
     assert 'source "${REPO_ROOT}/install/local_setup.bash"' in overlay_runner
     assert "set -u" in overlay_runner
     assert "colcon build --packages-select ranger_mini3_mode_controller" in overlay_runner
+    assert "--profile official_passthrough|custom" in set_profile
+    assert "kill -TERM" in set_profile
+    assert "killall -9" not in set_profile
+    assert "pkill -9" not in set_profile
+    assert "run_ranger_mini3_mode_controller.sh" in set_profile
+    assert "/cmd_vel_safe" in set_profile
+    assert "/cmd_vel" in set_profile
+    assert "--compare-cmd" in verify_passthrough
+    assert "mode_controller_profile" in verify_passthrough
+    assert "custom_ackermann_enabled" in verify_passthrough
+    assert "cmd_vel_passthrough" in verify_passthrough
+    assert "ranger_base_node" in verify_passthrough
+    assert "/ranger_mini3/docking_allow_reverse" in verify_passthrough
+    assert "/ranger_mini3/teleop_allow_reverse" in verify_passthrough
+    assert "--duration-sec" in ab_runner
+    assert "reports/ranger_official_passthrough_ab_" in ab_runner
+    assert "/wheel/odom" in ab_runner
+    assert "/localization/bridge_status" in ab_runner
 
 
 def test_occupancy_builder_package_exists():
@@ -4779,7 +4859,8 @@ def test_localization_bridge_latches_one_shot_localizer_pose():
         assert "forced_jump_threshold_m: 20.0" in cfg
         assert "force_accept_service: /robot_localization_bridge/force_accept_next_localization" in cfg
     assert "request_localization_bridge_force_accept" in api_code
-    assert "trigger_localization_and_wait_for_result(reason, detail, wait_timeout)" in api_code
+    assert "trigger_localization_and_wait_for_result(" in api_code
+    assert "&relocalization_sequence" in api_code
     assert "post_undock_relocalization_succeeded" in api_code
     assert "undocked before navigation but post-undock relocalization did not complete" in api_code
     for cfg in (api_cfg, overlay_api_cfg):
@@ -5607,6 +5688,7 @@ def test_phase115_flatscan_lifecycle_hardening_contracts():
     scripts_dir = overlay / "scripts"
 
     run_pipeline = (scripts_dir / "run_pointcloud_accel_pipeline.sh").read_text(encoding="utf-8")
+    common_services = (scripts_dir / "run_common_services.sh").read_text(encoding="utf-8")
     verify_profile = (scripts_dir / "verify_pointcloud_accel_profile.sh").read_text(encoding="utf-8")
     nav_runtime = (scripts_dir / "run_navigation_runtime_services.sh").read_text(encoding="utf-8")
     ab_runner = (scripts_dir / "run_pointcloud_accel_ab.sh").read_text(encoding="utf-8")
@@ -5662,9 +5744,23 @@ def test_phase115_flatscan_lifecycle_hardening_contracts():
     assert "FLATSCAN_MISSING" in nav_runtime
     assert "LOCALIZATION_RESULT_PUBLISHER_MISSING" in nav_runtime
     assert "scan_flatscan_admission_diagnostics" in nav_runtime
+    assert "recover_flatscan_helper_for_navigation" in nav_runtime
+    assert "current_pointcloud_accel_profile" in nav_runtime
+    assert "set_pointcloud_accel_profile.sh\" --profile \"${profile}\" --restart" in nav_runtime
+    assert "/flatscan repair succeeded after pointcloud accel restart" in nav_runtime
     assert "laser_scan_to_flatscan_process" in nav_runtime
     assert "pointcloud_accel_profile" in nav_runtime
     assert "suggested_fix" in nav_runtime
+    assert "pointcloud_accel_pipeline_aux_unique()" in common_services
+    assert "pointcloud_accel_pipeline_aux_complete()" in common_services
+    assert "stop_stale_pointcloud_accel_pipeline_processes()" in common_services
+    assert 'process_count_for_pattern "[r]un_pointcloud_accel_pipeline.sh"' in common_services
+    assert 'process_count_for_pattern "[l]aser_scan_to_flatscan"' in common_services
+    assert "stopping stale pointcloud accel pipeline before restart" in common_services
+    assert "stop_stale_pointcloud_accel_pipeline_processes" in common_services[
+        common_services.index('if reuse_common_services_enabled && canonical_jt128_runtime_complete; then') :
+        common_services.index('start_common_process "pointcloud_accel_pipeline"')
+    ]
 
     assert "flatscan helper pid" in ab_runner
     assert "flatscan helper restart count" in ab_runner
@@ -5920,8 +6016,12 @@ def test_phase_a1_amcl_shadow_localization_contracts():
         assert "amcl_input_enabled: false" in cfg
         assert "amcl_gate_mode: shadow" in cfg
         assert "amcl_max_result_age_ms: 500.0" in cfg
-        assert "amcl_small_correction_translation_m: 0.20" in cfg
+        assert "amcl_small_correction_translation_m: 0.30" in cfg
         assert "amcl_small_correction_yaw_rad: 0.20" in cfg
+        assert "amcl_medium_correction_translation_m: 0.70" in cfg
+        assert "amcl_medium_correction_yaw_rad: 0.20" in cfg
+        assert "amcl_medium_correction_consistency_count: 3" in cfg
+        assert "amcl_hard_reject_translation_m: 1.20" in cfg
         assert "amcl_max_xy_covariance: 1.0" in cfg
         assert "amcl_max_yaw_covariance: 0.5" in cfg
         assert "amcl_seed_service: /robot_localization_bridge/seed_amcl_initial_pose" in cfg
@@ -5934,6 +6034,8 @@ def test_phase_a1_amcl_shadow_localization_contracts():
     assert "amcl_pose_topic_" in bridge_cpp
     assert "accept_amcl_candidate" in bridge_cpp
     assert "AMCL_SMALL_CORRECTION" in bridge_cpp
+    assert "AMCL_MEDIUM_CONSISTENT_CORRECTION" in bridge_cpp
+    assert "AMCL_MEDIUM_CORRECTION_WAITING_FOR_CONSISTENCY" in bridge_cpp
     assert "AMCL_SHADOW_ONLY" in bridge_cpp
     assert "AMCL_CORRECTION_TOO_LARGE" in bridge_cpp
     assert "AMCL_NOT_SEEDED" in bridge_cpp
@@ -6007,6 +6109,11 @@ def test_phase_a13_amcl_scan_admission_cpu_affinity_contracts():
         in affinity_cfg
     )
     assert 'source "${SCRIPT_DIR}/cpu_affinity.sh"' in amcl_runner
+    assert "njrh_cpuset_for amcl" in amcl_runner
+    assert 'export NJRH_CPUSET_AMCL="${amcl_cpuset}"' in amcl_runner
+    assert 'taskset -c "${amcl_cpuset}" true' in amcl_runner
+    assert 'nohup taskset -c "${amcl_cpuset}" ros2 run nav2_amcl amcl' in amcl_runner
+    assert "njrh_apply_affinity_to_pids amcl" in amcl_runner
     assert "njrh_cpuset_for amcl_scan_admission" in amcl_runner
     assert 'export NJRH_CPUSET_AMCL_SCAN_ADMISSION="${relay_cpuset}"' in amcl_runner
     assert 'taskset -c "${relay_cpuset}" true' in amcl_runner
@@ -6215,13 +6322,22 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     bridge_cpp = (ROOT / "src" / "robot_localization_bridge" / "src" / "localization_bridge_node.cpp").read_text(
         encoding="utf-8"
     )
+    api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(encoding="utf-8")
     runtime_path = scripts_dir / "run_navigation_runtime_services.sh"
     runtime = runtime_path.read_text(encoding="utf-8")
     amcl_runner_path = scripts_dir / "run_amcl_shadow_localization.sh"
     amcl_runner = amcl_runner_path.read_text(encoding="utf-8")
     verify_path = scripts_dir / "verify_amcl_runtime_readiness.sh"
+    verify_contract_path = scripts_dir / "verify_amcl_runtime_contract.sh"
+    verify_status_path = scripts_dir / "verify_amcl_readiness_status.sh"
+    verify_nomotion_path = scripts_dir / "verify_amcl_nomotion_readiness.sh"
+    nomotion_probe_path = scripts_dir / "amcl_nomotion_update_probe.py"
     observe_path = scripts_dir / "observe_amcl_navigation_shadow_180s.sh"
     verify = verify_path.read_text(encoding="utf-8")
+    verify_contract = verify_contract_path.read_text(encoding="utf-8")
+    verify_status = verify_status_path.read_text(encoding="utf-8")
+    verify_nomotion = verify_nomotion_path.read_text(encoding="utf-8")
+    nomotion_probe = nomotion_probe_path.read_text(encoding="utf-8")
     observe = observe_path.read_text(encoding="utf-8")
 
     assert 'export NJRH_AMCL_LOCALIZATION_MODE="${NJRH_AMCL_LOCALIZATION_MODE:-gated}"' in profile
@@ -6237,13 +6353,51 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "seed_amcl_initial_pose || return 4" in amcl_runner
     assert 'status_log_period_sec:=${NJRH_AMCL_SCAN_ADMISSION_STATUS_LOG_PERIOD_SEC:-1.0}' in amcl_runner
     assert "request_amcl_nomotion_update" in amcl_runner
+    assert "request_amcl_nomotion_update_and_wait_for_pose" in amcl_runner
     assert "/request_nomotion_update" in amcl_runner
+    assert "amcl_nomotion_update_probe.py" in amcl_runner
+    assert "ros2 service call \"${service}\" std_srvs/srv/Empty" not in amcl_runner
     assert "wait_for_amcl_pose_fresh_or_nomotion_update" in amcl_runner
     assert "AMCL_RESIDENT mode=${MODE}" in amcl_runner
     assert "AMCL_READY mode=${MODE}" in amcl_runner
+    assert "NJRH_AMCL_RUNTIME_STATUS_FILE" in amcl_runner
+    assert "/tmp/njrh_amcl_runtime_status.env" in amcl_runner
+    assert "AMCL_EXIT_DEGRADED=10" in amcl_runner
+    assert "AMCL_EXIT_GATED_NOT_READY=21" in amcl_runner
+    assert "AMCL_EXIT_SCAN_ADMISSION_FAILED=22" in amcl_runner
+    assert "AMCL_EXIT_LIFECYCLE_FAILED=23" in amcl_runner
+    assert "AMCL_EXIT_SEED_FAILED=24" in amcl_runner
+    assert "AMCL_EXIT_POSE_MISSING=25" in amcl_runner
+    assert "write_amcl_runtime_status" in amcl_runner
+    assert "AMCL_STATE" in amcl_runner
+    assert "AMCL_STATUS_STAMP_SEC" in amcl_runner
+    assert "AMCL_STATUS_STALE" in amcl_runner
+    assert "AMCL_PROCESS_READY" in amcl_runner
+    assert "AMCL_SEED_RESPONSE_OK" in amcl_runner
+    assert "AMCL_NOMOTION_PROBE_USED" in amcl_runner
+    assert "AMCL_NOMOTION_POSE_RECEIVED" in amcl_runner
+    assert "AMCL_STATIC_STANDBY" in amcl_runner
+    assert "AMCL_CORRECTION_READY" in amcl_runner
+    assert "AMCL_DEGRADED" in amcl_runner
+    assert "AMCL_FAILED" in amcl_runner
+    assert "AMCL_PID_STALE_CLEARED" in amcl_runner
+    assert "SCAN_ADMISSION_PID_STALE_CLEARED" in amcl_runner
+    assert "validated_pid_from_file" in amcl_runner
+    assert "pid_cmdline_matches" in amcl_runner
+    assert "finish_amcl_status degraded false true" in amcl_runner
+    assert "finish_amcl_status failed false false" in amcl_runner
+    assert "continuing triggered localization baseline\"\\n    return 0" not in amcl_runner
+    assert 'AMCL lifecycle is active but not ready; continuing triggered localization baseline"\n    return 0' not in amcl_runner
 
     assert "start_amcl_resident_if_enabled_for_navigation" in runtime
     assert "complete_amcl_readiness_if_enabled_for_navigation" in runtime
+    assert "run_amcl_localization_step" in runtime
+    assert "set +e" in runtime
+    assert "rc=$?" in runtime
+    assert "AMCL_DEGRADED phase=${phase}" in runtime
+    assert "AMCL_GATED_NOT_READY" in runtime
+    assert "AMCL_SCAN_ADMISSION_FAILED" in runtime
+    assert "AMCL_POSE_MISSING" in runtime
     main_flow = runtime.split('if resident_navigation_ready; then', 1)[1]
     assert main_flow.index("start_amcl_resident_if_enabled_for_navigation") < main_flow.index(
         "trigger_global_localization_for_navigation"
@@ -6264,14 +6418,46 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "AMCL_CORRECTION_TOO_LARGE" in bridge_cpp
     assert "amcl_shadow_ready" in bridge_cpp
     assert "amcl_gated_ready" in bridge_cpp
+    assert "amcl_status_file_stale" in bridge_cpp
+    assert "stale_file_ignored" in bridge_cpp
+    assert "amcl_process_ready" in bridge_cpp
+    assert "amcl_seeded" in bridge_cpp
+    assert "amcl_seed_response_ok" in bridge_cpp
+    assert "amcl_nomotion_pose_received" in bridge_cpp
+    assert "amcl_static_standby" in bridge_cpp
+    assert "amcl_tracking_ready" in bridge_cpp
+    assert "amcl_correction_ready" in bridge_cpp
     assert "amcl_pose_age_ms" in bridge_cpp
     assert "amcl_pose_fresh" in bridge_cpp
     assert "amcl_not_moving_no_update_ok" in bridge_cpp
     assert "localization_degraded" in bridge_cpp
+    assert "amcl_runtime_status_file" in bridge_cpp
+    assert "read_amcl_runtime_status_file" in bridge_cpp
+    assert "amcl_process_alive" in bridge_cpp
+    assert "amcl_node_exists" in bridge_cpp
+    assert "amcl_lifecycle_active" in bridge_cpp
+    assert "amcl_scan_admission_alive" in bridge_cpp
+    assert "amcl_pose_publisher_count" in bridge_cpp
+    assert "amcl_scan_admission_status_publisher_count" in bridge_cpp
+    assert "AMCL_UPSTREAM_MISSING" in bridge_cpp
+    assert "amcl_state" in bridge_cpp
     assert "expected_map_to_odom_owner" in bridge_cpp
     assert "candidate.source == \"isaac_triggered\"" in bridge_cpp
     assert "publish_amcl_initial_pose(candidate.map_base_pose, \"isaac_triggered_accept\")" in bridge_cpp
     assert "tf_broadcaster_->sendTransform(tf)" in bridge_cpp
+    assert "amcl_runtime_status_file" in api_cpp
+    assert "read_amcl_runtime_status" in api_cpp
+    assert "amcl_state" in api_cpp
+    assert "amcl_status_file_stale" in api_cpp
+    assert "amcl_process_ready" in api_cpp
+    assert "amcl_seed_response_ok" in api_cpp
+    assert "amcl_nomotion_pose_received" in api_cpp
+    assert "amcl_static_standby" in api_cpp
+    assert "amcl_correction_ready" in api_cpp
+    assert "localization_degraded" in api_cpp
+    assert "localization_degraded_reason" in api_cpp
+    assert "using_triggered_baseline_only" in api_cpp
+    assert "amcl_scan_admission_status_publisher_count" in api_cpp
 
     assert "tf_broadcast: false" in amcl_cfg
     assert "scan_topic: /scan_amcl" in amcl_cfg
@@ -6281,9 +6467,13 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "robot_model_type: nav2_amcl::DifferentialMotionModel" in amcl_cfg
     assert "amcl_input_enabled: false" in bridge_cfg
     assert "amcl_gate_mode: shadow" in bridge_cfg
-    assert "amcl_small_correction_translation_m: 0.20" in bridge_cfg
-    assert "amcl_hard_reject_translation_m: 1.0" in bridge_cfg
+    assert "amcl_small_correction_translation_m: 0.30" in bridge_cfg
+    assert "amcl_medium_correction_translation_m: 0.70" in bridge_cfg
+    assert "amcl_medium_correction_consistency_count: 3" in bridge_cfg
+    assert "amcl_hard_reject_translation_m: 1.20" in bridge_cfg
     assert "amcl_scan_admission_status_topic: /amcl_scan_admission/status" in bridge_cfg
+    assert "amcl_runtime_status_file: /tmp/njrh_amcl_runtime_status.env" in bridge_cfg
+    assert "amcl_runtime_status_ttl_sec: 5.0" in bridge_cfg
     assert "max_odom_tf_age_ms: 100.0" in bridge_cfg
     assert "transform_tolerance: 0.10" in nav2
     assert "MPPIController" in nav2
@@ -6291,6 +6481,10 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "global_frame: odom" in local_costmap_config_block(nav2)
 
     assert verify_path.exists()
+    assert verify_contract_path.exists()
+    assert verify_status_path.exists()
+    assert verify_nomotion_path.exists()
+    assert nomotion_probe_path.exists()
     assert observe_path.exists()
     assert "--mode disabled|shadow|gated" in verify
     assert 'MODE="${NJRH_AMCL_LOCALIZATION_MODE:-gated}"' in verify
@@ -6304,6 +6498,30 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "ros2 action send_goal" not in verify
     assert "ros2 topic pub" not in verify
     assert "PointCloud2" not in verify
+    assert "--expect-ready" in verify_contract
+    assert "--expect-degraded" in verify_contract
+    assert "--expect-failed" in verify_contract
+    assert "--kill-amcl-for-test" in verify_contract
+    assert "AMCL_READY" in verify_contract
+    assert "AMCL_DEGRADED" in verify_contract
+    assert "AMCL_FAILED" in verify_contract
+    assert "bridge reports amcl_ready=true while runtime AMCL_READY" in verify_contract
+    assert "AMCL_PID_STALE_CLEARED" in verify_contract
+    assert "amcl_scan_admission_status_publisher_count" in verify_contract
+    assert "amcl_nomotion_update_probe.py" in verify_nomotion
+    assert "--expect-static-standby" in verify_nomotion
+    assert "pose received in request window" in verify_nomotion
+    assert "ros2 service call" not in verify_nomotion
+    assert "create_subscription(PoseWithCovarianceStamped" in nomotion_probe
+    assert "client.call_async(Empty.Request())" in nomotion_probe
+    assert nomotion_probe.index("create_subscription(PoseWithCovarianceStamped") < nomotion_probe.index(
+        "client.call_async(Empty.Request())"
+    )
+    assert "--request-nomotion-update" in verify_status
+    assert "--expect-static-standby" in verify_status
+    assert "amcl_status_file_stale" in verify_status
+    assert "stale_file_ignored" in verify_status
+    assert "pose_received_after_request" in verify_status
 
     assert "does not send goals" in observe
     assert "observe_navigation_tf_jitter_180s.sh" in observe
@@ -6315,7 +6533,7 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "ros2 topic pub" not in observe
     assert "PointCloud2" not in observe
 
-    for text in (amcl_runner, verify, observe):
+    for text in (amcl_runner, verify, verify_contract, verify_status, verify_nomotion, observe):
         assert "pkill -9" not in text
         assert "killall -9" not in text
 
@@ -6328,8 +6546,107 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
             check=False,
         )
         if bash_probe.returncode == 0:
-            for path in (runtime_path, amcl_runner_path, verify_path, observe_path):
+            for path in (
+                runtime_path,
+                amcl_runner_path,
+                verify_path,
+                verify_contract_path,
+                verify_status_path,
+                verify_nomotion_path,
+                observe_path,
+            ):
                 subprocess.run([bash, "-n", str(path)], check=True)
+
+
+def test_phase_a22_amcl_readiness_stale_status_and_nomotion_race_contracts():
+    overlay = ROOT / "scripts" / "jetson" / "runtime_overlay"
+    config_dir = overlay / "config"
+    scripts_dir = overlay / "scripts"
+
+    amcl_runner = (scripts_dir / "run_amcl_shadow_localization.sh").read_text(encoding="utf-8")
+    verify_status_path = scripts_dir / "verify_amcl_readiness_status.sh"
+    verify_nomotion_path = scripts_dir / "verify_amcl_nomotion_readiness.sh"
+    nomotion_probe_path = scripts_dir / "amcl_nomotion_update_probe.py"
+    verify_status = verify_status_path.read_text(encoding="utf-8")
+    verify_nomotion = verify_nomotion_path.read_text(encoding="utf-8")
+    nomotion_probe = nomotion_probe_path.read_text(encoding="utf-8")
+    bridge_cpp = (ROOT / "src" / "robot_localization_bridge" / "src" / "localization_bridge_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(encoding="utf-8")
+    bridge_cfg = (config_dir / "localization_bridge.yaml").read_text(encoding="utf-8")
+    api_cfg = (config_dir / "robot_api_server.yaml").read_text(encoding="utf-8")
+
+    assert "AMCL_STATUS_STAMP_SEC" in amcl_runner
+    assert "AMCL_STATUS_AGE_MS" in amcl_runner
+    assert "AMCL_STATUS_STALE" in amcl_runner
+    assert "AMCL_PROCESS_READY" in amcl_runner
+    assert "AMCL_SEEDED" in amcl_runner
+    assert "AMCL_STATIC_STANDBY" in amcl_runner
+    assert "AMCL_TRACKING_READY" in amcl_runner
+    assert "AMCL_CORRECTION_READY" in amcl_runner
+    assert "AMCL_NOMOTION_PROBE_USED" in amcl_runner
+    assert "AMCL_NOMOTION_POSE_RECEIVED" in amcl_runner
+    assert "AMCL_NOMOTION_UPDATE_ACCEPT_RECEIVED_AFTER_CALL" in amcl_runner
+    assert "AMCL_SEED_READINESS_DO_NOT_REQUIRE_FRESH_HEADER_WHEN_STATIC" in amcl_runner
+    assert "amcl_nomotion_update_probe.py" in amcl_runner
+    assert "python3 \"${NOMOTION_PROBE}\"" in amcl_runner
+    assert "ros2 service call \"${service}\" std_srvs/srv/Empty" not in amcl_runner
+    assert "create_subscription(PoseWithCovarianceStamped" in nomotion_probe
+    assert "client.call_async(Empty.Request())" in nomotion_probe
+    assert nomotion_probe.index("create_subscription(PoseWithCovarianceStamped") < nomotion_probe.index(
+        "client.call_async(Empty.Request())"
+    )
+    assert "--require-header-fresh \"${require_header_fresh}\"" in amcl_runner
+    assert "wait_for_amcl_pose_fresh && return 0" in amcl_runner
+    assert "request_amcl_nomotion_update_and_wait_for_pose" in amcl_runner
+    assert "request_amcl_nomotion_update || return 1" not in amcl_runner
+
+    assert "amcl_runtime_status_ttl_sec" in bridge_cpp
+    assert "amcl_runtime_status_authoritative" in bridge_cpp
+    assert "stale_file_ignored" in bridge_cpp
+    assert "amcl_status_file_stale" in bridge_cpp
+    assert "amcl_status_age_ms" in bridge_cpp
+    assert "amcl_status_source" in bridge_cpp
+    assert "amcl_process_ready" in bridge_cpp
+    assert "amcl_seeded" in bridge_cpp
+    assert "amcl_seed_response_ok" in bridge_cpp
+    assert "amcl_nomotion_pose_received" in bridge_cpp
+    assert "amcl_static_standby" in bridge_cpp
+    assert "amcl_tracking_ready" in bridge_cpp
+    assert "amcl_correction_ready" in bridge_cpp
+    assert 'amcl_gate_mode_ == "gated" && amcl_correction_ready' in bridge_cpp
+    assert "amcl_gated_ready = amcl_shadow_ready && amcl_gate_mode_ == \"gated\"" not in bridge_cpp
+    assert "AMCL_STATIC_STANDBY_NO_CORRECTION" in bridge_cpp
+    assert "AMCL_CORRECTION_NOT_READY" in bridge_cpp
+
+    assert "amcl_runtime_status_ttl_sec" in api_cpp
+    assert "bridge_status.amcl_correction_ready" in api_cpp
+    assert "amcl_status_file_stale" in api_cpp
+    assert "amcl_seed_response_ok" in api_cpp
+    assert "amcl_nomotion_pose_received" in api_cpp
+    assert "amcl_status_source" in api_cpp
+    assert "stale_file_ignored" in api_cpp
+    assert "using_triggered_baseline_only" in api_cpp
+
+    assert "amcl_runtime_status_ttl_sec: 5.0" in bridge_cfg
+    assert "amcl_runtime_status_ttl_sec: 5.0" in api_cfg
+    assert "max_odom_tf_age_ms: 100.0" in bridge_cfg
+
+    assert verify_status_path.exists()
+    assert verify_nomotion_path.exists()
+    assert nomotion_probe_path.exists()
+    assert "--request-nomotion-update" in verify_status
+    assert "--expect-static-standby" in verify_nomotion
+    assert "amcl_nomotion_update_probe.py" in verify_nomotion
+    assert "pose received in request window" in verify_nomotion
+    assert "pose_received_after_request" in verify_status
+    assert "amcl_gated_ready=true with /amcl_pose publisher_count=0" in verify_status
+    assert "ros2 action send_goal" not in verify_status
+    assert "ros2 topic pub" not in verify_status
+    assert "PointCloud2" not in verify_status
+    assert "pkill -9" not in verify_status
+    assert "killall -9" not in verify_status
 
 
 def test_phase_c1_nav2_controller_cpu_profile_contracts():
@@ -6438,6 +6755,105 @@ def test_phase_c1_nav2_controller_cpu_profile_contracts():
         if bash_probe.returncode == 0:
             for path in (nav_runner_path, inspect_path, observe_path, ab_path, cleanup_path):
                 subprocess.run([bash, "-n", str(path)], check=True)
+
+
+def test_phase_l2_post_relocalization_settle_barrier_contracts():
+    overlay = ROOT / "scripts" / "jetson" / "runtime_overlay"
+    config_dir = overlay / "config"
+    scripts_dir = overlay / "scripts"
+
+    api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    bridge_cpp = (
+        ROOT / "src" / "robot_localization_bridge" / "src" / "localization_bridge_node.cpp"
+    ).read_text(encoding="utf-8")
+    api_cfg = (ROOT / "src" / "robot_api_server" / "config" / "robot_api_server.yaml").read_text(
+        encoding="utf-8"
+    )
+    overlay_api_cfg = (config_dir / "robot_api_server.yaml").read_text(encoding="utf-8")
+    nav2_cfg = (config_dir / "nav2.yaml").read_text(encoding="utf-8")
+    bridge_cfg = (config_dir / "localization_bridge.yaml").read_text(encoding="utf-8")
+    verify_script_path = scripts_dir / "verify_post_relocalization_settle_barrier.sh"
+    observe_script_path = scripts_dir / "observe_relocalization_to_next_stage.sh"
+    verify_script = verify_script_path.read_text(encoding="utf-8")
+    observe_script = observe_script_path.read_text(encoding="utf-8")
+
+    for cfg in (api_cfg, overlay_api_cfg):
+        assert "localization_bridge_status_topic: \"/localization/bridge_status\"" in cfg
+        assert "local_costmap_topic: \"/local_costmap/costmap\"" in cfg
+        assert "post_relocalization_settle_enabled: true" in cfg
+        assert "post_relocalization_settle_min_ms: 800" in cfg
+        assert "post_relocalization_settle_max_ms: 3000" in cfg
+        assert "post_relocalization_stable_tf_samples: 5" in cfg
+        assert "post_relocalization_tf_sample_period_ms: 100" in cfg
+        assert "post_relocalization_required_local_costmap_updates: 2" in cfg
+        assert "post_relocalization_large_correction_translation_m: 0.5" in cfg
+        assert "post_relocalization_large_correction_yaw_rad: 0.3" in cfg
+        assert "post_relocalization_large_correction_min_ms: 1500" in cfg
+
+    assert 'candidate.source == "isaac_triggered" && candidate.explicit_trigger' in bridge_cpp
+    assert "last_explicit_relocalization_sequence_" in bridge_cpp
+    assert "last_explicit_relocalization_accept_time" in bridge_cpp
+    assert "localization_settle_required" in bridge_cpp
+
+    assert "wait_for_post_relocalization_settle_barrier(" in api_cpp
+    assert '"post_undock"' in api_cpp
+    assert '"before_predock"' in api_cpp
+    assert '"after_predock"' in api_cpp
+    assert '"manual_before_navigation"' in api_cpp
+    assert '"nav2_goal"' in api_cpp
+    assert '"fine_docking"' in api_cpp
+    assert "local_costmap_message_filter_drop_count()" in api_cpp
+    assert "base_to_lidar_static_tf_ready()" in api_cpp
+    assert "post_relocalization_settle_state_json()" in api_cpp
+    assert "publish_teleop_zero_burst()" in api_cpp
+    assert "publish_final_yaw_align_zero_burst()" in api_cpp
+
+    for code in [
+        "POST_RELOCALIZATION_SETTLE_TIMEOUT",
+        "POST_RELOCALIZATION_MAP_ODOM_NOT_FRESH",
+        "POST_RELOCALIZATION_ODOM_BASE_NOT_FRESH",
+        "POST_RELOCALIZATION_TF_CHAIN_UNSTABLE",
+        "POST_RELOCALIZATION_LOCAL_COSTMAP_NOT_UPDATED",
+        "POST_RELOCALIZATION_LOCAL_COSTMAP_TF_DROPS",
+        "POST_RELOCALIZATION_SCAN_ADMISSION_TF_ERROR",
+        "POST_RELOCALIZATION_WRONG_MAP_ODOM_OWNER",
+        "POST_RELOCALIZATION_SEQUENCE_MISMATCH",
+        "CANCELLED_BY_APP",
+    ]:
+        assert code in api_cpp
+
+    assert verify_script_path.exists()
+    assert observe_script_path.exists()
+    assert "never sends" in verify_script
+    assert "ros2 action send_goal" not in verify_script
+    assert "ros2 topic pub" not in verify_script
+    assert "does not send goals or velocity" in observe_script
+    assert "ros2 action send_goal" not in observe_script
+    assert "ros2 topic pub" not in observe_script
+
+    assert "transform_tolerance: 0.10" in nav2_cfg
+    assert "transform_tolerance: 0.15" in local_costmap_config_block(nav2_cfg)
+    assert "max_odom_tf_age_ms: 100.0" in bridge_cfg
+    assert "MPPIController" in nav2_cfg
+    assert "SmacPlanner2D" in nav2_cfg
+    assert "PointCloud2" not in api_cpp
+    assert "FAST-LIO" not in api_cpp
+    assert "pkill -9" not in verify_script + observe_script
+    assert "killall -9" not in verify_script + observe_script
+
+    bash = shutil.which("bash")
+    if bash:
+        bash_probe = subprocess.run(
+            [bash, "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if bash_probe.returncode == 0:
+            subprocess.run([bash, "-n", str(verify_script_path)], check=True)
+            subprocess.run([bash, "-n", str(observe_script_path)], check=True)
 
 
 def test_phase24a_local_costmap_timestamp_audit_contracts():

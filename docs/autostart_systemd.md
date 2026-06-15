@@ -54,6 +54,7 @@ The boot service starts common infrastructure first:
 - `floor_manager_node`
 - `robot_safety_node`
 - `mode_controller_node` from `ranger_mini3_mode_controller`
+- `docking_manager_node` from `robot_docking_manager`, exposing resident `/docking/start`, `/docking/stop`, and `/docking/undock`
 - `robot_api_server_node`
 
 By default `run_common_services.sh` then runs
@@ -76,6 +77,12 @@ GS2 autostart can be disabled for bench tests by setting this in `/etc/njrh/runt
 
 ```bash
 NJRH_GS2_AUTOSTART=false
+```
+
+Docking-manager autostart can be disabled only for controlled bench diagnostics:
+
+```bash
+NJRH_DOCKING_MANAGER_AUTOSTART=false
 ```
 
 For GS2 startup, `njrh-runtime.service` resolves the host `/dev/gs2` symlink before entering the container and exports the real tty path as `NJRH_GS2_SERIAL_PORT`. This prevents the container from accidentally using an unrelated `/dev/ttyUSB*` device after USB re-enumeration.

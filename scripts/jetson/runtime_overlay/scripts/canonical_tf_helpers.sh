@@ -106,13 +106,50 @@ local_state_endpoint_ready() {
   runtime_readiness_probe local-state-endpoint "${timeout_sec}" "${mode}"
 }
 
+local_state_tf_ready() {
+  local timeout_sec="${1:-8}"
+  local max_age_sec="${2:-${LOCAL_STATE_TF_READY_MAX_AGE_SEC:-0.75}}"
+  local probe_timeout_sec
+  local probe
+  local output
+  local rc
+  if runtime_health_fresh_tf_ready "odom" "base_link" "${max_age_sec}" >/dev/null 2>&1; then
+    return 0
+  fi
+  probe="$(runtime_readiness_probe_bin)" || return $?
+  probe_timeout_sec="$(awk \
+    -v timeout_sec="${timeout_sec}" \
+    -v grace_sec="${NJRH_RUNTIME_READINESS_PROBE_EXIT_GRACE_SEC:-3}" \
+    'BEGIN {printf "%.3f", timeout_sec + grace_sec}')"
+  set +e
+  output="$(timeout --kill-after=2 "${probe_timeout_sec}" \
+    "${probe}" fresh-tf "odom" "base_link" "${timeout_sec}" "${max_age_sec}" 2>&1)"
+  rc=$?
+  set -e
+  [[ -z "${output}" ]] || printf '%s\n' "${output}" >&2
+  if [[ "${rc}" -eq 0 ]]; then
+    return 0
+  fi
+  if [[ "${output}" == *"fresh TF ready:"* ]]; then
+    echo "[runtime-overlay] fresh TF probe did not exit after success; continuing after bounded timeout" >&2
+    return 0
+  fi
+  return "${rc}"
+}
+
+local_state_runtime_ready() {
+  local timeout_sec="${1:-8}"
+  local max_age_sec="${2:-${LOCAL_STATE_TF_READY_MAX_AGE_SEC:-0.75}}"
+  local_state_required_processes_running &&
+    local_state_endpoint_ready "${timeout_sec}" &&
+    local_state_tf_ready "${timeout_sec}" "${max_age_sec}"
+}
+
 canonical_helper_ready() {
-  # Startup path must not create ROS graph probes. If the helper process exists,
-  # lifecycle/API layers decide whether it is usable.
   local helper_name="$1"
   case "${helper_name}" in
     local_state*|robot_local_state*)
-      local_state_required_processes_running
+      local_state_runtime_ready "${LOCAL_STATE_REUSE_READY_TIMEOUT_SEC:-3}"
       ;;
     *)
       return 0
@@ -124,7 +161,8 @@ canonical_helper_start_ready() {
   local helper_name="$1"
   case "${helper_name}" in
     local_state*|robot_local_state*)
-      wait_for_local_state_required_processes "${LOCAL_STATE_PROCESS_START_TIMEOUT_SEC:-8}"
+      wait_for_local_state_required_processes "${LOCAL_STATE_PROCESS_START_TIMEOUT_SEC:-8}" &&
+        local_state_runtime_ready "${LOCAL_STATE_START_READY_TIMEOUT_SEC:-12}"
       ;;
     *)
       # A just-started helper only has to stay alive. Topic/TF/service checks

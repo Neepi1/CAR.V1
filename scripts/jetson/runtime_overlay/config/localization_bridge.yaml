@@ -23,13 +23,17 @@ robot_localization_bridge:
     triggered_allow_large_correction: true
     triggered_hard_reject_translation_m: 20.0
     amcl_pose_topic: /amcl_pose
+    amcl_runtime_status_file: /tmp/njrh_amcl_runtime_status.env
+    amcl_runtime_status_ttl_sec: 5.0
     amcl_input_enabled: false
     amcl_gate_mode: shadow
     amcl_max_result_age_ms: 500.0
-    amcl_small_correction_translation_m: 0.20
+    amcl_small_correction_translation_m: 0.30
     amcl_small_correction_yaw_rad: 0.20
-    amcl_large_correction_consistency_count: 3
-    amcl_hard_reject_translation_m: 1.0
+    amcl_medium_correction_translation_m: 0.70
+    amcl_medium_correction_yaw_rad: 0.20
+    amcl_medium_correction_consistency_count: 3
+    amcl_hard_reject_translation_m: 1.20
     amcl_hard_reject_yaw_rad: 0.8
     amcl_min_pose_covariance_ok: true
     amcl_max_xy_covariance: 1.0

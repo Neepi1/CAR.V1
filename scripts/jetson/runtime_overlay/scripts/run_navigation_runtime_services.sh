@@ -12,6 +12,7 @@ export NJRH_RUNTIME_FAILURE_CODE=""
 export NJRH_RUNTIME_LOCALIZATION_MODE="${NJRH_ISAAC_LOCALIZATION_MODE:-triggered}"
 export NJRH_RUNTIME_LAST_TRIGGERED_RELOCALIZATION_OK=""
 export NJRH_RUNTIME_MAP_TO_ODOM_AGE_MS=""
+export NJRH_AMCL_RUNTIME_STATUS_FILE="${NJRH_AMCL_RUNTIME_STATUS_FILE:-/tmp/njrh_amcl_runtime_status.env}"
 
 [[ -n "${floor_id}" ]] || {
   echo "[runtime-overlay] floor_id is required for resident navigation runtime" >&2
@@ -282,6 +283,82 @@ amcl_mode_for_navigation() {
   esac
 }
 
+load_amcl_runtime_status() {
+  AMCL_MODE=""
+  AMCL_START_RESULT=""
+  AMCL_READY="false"
+  AMCL_DEGRADED="false"
+  AMCL_FAILURE_REASON=""
+  AMCL_NODE_EXISTS="false"
+  AMCL_LIFECYCLE_ACTIVE="false"
+  AMCL_PID_ALIVE="false"
+  SCAN_ADMISSION_ALIVE="false"
+  SCAN_ADMISSION_STATUS_PUBLISHER_COUNT="0"
+  AMCL_POSE_PUBLISHER_COUNT="0"
+  AMCL_SEED_SUCCEEDED="false"
+  if [[ -f "${NJRH_AMCL_RUNTIME_STATUS_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    source "${NJRH_AMCL_RUNTIME_STATUS_FILE}"
+  fi
+}
+
+log_amcl_runtime_status() {
+  load_amcl_runtime_status
+  echo "[runtime-overlay] AMCL_STATUS mode=${AMCL_MODE:-unknown} result=${AMCL_START_RESULT:-unknown} ready=${AMCL_READY:-false} degraded=${AMCL_DEGRADED:-false} node=${AMCL_NODE_EXISTS:-false} lifecycle=${AMCL_LIFECYCLE_ACTIVE:-false} pid_alive=${AMCL_PID_ALIVE:-false} scan_alive=${SCAN_ADMISSION_ALIVE:-false} scan_status_publishers=${SCAN_ADMISSION_STATUS_PUBLISHER_COUNT:-0} pose_publishers=${AMCL_POSE_PUBLISHER_COUNT:-0} seed=${AMCL_SEED_SUCCEEDED:-false} reason=${AMCL_FAILURE_REASON:-}" >&2
+}
+
+run_amcl_localization_step() {
+  local mode="$1"
+  local phase="$2"
+  shift 2
+  local rc=0
+  set +e
+  NJRH_AMCL_LOCALIZATION_MODE="${mode}" \
+    NJRH_AMCL_RUNTIME_STATUS_FILE="${NJRH_AMCL_RUNTIME_STATUS_FILE}" \
+    bash "${SCRIPT_DIR}/run_amcl_shadow_localization.sh" --mode "${mode}" "$@"
+  rc=$?
+  set -e
+  log_amcl_runtime_status
+  case "${rc}" in
+    0)
+      return 0
+      ;;
+    10)
+      if [[ "${mode}" == "shadow" ]]; then
+        echo "[runtime-overlay] AMCL_DEGRADED phase=${phase}; continuing triggered baseline because mode=shadow" >&2
+        write_runtime_map_context "degraded" "true" "AMCL shadow degraded: ${AMCL_FAILURE_REASON:-unknown}"
+        return 0
+      fi
+      set_localization_ready_failure "AMCL_GATED_DEGRADED" "AMCL gated returned degraded in phase=${phase}: ${AMCL_FAILURE_REASON:-unknown}"
+      return 1
+      ;;
+    21)
+      set_localization_ready_failure "AMCL_GATED_NOT_READY" "AMCL gated not ready in phase=${phase}: ${AMCL_FAILURE_REASON:-unknown}"
+      return 1
+      ;;
+    22)
+      set_localization_ready_failure "AMCL_SCAN_ADMISSION_FAILED" "AMCL scan admission failed in phase=${phase}: ${AMCL_FAILURE_REASON:-unknown}"
+      return 1
+      ;;
+    23)
+      set_localization_ready_failure "AMCL_LIFECYCLE_FAILED" "AMCL lifecycle failed in phase=${phase}: ${AMCL_FAILURE_REASON:-unknown}"
+      return 1
+      ;;
+    24)
+      set_localization_ready_failure "AMCL_SEED_FAILED" "AMCL seed failed in phase=${phase}: ${AMCL_FAILURE_REASON:-unknown}"
+      return 1
+      ;;
+    25)
+      set_localization_ready_failure "AMCL_POSE_MISSING" "AMCL pose missing/stale in phase=${phase}: ${AMCL_FAILURE_REASON:-unknown}"
+      return 1
+      ;;
+    *)
+      set_localization_ready_failure "AMCL_FAILED" "AMCL runner failed in phase=${phase} exit=${rc}: ${AMCL_FAILURE_REASON:-unknown}"
+      return 1
+      ;;
+  esac
+}
+
 start_amcl_resident_if_enabled_for_navigation() {
   local mode="${NJRH_AMCL_LOCALIZATION_MODE:-disabled}"
   mode="$(amcl_mode_for_navigation)" || return 1
@@ -292,8 +369,7 @@ start_amcl_resident_if_enabled_for_navigation() {
       ;;
   esac
   echo "[runtime-overlay] starting resident AMCL localization candidate mode=${mode} before triggered relocalization" >&2
-  NJRH_AMCL_LOCALIZATION_MODE="${mode}" \
-    bash "${SCRIPT_DIR}/run_amcl_shadow_localization.sh" --mode "${mode}" --start-resident
+  run_amcl_localization_step "${mode}" "start-resident" --start-resident
   amcl_runtime_started=1
 }
 
@@ -306,8 +382,7 @@ complete_amcl_readiness_if_enabled_for_navigation() {
       ;;
   esac
   echo "[runtime-overlay] completing AMCL readiness from accepted triggered localization mode=${mode}" >&2
-  NJRH_AMCL_LOCALIZATION_MODE="${mode}" \
-    bash "${SCRIPT_DIR}/run_amcl_shadow_localization.sh" --mode "${mode}" --complete-readiness
+  run_amcl_localization_step "${mode}" "complete-readiness" --complete-readiness
   amcl_runtime_started=1
 }
 
@@ -335,6 +410,58 @@ scan_flatscan_admission_diagnostics() {
   echo "[runtime-overlay]   laser_scan_to_flatscan_process=${flatscan_process}" >&2
   echo "[runtime-overlay]   pointcloud_accel_profile=${profile}" >&2
   echo "[runtime-overlay]   suggested_fix=bash scripts/jetson/runtime_overlay/scripts/verify_pointcloud_accel_profile.sh; bash scripts/jetson/runtime_overlay/scripts/set_pointcloud_accel_profile.sh --profile ${profile} --restart" >&2
+}
+
+current_pointcloud_accel_profile() {
+  local profile="${NJRH_POINTCLOUD_ACCEL_PROFILE:-}"
+  if [[ -f "${NJRH_OVERLAY_ROOT}/config/pointcloud_accel_profile.env" ]]; then
+    # shellcheck source=../config/pointcloud_accel_profile.env
+    source "${NJRH_OVERLAY_ROOT}/config/pointcloud_accel_profile.env"
+  fi
+  printf '%s\n' "${NJRH_POINTCLOUD_ACCEL_PROFILE:-${profile:-ipc_worker}}"
+}
+
+topic_publisher_count() {
+  local topic="$1"
+  timeout 4 ros2 topic info -v "${topic}" 2>/dev/null \
+    | awk -F: '/Publisher count/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}'
+}
+
+recover_flatscan_helper_for_navigation() {
+  local wait_sec="${1:-30}"
+  local scan_publishers
+  local profile
+
+  scan_publishers="$(topic_publisher_count /scan)"
+  if [[ "${scan_publishers:-0}" -le 0 ]]; then
+    echo "[runtime-overlay] /flatscan repair skipped: /scan has no publisher" >&2
+    return 1
+  fi
+
+  profile="$(current_pointcloud_accel_profile)"
+  case "${profile}" in
+    legacy|ipc_worker|nitros)
+      ;;
+    *)
+      echo "[runtime-overlay] /flatscan repair skipped: invalid pointcloud accel profile=${profile}" >&2
+      return 1
+      ;;
+  esac
+
+  echo "[runtime-overlay] attempting /flatscan repair by restarting pointcloud accel profile=${profile}" >&2
+  if ! timeout "${NJRH_FLATSCAN_REPAIR_RESTART_TIMEOUT_SEC:-20}" \
+    bash "${SCRIPT_DIR}/set_pointcloud_accel_profile.sh" --profile "${profile}" --restart >&2; then
+    echo "[runtime-overlay] /flatscan repair failed to launch pointcloud accel restart" >&2
+    return 1
+  fi
+
+  if wait_for_topic_message "/flatscan" "${wait_sec}"; then
+    echo "[runtime-overlay] /flatscan repair succeeded after pointcloud accel restart" >&2
+    return 0
+  fi
+
+  echo "[runtime-overlay] /flatscan repair did not restore /flatscan within ${wait_sec}s" >&2
+  return 1
 }
 
 set_localization_ready_failure() {
@@ -370,8 +497,10 @@ ensure_localization_stack_ready_for_navigation() {
   fi
   if ! wait_for_topic_message "/flatscan" "${flatscan_timeout}"; then
     scan_flatscan_admission_diagnostics
-    set_localization_ready_failure "FLATSCAN_MISSING" "/flatscan FlatScan message not ready within ${flatscan_timeout}s"
-    return 1
+    if ! recover_flatscan_helper_for_navigation "${flatscan_timeout}"; then
+      set_localization_ready_failure "FLATSCAN_MISSING" "/flatscan FlatScan message not ready within ${flatscan_timeout}s"
+      return 1
+    fi
   fi
   if ! wait_for_topic_publisher "/localization_result" "${publisher_timeout}"; then
     set_localization_ready_failure "LOCALIZATION_RESULT_PUBLISHER_MISSING" "/localization_result publisher not ready within ${publisher_timeout}s"

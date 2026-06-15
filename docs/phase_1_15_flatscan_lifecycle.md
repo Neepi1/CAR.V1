@@ -86,6 +86,19 @@ For `FLATSCAN_MISSING`, the log also prints:
 - current pointcloud accel profile
 - suggested verify/restart command
 
+Navigation stop and localization cleanup preserve the common
+`laser_scan_to_flatscan` helper. If an older field transition still kills the
+helper and leaves `/scan` alive with no `/flatscan`, navigation startup attempts
+one current-profile pointcloud accel restart and waits for `/flatscan` again
+before reporting `FLATSCAN_MISSING`.
+
+Common runtime startup still owns pointcloud-profile uniqueness. In non-legacy
+profiles, startup requires exactly one `run_pointcloud_accel_pipeline.sh`
+supervisor and one `laser_scan_to_flatscan` helper. If a previous mode switch or
+service restart leaves duplicate helpers, common startup treats the existing
+pointcloud profile as stale, stops it with targeted SIGINT/SIGTERM, and starts
+one replacement chain.
+
 ## Verification
 
 ```bash
@@ -103,6 +116,8 @@ Expected `ipc_worker` result:
 
 - `/scan` publisher is `pointcloud_accel_axis_node`.
 - `/flatscan` publisher is `laser_scan_to_flatscan` compatibility helper.
+- one `run_pointcloud_accel_pipeline.sh` supervisor and one
+  `laser_scan_to_flatscan` helper are present.
 - `/flatscan` is at least `5Hz`, typically about `8Hz..10Hz`.
 - `verify_pointcloud_accel_profile.sh` prints `FLATSCAN_OWNER_OK=true`,
   `FLATSCAN_HZ_OK=true`, and `FLATSCAN_NAV_STARTUP_GATE_OK=true`.

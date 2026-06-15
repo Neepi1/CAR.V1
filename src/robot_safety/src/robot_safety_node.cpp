@@ -339,6 +339,25 @@ private:
     last_docking_status_time_ = now();
   }
 
+  bool fresh_battery_sample() const
+  {
+    return last_battery_time_.nanoseconds() > 0 &&
+      (now() - last_battery_time_).seconds() <= dock_contact_max_age_sec_;
+  }
+
+  bool docking_status_indicates_docked() const
+  {
+    if (!enable_docking_status_guard_) {
+      return false;
+    }
+    for (const auto & prefix : docked_status_prefixes_) {
+      if (!prefix.empty() && starts_with(latest_docking_status_, lower_copy(prefix))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   bool dock_contact_latch_is_docked() const
   {
     if (docking_contact_latch_file_.empty()) {
@@ -370,21 +389,21 @@ private:
     if (!block_normal_motion_when_docked_) {
       return false;
     }
-    if (enable_bms_contact_guard_ &&
-      last_battery_time_.nanoseconds() > 0 &&
-      (now() - last_battery_time_).seconds() <= dock_contact_max_age_sec_ &&
-      battery_contact_active_)
-    {
+    if (enable_bms_contact_guard_ && fresh_battery_sample() && battery_contact_active_) {
       return true;
     }
-    if (enable_docking_status_guard_) {
-      for (const auto & prefix : docked_status_prefixes_) {
-        if (!prefix.empty() && starts_with(latest_docking_status_, lower_copy(prefix))) {
-          return true;
-        }
-      }
+    if (docking_status_indicates_docked()) {
+      return true;
     }
-    return enable_docked_latch_file_guard_ && dock_contact_latch_is_docked();
+    if (!enable_docked_latch_file_guard_ || !dock_contact_latch_is_docked()) {
+      return false;
+    }
+    const bool bms_contradicts_latch =
+      enable_bms_contact_guard_ && fresh_battery_sample() && !battery_contact_active_;
+    const bool status_allows_latch_clear =
+      !enable_docking_status_guard_ || !docking_status_indicates_docked();
+    const bool live_no_contact = bms_contradicts_latch && status_allows_latch_clear;
+    return !live_no_contact;
   }
 
   bool estop_active_{false};

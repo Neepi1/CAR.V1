@@ -158,7 +158,6 @@ stop_existing_localization_stack() {
     "isaac_continuous_flatscan_forwarder"
     "map_server"
     "lifecycle_manager_map"
-    "laser_scan_to_flatscan"
     "pointcloud_to_laserscan_node"
     "pointcloud_to_laserscan"
     "scan_republisher_node"

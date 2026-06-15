@@ -81,7 +81,6 @@ patterns=(
   "lifecycle_manager_map"
   "occupancy_grid_localizer_container"
   "occupancy_grid_localizer"
-  "laser_scan_to_flatscan"
   "pointcloud_to_laserscan_node"
   "pointcloud_to_laserscan"
   "scan_republisher_node"

@@ -50,6 +50,7 @@ njrh_exec_affined robot_localization_bridge "${NODE_BIN}" --ros-args \
   -p "amcl_input_enabled:=${AMCL_INPUT_ENABLED}" \
   -p "amcl_gate_mode:=${AMCL_GATE_MODE}" \
   -p "amcl_pose_topic:=${NJRH_AMCL_POSE_TOPIC:-/amcl_pose}" \
+  -p "amcl_runtime_status_file:=${NJRH_AMCL_RUNTIME_STATUS_FILE:-/tmp/njrh_amcl_runtime_status.env}" \
   -p "amcl_initial_pose_topic:=${NJRH_AMCL_INITIAL_POSE_TOPIC:-/initialpose}" \
   -p "amcl_scan_admission_enabled:=${AMCL_SCAN_ADMISSION_ENABLED}" \
   -p "amcl_scan_admission_status_topic:=${NJRH_AMCL_SCAN_ADMISSION_STATUS_TOPIC:-/amcl_scan_admission/status}"

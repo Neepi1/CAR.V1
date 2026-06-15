@@ -49,6 +49,7 @@
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "nav_msgs/msg/odometry.hpp"
+#include "rcl_interfaces/msg/log.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "robot_interfaces/srv/switch_floor.hpp"
@@ -206,6 +207,62 @@ bool starts_with(const std::string & value, const std::string & prefix)
   return value.rfind(prefix, 0) == 0;
 }
 
+std::string unquote_env_value(std::string value)
+{
+  value = trim(value);
+  if (value.size() >= 2U && value.front() == '"' && value.back() == '"') {
+    value = value.substr(1U, value.size() - 2U);
+  }
+  std::string output;
+  output.reserve(value.size());
+  bool escaped = false;
+  for (const char c : value) {
+    if (escaped) {
+      output.push_back(c);
+      escaped = false;
+    } else if (c == '\\') {
+      escaped = true;
+    } else {
+      output.push_back(c);
+    }
+  }
+  if (escaped) {
+    output.push_back('\\');
+  }
+  return output;
+}
+
+struct AmclRuntimeStatus
+{
+  bool available{false};
+  std::string mode;
+  std::string state;
+  std::string start_result;
+  bool ready{false};
+  bool degraded{false};
+  std::string degraded_reason;
+  bool process_alive{false};
+  bool scan_admission_alive{false};
+  int pose_publisher_count{0};
+  int scan_admission_status_publisher_count{0};
+  bool seed_succeeded{false};
+  bool seed_response_ok{false};
+  bool nomotion_probe_used{false};
+  bool nomotion_pose_received{false};
+  int nomotion_pose_count{0};
+  double nomotion_pose_header_age_ms{-1.0};
+  bool process_ready{false};
+  bool seeded{false};
+  bool static_standby{false};
+  bool tracking_ready{false};
+  bool correction_ready{false};
+  bool not_moving_no_update_ok{false};
+  std::string stamp;
+  double stamp_sec{-1.0};
+  double age_ms{-1.0};
+  bool stale{true};
+};
+
 std::optional<double> parse_utc_iso8601_seconds(const std::string & text)
 {
   if (text.empty()) {
@@ -300,6 +357,8 @@ public:
       "/robot_localization_bridge/force_accept_next_localization");
     localization_result_topic_ =
       declare_parameter<std::string>("localization_result_topic", "/localization_result");
+    localization_bridge_status_topic_ =
+      declare_parameter<std::string>("localization_bridge_status_topic", "/localization/bridge_status");
     navigate_to_pose_action_ = declare_parameter<std::string>("navigate_to_pose_action", "/navigate_to_pose");
     mapping_2d_start_command_ = declare_parameter<std::string>(
       "mapping_2d_start_command",
@@ -316,6 +375,10 @@ public:
       declare_parameter<std::string>("navigation_resume_log_file", "/tmp/njrh_navigation_resume.log");
     runtime_map_context_file_ =
       declare_parameter<std::string>("runtime_map_context_file", "/tmp/njrh_runtime_map_context.json");
+    amcl_runtime_status_file_ =
+      declare_parameter<std::string>("amcl_runtime_status_file", "/tmp/njrh_amcl_runtime_status.env");
+    amcl_runtime_status_ttl_sec_ =
+      std::max(0.0, declare_parameter<double>("amcl_runtime_status_ttl_sec", 5.0));
     last_navigation_map_file_ = declare_parameter<std::string>(
       "last_navigation_map_file",
       "/workspaces/njrh-v3/workspace1/maps_release/last_navigation_map.json");
@@ -356,9 +419,12 @@ public:
     scan_topic_ = declare_parameter<std::string>("scan_topic", "/scan");
     scan_max_age_sec_ = std::max(0.1, declare_parameter<double>("scan_max_age_sec", 2.0));
     tf_topic_ = declare_parameter<std::string>("tf_topic", "/tf");
+    tf_static_topic_ = declare_parameter<std::string>("tf_static_topic", "/tf_static");
     tf_map_frame_ = declare_parameter<std::string>("tf_map_frame", "map");
     tf_odom_frame_ = declare_parameter<std::string>("tf_odom_frame", "odom");
     tf_base_frame_ = declare_parameter<std::string>("tf_base_frame", "base_link");
+    post_relocalization_static_lidar_frame_ = normalized_frame_id(
+      declare_parameter<std::string>("post_relocalization_static_lidar_frame", "lidar_level_link"));
     tf_map_frame_ = normalized_frame_id(tf_map_frame_);
     tf_odom_frame_ = normalized_frame_id(tf_odom_frame_);
     tf_base_frame_ = normalized_frame_id(tf_base_frame_);
@@ -499,6 +565,35 @@ public:
       declare_parameter<bool>("undock_relocalize_after_success", true);
     undock_relocalize_wait_sec_ =
       std::max(0.5, declare_parameter<double>("undock_relocalize_wait_sec", docking_relocalize_wait_sec_));
+    local_costmap_topic_ = declare_parameter<std::string>("local_costmap_topic", "/local_costmap/costmap");
+    post_relocalization_settle_enabled_ =
+      declare_parameter<bool>("post_relocalization_settle_enabled", true);
+    post_relocalization_settle_min_ms_ =
+      std::max(0, static_cast<int>(declare_parameter<int>("post_relocalization_settle_min_ms", 800)));
+    post_relocalization_settle_max_ms_ = std::max(
+      post_relocalization_settle_min_ms_,
+      static_cast<int>(declare_parameter<int>("post_relocalization_settle_max_ms", 3000)));
+    post_relocalization_stable_tf_samples_ =
+      std::max(1, static_cast<int>(declare_parameter<int>("post_relocalization_stable_tf_samples", 5)));
+    post_relocalization_tf_sample_period_ms_ =
+      std::max(20, static_cast<int>(declare_parameter<int>("post_relocalization_tf_sample_period_ms", 100)));
+    post_relocalization_zero_cmd_ =
+      declare_parameter<bool>("post_relocalization_zero_cmd", true);
+    post_relocalization_require_local_costmap_update_ =
+      declare_parameter<bool>("post_relocalization_require_local_costmap_update", true);
+    post_relocalization_required_local_costmap_updates_ =
+      std::max(
+        0,
+        static_cast<int>(declare_parameter<int>("post_relocalization_required_local_costmap_updates", 2)));
+    post_relocalization_reject_if_new_message_filter_drop_ =
+      declare_parameter<bool>("post_relocalization_reject_if_new_message_filter_drop", true);
+    post_relocalization_large_correction_translation_m_ =
+      std::max(0.0, declare_parameter<double>("post_relocalization_large_correction_translation_m", 0.5));
+    post_relocalization_large_correction_yaw_rad_ =
+      std::max(0.0, declare_parameter<double>("post_relocalization_large_correction_yaw_rad", 0.3));
+    post_relocalization_large_correction_min_ms_ = std::max(
+      post_relocalization_settle_min_ms_,
+      static_cast<int>(declare_parameter<int>("post_relocalization_large_correction_min_ms", 1500)));
     docking_cancel_active_goal_before_predock_ =
       declare_parameter<bool>("docking_cancel_active_goal_before_predock", true);
     navigation_auto_undock_timeout_sec_ =
@@ -526,6 +621,26 @@ public:
       localization_result_topic_, rclcpp::QoS(10),
       [this](const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg) {
         handle_localization_result(msg);
+      });
+    localization_bridge_status_sub_ = create_subscription<std_msgs::msg::String>(
+      localization_bridge_status_topic_, rclcpp::QoS(10),
+      [this](const std_msgs::msg::String::SharedPtr msg) {
+        handle_localization_bridge_status(msg);
+      });
+    local_costmap_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
+      local_costmap_topic_, rclcpp::QoS(rclcpp::KeepLast(5)).reliable().transient_local(),
+      [this](const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+        handle_local_costmap(msg);
+      });
+    tf_static_sub_ = create_subscription<tf2_msgs::msg::TFMessage>(
+      tf_static_topic_, rclcpp::QoS(rclcpp::KeepLast(10)).reliable().transient_local(),
+      [this](const tf2_msgs::msg::TFMessage::SharedPtr msg) {
+        handle_tf_static_message(msg);
+      });
+    rosout_sub_ = create_subscription<rcl_interfaces::msg::Log>(
+      "/rosout", rclcpp::QoS(100),
+      [this](const rcl_interfaces::msg::Log::SharedPtr msg) {
+        handle_rosout_message(msg);
       });
     teleop_repeat_timer_ = create_wall_timer(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -775,6 +890,68 @@ private:
     double map_pose_age_sec{-1.0};
     double map_to_odom_stamp_sec{0.0};
     double odom_to_base_stamp_sec{0.0};
+  };
+
+  struct BridgeStatusSnapshot
+  {
+    bool available{false};
+    std::string raw;
+    std::chrono::steady_clock::time_point received_at{};
+    double age_sec{-1.0};
+    bool has_map_to_odom{false};
+    std::string map_to_odom_publisher_owner{"unknown"};
+    double map_to_odom_age_ms{-1.0};
+    std::uint64_t last_explicit_relocalization_sequence{0U};
+    double last_explicit_relocalization_accept_time{0.0};
+    std::string last_explicit_relocalization_source{"none"};
+    double last_accepted_correction_translation_m{0.0};
+    double last_accepted_correction_yaw_rad{0.0};
+    bool amcl_input_enabled{false};
+    bool amcl_ready{false};
+    bool amcl_degraded{false};
+    std::string amcl_degraded_reason;
+    std::string amcl_status_source;
+    bool amcl_status_file_stale{true};
+    double amcl_status_age_ms{-1.0};
+    bool amcl_process_ready{false};
+    bool amcl_seeded{false};
+    bool amcl_seed_response_ok{false};
+    bool amcl_nomotion_pose_received{false};
+    bool amcl_static_standby{false};
+    bool amcl_tracking_ready{false};
+    bool amcl_correction_ready{false};
+    bool amcl_not_moving_no_update_ok{false};
+    bool amcl_scan_admission_enabled{false};
+    bool amcl_scan_admission_alive{false};
+    bool amcl_message_filter_drop_detected{false};
+    std::string amcl_scan_admission_last_error{"none"};
+    bool localization_degraded{false};
+  };
+
+  struct PostRelocalizationSettleResult
+  {
+    bool ok{false};
+    std::string failure_code{"POST_RELOCALIZATION_SETTLE_TIMEOUT"};
+    std::string detail;
+    std::uint64_t expected_sequence{0U};
+    std::uint64_t observed_sequence{0U};
+    int stable_samples{0};
+    std::uint64_t local_costmap_updates{0U};
+    double elapsed_ms{0.0};
+  };
+
+  struct PostRelocalizationSettleState
+  {
+    bool required{false};
+    bool in_progress{false};
+    bool complete{true};
+    std::string reason{"none"};
+    std::string target_stage{"none"};
+    std::string failure_reason{"none"};
+    std::string detail;
+    std::uint64_t expected_sequence{0U};
+    int min_ms{0};
+    double start_wall_time{0.0};
   };
 
   std::chrono::nanoseconds service_timeout() const
@@ -1140,6 +1317,286 @@ private:
     return false;
   }
 
+  void update_post_relocalization_settle_state(
+    const std::function<void(PostRelocalizationSettleState &)> & update)
+  {
+    std::lock_guard<std::mutex> lock(post_relocalization_settle_mutex_);
+    update(post_relocalization_settle_state_);
+  }
+
+  PostRelocalizationSettleState post_relocalization_settle_state_snapshot() const
+  {
+    std::lock_guard<std::mutex> lock(post_relocalization_settle_mutex_);
+    return post_relocalization_settle_state_;
+  }
+
+  std::string post_relocalization_settle_state_json() const
+  {
+    const auto state = post_relocalization_settle_state_snapshot();
+    std::ostringstream out;
+    out << "{\"required\":" << (state.required ? "true" : "false")
+        << ",\"in_progress\":" << (state.in_progress ? "true" : "false")
+        << ",\"complete\":" << (state.complete ? "true" : "false")
+        << ",\"reason\":" << json_string(state.reason)
+        << ",\"target_stage\":" << json_string(state.target_stage)
+        << ",\"expected_sequence\":" << state.expected_sequence
+        << ",\"start_time\":" << std::fixed << std::setprecision(3) << state.start_wall_time
+        << ",\"min_ms\":" << state.min_ms
+        << ",\"failure_reason\":" << json_string(state.failure_reason)
+        << ",\"detail\":" << json_string(state.detail) << "}";
+    return out.str();
+  }
+
+  PostRelocalizationSettleResult wait_for_post_relocalization_settle_barrier(
+    const std::uint64_t expected_sequence,
+    const std::string & reason,
+    const std::string & target_next_stage,
+    const std::function<bool(std::string &)> & cancel_requested = {})
+  {
+    PostRelocalizationSettleResult result;
+    result.expected_sequence = expected_sequence;
+    if (!post_relocalization_settle_enabled_) {
+      result.ok = true;
+      result.failure_code = "NONE";
+      result.detail = "post relocalization settle disabled";
+      return result;
+    }
+
+    if (expected_sequence == 0U) {
+      result.failure_code = "POST_RELOCALIZATION_SEQUENCE_MISMATCH";
+      result.detail = "post relocalization settle missing expected explicit relocalization sequence";
+      return result;
+    }
+
+    const auto initial_bridge = bridge_status_snapshot();
+    int min_ms = post_relocalization_settle_min_ms_;
+    if (std::fabs(initial_bridge.last_accepted_correction_translation_m) >=
+      post_relocalization_large_correction_translation_m_ ||
+      std::fabs(initial_bridge.last_accepted_correction_yaw_rad) >=
+      post_relocalization_large_correction_yaw_rad_)
+    {
+      min_ms = std::max(min_ms, post_relocalization_large_correction_min_ms_);
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    auto settle_start = start;
+    auto deadline = start + std::chrono::milliseconds(post_relocalization_settle_max_ms_);
+    auto min_deadline = start + std::chrono::milliseconds(min_ms);
+    const auto sample_period = std::chrono::milliseconds(post_relocalization_tf_sample_period_ms_);
+    const std::uint64_t baseline_costmap_updates = local_costmap_update_count();
+    const std::uint64_t baseline_local_costmap_drops = local_costmap_message_filter_drop_count();
+    int stable_samples = 0;
+    bool sequence_observed = false;
+    auto mark_sequence_observed = [&]() {
+      if (sequence_observed) {
+        return;
+      }
+      sequence_observed = true;
+      settle_start = std::chrono::steady_clock::now();
+      deadline = settle_start + std::chrono::milliseconds(post_relocalization_settle_max_ms_);
+      min_deadline = settle_start + std::chrono::milliseconds(min_ms);
+      stable_samples = 0;
+    };
+    std::string last_failure_code = "POST_RELOCALIZATION_SETTLE_TIMEOUT";
+    std::string last_detail = "waiting for first settle sample";
+
+    update_post_relocalization_settle_state([&](PostRelocalizationSettleState & state) {
+      state.required = true;
+      state.in_progress = true;
+      state.complete = false;
+      state.reason = reason;
+      state.target_stage = target_next_stage;
+      state.failure_reason = "none";
+      state.detail = "waiting for post relocalization settle";
+      state.expected_sequence = expected_sequence;
+      state.min_ms = min_ms;
+      state.start_wall_time = wall_time_seconds();
+    });
+
+    if (post_relocalization_zero_cmd_) {
+      clear_teleop_command();
+      publish_teleop_zero_burst();
+      publish_final_yaw_align_zero_burst();
+    }
+
+    while (std::chrono::steady_clock::now() <= deadline) {
+      if (post_relocalization_zero_cmd_) {
+        clear_teleop_command();
+        publish_teleop_zero_burst();
+        publish_final_yaw_align_zero_burst();
+      }
+
+      std::string cancel_detail;
+      if (cancel_requested && cancel_requested(cancel_detail)) {
+        result.failure_code = "CANCELLED_BY_APP";
+        result.detail = cancel_detail.empty() ? "post relocalization settle canceled by app" : cancel_detail;
+        update_post_relocalization_settle_state([&](PostRelocalizationSettleState & state) {
+          state.in_progress = false;
+          state.complete = false;
+          state.failure_reason = result.failure_code;
+          state.detail = result.detail;
+        });
+        return result;
+      }
+
+      const auto bridge = bridge_status_snapshot();
+      const auto tf = tf_chain_freshness_snapshot();
+      const std::uint64_t costmap_updates =
+        local_costmap_update_count() - baseline_costmap_updates;
+      result.observed_sequence = bridge.last_explicit_relocalization_sequence;
+      result.local_costmap_updates = costmap_updates;
+
+      bool sample_ok = true;
+      std::ostringstream sample_detail;
+      sample_detail << std::fixed << std::setprecision(3)
+                    << "reason=" << reason
+                    << " target=" << target_next_stage
+                    << " expected_seq=" << expected_sequence
+                    << " observed_seq=" << bridge.last_explicit_relocalization_sequence
+                    << " bridge_age_sec=" << bridge.age_sec
+                    << " map_to_odom_age_ms=" << bridge.map_to_odom_age_ms
+                    << " costmap_updates=" << costmap_updates
+                    << " stable_samples=" << stable_samples;
+
+      if (!bridge.available) {
+        sample_ok = false;
+        last_failure_code = "POST_RELOCALIZATION_MAP_ODOM_NOT_FRESH";
+        sample_detail << "; bridge_status unavailable";
+      } else if (bridge.map_to_odom_publisher_owner != "robot_localization_bridge") {
+        result.failure_code = "POST_RELOCALIZATION_WRONG_MAP_ODOM_OWNER";
+        result.detail = "post relocalization settle rejected wrong map->odom owner: " +
+          bridge.map_to_odom_publisher_owner;
+        update_post_relocalization_settle_state([&](PostRelocalizationSettleState & state) {
+          state.in_progress = false;
+          state.complete = false;
+          state.failure_reason = result.failure_code;
+          state.detail = result.detail;
+        });
+        return result;
+      } else if (bridge.last_explicit_relocalization_sequence != expected_sequence) {
+        sample_ok = false;
+        last_failure_code = "POST_RELOCALIZATION_SEQUENCE_MISMATCH";
+        sample_detail << "; sequence mismatch";
+        if (bridge.last_explicit_relocalization_sequence > expected_sequence) {
+          result.failure_code = last_failure_code;
+          result.detail = sample_detail.str();
+          update_post_relocalization_settle_state([&](PostRelocalizationSettleState & state) {
+            state.in_progress = false;
+            state.complete = false;
+            state.failure_reason = result.failure_code;
+            state.detail = result.detail;
+          });
+          return result;
+        }
+      } else if (!bridge.has_map_to_odom)
+      {
+        mark_sequence_observed();
+        sample_ok = false;
+        last_failure_code = "POST_RELOCALIZATION_MAP_ODOM_NOT_FRESH";
+        sample_detail << "; bridge has no map->odom";
+      } else if (!tf.have_map_to_odom || tf.map_to_odom_age_sec < 0.0 ||
+        tf.map_to_odom_age_sec > tf_chain_freshness_sec_)
+      {
+        mark_sequence_observed();
+        sample_ok = false;
+        last_failure_code = "POST_RELOCALIZATION_MAP_ODOM_NOT_FRESH";
+        sample_detail << "; api tf map->odom not fresh: " << tf_chain_freshness_detail(tf);
+      } else if (!tf.have_odom_to_base || tf.odom_to_base_age_sec < 0.0 ||
+        tf.odom_to_base_age_sec > tf_chain_freshness_sec_)
+      {
+        mark_sequence_observed();
+        sample_ok = false;
+        last_failure_code = "POST_RELOCALIZATION_ODOM_BASE_NOT_FRESH";
+        sample_detail << "; api tf odom->base_link not fresh: " << tf_chain_freshness_detail(tf);
+      } else if (!tf.have_map_pose || tf.map_pose_age_sec < 0.0 ||
+        tf.map_pose_age_sec > robot_pose_freshness_sec_)
+      {
+        mark_sequence_observed();
+        sample_ok = false;
+        last_failure_code = "POST_RELOCALIZATION_TF_CHAIN_UNSTABLE";
+        sample_detail << "; api map pose not fresh: " << tf_chain_freshness_detail(tf);
+      } else if (!base_to_lidar_static_tf_ready()) {
+        mark_sequence_observed();
+        sample_ok = false;
+        last_failure_code = "POST_RELOCALIZATION_TF_CHAIN_UNSTABLE";
+        sample_detail << "; static " << tf_base_frame_ << "->"
+                      << post_relocalization_static_lidar_frame_ << " not observed";
+      } else if (post_relocalization_require_local_costmap_update_ &&
+        costmap_updates < static_cast<std::uint64_t>(post_relocalization_required_local_costmap_updates_))
+      {
+        mark_sequence_observed();
+        sample_ok = false;
+        last_failure_code = "POST_RELOCALIZATION_LOCAL_COSTMAP_NOT_UPDATED";
+        sample_detail << "; local_costmap updates below required="
+                      << post_relocalization_required_local_costmap_updates_;
+      } else if (post_relocalization_reject_if_new_message_filter_drop_ &&
+        local_costmap_message_filter_drop_count() > baseline_local_costmap_drops)
+      {
+        mark_sequence_observed();
+        sample_ok = false;
+        last_failure_code = "POST_RELOCALIZATION_LOCAL_COSTMAP_TF_DROPS";
+        sample_detail << "; local_costmap MessageFilter drop: "
+                      << last_local_costmap_message_filter_drop_text();
+      } else if (bridge.amcl_scan_admission_enabled &&
+        (!bridge.amcl_scan_admission_alive ||
+        bridge.amcl_message_filter_drop_detected ||
+        lower_copy(bridge.amcl_scan_admission_last_error).find("tf") != std::string::npos ||
+        lower_copy(bridge.amcl_scan_admission_last_error).find("transform") != std::string::npos))
+      {
+        mark_sequence_observed();
+        sample_ok = false;
+        last_failure_code = "POST_RELOCALIZATION_SCAN_ADMISSION_TF_ERROR";
+        sample_detail << "; amcl scan admission not clean: alive="
+                      << (bridge.amcl_scan_admission_alive ? "true" : "false")
+                      << " error=" << bridge.amcl_scan_admission_last_error;
+      } else if (!sequence_observed) {
+        mark_sequence_observed();
+      }
+
+      if (sample_ok) {
+        ++stable_samples;
+      } else {
+        stable_samples = 0;
+      }
+      last_detail = sample_detail.str();
+      result.stable_samples = stable_samples;
+      update_post_relocalization_settle_state([&](PostRelocalizationSettleState & state) {
+        state.detail = last_detail;
+      });
+
+      if (stable_samples >= post_relocalization_stable_tf_samples_ &&
+        std::chrono::steady_clock::now() >= min_deadline)
+      {
+        result.ok = true;
+        result.failure_code = "NONE";
+        result.detail = last_detail + "; post relocalization settle passed";
+        result.elapsed_ms =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        update_post_relocalization_settle_state([&](PostRelocalizationSettleState & state) {
+          state.in_progress = false;
+          state.complete = true;
+          state.failure_reason = "none";
+          state.detail = result.detail;
+        });
+        return result;
+      }
+
+      std::this_thread::sleep_for(sample_period);
+    }
+
+    result.failure_code = last_failure_code;
+    result.detail = last_detail + "; timed out waiting for post relocalization settle";
+    result.elapsed_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    update_post_relocalization_settle_state([&](PostRelocalizationSettleState & state) {
+      state.in_progress = false;
+      state.complete = false;
+      state.failure_reason = result.failure_code;
+      state.detail = result.detail;
+    });
+    return result;
+  }
+
   RobotPoseSnapshot wait_for_current_robot_pose(
     const bool require_map_frame,
     std::string & error)
@@ -1427,6 +1884,151 @@ private:
     return snapshot;
   }
 
+  static std::uint64_t json_uint64_value(
+    const std::string & body,
+    const std::string & key,
+    const std::uint64_t fallback = 0U)
+  {
+    const auto value = json_number_value(body, key);
+    if (!value || !std::isfinite(*value) || *value < 0.0) {
+      return fallback;
+    }
+    return static_cast<std::uint64_t>(*value);
+  }
+
+  void handle_localization_bridge_status(const std_msgs::msg::String::SharedPtr msg)
+  {
+    BridgeStatusSnapshot snapshot;
+    snapshot.available = true;
+    snapshot.raw = msg->data;
+    snapshot.received_at = std::chrono::steady_clock::now();
+    snapshot.has_map_to_odom = json_bool_value(msg->data, "has_map_to_odom", false);
+    snapshot.map_to_odom_publisher_owner =
+      json_string_value(msg->data, "map_to_odom_publisher_owner").value_or("unknown");
+    snapshot.map_to_odom_age_ms = json_number_value(msg->data, "map_to_odom_age_ms").value_or(-1.0);
+    snapshot.last_explicit_relocalization_sequence =
+      json_uint64_value(msg->data, "last_explicit_relocalization_sequence");
+    snapshot.last_explicit_relocalization_accept_time =
+      json_number_value(msg->data, "last_explicit_relocalization_accept_time").value_or(0.0);
+    snapshot.last_explicit_relocalization_source =
+      json_string_value(msg->data, "last_explicit_relocalization_source").value_or("none");
+    snapshot.last_accepted_correction_translation_m =
+      json_number_value(msg->data, "last_accepted_correction_translation_m").value_or(0.0);
+    snapshot.last_accepted_correction_yaw_rad =
+      json_number_value(msg->data, "last_accepted_correction_yaw_rad").value_or(0.0);
+    snapshot.amcl_input_enabled = json_bool_value(msg->data, "amcl_input_enabled", false);
+    snapshot.amcl_ready = json_bool_value(msg->data, "amcl_ready", false);
+    snapshot.amcl_degraded = json_bool_value(msg->data, "amcl_degraded", false);
+    snapshot.amcl_degraded_reason =
+      json_string_value(msg->data, "amcl_degraded_reason").value_or("");
+    snapshot.amcl_status_source =
+      json_string_value(msg->data, "amcl_status_source").value_or("");
+    snapshot.amcl_status_file_stale =
+      json_bool_value(msg->data, "amcl_status_file_stale", true);
+    snapshot.amcl_status_age_ms =
+      json_number_value(msg->data, "amcl_status_age_ms").value_or(-1.0);
+    snapshot.amcl_process_ready =
+      json_bool_value(msg->data, "amcl_process_ready", false);
+    snapshot.amcl_seeded = json_bool_value(msg->data, "amcl_seeded", false);
+    snapshot.amcl_seed_response_ok =
+      json_bool_value(msg->data, "amcl_seed_response_ok", false);
+    snapshot.amcl_nomotion_pose_received =
+      json_bool_value(msg->data, "amcl_nomotion_pose_received", false);
+    snapshot.amcl_static_standby =
+      json_bool_value(msg->data, "amcl_static_standby", false);
+    snapshot.amcl_tracking_ready =
+      json_bool_value(msg->data, "amcl_tracking_ready", false);
+    snapshot.amcl_correction_ready =
+      json_bool_value(msg->data, "amcl_correction_ready", false);
+    snapshot.amcl_not_moving_no_update_ok =
+      json_bool_value(msg->data, "amcl_not_moving_no_update_ok", false);
+    snapshot.amcl_scan_admission_enabled =
+      json_bool_value(msg->data, "amcl_scan_admission_enabled", false);
+    snapshot.amcl_scan_admission_alive =
+      json_bool_value(msg->data, "amcl_scan_admission_alive", false);
+    snapshot.amcl_message_filter_drop_detected =
+      json_bool_value(msg->data, "amcl_message_filter_drop_detected", false);
+    snapshot.amcl_scan_admission_last_error =
+      json_string_value(msg->data, "amcl_scan_admission_last_error").value_or("none");
+    snapshot.localization_degraded = json_bool_value(msg->data, "localization_degraded", false);
+
+    std::lock_guard<std::mutex> lock(bridge_status_mutex_);
+    latest_bridge_status_ = snapshot;
+  }
+
+  BridgeStatusSnapshot bridge_status_snapshot() const
+  {
+    std::lock_guard<std::mutex> lock(bridge_status_mutex_);
+    BridgeStatusSnapshot snapshot = latest_bridge_status_;
+    if (snapshot.available) {
+      snapshot.age_sec =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - snapshot.received_at).count();
+    }
+    return snapshot;
+  }
+
+  void handle_local_costmap(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
+  {
+    (void)msg;
+    std::lock_guard<std::mutex> lock(local_costmap_mutex_);
+    ++local_costmap_update_count_;
+    latest_local_costmap_received_at_ = std::chrono::steady_clock::now();
+  }
+
+  std::uint64_t local_costmap_update_count() const
+  {
+    std::lock_guard<std::mutex> lock(local_costmap_mutex_);
+    return local_costmap_update_count_;
+  }
+
+  void handle_tf_static_message(const tf2_msgs::msg::TFMessage::SharedPtr msg)
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    for (const auto & transform : msg->transforms) {
+      const auto parent = normalized_frame_id(transform.header.frame_id);
+      const auto child = normalized_frame_id(transform.child_frame_id);
+      if (parent == tf_base_frame_ && child == post_relocalization_static_lidar_frame_) {
+        have_base_to_lidar_static_tf_ = true;
+        base_to_lidar_static_tf_received_at_ = std::chrono::steady_clock::now();
+      }
+    }
+  }
+
+  bool base_to_lidar_static_tf_ready()
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return have_base_to_lidar_static_tf_;
+  }
+
+  void handle_rosout_message(const rcl_interfaces::msg::Log::SharedPtr msg)
+  {
+    const std::string combined = msg->name + ": " + msg->msg;
+    if (combined.find("Message Filter dropping") == std::string::npos) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(rosout_mutex_);
+    ++message_filter_drop_count_;
+    last_message_filter_drop_text_ = combined;
+    if (combined.find("local_costmap") != std::string::npos ||
+      combined.find("controller_server") != std::string::npos)
+    {
+      ++local_costmap_message_filter_drop_count_;
+      last_local_costmap_message_filter_drop_text_ = combined;
+    }
+  }
+
+  std::uint64_t local_costmap_message_filter_drop_count() const
+  {
+    std::lock_guard<std::mutex> lock(rosout_mutex_);
+    return local_costmap_message_filter_drop_count_;
+  }
+
+  std::string last_local_costmap_message_filter_drop_text() const
+  {
+    std::lock_guard<std::mutex> lock(rosout_mutex_);
+    return last_local_costmap_message_filter_drop_text_;
+  }
+
   bool wait_for_localization_result_after(
     const std::chrono::steady_clock::time_point & min_received_at,
     const double timeout_sec,
@@ -1517,9 +2119,16 @@ private:
   bool trigger_localization_and_wait_for_result(
     const std::string & reason,
     std::string & detail,
-    const double wait_timeout_sec = -1.0)
+    const double wait_timeout_sec = -1.0,
+    std::uint64_t * accepted_sequence = nullptr)
   {
     const auto trigger_started_at = std::chrono::steady_clock::now();
+    if (accepted_sequence != nullptr) {
+      *accepted_sequence = 0U;
+    }
+    const auto bridge_before = bridge_status_snapshot();
+    const std::uint64_t previous_explicit_sequence =
+      bridge_before.available ? bridge_before.last_explicit_relocalization_sequence : 0U;
     const double timeout_sec = wait_timeout_sec > 0.0 ? wait_timeout_sec : docking_relocalize_wait_sec_;
     const auto trigger_timeout = localization_trigger_service_timeout(timeout_sec);
     if (!localization_trigger_client_->wait_for_service(trigger_timeout)) {
@@ -1558,13 +2167,29 @@ private:
           response->message,
           localization_result_topic_,
           accepted_snapshot);
-        return wait_for_localization_bridge_acceptance(accepted_snapshot, detail);
+        const bool accepted = wait_for_localization_bridge_acceptance(accepted_snapshot, detail);
+        if (accepted && accepted_sequence != nullptr) {
+          const auto bridge_after = bridge_status_snapshot();
+          *accepted_sequence =
+            bridge_after.available &&
+            bridge_after.last_explicit_relocalization_sequence > previous_explicit_sequence ?
+            bridge_after.last_explicit_relocalization_sequence : previous_explicit_sequence + 1U;
+        }
+        return accepted;
       }
       detail = force_accept_detail + "; " + response->message + "; " + result_detail;
       return false;
     }
     detail = force_accept_detail + "; " + response->message + "; " + result_detail;
-    return wait_for_localization_bridge_acceptance(accepted_snapshot, detail);
+    const bool accepted = wait_for_localization_bridge_acceptance(accepted_snapshot, detail);
+    if (accepted && accepted_sequence != nullptr) {
+      const auto bridge_after = bridge_status_snapshot();
+      *accepted_sequence =
+        bridge_after.available &&
+        bridge_after.last_explicit_relocalization_sequence > previous_explicit_sequence ?
+        bridge_after.last_explicit_relocalization_sequence : previous_explicit_sequence + 1U;
+    }
+    return accepted;
   }
 
   NavigationRelocalizationDecision navigation_goal_relocalization_decision(const bool force_requested)
@@ -2420,6 +3045,31 @@ private:
       "map",
       false);
     const auto localization = localization_result_snapshot();
+    const auto amcl_status = read_amcl_runtime_status();
+    const auto bridge_status = bridge_status_snapshot();
+    const bool amcl_file_authoritative = amcl_status.available && !amcl_status.stale;
+    const bool bridge_amcl_available = bridge_status.available && bridge_status.amcl_input_enabled;
+    const bool effective_amcl_ready =
+      bridge_amcl_available ? bridge_status.amcl_ready :
+      (amcl_file_authoritative && amcl_status.ready);
+    const bool effective_amcl_degraded =
+      bridge_amcl_available ? bridge_status.localization_degraded :
+      (amcl_file_authoritative && (amcl_status.degraded || !amcl_status.ready));
+    const std::string effective_amcl_degraded_reason =
+      bridge_amcl_available ?
+      (bridge_status.amcl_degraded_reason.empty() ?
+        (bridge_status.localization_degraded ? std::string("AMCL_NOT_READY") : std::string()) :
+        bridge_status.amcl_degraded_reason) :
+      (effective_amcl_degraded ?
+        (amcl_status.degraded_reason.empty() ? std::string("AMCL_NOT_READY") : amcl_status.degraded_reason) :
+        std::string());
+    const bool localization_degraded =
+      effective_amcl_degraded;
+    const bool using_triggered_baseline_only =
+      (bridge_amcl_available || (amcl_status.available && amcl_status.mode != "disabled")) &&
+      !effective_amcl_ready;
+    const std::string localization_degraded_reason =
+      localization_degraded ? effective_amcl_degraded_reason : std::string();
     bool live_mapping_map_available = false;
     double live_mapping_map_age_sec = 0.0;
     std::uint32_t live_mapping_map_width = 0U;
@@ -2451,6 +3101,11 @@ private:
     body << "\"navigation_active\":" << (runtime.navigation_active ? "true" : "false") << ",";
     body << "\"healthy\":" << (runtime.healthy ? "true" : "false") << ",";
     body << "\"message\":" << json_string(runtime.message) << ",";
+    body << "\"localization_degraded\":" << (localization_degraded ? "true" : "false") << ",";
+    body << "\"localization_degraded_reason\":"
+         << json_string(localization_degraded_reason) << ",";
+    body << "\"using_triggered_baseline_only\":"
+         << (using_triggered_baseline_only ? "true" : "false") << ",";
     body << "\"mapping\":{";
     body << "\"active\":" << (runtime.mapping_active ? "true" : "false") << ",";
     body << "\"state\":" << json_string(runtime.mapping_state) << ",";
@@ -2477,6 +3132,7 @@ private:
     body << "\"normal_motion_blocked_reason\":"
          << json_string(safety_status == "DOCKED_CONTACT_BLOCK" ? "DOCKED_CONTACT_BLOCK" : "") << ",";
     body << "\"pre_navigation_dock_check\":" << status_dock_check_json << ",";
+    body << "\"post_relocalization_settle\":" << post_relocalization_settle_state_json() << ",";
     body << "\"goal\":" << navigation_goal_json;
     body << "},";
     body << "\"docking_active\":" << (runtime.docking_active ? "true" : "false") << ",";
@@ -2504,6 +3160,54 @@ private:
     body << "\"localization\":{";
     body << "\"trigger_service\":" << json_string(localization_trigger_service_) << ",";
     body << "\"result_topic\":" << json_string(localization_result_topic_) << ",";
+    body << "\"amcl_mode\":" << json_string(amcl_status.mode) << ",";
+    body << "\"amcl_state\":" << json_string(amcl_status.state) << ",";
+    body << "\"amcl_start_result\":" << json_string(amcl_status.start_result) << ",";
+    body << "\"amcl_status_file_stale\":" << (amcl_status.stale ? "true" : "false") << ",";
+    body << "\"amcl_status_age_ms\":" << amcl_status.age_ms << ",";
+    body << "\"amcl_status_source\":" << json_string(
+      bridge_amcl_available ? bridge_status.amcl_status_source :
+      (amcl_file_authoritative ? std::string("file") : std::string("stale_file_ignored"))) << ",";
+    body << "\"amcl_ready\":" << (effective_amcl_ready ? "true" : "false") << ",";
+    body << "\"amcl_degraded\":" << (effective_amcl_degraded ? "true" : "false") << ",";
+    body << "\"amcl_degraded_reason\":" << json_string(effective_amcl_degraded_reason) << ",";
+    body << "\"amcl_process_alive\":" << (amcl_status.process_alive ? "true" : "false") << ",";
+    body << "\"amcl_process_ready\":" << ((
+      bridge_amcl_available ? bridge_status.amcl_process_ready : amcl_status.process_ready
+    ) ? "true" : "false") << ",";
+    body << "\"amcl_seeded\":" << ((
+      bridge_amcl_available ? bridge_status.amcl_seeded : amcl_status.seeded
+    ) ? "true" : "false") << ",";
+    body << "\"amcl_seed_response_ok\":" << ((
+      bridge_amcl_available ? bridge_status.amcl_seed_response_ok : amcl_status.seed_response_ok
+    ) ? "true" : "false") << ",";
+    body << "\"amcl_nomotion_pose_received\":" << ((
+      bridge_amcl_available ? bridge_status.amcl_nomotion_pose_received : amcl_status.nomotion_pose_received
+    ) ? "true" : "false") << ",";
+    body << "\"amcl_static_standby\":" << ((
+      bridge_amcl_available ? bridge_status.amcl_static_standby : amcl_status.static_standby
+    ) ? "true" : "false") << ",";
+    body << "\"amcl_tracking_ready\":" << ((
+      bridge_amcl_available ? bridge_status.amcl_tracking_ready : amcl_status.tracking_ready
+    ) ? "true" : "false") << ",";
+    body << "\"amcl_correction_ready\":" << ((
+      bridge_amcl_available ? bridge_status.amcl_correction_ready : amcl_status.correction_ready
+    ) ? "true" : "false") << ",";
+    body << "\"amcl_not_moving_no_update_ok\":" << ((
+      bridge_amcl_available ?
+        bridge_status.amcl_not_moving_no_update_ok :
+        amcl_status.not_moving_no_update_ok
+    ) ? "true" : "false") << ",";
+    body << "\"amcl_scan_admission_alive\":"
+         << (amcl_status.scan_admission_alive ? "true" : "false") << ",";
+    body << "\"amcl_pose_publisher_count\":" << amcl_status.pose_publisher_count << ",";
+    body << "\"amcl_scan_admission_status_publisher_count\":"
+         << amcl_status.scan_admission_status_publisher_count << ",";
+    body << "\"localization_degraded\":" << (localization_degraded ? "true" : "false") << ",";
+    body << "\"localization_degraded_reason\":"
+         << json_string(localization_degraded_reason) << ",";
+    body << "\"using_triggered_baseline_only\":"
+         << (using_triggered_baseline_only ? "true" : "false") << ",";
     body << "\"last_result_available\":" << (localization.available ? "true" : "false") << ",";
     body << "\"last_result_frame\":" << json_string(localization.frame_id) << ",";
     body << "\"last_result_age_sec\":";
@@ -2512,7 +3216,8 @@ private:
     } else {
       body << "null";
     }
-    body << ",\"last_result_seq\":" << localization.seq;
+    body << ",\"last_result_seq\":" << localization.seq << ",";
+    body << "\"post_relocalization_settle\":" << post_relocalization_settle_state_json();
     body << "},";
     body << "\"bms\":{";
     body << "\"soc\":";
@@ -2724,6 +3429,97 @@ private:
       return std::nullopt;
     }
     return read_runtime_map_context_file(fs::path(runtime_map_context_file_));
+  }
+
+  AmclRuntimeStatus read_amcl_runtime_status() const
+  {
+    AmclRuntimeStatus status;
+    if (amcl_runtime_status_file_.empty()) {
+      return status;
+    }
+    std::ifstream input(amcl_runtime_status_file_);
+    if (!input.good()) {
+      return status;
+    }
+    std::map<std::string, std::string> fields;
+    std::string line;
+    while (std::getline(input, line)) {
+      line = trim(line);
+      if (line.empty() || line.front() == '#') {
+        continue;
+      }
+      const auto equal_pos = line.find('=');
+      if (equal_pos == std::string::npos) {
+        continue;
+      }
+      const auto key = trim(line.substr(0U, equal_pos));
+      if (!key.empty()) {
+        fields[key] = unquote_env_value(line.substr(equal_pos + 1U));
+      }
+    }
+    auto string_field = [&](const std::string & key) -> std::string {
+        const auto it = fields.find(key);
+        return it == fields.end() ? std::string() : it->second;
+      };
+    auto bool_field = [&](const std::string & key) -> bool {
+        const auto value = string_field(key);
+        return value == "true" || value == "True" || value == "1";
+      };
+    auto int_field = [&](const std::string & key) -> int {
+        const auto value = string_field(key);
+        if (value.empty()) {
+          return 0;
+        }
+        try {
+          return std::stoi(value);
+        } catch (const std::exception &) {
+          return 0;
+        }
+      };
+    auto double_field = [&](const std::string & key, const double fallback = -1.0) -> double {
+        const auto value = string_field(key);
+        if (value.empty()) {
+          return fallback;
+        }
+        try {
+          return std::stod(value);
+        } catch (const std::exception &) {
+          return fallback;
+        }
+      };
+    status.available = true;
+    status.mode = string_field("AMCL_MODE");
+    status.state = string_field("AMCL_STATE");
+    status.start_result = string_field("AMCL_START_RESULT");
+    status.ready = bool_field("AMCL_READY");
+    status.degraded = bool_field("AMCL_DEGRADED");
+    status.degraded_reason = string_field("AMCL_FAILURE_REASON");
+    status.process_alive = bool_field("AMCL_PID_ALIVE");
+    status.scan_admission_alive = bool_field("SCAN_ADMISSION_ALIVE");
+    status.pose_publisher_count = int_field("AMCL_POSE_PUBLISHER_COUNT");
+    status.scan_admission_status_publisher_count = int_field("SCAN_ADMISSION_STATUS_PUBLISHER_COUNT");
+    status.seed_succeeded = bool_field("AMCL_SEED_SUCCEEDED");
+    status.seed_response_ok = bool_field("AMCL_SEED_RESPONSE_OK");
+    status.nomotion_probe_used = bool_field("AMCL_NOMOTION_PROBE_USED");
+    status.nomotion_pose_received = bool_field("AMCL_NOMOTION_POSE_RECEIVED");
+    status.nomotion_pose_count = int_field("AMCL_NOMOTION_POSE_COUNT");
+    status.nomotion_pose_header_age_ms = double_field("AMCL_NOMOTION_POSE_HEADER_AGE_MS");
+    status.process_ready = bool_field("AMCL_PROCESS_READY");
+    status.seeded = bool_field("AMCL_SEEDED") || status.seed_succeeded || status.seed_response_ok;
+    status.static_standby = bool_field("AMCL_STATIC_STANDBY");
+    status.tracking_ready = bool_field("AMCL_TRACKING_READY");
+    status.correction_ready = bool_field("AMCL_CORRECTION_READY");
+    status.not_moving_no_update_ok = bool_field("AMCL_NOT_MOVING_NO_UPDATE_OK");
+    status.stamp_sec = double_field("AMCL_STATUS_STAMP_SEC");
+    if (status.stamp_sec > 0.0) {
+      status.age_ms = std::max(0.0, (wall_time_seconds() - status.stamp_sec) * 1000.0);
+      status.stale = status.age_ms > amcl_runtime_status_ttl_sec_ * 1000.0;
+    } else {
+      status.age_ms = -1.0;
+      status.stale = true;
+    }
+    status.stamp = string_field("TIMESTAMP");
+    return status;
   }
 
   void clear_runtime_map_context() const
@@ -4143,6 +4939,7 @@ private:
     }
     if (pid == 0) {
       prepare_child_process(navigation_resume_log_file_);
+      ::setenv("NJRH_AMCL_RUNTIME_STATUS_FILE", amcl_runtime_status_file_.c_str(), 1);
       if (selected_map) {
         ::setenv("NJRH_RUNTIME_MAP_CONTEXT_FILE", runtime_map_context_file_.c_str(), 1);
         ::setenv("NJRH_MAP_ID", selected_map->map_id.c_str(), 1);
@@ -5171,6 +5968,7 @@ private:
     bool pre_navigation_relocalization_requested = false;
     bool pre_navigation_relocalization_succeeded = false;
     std::string pre_navigation_relocalization_detail;
+    std::uint64_t pre_navigation_relocalization_sequence = 0U;
     const auto pre_navigation_relocalization_decision =
       navigation_goal_relocalization_decision(force_pre_navigation_relocalization);
     if (pre_navigation_relocalization_decision.requested && !pre_navigation_undock) {
@@ -5183,12 +5981,29 @@ private:
       pre_navigation_relocalization_succeeded = trigger_localization_and_wait_for_result(
         reason,
         pre_navigation_relocalization_detail,
-        navigation_relocalize_wait_sec_);
+        navigation_relocalize_wait_sec_,
+        &pre_navigation_relocalization_sequence);
       if (!pre_navigation_relocalization_succeeded && navigation_relocalize_before_goal_required_) {
         const auto detail =
           "navigation requires fresh localization before goal: " + pre_navigation_relocalization_detail;
         set_navigation_runtime_state(true, "localization_failed", detail, false);
         return navigation_goal_error(409, detail, pre_navigation_undock, pre_navigation_undock_detail);
+      }
+      if (pre_navigation_relocalization_succeeded) {
+        set_navigation_runtime_state(
+          true,
+          "post_relocalization_settle",
+          "settling after explicit relocalization before Nav2 goal");
+        const auto settle = wait_for_post_relocalization_settle_barrier(
+          pre_navigation_relocalization_sequence,
+          "manual_before_navigation",
+          "nav2_goal");
+        if (!settle.ok) {
+          const auto detail = settle.failure_code + ": " + settle.detail;
+          set_navigation_runtime_state(true, "post_relocalization_settle_failed", detail, false);
+          return navigation_goal_error(503, detail, pre_navigation_undock, pre_navigation_undock_detail);
+        }
+        pre_navigation_relocalization_detail += "; " + settle.detail;
       }
     } else if (pre_navigation_undock) {
       pre_navigation_relocalization_detail = "covered by pre-navigation undock relocalization";
@@ -6530,6 +7345,31 @@ private:
       "",
       "map",
       false);
+    const auto amcl_status = read_amcl_runtime_status();
+    const auto bridge_status = bridge_status_snapshot();
+    const bool amcl_file_authoritative = amcl_status.available && !amcl_status.stale;
+    const bool bridge_amcl_available = bridge_status.available && bridge_status.amcl_input_enabled;
+    const bool effective_amcl_ready =
+      bridge_amcl_available ? bridge_status.amcl_ready :
+      (amcl_file_authoritative && amcl_status.ready);
+    const bool effective_amcl_degraded =
+      bridge_amcl_available ? bridge_status.localization_degraded :
+      (amcl_file_authoritative && (amcl_status.degraded || !amcl_status.ready));
+    const std::string effective_amcl_degraded_reason =
+      bridge_amcl_available ?
+      (bridge_status.amcl_degraded_reason.empty() ?
+        (bridge_status.localization_degraded ? std::string("AMCL_NOT_READY") : std::string()) :
+        bridge_status.amcl_degraded_reason) :
+      (effective_amcl_degraded ?
+        (amcl_status.degraded_reason.empty() ? std::string("AMCL_NOT_READY") : amcl_status.degraded_reason) :
+        std::string());
+    const bool localization_degraded =
+      effective_amcl_degraded;
+    const bool using_triggered_baseline_only =
+      (bridge_amcl_available || (amcl_status.available && amcl_status.mode != "disabled")) &&
+      !effective_amcl_ready;
+    const std::string localization_degraded_reason =
+      localization_degraded ? effective_amcl_degraded_reason : std::string();
     std::string safety_status;
     bool motion_allowed = false;
     bool have_motion_allowed = false;
@@ -6548,16 +7388,66 @@ private:
              << "\"navigation_active\":" << (runtime.navigation_active ? "true" : "false") << ","
              << "\"healthy\":" << (runtime.healthy ? "true" : "false") << ","
              << "\"message\":" << json_string(runtime.message) << ","
+             << "\"localization_degraded\":" << (localization_degraded ? "true" : "false") << ","
+             << "\"localization_degraded_reason\":" << json_string(localization_degraded_reason) << ","
+             << "\"using_triggered_baseline_only\":"
+             << (using_triggered_baseline_only ? "true" : "false") << ","
+             << "\"amcl_mode\":" << json_string(amcl_status.mode) << ","
+             << "\"amcl_state\":" << json_string(amcl_status.state) << ","
+             << "\"amcl_start_result\":" << json_string(amcl_status.start_result) << ","
+             << "\"amcl_status_file_stale\":" << (amcl_status.stale ? "true" : "false") << ","
+             << "\"amcl_status_age_ms\":" << amcl_status.age_ms << ","
+             << "\"amcl_status_source\":" << json_string(
+               bridge_amcl_available ? bridge_status.amcl_status_source :
+               (amcl_file_authoritative ? std::string("file") : std::string("stale_file_ignored"))) << ","
+             << "\"amcl_ready\":" << (effective_amcl_ready ? "true" : "false") << ","
+             << "\"amcl_degraded\":" << (effective_amcl_degraded ? "true" : "false") << ","
+             << "\"amcl_degraded_reason\":" << json_string(effective_amcl_degraded_reason) << ","
+             << "\"amcl_process_alive\":" << (amcl_status.process_alive ? "true" : "false") << ","
+             << "\"amcl_process_ready\":" << ((
+               bridge_amcl_available ? bridge_status.amcl_process_ready : amcl_status.process_ready
+             ) ? "true" : "false") << ","
+             << "\"amcl_seeded\":" << ((
+               bridge_amcl_available ? bridge_status.amcl_seeded : amcl_status.seeded
+             ) ? "true" : "false") << ","
+             << "\"amcl_seed_response_ok\":" << ((
+               bridge_amcl_available ? bridge_status.amcl_seed_response_ok : amcl_status.seed_response_ok
+             ) ? "true" : "false") << ","
+             << "\"amcl_nomotion_pose_received\":" << ((
+               bridge_amcl_available ?
+                 bridge_status.amcl_nomotion_pose_received :
+                 amcl_status.nomotion_pose_received
+             ) ? "true" : "false") << ","
+             << "\"amcl_static_standby\":" << ((
+               bridge_amcl_available ? bridge_status.amcl_static_standby : amcl_status.static_standby
+             ) ? "true" : "false") << ","
+             << "\"amcl_tracking_ready\":" << ((
+               bridge_amcl_available ? bridge_status.amcl_tracking_ready : amcl_status.tracking_ready
+             ) ? "true" : "false") << ","
+             << "\"amcl_correction_ready\":" << ((
+               bridge_amcl_available ? bridge_status.amcl_correction_ready : amcl_status.correction_ready
+             ) ? "true" : "false") << ","
+             << "\"amcl_not_moving_no_update_ok\":" << ((
+               bridge_amcl_available ?
+                 bridge_status.amcl_not_moving_no_update_ok :
+                 amcl_status.not_moving_no_update_ok
+             ) ? "true" : "false") << ","
+             << "\"amcl_scan_admission_alive\":"
+             << (amcl_status.scan_admission_alive ? "true" : "false") << ","
+             << "\"amcl_pose_publisher_count\":" << amcl_status.pose_publisher_count << ","
+             << "\"amcl_scan_admission_status_publisher_count\":"
+             << amcl_status.scan_admission_status_publisher_count << ","
              << "\"pre_navigation_dock_check\":" << dock_check_json << ","
              << "\"blocked_by_docked_contact\":"
              << (dock_check.final_auto_undock_required ? "true" : "false") << ","
              << "\"normal_motion_blocked_reason\":"
              << json_string(safety_status == "DOCKED_CONTACT_BLOCK" ? "DOCKED_CONTACT_BLOCK" : "") << ","
              << "\"safety\":{"
-             << "\"status\":" << json_string(safety_status) << ","
-             << "\"motion_allowed\":" << (motion_allowed ? "true" : "false") << ","
-             << "\"motion_allowed_valid\":" << (have_motion_allowed ? "true" : "false") << "},"
-             << "\"navigation_goal\":" << navigation_goal_job_json_locked() << ","
+              << "\"status\":" << json_string(safety_status) << ","
+              << "\"motion_allowed\":" << (motion_allowed ? "true" : "false") << ","
+              << "\"motion_allowed_valid\":" << (have_motion_allowed ? "true" : "false") << "},"
+              << "\"post_relocalization_settle\":" << post_relocalization_settle_state_json() << ","
+              << "\"navigation_goal\":" << navigation_goal_job_json_locked() << ","
              << "\"navigation_cancel\":" << navigation_cancel_job_json_locked() << "}";
     return {200, "application/json", response.str()};
   }
@@ -6803,10 +7693,30 @@ private:
     const auto reason = json_string_value(body, "reason").value_or("robot_api_server");
     const auto wait_timeout = json_number_value(body, "wait_timeout_sec").value_or(docking_relocalize_wait_sec_);
     std::string detail;
-    const bool ok = trigger_localization_and_wait_for_result(reason, detail, wait_timeout);
+    std::uint64_t relocalization_sequence = 0U;
+    bool ok = trigger_localization_and_wait_for_result(
+      reason,
+      detail,
+      wait_timeout,
+      &relocalization_sequence);
+    if (ok) {
+      const auto settle = wait_for_post_relocalization_settle_barrier(
+        relocalization_sequence,
+        "manual_before_navigation",
+        "navigation_resume");
+      if (!settle.ok) {
+        ok = false;
+        detail += "; " + settle.failure_code + ": " + settle.detail;
+      } else {
+        detail += "; " + settle.detail;
+      }
+    }
     std::ostringstream out;
     out << "{\"ok\":" << (ok ? "true" : "false")
-        << ",\"message\":" << json_string(detail) << "}";
+        << ",\"message\":" << json_string(detail)
+        << ",\"last_explicit_relocalization_sequence\":" << relocalization_sequence
+        << ",\"post_relocalization_settle\":" << post_relocalization_settle_state_json()
+        << "}";
     return {ok ? 200 : 503, "application/json", out.str()};
   }
 
@@ -7143,12 +8053,18 @@ private:
     const bool required_before_final_state)
   {
     std::string localization_detail;
+    std::uint64_t relocalization_sequence = 0U;
     const std::string reason =
       "docking_after_fine:" + (dock_id.empty() ? std::string("unknown_dock") : dock_id);
     const bool relocalized = trigger_localization_and_wait_for_result(
       reason,
       localization_detail,
-      docking_relocalize_wait_sec_);
+      docking_relocalize_wait_sec_,
+      &relocalization_sequence);
+    if (relocalized) {
+      localization_detail += "; post_fine_docking_relocalization_sequence=" +
+        std::to_string(relocalization_sequence) + "; settle_record_only=docked_idle";
+    }
 
     std::lock_guard<std::mutex> lock(docking_job_mutex_);
     if (docking_job_.id != job_id || docking_job_.state != "running") {
@@ -7184,21 +8100,40 @@ private:
     const bool required_before_navigation)
   {
     std::string localization_detail;
+    std::uint64_t relocalization_sequence = 0U;
     const std::string reason =
       "undock_after_success:" + (dock_id.empty() ? std::string("unknown_dock") : dock_id);
     const bool relocalized = trigger_localization_and_wait_for_result(
       reason,
       localization_detail,
-      undock_relocalize_wait_sec_);
+      undock_relocalize_wait_sec_,
+      &relocalization_sequence);
+    bool settle_ok = true;
+    if (relocalized) {
+      const auto settle = wait_for_post_relocalization_settle_barrier(
+        relocalization_sequence,
+        "post_undock",
+        "nav2_goal",
+        [this, job_id](std::string & cancel_detail) {
+          if (!docking_cancel_requested(job_id)) {
+            return false;
+          }
+          cancel_detail = "CANCELLED_BY_APP: docking canceled during post-undock settle barrier";
+          return true;
+        });
+      settle_ok = settle.ok;
+      localization_detail += "; " +
+        (settle.ok ? settle.detail : settle.failure_code + ": " + settle.detail);
+    }
 
     std::lock_guard<std::mutex> lock(docking_job_mutex_);
     if (docking_job_.id != job_id || docking_job_.state != "running") {
       return;
     }
-    docking_job_.post_undock_relocalization_succeeded = relocalized;
+    docking_job_.post_undock_relocalization_succeeded = relocalized && settle_ok;
     docking_job_.post_undock_relocalization_detail = localization_detail;
     docking_job_.detail = localization_detail;
-    if (relocalized) {
+    if (relocalized && settle_ok) {
       finish_docking_job_locked(
         true,
         "undocked",
@@ -7209,13 +8144,13 @@ private:
       finish_docking_job_locked(
         false,
         "failed",
-        undock_status + "; relocalize after undock failed before navigation: " + localization_detail);
+        undock_status + "; relocalize/settle after undock failed before navigation: " + localization_detail);
       return;
     }
     finish_docking_job_locked(
       true,
       "undocked",
-      undock_status + "; relocalize after undock failed: " + localization_detail);
+      undock_status + "; relocalize/settle after undock warning: " + localization_detail);
   }
 
   std::string docking_job_json_locked() const
@@ -7372,18 +8307,48 @@ private:
       }
       set_docking_runtime_state(true, "relocalizing", "triggering localization before predock navigation");
       std::string localization_detail;
+      std::uint64_t relocalization_sequence = 0U;
       const bool relocalized = trigger_localization_and_wait_for_result(
-        "docking_start_before_predock:" + job.dock_id, localization_detail);
+        "docking_start_before_predock:" + job.dock_id,
+        localization_detail,
+        -1.0,
+        &relocalization_sequence);
+      bool settle_ok = true;
+      if (relocalized) {
+        set_docking_job_phase(job_id, "settle_before_predock");
+        set_docking_runtime_state(
+          true,
+          "post_relocalization_settle",
+          "settling after relocalization before predock Nav2 goal");
+        const auto settle = wait_for_post_relocalization_settle_barrier(
+          relocalization_sequence,
+          "before_predock",
+          "nav2_goal",
+          [this, job_id](std::string & cancel_detail) {
+            if (!docking_cancel_requested(job_id)) {
+              return false;
+            }
+            cancel_detail = "CANCELLED_BY_APP: docking canceled during before-predock settle barrier";
+            return true;
+          });
+        settle_ok = settle.ok;
+        localization_detail += "; " +
+          (settle.ok ? settle.detail : settle.failure_code + ": " + settle.detail);
+      }
       {
         std::lock_guard<std::mutex> lock(docking_job_mutex_);
         if (docking_job_.id == job_id && docking_job_.state == "running") {
-          docking_job_.relocalization_succeeded = relocalized;
+          docking_job_.relocalization_succeeded = relocalized && settle_ok;
           docking_job_.relocalization_detail = localization_detail;
           docking_job_.detail = localization_detail;
         }
       }
-      if (!relocalized) {
-        finish_docking_job(job_id, false, "failed", "relocalize before predock failed: " + localization_detail);
+      if (!relocalized || !settle_ok) {
+        finish_docking_job(
+          job_id,
+          false,
+          "failed",
+          "relocalize/settle before predock failed: " + localization_detail);
         return;
       }
     }
@@ -7490,9 +8455,13 @@ private:
         "relocalize_after_predock",
         "predock reached; triggering localization before fine docking");
       std::string localization_detail;
+      std::uint64_t relocalization_sequence = 0U;
       const bool relocalized = trigger_localization_and_wait_for_result(
         "docking_after_predock:" + job.dock_id,
-        localization_detail);
+        localization_detail,
+        -1.0,
+        &relocalization_sequence);
+      bool settle_ok = true;
       {
         std::lock_guard<std::mutex> lock(docking_job_mutex_);
         if (docking_job_.id == job_id && docking_job_.state == "running") {
@@ -7506,8 +8475,45 @@ private:
           job_id,
           false,
           "failed",
-          "relocalize after predock failed before fine docking: " + localization_detail);
+            "relocalize after predock failed before fine docking: " + localization_detail);
         return;
+      }
+      if (relocalized) {
+        set_docking_job_phase(job_id, "settle_after_predock");
+        set_docking_runtime_state(
+          true,
+          "post_relocalization_settle",
+          "settling after predock relocalization before fine docking");
+        const auto settle = wait_for_post_relocalization_settle_barrier(
+          relocalization_sequence,
+          "after_predock",
+          "fine_docking",
+          [this, job_id](std::string & cancel_detail) {
+            if (!docking_cancel_requested(job_id)) {
+              return false;
+            }
+            cancel_detail = "CANCELLED_BY_APP: docking canceled during after-predock settle barrier";
+            return true;
+          });
+        settle_ok = settle.ok;
+        localization_detail += "; " +
+          (settle.ok ? settle.detail : settle.failure_code + ": " + settle.detail);
+        {
+          std::lock_guard<std::mutex> lock(docking_job_mutex_);
+          if (docking_job_.id == job_id && docking_job_.state == "running") {
+            docking_job_.post_predock_relocalization_succeeded = settle_ok;
+            docking_job_.post_predock_relocalization_detail = localization_detail;
+            docking_job_.detail = localization_detail;
+          }
+        }
+        if (!settle_ok) {
+          finish_docking_job(
+            job_id,
+            false,
+            "failed",
+            "post-predock relocalization settle failed before fine docking: " + localization_detail);
+          return;
+        }
       }
       if (relocalized && docking_validate_predock_pose_after_relocalization_) {
         std::string pose_check_detail;
@@ -8992,6 +9998,7 @@ private:
   std::string floor_switch_service_;
   std::string localization_trigger_service_;
   std::string localization_result_topic_;
+  std::string localization_bridge_status_topic_;
   std::string navigate_to_pose_action_;
   std::string mapping_2d_start_command_;
   std::string mapping_2d_log_file_;
@@ -8999,6 +10006,8 @@ private:
   std::string navigation_resume_command_;
   std::string navigation_resume_log_file_;
   std::string runtime_map_context_file_;
+  std::string amcl_runtime_status_file_;
+  double amcl_runtime_status_ttl_sec_{5.0};
   std::string last_navigation_map_file_;
   std::string navigation_stop_command_;
   std::string navigation_stop_log_file_;
@@ -9049,13 +10058,28 @@ private:
   std::string scan_topic_;
   double scan_max_age_sec_{2.0};
   std::string tf_topic_;
+  std::string tf_static_topic_;
   std::string tf_map_frame_{"map"};
   std::string tf_odom_frame_{"odom"};
   std::string tf_base_frame_{"base_link"};
+  std::string post_relocalization_static_lidar_frame_{"lidar_level_link"};
   double tf_pose_max_age_sec_{2.0};
   double robot_pose_freshness_sec_{0.5};
   double tf_chain_freshness_sec_{0.30};
   double tf_chain_settle_timeout_sec_{2.0};
+  std::string local_costmap_topic_{"/local_costmap/costmap"};
+  bool post_relocalization_settle_enabled_{true};
+  int post_relocalization_settle_min_ms_{800};
+  int post_relocalization_settle_max_ms_{3000};
+  int post_relocalization_stable_tf_samples_{5};
+  int post_relocalization_tf_sample_period_ms_{100};
+  bool post_relocalization_zero_cmd_{true};
+  bool post_relocalization_require_local_costmap_update_{true};
+  int post_relocalization_required_local_costmap_updates_{2};
+  bool post_relocalization_reject_if_new_message_filter_drop_{true};
+  double post_relocalization_large_correction_translation_m_{0.5};
+  double post_relocalization_large_correction_yaw_rad_{0.3};
+  int post_relocalization_large_correction_min_ms_{1500};
   std::string teleop_cmd_topic_;
   std::string teleop_reverse_enable_topic_;
   std::string teleop_pose_topic_;
@@ -9172,6 +10196,21 @@ private:
   double latest_scan_angle_min_{0.0};
   double latest_scan_angle_max_{0.0};
   std::chrono::steady_clock::time_point latest_scan_received_at_{};
+  bool have_base_to_lidar_static_tf_{false};
+  std::chrono::steady_clock::time_point base_to_lidar_static_tf_received_at_{};
+
+  mutable std::mutex bridge_status_mutex_;
+  BridgeStatusSnapshot latest_bridge_status_;
+  mutable std::mutex local_costmap_mutex_;
+  std::uint64_t local_costmap_update_count_{0U};
+  std::chrono::steady_clock::time_point latest_local_costmap_received_at_{};
+  mutable std::mutex rosout_mutex_;
+  std::uint64_t message_filter_drop_count_{0U};
+  std::uint64_t local_costmap_message_filter_drop_count_{0U};
+  std::string last_message_filter_drop_text_;
+  std::string last_local_costmap_message_filter_drop_text_;
+  mutable std::mutex post_relocalization_settle_mutex_;
+  PostRelocalizationSettleState post_relocalization_settle_state_;
 
   mutable std::mutex runtime_mode_mutex_;
   bool mapping_runtime_active_{false};
@@ -9243,8 +10282,12 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::BatteryState>::SharedPtr bms_state_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr docking_status_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr localization_result_sub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr localization_bridge_status_sub_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr tf_sub_;
+  rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr tf_static_sub_;
+  rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr local_costmap_sub_;
+  rclcpp::Subscription<rcl_interfaces::msg::Log>::SharedPtr rosout_sub_;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr live_map_sub_;
   bool live_map_page_subscription_active_{false};
   bool live_map_mapping_cache_active_{false};

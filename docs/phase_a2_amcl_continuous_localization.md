@@ -18,9 +18,9 @@ removes the earlier Isaac continuous replacement path.
 6. Complete AMCL readiness by waiting for `map -> odom`, then seed AMCL through
    `/robot_localization_bridge/seed_amcl_initial_pose`, which
    publishes `/initialpose` from the current bridge-approved `map -> base_link`.
-7. Wait for a fresh `/amcl_pose`; if the robot is stationary, request one
-   `/request_nomotion_update` so the bridge sees an AMCL candidate without
-   moving the chassis.
+7. Wait for a fresh `/amcl_pose`; if the robot is stationary, subscribe to
+   `/amcl_pose` first and then request one `/request_nomotion_update` so the
+   bridge sees AMCL's single no-motion response without moving the chassis.
 8. Report shadow readiness only after AMCL is active, seeded, scan admission is
    healthy, and AMCL has produced at least one pose sample. During motion, that
    sample must remain fresh; while stopped or docked, stale `/amcl_pose` is
@@ -47,6 +47,20 @@ binary is missing. If seed, moving-state fresh `/amcl_pose`, or scan admission
 fails, the navigation runtime keeps the Isaac triggered plus odom baseline
 active and exposes AMCL as not ready or degraded rather than pretending
 continuous correction is active.
+
+## Readiness Status
+
+`run_amcl_shadow_localization.sh` writes
+`/tmp/njrh_amcl_runtime_status.env` as a TTL-bound startup/readiness snapshot.
+It includes `AMCL_STATUS_STAMP_SEC`, process/lifecycle state, scan-admission
+state, seed response state, static-standby state, tracking readiness, and gated
+correction readiness. A stale `AMCL_FAILED` in this file is diagnostic only:
+`robot_localization_bridge` reports `amcl_status_source=stale_file_ignored` and
+uses live AMCL graph/subscription evidence instead of keeping localization
+permanently degraded. Static `/amcl_pose` staleness is normal when AMCL is
+seeded and the robot is not moving; gated correction still requires
+`amcl_correction_ready=true`, which means a fresh AMCL pose is available for
+the correction gate.
 
 The removed Isaac continuous path no longer starts a repository flatscan
 forwarder. Isaac may still expose internal `/flatscan_localization` endpoints,
@@ -75,8 +89,8 @@ Use the resident readiness check without moving the robot:
 
 ```bash
 export NJRH_AMCL_LOCALIZATION_MODE=gated
-bash scripts/jetson/runtime_overlay/scripts/verify_amcl_runtime_readiness.sh \
-  --mode gated --seed --duration-sec 60 --check-triggered --check-amcl --check-owner
+bash scripts/jetson/runtime_overlay/scripts/verify_amcl_readiness_status.sh \
+  --mode gated --request-nomotion-update --expect-static-standby
 ```
 
 For a dynamic navigation window, start the observer and then send a short

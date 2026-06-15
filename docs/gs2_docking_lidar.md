@@ -88,6 +88,7 @@ ros2 launch robot_eai_gs2 gs2.launch.py serial_port:=/dev/gs2
 Start the near-field docking controller only when entering docking or controlled undocking mode:
 
 ```bash
+## Diagnostic manual start only; production starts this as a resident common service.
 bash /workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/run_docking_manager.sh
 ros2 service call /docking/start std_srvs/srv/Trigger {}
 ros2 topic echo /docking/status

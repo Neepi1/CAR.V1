@@ -3,6 +3,10 @@ ranger_mini3_mode_controller:
     cmd_vel_in_topic: /cmd_vel_safe
     cmd_vel_out_topic: /cmd_vel
 
+    # Production default. custom keeps the legacy repository-owned Ackermann
+    # shaping path available only for rollback and A/B diagnostics.
+    mode_controller_profile: official_passthrough
+
     wheelbase_m: 0.494
     track_m: 0.364
     max_linear_mps: 1.5

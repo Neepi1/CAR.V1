@@ -4,6 +4,7 @@
 
 Runtime contract:
 
+- Lifecycle: resident common service started by `run_common_services.sh`; idle until `/docking/start` or `/docking/undock`
 - Input scan: `/dock/gs2_scan` in `gs2_link`
 - Charging state: `/battery_state`
 - Undock odometry confirmation: `/local_state/odometry`

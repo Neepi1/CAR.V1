@@ -24,6 +24,7 @@ robot_api_server:
     localization_trigger_service: "/global_localization/trigger"
     localization_bridge_force_accept_service: "/robot_localization_bridge/force_accept_next_localization"
     localization_result_topic: "/localization_result"
+    localization_bridge_status_topic: "/localization/bridge_status"
     navigate_to_pose_action: "/navigate_to_pose"
 
     mapping_2d_start_command: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/run_projected_map.sh"
@@ -32,6 +33,8 @@ robot_api_server:
     navigation_resume_command: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/run_navigation_runtime_services.sh"
     navigation_resume_log_file: "/tmp/njrh_navigation_resume.log"
     runtime_map_context_file: "/tmp/njrh_runtime_map_context.json"
+    amcl_runtime_status_file: "/tmp/njrh_amcl_runtime_status.env"
+    amcl_runtime_status_ttl_sec: 5.0
     last_navigation_map_file: "/workspaces/njrh-v3/workspace1/maps_release/last_navigation_map.json"
     navigation_stop_command: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/stop_floor_navigation.sh"
     navigation_stop_log_file: "/tmp/njrh_navigation_stop.log"
@@ -75,13 +78,28 @@ robot_api_server:
     scan_topic: "/scan"
     scan_max_age_sec: 2.0
     tf_topic: "/tf"
+    tf_static_topic: "/tf_static"
     tf_map_frame: "map"
     tf_odom_frame: "odom"
     tf_base_frame: "base_link"
+    post_relocalization_static_lidar_frame: "lidar_level_link"
     tf_pose_max_age_sec: 2.0
     robot_pose_freshness_sec: 0.5
     tf_chain_freshness_sec: 0.30
     tf_chain_settle_timeout_sec: 2.0
+    local_costmap_topic: "/local_costmap/costmap"
+    post_relocalization_settle_enabled: true
+    post_relocalization_settle_min_ms: 800
+    post_relocalization_settle_max_ms: 3000
+    post_relocalization_stable_tf_samples: 5
+    post_relocalization_tf_sample_period_ms: 100
+    post_relocalization_zero_cmd: true
+    post_relocalization_require_local_costmap_update: true
+    post_relocalization_required_local_costmap_updates: 2
+    post_relocalization_reject_if_new_message_filter_drop: true
+    post_relocalization_large_correction_translation_m: 0.5
+    post_relocalization_large_correction_yaw_rad: 0.3
+    post_relocalization_large_correction_min_ms: 1500
 
     teleop_cmd_topic: "/cmd_vel_collision_checked"
     teleop_reverse_enable_topic: "/ranger_mini3/teleop_allow_reverse"

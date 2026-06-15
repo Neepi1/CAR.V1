@@ -55,8 +55,29 @@ struct ActualMotionMode {
   std::string source;
 };
 
+struct PublishDecision {
+  geometry_msgs::msg::Twist input;
+  geometry_msgs::msg::Twist output;
+  MotionMode predicted_mode{MotionMode::kDualAckermann};
+  bool has_input{false};
+  bool valid{true};
+  std::string state{"ok"};
+  std::string reason;
+  std::string diff_reason;
+};
+
 double clamp(double value, double lower, double upper) {
   return std::max(lower, std::min(upper, value));
+}
+
+void appendDiffReason(std::string & reason, const std::string & next) {
+  if (next.empty()) {
+    return;
+  }
+  if (!reason.empty()) {
+    reason += ",";
+  }
+  reason += next;
 }
 
 std::string legacyModeName(MotionMode mode) {
@@ -160,6 +181,7 @@ class RangerMini3ModeController : public rclcpp::Node {
   RangerMini3ModeController() : Node("ranger_mini3_mode_controller") {
     declare_parameter<std::string>("cmd_vel_in_topic", "/cmd_vel_safe");
     declare_parameter<std::string>("cmd_vel_out_topic", "/cmd_vel");
+    declare_parameter<std::string>("mode_controller_profile", "official_passthrough");
     declare_parameter<double>("wheelbase_m", 0.494);
     declare_parameter<double>("track_m", 0.364);
     declare_parameter<double>("max_linear_mps", 1.5);
@@ -198,6 +220,14 @@ class RangerMini3ModeController : public rclcpp::Node {
     declare_parameter<double>("reverse_enable_timeout_s", 0.75);
     declare_parameter<std::string>("park_topic", "/ranger_mini3/park");
 
+    mode_controller_profile_ = lowercase(get_parameter("mode_controller_profile").as_string());
+    if (mode_controller_profile_ != "official_passthrough" && mode_controller_profile_ != "custom") {
+      RCLCPP_WARN(
+        get_logger(),
+        "Unknown mode_controller_profile '%s'; falling back to official_passthrough",
+        mode_controller_profile_.c_str());
+      mode_controller_profile_ = "official_passthrough";
+    }
     wheelbase_m_ = get_parameter("wheelbase_m").as_double();
     track_m_ = get_parameter("track_m").as_double();
     max_linear_mps_ = get_parameter("max_linear_mps").as_double();
@@ -283,14 +313,22 @@ class RangerMini3ModeController : public rclcpp::Node {
       [this]() { onTimer(); });
 
     if (get_parameter("publish_zero_on_startup").as_bool()) {
-      publishCommand(geometry_msgs::msg::Twist{}, MotionMode::kDualAckermann, "startup_zero", true, "");
+      PublishDecision startup;
+      startup.output = geometry_msgs::msg::Twist{};
+      startup.predicted_mode = MotionMode::kDualAckermann;
+      startup.state = "startup_zero";
+      startup.diff_reason = "startup_zero";
+      publishDecision(startup);
     }
 
     RCLCPP_INFO(
       get_logger(),
-      "Ranger Mini 3 C++ mode controller started: %s -> %s, policy=%s, lateral_policy=%s, allow_reverse=%s, spin_enter=%.3f rad, spin_exit=%.3f rad, auto_spin_max_vx=%.3f m/s, moving_curvature_spin=%s, actual topics=%s,%s",
+      "Ranger Mini 3 C++ mode controller started: %s -> %s, mode_controller_profile=%s, custom_ackermann_enabled=%s, cmd_vel_passthrough=%s, policy=%s, lateral_policy=%s, allow_reverse=%s, spin_enter=%.3f rad, spin_exit=%.3f rad, auto_spin_max_vx=%.3f m/s, moving_curvature_spin=%s, actual topics=%s,%s",
       get_parameter("cmd_vel_in_topic").as_string().c_str(),
       get_parameter("cmd_vel_out_topic").as_string().c_str(),
+      mode_controller_profile_.c_str(),
+      customAckermannEnabled() ? "true" : "false",
+      cmdVelPassthrough() ? "true" : "false",
       mode_policy_.c_str(),
       lateral_policy_.c_str(),
       allow_reverse_ ? "true" : "false",
@@ -303,6 +341,14 @@ class RangerMini3ModeController : public rclcpp::Node {
   }
 
  private:
+  bool customAckermannEnabled() const {
+    return mode_controller_profile_ == "custom";
+  }
+
+  bool cmdVelPassthrough() const {
+    return mode_controller_profile_ == "official_passthrough";
+  }
+
   void updateActualMotionMode(const std::uint8_t code, const std::string & source) {
     actual_motion_mode_ = ActualMotionMode{
       ranger_motion_mode_from_code(code),
@@ -359,13 +405,123 @@ class RangerMini3ModeController : public rclcpp::Node {
   }
 
   void onTimer() {
-    const RangerCommand command = computeCommand(std::chrono::steady_clock::now());
+    const auto now = std::chrono::steady_clock::now();
+    if (cmdVelPassthrough()) {
+      publishDecision(computeOfficialPassthrough(now));
+      return;
+    }
+
+    const RangerCommand command = computeCommand(now);
     if (!command.valid) {
-      publishCommand(geometry_msgs::msg::Twist{}, command.mode, "invalid_stop", false, command.reason);
+      PublishDecision decision;
+      decision.has_input = last_cmd_time_.time_since_epoch().count() != 0;
+      decision.input = last_cmd_;
+      decision.output = geometry_msgs::msg::Twist{};
+      decision.predicted_mode = command.mode;
+      decision.state = "invalid_stop";
+      decision.valid = false;
+      decision.reason = command.reason;
+      decision.diff_reason = "invalid_stop";
+      publishDecision(decision);
       warnThrottled("invalid_cmd", command.reason);
       return;
     }
-    publishCommand(commandToTwist(command), command.mode, "ok", true, command.reason);
+    PublishDecision decision;
+    decision.has_input = last_cmd_time_.time_since_epoch().count() != 0;
+    decision.input = last_cmd_;
+    decision.output = commandToTwist(command);
+    decision.predicted_mode = command.mode;
+    decision.state = "ok";
+    decision.valid = true;
+    decision.reason = command.reason;
+    if (customAckermannEnabled()) {
+      decision.diff_reason = "custom_profile";
+    }
+    publishDecision(decision);
+  }
+
+  bool hasFreshCommand(const std::chrono::steady_clock::time_point now) const {
+    return last_cmd_time_.time_since_epoch().count() != 0 &&
+           std::chrono::duration<double>(now - last_cmd_time_).count() <= cmd_timeout_s_;
+  }
+
+  bool sourceReversePermitActive(
+    const std::string & source,
+    const std::chrono::steady_clock::time_point now) const
+  {
+    const auto iter = reverse_permits_by_source_.find(source);
+    if (iter == reverse_permits_by_source_.end()) {
+      return false;
+    }
+    const auto & permit = iter->second;
+    return permit.enabled &&
+           permit.stamp.time_since_epoch().count() != 0 &&
+           std::chrono::duration<double>(now - permit.stamp).count() <= reverse_enable_timeout_s_;
+  }
+
+  MotionMode predictedModeFromTwist(const geometry_msgs::msg::Twist & twist) const {
+    const bool has_vx = std::abs(twist.linear.x) >= linear_eps_;
+    const bool has_vy = std::abs(twist.linear.y) >= lateral_eps_;
+    const bool has_wz = std::abs(twist.angular.z) >= yaw_eps_;
+    if (has_vy) {
+      return MotionMode::kCrab;
+    }
+    if (!has_vx && has_wz) {
+      return MotionMode::kSpin;
+    }
+    return MotionMode::kDualAckermann;
+  }
+
+  bool lateralAllowed() const {
+    const std::string policy = lowercase(lateral_policy_);
+    return policy == "allow" || policy == "crab" || policy == "parallel";
+  }
+
+  PublishDecision computeOfficialPassthrough(const std::chrono::steady_clock::time_point now) {
+    PublishDecision decision;
+    decision.state = "ok";
+    decision.valid = true;
+
+    if (last_cmd_time_.time_since_epoch().count() != 0) {
+      decision.has_input = true;
+      decision.input = last_cmd_;
+      decision.output = last_cmd_;
+      decision.predicted_mode = predictedModeFromTwist(last_cmd_);
+    }
+
+    if (park_requested_ || forced_policy_ == "park") {
+      decision.output = geometry_msgs::msg::Twist{};
+      decision.predicted_mode = MotionMode::kPark;
+      decision.state = "park_zero";
+      decision.reason = "park requested";
+      appendDiffReason(decision.diff_reason, "park_requested");
+      return decision;
+    }
+
+    if (!hasFreshCommand(now)) {
+      decision.output = geometry_msgs::msg::Twist{};
+      decision.predicted_mode = MotionMode::kDualAckermann;
+      decision.state = "timeout_zero";
+      decision.reason = "command timeout";
+      appendDiffReason(decision.diff_reason, "timeout_zero");
+      return decision;
+    }
+
+    if (!forced_policy_.empty()) {
+      decision.reason = "forced_mode diagnostic-only under official_passthrough";
+    }
+
+    if (decision.output.linear.x < 0.0 && !effectiveAllowReverse(now)) {
+      decision.output.linear.x = 0.0;
+      appendDiffReason(decision.diff_reason, "reverse_not_allowed");
+    }
+
+    if (std::abs(decision.output.linear.y) >= lateral_eps_ && !lateralAllowed()) {
+      decision.output.linear.y = 0.0;
+      appendDiffReason(decision.diff_reason, "lateral_not_allowed");
+    }
+
+    return decision;
   }
 
   RangerCommand computeCommand(std::chrono::steady_clock::time_point now) {
@@ -594,15 +750,22 @@ class RangerMini3ModeController : public rclcpp::Node {
     return msg;
   }
 
-  void publishCommand(
-    const geometry_msgs::msg::Twist & cmd,
-    MotionMode mode,
-    const std::string & state,
-    bool valid,
-    const std::string & reason) {
-    cmd_pub_->publish(cmd);
+  bool outputDiffersFromInput(const PublishDecision & decision) const {
+    if (!decision.has_input) {
+      return std::abs(decision.output.linear.x) > 1.0e-9 ||
+             std::abs(decision.output.linear.y) > 1.0e-9 ||
+             std::abs(decision.output.angular.z) > 1.0e-9;
+    }
+    return std::abs(decision.output.linear.x - decision.input.linear.x) > 1.0e-9 ||
+           std::abs(decision.output.linear.y - decision.input.linear.y) > 1.0e-9 ||
+           std::abs(decision.output.angular.z - decision.input.angular.z) > 1.0e-9;
+  }
+
+  void publishDecision(const PublishDecision & decision) {
+    cmd_pub_->publish(decision.output);
 
     const auto now = std::chrono::steady_clock::now();
+    const MotionMode mode = decision.predicted_mode;
     const RangerMotionMode desired_mode = desiredRangerMode(mode);
     const auto actual_age = actualMotionModeAgeSec(now);
     const bool actual_available = actual_motion_mode_.has_value();
@@ -611,8 +774,9 @@ class RangerMini3ModeController : public rclcpp::Node {
     const bool mode_aligned =
       actual_fresh && actual_motion_mode_->mode == desired_mode;
     const bool motion_commanded =
-      std::abs(cmd.linear.x) > linear_eps_ || std::abs(cmd.linear.y) > lateral_eps_ ||
-      std::abs(cmd.angular.z) > yaw_eps_;
+      std::abs(decision.output.linear.x) > linear_eps_ ||
+      std::abs(decision.output.linear.y) > lateral_eps_ ||
+      std::abs(decision.output.angular.z) > yaw_eps_;
     std::string alignment_state = "actual_unavailable";
     if (actual_fresh) {
       alignment_state = mode_aligned ? "aligned" : "waiting_actual_motion_mode";
@@ -620,7 +784,7 @@ class RangerMini3ModeController : public rclcpp::Node {
       alignment_state = "actual_stale";
     }
 
-    if (valid && motion_commanded && !mode_aligned && actual_fresh) {
+    if (decision.valid && motion_commanded && !mode_aligned && actual_fresh) {
       const auto & actual = *actual_motion_mode_;
       const double mismatch_age =
         desired_mode_mismatch_since_.time_since_epoch().count() == 0 ?
@@ -648,13 +812,34 @@ class RangerMini3ModeController : public rclcpp::Node {
     mode_msg.data = ranger_motion_mode_json(desired_mode, legacyModeName(mode));
     mode_pub_->publish(mode_msg);
 
+    const bool output_diff_from_input = outputDiffersFromInput(decision);
+    const bool passthrough_preserves_twist =
+      cmdVelPassthrough() && decision.has_input && !output_diff_from_input;
+    const bool docking_reverse_active = sourceReversePermitActive("docking", now);
+    const bool teleop_reverse_active = sourceReversePermitActive("teleop", now);
+    const bool legacy_reverse_active = sourceReversePermitActive("legacy", now);
+    const bool reverse_permit_active =
+      allow_reverse_ || docking_reverse_active || teleop_reverse_active || legacy_reverse_active;
+    const std::string desired_source =
+      cmdVelPassthrough() ? "predicted_from_cmd_vel_safe" : "custom_profile_decision";
+
     std::ostringstream out;
-    out << "{\"state\":\"" << state << "\",\"valid\":" << (valid ? "true" : "false")
-        << ",\"desired_mode\":\"" << legacyModeName(mode) << "\",\"reason\":\"" << reason
+    out << "{\"state\":\"" << decision.state << "\",\"valid\":"
+        << (decision.valid ? "true" : "false")
+        << ",\"mode_controller_profile\":\"" << mode_controller_profile_
+        << "\",\"custom_ackermann_enabled\":" << (customAckermannEnabled() ? "true" : "false")
+        << ",\"custom_ackermann_diagnostic_only\":" << (cmdVelPassthrough() ? "true" : "false")
+        << ",\"cmd_vel_passthrough\":" << (cmdVelPassthrough() ? "true" : "false")
+        << ",\"passthrough_preserves_twist\":" << (passthrough_preserves_twist ? "true" : "false")
+        << ",\"output_diff_from_input\":" << (output_diff_from_input ? "true" : "false")
+        << ",\"diff_reason\":\"" << decision.diff_reason
+        << "\",\"desired_mode\":\"" << legacyModeName(mode) << "\",\"reason\":\"" << decision.reason
         << "\",\"desired_motion_mode\":{\"code\":" << static_cast<int>(ranger_motion_mode_code(desired_mode))
         << ",\"name\":\"" << ranger_motion_mode_name(desired_mode)
         << "\",\"short\":\"" << ranger_motion_mode_short_name(desired_mode)
-        << "\",\"legacy\":\"" << legacyModeName(mode) << "\"}"
+        << "\",\"legacy\":\"" << legacyModeName(mode)
+        << "\",\"source\":\"" << desired_source << "\"}"
+        << ",\"desired_motion_mode_source\":\"" << desired_source << "\""
         << ",\"actual_motion_mode\":{";
     if (actual_available) {
       out << "\"available\":true,\"fresh\":" << (actual_fresh ? "true" : "false")
@@ -669,10 +854,21 @@ class RangerMini3ModeController : public rclcpp::Node {
       out << "\"available\":false,\"fresh\":false,\"code\":255,\"name\":\"MOTION_MODE_UNKNOWN\","
           << "\"short\":\"unknown\",\"source\":\"\"";
     }
-    out << "},\"mode_aligned\":" << (mode_aligned ? "true" : "false")
+    out << "},\"actual_motion_mode_source\":\""
+        << (actual_available ? actual_motion_mode_->source : "")
+        << "\",\"mode_aligned\":" << (mode_aligned ? "true" : "false")
+        << ",\"motion_mode_matched\":" << (mode_aligned ? "true" : "false")
         << ",\"mode_alignment_state\":\"" << alignment_state
-        << "\",\"cmd_out\":{\"linear_x\":" << cmd.linear.x << ",\"linear_y\":" << cmd.linear.y
-        << ",\"angular_z\":" << cmd.angular.z << "}}";
+        << "\",\"reverse_permit_active\":" << (reverse_permit_active ? "true" : "false")
+        << ",\"docking_reverse_permit_active\":" << (docking_reverse_active ? "true" : "false")
+        << ",\"teleop_reverse_permit_active\":" << (teleop_reverse_active ? "true" : "false")
+        << ",\"cmd_in\":{\"available\":" << (decision.has_input ? "true" : "false")
+        << ",\"linear_x\":" << decision.input.linear.x
+        << ",\"linear_y\":" << decision.input.linear.y
+        << ",\"angular_z\":" << decision.input.angular.z
+        << "},\"cmd_out\":{\"linear_x\":" << decision.output.linear.x
+        << ",\"linear_y\":" << decision.output.linear.y
+        << ",\"angular_z\":" << decision.output.angular.z << "}}";
     const std::string status = out.str();
     if (status != last_status_) {
       std_msgs::msg::String msg;
@@ -709,6 +905,7 @@ class RangerMini3ModeController : public rclcpp::Node {
   double max_lateral_mps_{0.08};
   double max_crab_yaw_radps_{0.15};
   double cmd_timeout_s_{0.25};
+  std::string mode_controller_profile_{"official_passthrough"};
   std::string mode_policy_{"auto"};
   bool allow_reverse_{false};
   std::string lateral_policy_{"reject"};
