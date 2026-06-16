@@ -15,6 +15,10 @@ That command still flows through:
 
 It is separate from normal delivery `final_yaw_align`, which uses
 `/cmd_vel_collision_checked` and is intentionally blocked by dock/contact gates.
+Phase N2 makes that separation explicit in state: the predock Nav2 target is
+`goal_completion_policy=dock_staging`, ordinary `final_yaw_align` is forbidden
+for staging goals, and `ordinary_final_yaw_align_active` /
+`predock_yaw_align_active` must not be true at the same time.
 
 The API checks `ranger_mini3_mode_controller/status` during predock yaw alignment.
 When `predock_yaw_align_require_actual_spin=true`, the actual AgileX motion mode
@@ -22,6 +26,10 @@ must enter `SPINNING=2` before the mode-switch timeout.
 
 Fine docking entry is refused before `/docking/start` when:
 
+- The docking job is not `goal_completion_policy=dock_staging`.
+- `dock_staging_handoff_ready` is false.
+- Post-predock relocalization/settle has not completed.
+- Global correction pause has not been applied.
 - GS2 scan is not fresh.
 - The staging pose is too far from the expected pre-dock pose.
 - Predock yaw alignment did not complete.

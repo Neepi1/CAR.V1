@@ -254,6 +254,101 @@ def test_verify_navigation_final_yaw_align_script_contract():
     assert "final_yaw_align_attempted" in script
 
 
+def test_phase_n2_goal_completion_semantics_contracts():
+    api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    docking_job_hpp = (
+        ROOT / "src" / "robot_api_server" / "include" / "robot_api_server" / "docking_job_model.hpp"
+    ).read_text(encoding="utf-8")
+    docking_job_cpp = (ROOT / "src" / "robot_api_server" / "src" / "docking_job_model.cpp").read_text(
+        encoding="utf-8"
+    )
+    config = (ROOT / "src" / "robot_api_server" / "config" / "robot_api_server.yaml").read_text(
+        encoding="utf-8"
+    )
+    overlay_config = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "robot_api_server.yaml"
+    ).read_text(encoding="utf-8")
+    verify_script = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "verify_goal_completion_semantics.sh"
+    ).read_text(encoding="utf-8")
+    observe_script = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "observe_navigation_final_yaw_align.sh"
+    ).read_text(encoding="utf-8")
+
+    for token in (
+        "goal_completion_policy",
+        "position_only",
+        "pose_required",
+        "dock_staging",
+        "yaw_align_required",
+        "yaw_align_active",
+        "yaw_align_failed",
+        "final_pose_verified",
+        "task_complete",
+        "final_yaw_align_retry_count",
+        "reposition_after_yaw_drift_retry_count",
+    ):
+        assert token in api_cpp
+
+    assert 'navigation_default_goal_completion_policy", "pose_required"' in api_cpp
+    assert 'navigation_default_goal_completion_policy: "pose_required"' in config
+    assert 'navigation_default_goal_completion_policy: "pose_required"' in overlay_config
+    assert "navigation_max_reposition_after_yaw_retry: 1" in config
+    assert "navigation_max_reposition_after_yaw_retry: 1" in overlay_config
+    assert "navigation_reposition_after_yaw_drift_timeout_sec: 30.0" in config
+    assert "navigation_reposition_after_yaw_drift_timeout_sec: 30.0" in overlay_config
+
+    assert "goal_completion_policy=dock_staging is reserved for /api/v1/docking/start" in api_cpp
+    assert "goal_completion_policy=position_only; final yaw alignment not required" in api_cpp
+    assert "manual localization correction accepted; post-settle not requested" in api_cpp
+    assert 'json_bool_value(body, "wait_for_settle", false)' in api_cpp
+    assert "post_relocalization_settle_requested" in api_cpp
+    assert "post_relocalization_settle_ok" in api_cpp
+    assert "run_reposition_after_yaw_drift" in api_cpp
+    assert "REPOSITION_AFTER_YAW_DRIFT" in api_cpp
+    assert "failed_final_pose_verify" in api_cpp
+    assert "position_reached_yaw_warning" not in api_cpp
+
+    assert "ordinary_final_yaw_align_active_" in api_cpp
+    assert "predock_yaw_align_active_" in api_cpp
+    assert "PREDOCK_YAW_ALIGN_OWNER_CONFLICT" in api_cpp
+    assert "docking request preempts ordinary final_yaw_align" in api_cpp
+    assert 'navigation_final_yaw_align_cmd_topic_ != "/cmd_vel_nav"' in api_cpp
+    assert 'navigation_final_yaw_align_cmd_topic_ != "/cmd_vel_collision_checked"' in api_cpp
+    assert 'predock_yaw_align_cmd_topic_ != "/cmd_vel_docking"' in api_cpp
+    assert 'navigation_final_yaw_align_cmd_topic: "/cmd_vel_docking"' not in config
+    assert 'predock_yaw_align_cmd_topic: "/cmd_vel_docking"' in config
+    assert 'predock_yaw_align_cmd_topic: "/cmd_vel_docking"' in overlay_config
+
+    for token in (
+        "goal_completion_policy",
+        "dock_staging_handoff_ready",
+        "post_predock_settle_complete",
+        "ordinary_final_yaw_align_active",
+        "predock_yaw_align_active",
+        "cmd_owner_conflict_detected",
+        "final_yaw_align_blocked_by_docking",
+        "docking_blocked_by_final_yaw_align",
+    ):
+        assert token in docking_job_hpp
+        assert token in docking_job_cpp
+        assert token in api_cpp
+
+    assert "global_correction_pause_applied" in api_cpp
+    assert "fine_docking_entry_require_predock_yaw_aligned_ && !predock_yaw_aligned" in api_cpp
+    assert "fine_docking_retry_on_yaw_reject_" in api_cpp
+    assert "FINE_DOCKING_REJECTED_YAW_TOO_LARGE" in api_cpp
+    assert "PREDOCK_YAW_ALIGN" in api_cpp
+    assert "RESTAGE_RETRY" in api_cpp
+
+    assert "verify_goal_completion_semantics.sh" in verify_script
+    assert "observe_navigation_final_yaw_align.sh" in verify_script
+    assert "ros2 topic pub" not in observe_script
+    assert "/api/v1/navigation/state" in observe_script
+
+
 def test_nav2_rotation_progress_scripts_contract():
     scripts_root = ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts"
     ab = (scripts_root / "run_nav2_rotation_shim_ab.sh").read_text(encoding="utf-8")
@@ -2695,7 +2790,8 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "navigation_lifecycle_check_timeout_sec" in node_cpp
     assert "navigation_lifecycle_snapshot" in node_cpp
     assert "navigation lifecycle inactive" in node_cpp
-    assert "navigation requires fresh localization before goal" in node_cpp
+    assert "force_relocalize is no longer executed inside normal navigation goals" in node_cpp
+    assert 'bridge_safe_for_goal_start("navigation goal"' in node_cpp
     assert "pre_navigation_relocalization_requested" in node_cpp
     assert "pre_navigation_relocalization_succeeded" in node_cpp
     assert "docking_relocalize_before_predock" in node_cpp
@@ -2808,14 +2904,24 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert 'navigation_final_yaw_align_cmd_topic_ = "/cmd_vel_collision_checked"' in node_cpp
     assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel_safe"' not in node_cpp
     assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel"' not in node_cpp
-    assert "position_reached_yaw_warning" in node_cpp
     assert "position_reached_verifying" in node_cpp
     assert "position_reached_yaw_aligning" in node_cpp
     assert "final_pose_verifying" in node_cpp
     assert "final_pose_verified" in node_cpp
     assert "failed_final_pose_verify" in node_cpp
     assert "blocked_by_safety" in node_cpp
-    assert "navigation position reached; final yaw alignment warning" in node_cpp
+    assert "goal_completion_policy" in node_cpp
+    assert "position_only" in node_cpp
+    assert "pose_required" in node_cpp
+    assert "dock_staging" in node_cpp
+    assert "task_complete" in node_cpp
+    assert "yaw_align_required" in node_cpp
+    assert "yaw_align_active" in node_cpp
+    assert "yaw_align_failed" in node_cpp
+    assert "REPOSITION_AFTER_YAW_DRIFT" in node_cpp
+    assert "run_reposition_after_yaw_drift" in node_cpp
+    assert "navigation position reached but pose_required final yaw failed" in node_cpp
+    assert "goal_completion_policy=position_only; final yaw alignment not required" in node_cpp
     assert "bool position_reached = pose_check.position_reached;" in node_cpp
     assert "bool position_reached = nav2_succeeded" not in node_cpp
     assert "navigation reported success but final position is outside tolerance" in node_cpp
@@ -2996,13 +3102,16 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "tf_chain_freshness_sec: 0.30" in config
     assert "tf_chain_settle_timeout_sec: 2.0" in config
     assert "localization_result_topic: \"/localization_result\"" in config
-    assert "navigation_relocalize_before_goal: true" in config
+    assert "navigation_relocalize_before_goal: false" in config
     assert "navigation_relocalize_before_goal_always: false" in config
-    assert "navigation_relocalize_before_goal_required: true" in config
+    assert "navigation_relocalize_before_goal_required: false" in config
     assert "navigation_relocalize_wait_sec: 8.0" in config
     assert "navigation_lifecycle_check_timeout_sec: 0.35" in config
     assert "navigation_goal_result_timeout_sec: 600.0" in config
     assert "navigation_goal_position_success_tolerance_m: 0.20" in config
+    assert "navigation_default_goal_completion_policy: \"pose_required\"" in config
+    assert "navigation_max_reposition_after_yaw_retry: 1" in config
+    assert "navigation_reposition_after_yaw_drift_timeout_sec: 30.0" in config
     assert "navigation_final_yaw_align_enable: true" in config
     assert "navigation_final_yaw_tolerance_rad: 0.05" in config
     assert "navigation_final_yaw_align_trigger_rad: 0.08" in config
@@ -3016,10 +3125,10 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "navigation_final_yaw_align_cmd_topic: \"/cmd_vel_collision_checked\"" in config
     assert "navigation_final_yaw_align_bypass_collision_monitor: true" in config
     assert "navigation_final_yaw_align_zero_cmd_count: 3" in config
-    assert "docking_relocalize_before_predock: true" in config
-    assert "docking_relocalize_after_predock: true" in config
-    assert "docking_relocalize_after_predock_required: true" in config
-    assert "docking_relocalize_after_fine_docking: true" in config
+    assert "docking_relocalize_before_predock: false" in config
+    assert "docking_relocalize_after_predock: false" in config
+    assert "docking_relocalize_after_predock_required: false" in config
+    assert "docking_relocalize_after_fine_docking: false" in config
     assert "docking_relocalize_after_fine_docking_required: false" in config
     assert "docking_validate_predock_pose_after_relocalization: true" in config
     assert "docking_predock_pose_max_distance_m: 0.35" in config
@@ -3104,13 +3213,16 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "robot_pose_freshness_sec: 0.5" in overlay_config
     assert "tf_chain_freshness_sec: 0.30" in overlay_config
     assert "tf_chain_settle_timeout_sec: 2.0" in overlay_config
-    assert "navigation_relocalize_before_goal: true" in overlay_config
+    assert "navigation_relocalize_before_goal: false" in overlay_config
     assert "navigation_relocalize_before_goal_always: false" in overlay_config
-    assert "navigation_relocalize_before_goal_required: true" in overlay_config
+    assert "navigation_relocalize_before_goal_required: false" in overlay_config
     assert "navigation_relocalize_wait_sec: 8.0" in overlay_config
     assert "navigation_lifecycle_check_timeout_sec: 0.35" in overlay_config
     assert "navigation_goal_result_timeout_sec: 600.0" in overlay_config
     assert "navigation_goal_position_success_tolerance_m: 0.20" in overlay_config
+    assert "navigation_default_goal_completion_policy: \"pose_required\"" in overlay_config
+    assert "navigation_max_reposition_after_yaw_retry: 1" in overlay_config
+    assert "navigation_reposition_after_yaw_drift_timeout_sec: 30.0" in overlay_config
     assert "navigation_final_yaw_align_enable: true" in overlay_config
     assert "navigation_final_yaw_tolerance_rad: 0.05" in overlay_config
     assert "navigation_final_yaw_align_trigger_rad: 0.08" in overlay_config
@@ -3125,9 +3237,9 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "navigation_final_yaw_align_bypass_collision_monitor: true" in overlay_config
     assert "navigation_final_yaw_align_zero_cmd_count: 3" in overlay_config
     assert "localization_result_topic: \"/localization_result\"" in overlay_config
-    assert "docking_relocalize_before_predock: true" in overlay_config
-    assert "docking_relocalize_after_predock: true" in overlay_config
-    assert "docking_relocalize_after_predock_required: true" in overlay_config
+    assert "docking_relocalize_before_predock: false" in overlay_config
+    assert "docking_relocalize_after_predock: false" in overlay_config
+    assert "docking_relocalize_after_predock_required: false" in overlay_config
     assert "docking_relocalize_wait_sec: 8.0" in overlay_config
     assert "docking_relocalize_recent_result_max_age_sec: 5.0" in overlay_config
     assert "localization_trigger_service_timeout_sec: 15.0" in overlay_config
@@ -3278,9 +3390,10 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "POST /api/v1/maps/filters/keepout/save" in app_doc
     assert "POST /api/v1/navigation/goal" in app_doc
     assert "navigation_goal_id" in app_doc
-    assert "position_reached_yaw_warning" in app_doc
+    assert "goal_completion_policy" in app_doc
+    assert "task_complete" in app_doc
     assert "final_yaw_align_blocked" in app_doc
-    assert "Delivery success is position-first" in readme
+    assert "Delivery completion is policy-driven" in readme
     assert "POST http://<robot-ip>:8080/api/v1/docking/undock" in app_doc
     assert "automatically performs controlled undocking first" in app_doc
     assert "The App must not use mapping teleop or direct velocity commands for docking" in app_doc
@@ -6833,7 +6946,7 @@ def test_phase_d3_docking_framework_state_machine_contracts():
     assert "actual_motion_mode_code == 2" in api_cpp
     assert "mode_controller_status_topic_" in api_cpp
     assert "docking_gs2_scan_topic_" in api_cpp
-    assert "set_global_correction_paused_for_docking(job_id, true, \"docking_fine\"" in api_cpp
+    assert "set_global_correction_paused_for_docking(job_id, true, \"docking_fine_entry\"" in api_cpp
     assert "std_srvs::srv::SetBool" in api_cpp
 
     for code in (
@@ -7193,6 +7306,147 @@ def test_phase_u1_post_undock_settle_before_pending_nav_goal_contracts():
         )
         if bash_probe.returncode == 0:
             subprocess.run([bash, "-n", str(observe_path)], check=True)
+
+
+def test_phase_r0_r2_runtime_force_accept_reduction_and_bridge_smoothing_contracts():
+    overlay = ROOT / "scripts" / "jetson" / "runtime_overlay"
+    scripts_dir = overlay / "scripts"
+    api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    bridge_cpp = (
+        ROOT / "src" / "robot_localization_bridge" / "src" / "localization_bridge_node.cpp"
+    ).read_text(encoding="utf-8")
+    api_cfg = (ROOT / "src" / "robot_api_server" / "config" / "robot_api_server.yaml").read_text(
+        encoding="utf-8"
+    )
+    overlay_api_cfg = (overlay / "config" / "robot_api_server.yaml").read_text(encoding="utf-8")
+    bridge_cfg = (
+        ROOT / "src" / "robot_localization_bridge" / "config" / "localization_bridge.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_bridge_cfg = (overlay / "config" / "localization_bridge.yaml").read_text(
+        encoding="utf-8"
+    )
+    nav2_cfg = (overlay / "config" / "nav2.yaml").read_text(encoding="utf-8")
+    amcl_cfg = (overlay / "config" / "amcl_shadow.yaml").read_text(encoding="utf-8")
+
+    audit_reports = sorted(
+        (ROOT / "reports").glob("runtime_force_accept_and_bridge_smoothing_audit_*.md")
+    )
+    assert audit_reports
+    audit_report = audit_reports[-1].read_text(encoding="utf-8")
+    assert "Normal-path high-risk calls" in audit_report
+    assert "Required Reduction" in audit_report
+
+    goal_start = api_cpp.index("HttpResponse handle_navigation_goal")
+    goal_end = api_cpp.index("bool undock_before_navigation_if_needed", goal_start)
+    goal_handler = api_cpp[goal_start:goal_end]
+    assert "trigger_localization_and_wait_for_result(" not in goal_handler
+    assert "request_localization_bridge_force_accept(" not in goal_handler
+    assert "wait_for_post_relocalization_settle_barrier(" not in goal_handler
+    assert "wait_for_localization_result_after(" not in goal_handler
+    assert "/global_localization/trigger" not in goal_handler
+    assert 'bridge_safe_for_goal_start("navigation goal"' in goal_handler
+    assert "force_relocalize is no longer executed inside normal navigation goals" in goal_handler
+    assert "LOCALIZATION_RECOVERY_REQUIRED" in goal_handler
+
+    assert "trigger_localization_and_wait_for_result(" in api_cpp
+    assert "request_localization_bridge_force_accept(" in api_cpp
+    assert "/api/v1/localization/trigger" in api_cpp
+    assert "handle_trigger_localization" in api_cpp
+
+    for cfg in (api_cfg, overlay_api_cfg):
+        assert "navigation_relocalize_before_goal: false" in cfg
+        assert "navigation_relocalize_before_goal_required: false" in cfg
+        assert "navigation_relocalize_before_goal_always: false" in cfg
+        assert "docking_relocalize_before_predock: false" in cfg
+        assert "docking_relocalize_after_predock: false" in cfg
+        assert "docking_relocalize_after_predock_required: false" in cfg
+        assert "docking_relocalize_after_fine_docking: false" in cfg
+        assert "docking_relocalize_after_fine_docking_required: false" in cfg
+
+    for token in (
+        "navigation_normal_path_relocalization_enabled",
+        "docking_normal_path_relocalization_enabled",
+        "localization_recovery_available",
+        "force_accept_allowed_in_normal_path",
+        "ordinary_navigation_triggered_relocalization",
+        "docking_predock_triggered_relocalization",
+        "removed_redundant_gates",
+        "active_runtime_mode",
+        "safe_for_goal_start",
+        "bridge_localization_degraded_blocks_goal_start",
+        "AMCL_STATIC_STANDBY_NO_CORRECTION",
+        "amcl_not_moving_no_update_ok",
+        "LOCALIZATION_DEGRADED",
+        "LOCALIZATION_TRANSITION_ACTIVE",
+    ):
+        assert token in api_cpp
+    assert "bridge_localization_degraded_blocks_goal_start(bridge_status)" in api_cpp
+
+    assert "current_transform" in bridge_cpp
+    assert "target_transform" in bridge_cpp
+    assert "advance_map_odom_state_locked" in bridge_cpp
+    assert "current_map_to_odom_snapshot" in bridge_cpp
+    assert "safe_for_goal_start" in bridge_cpp
+    assert "correction_active" in bridge_cpp
+    assert "smoothing_enabled" in bridge_cpp
+    assert "online_correction_requires_recovery" in bridge_cpp
+    assert "large_correction_rejected_count" in bridge_cpp
+    apply_start = bridge_cpp.index("void apply_candidate(")
+    apply_end = bridge_cpp.index("void fill_amcl_initial_pose_covariance", apply_start)
+    apply_candidate = bridge_cpp[apply_start:apply_end]
+    assert "map_to_odom_ = candidate.transform" not in apply_candidate
+    assert "update_map_odom_state_from_candidate(candidate, initial_lock)" in apply_candidate
+    assert bridge_cpp.count("tf_broadcaster_->sendTransform(tf)") == 1
+    publish_start = bridge_cpp.index("void publish_map_to_odom_from_state")
+    publish_end = bridge_cpp.index("void refresh_state", publish_start)
+    publish_block = bridge_cpp[publish_start:publish_end]
+    assert "advance_map_odom_state_locked(map_odom_state_, wall_sec)" in publish_block
+    assert "tf_broadcaster_->sendTransform(tf)" in publish_block
+
+    for cfg in (bridge_cfg, overlay_bridge_cfg):
+        assert "amcl_input_enabled" in cfg
+        assert "amcl_gate_mode" in cfg
+        assert "map_odom_smoothing_enabled: true" in cfg
+        assert "map_odom_smoothing_publish_rate_hz: 50.0" in cfg
+        assert "map_odom_smoothing_translation_rate_mps: 0.20" in cfg
+        assert "map_odom_smoothing_yaw_rate_radps: 0.25" in cfg
+        assert "map_odom_large_correction_requires_recovery: true" in cfg
+        assert "map_odom_online_hard_reject_translation_m: 0.80" in cfg
+        assert "max_odom_tf_age_ms: 100.0" in cfg
+
+    assert "tf_broadcast: false" in amcl_cfg
+    assert "transform_tolerance: 0.10" in nav2_cfg
+    assert "transform_tolerance: 0.15" in local_costmap_config_block(nav2_cfg)
+    assert "MPPIController" in nav2_cfg
+    assert "SmacPlanner2D" in nav2_cfg
+
+    script_names = (
+        "verify_runtime_force_accept_reduction.sh",
+        "verify_bridge_map_odom_smoothing.sh",
+        "observe_normal_navigation_minimal_path.sh",
+    )
+    for script_name in script_names:
+        script_path = scripts_dir / script_name
+        assert script_path.exists()
+        script = script_path.read_text(encoding="utf-8")
+        assert "ros2 topic pub" not in script
+        assert "ros2 action send_goal" not in script
+        assert "pkill -9" not in script
+        assert "killall -9" not in script
+
+    bash = shutil.which("bash")
+    if bash:
+        bash_probe = subprocess.run(
+            [bash, "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if bash_probe.returncode == 0:
+            for script_name in script_names:
+                subprocess.run([bash, "-n", str(scripts_dir / script_name)], check=True)
 
 
 def test_phase24a_local_costmap_timestamp_audit_contracts():

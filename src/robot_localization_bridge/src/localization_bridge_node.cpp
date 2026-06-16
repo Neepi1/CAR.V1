@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -287,16 +288,41 @@ struct CandidateCorrection
 
 struct MapOdomState
 {
+  MapToOdom current_transform;
+  MapToOdom target_transform;
   MapToOdom transform;
+  double current_z{0.0};
+  double target_z{0.0};
   double z{0.0};
+  std::uint64_t current_sequence{0U};
+  std::uint64_t target_sequence{0U};
+  std::uint64_t last_accepted_sequence{0U};
+  std::uint64_t last_published_sequence{0U};
   std::uint64_t sequence{0U};
   double accepted_time_sec{0.0};
+  double last_correction_accept_time{0.0};
+  double last_correction_apply_time{0.0};
+  std::string current_source{"none"};
+  std::string target_source{"none"};
   std::string source{"none"};
+  std::string last_correction_source{"none"};
   double correction_translation_m{0.0};
   double correction_yaw_rad{0.0};
+  double remaining_translation_error_m{0.0};
+  double remaining_yaw_error_rad{0.0};
+  double last_step_translation_m{0.0};
+  double last_step_yaw_rad{0.0};
+  double smoothing_translation_rate_mps{0.0};
+  double smoothing_yaw_rate_radps{0.0};
+  double last_correction_delta_translation_m{0.0};
+  double last_correction_delta_yaw_rad{0.0};
   bool valid{false};
   bool correction_paused{false};
   bool frozen_due_to_pause{false};
+  bool correction_active{false};
+  bool safe_for_goal_start{true};
+  bool smoothing_enabled{false};
+  bool large_correction_requires_recovery{true};
 };
 
 struct AmclRuntimeStatus
@@ -429,6 +455,27 @@ public:
       declare_parameter<double>("map_odom_publish_gap_warn_ms", 100.0);
     map_odom_publish_gap_fail_ms_ =
       declare_parameter<double>("map_odom_publish_gap_fail_ms", 250.0);
+    map_odom_smoothing_enabled_ = declare_parameter<bool>("map_odom_smoothing_enabled", true);
+    map_odom_smoothing_publish_rate_hz_ =
+      declare_parameter<double>("map_odom_smoothing_publish_rate_hz", publish_rate_hz_);
+    map_odom_smoothing_translation_rate_mps_ =
+      declare_parameter<double>("map_odom_smoothing_translation_rate_mps", 0.20);
+    map_odom_smoothing_yaw_rate_radps_ =
+      declare_parameter<double>("map_odom_smoothing_yaw_rate_radps", 0.25);
+    map_odom_smoothing_snap_translation_epsilon_m_ =
+      declare_parameter<double>("map_odom_smoothing_snap_translation_epsilon_m", 0.005);
+    map_odom_smoothing_snap_yaw_epsilon_rad_ =
+      declare_parameter<double>("map_odom_smoothing_snap_yaw_epsilon_rad", 0.005);
+    map_odom_large_correction_translation_m_ =
+      declare_parameter<double>("map_odom_large_correction_translation_m", 0.50);
+    map_odom_large_correction_yaw_rad_ =
+      declare_parameter<double>("map_odom_large_correction_yaw_rad", 0.35);
+    map_odom_large_correction_requires_recovery_ =
+      declare_parameter<bool>("map_odom_large_correction_requires_recovery", true);
+    map_odom_online_hard_reject_translation_m_ =
+      declare_parameter<double>("map_odom_online_hard_reject_translation_m", 0.80);
+    map_odom_online_hard_reject_yaw_rad_ =
+      declare_parameter<double>("map_odom_online_hard_reject_yaw_rad", 0.80);
     require_result_frame_match_ = declare_parameter<bool>("require_result_frame_match", true);
 
     if (continuous_localization_mode_ != "triggered") {
@@ -496,6 +543,24 @@ public:
     map_odom_publish_gap_warn_ms_ = std::max(1.0, map_odom_publish_gap_warn_ms_);
     map_odom_publish_gap_fail_ms_ =
       std::max(map_odom_publish_gap_warn_ms_, map_odom_publish_gap_fail_ms_);
+    map_odom_smoothing_translation_rate_mps_ =
+      std::max(0.001, map_odom_smoothing_translation_rate_mps_);
+    map_odom_smoothing_publish_rate_hz_ =
+      std::max(1.0, map_odom_smoothing_publish_rate_hz_);
+    map_odom_smoothing_yaw_rate_radps_ =
+      std::max(0.001, map_odom_smoothing_yaw_rate_radps_);
+    map_odom_smoothing_snap_translation_epsilon_m_ =
+      std::max(0.0, map_odom_smoothing_snap_translation_epsilon_m_);
+    map_odom_smoothing_snap_yaw_epsilon_rad_ =
+      std::max(0.0, map_odom_smoothing_snap_yaw_epsilon_rad_);
+    map_odom_large_correction_translation_m_ =
+      std::max(0.0, map_odom_large_correction_translation_m_);
+    map_odom_large_correction_yaw_rad_ =
+      std::max(0.0, map_odom_large_correction_yaw_rad_);
+    map_odom_online_hard_reject_translation_m_ =
+      std::max(map_odom_large_correction_translation_m_, map_odom_online_hard_reject_translation_m_);
+    map_odom_online_hard_reject_yaw_rad_ =
+      std::max(map_odom_large_correction_yaw_rad_, map_odom_online_hard_reject_yaw_rad_);
 
     pose_sub_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
       localization_topic_,
@@ -872,6 +937,15 @@ private:
     return reason.empty() ? "AMCL_TF_LOOKUP_FAILED" : reason;
   }
 
+  MapToOdom current_map_to_odom_snapshot() const
+  {
+    std::lock_guard<std::mutex> lock(map_odom_state_mutex_);
+    if (map_odom_state_.valid) {
+      return map_odom_state_.transform;
+    }
+    return map_to_odom_;
+  }
+
   CandidateCorrection build_candidate(
     const geometry_msgs::msg::PoseWithCovarianceStamped & pose,
     const std::string & gate_mode,
@@ -954,10 +1028,12 @@ private:
     candidate.transform.yaw = map_to_odom_yaw;
     candidate.map_base_pose = pose;
     if (has_map_to_odom_) {
+      const auto current_map_to_odom = current_map_to_odom_snapshot();
       candidate.correction_translation_m = std::hypot(
-        map_to_odom_x - map_to_odom_.x,
-        map_to_odom_y - map_to_odom_.y);
-      candidate.correction_yaw_rad = std::abs(normalize_yaw(map_to_odom_yaw - map_to_odom_.yaw));
+        map_to_odom_x - current_map_to_odom.x,
+        map_to_odom_y - current_map_to_odom.y);
+      candidate.correction_yaw_rad =
+        std::abs(normalize_yaw(map_to_odom_yaw - current_map_to_odom.yaw));
     }
     candidate.valid = true;
     return candidate;
@@ -1060,6 +1136,7 @@ private:
         forced_jump_threshold_m_,
         triggered_hard_reject_translation_m_);
       if (candidate.correction_translation_m > forced_limit) {
+        ++large_correction_rejected_count_;
         reject_candidate("bridge forced map->odom jump rejected", source);
         force_accept_next_pose_ = false;
         force_accept_next_pose_explicit_trigger_ = false;
@@ -1077,7 +1154,17 @@ private:
       return true;
     }
 
+    if (
+      candidate.correction_translation_m > map_odom_online_hard_reject_translation_m_ ||
+      candidate.correction_yaw_rad > map_odom_online_hard_reject_yaw_rad_)
+    {
+      ++large_correction_rejected_count_;
+      reject_candidate("online_correction_requires_recovery", source);
+      return false;
+    }
+
     if (candidate.correction_translation_m > jump_threshold_m_) {
+      ++large_correction_rejected_count_;
       reject_candidate("triggered_jump_over_threshold", source);
       return false;
     }
@@ -1135,6 +1222,7 @@ private:
     {
       reset_amcl_medium_consistency();
       last_amcl_state_ = "hard_reject";
+      ++large_correction_rejected_count_;
       reject_candidate("AMCL_CORRECTION_TOO_LARGE", source, false);
       return false;
     }
@@ -1177,23 +1265,85 @@ private:
     }
   }
 
-  void update_map_odom_state_from_candidate(const CandidateCorrection & candidate)
+  double candidate_target_z(const CandidateCorrection & candidate) const
   {
-    MapOdomState state;
-    state.transform = candidate.transform;
-    state.z = (!two_d_mode_ && has_odom_) ?
+    return (!two_d_mode_ && has_odom_) ?
       candidate.map_base_pose.pose.pose.position.z - latest_odom_.pose.pose.position.z : 0.0;
-    state.sequence = accepted_result_count_;
+  }
+
+  void refresh_map_odom_error_locked(MapOdomState & state)
+  {
+    const double dx = state.target_transform.x - state.current_transform.x;
+    const double dy = state.target_transform.y - state.current_transform.y;
+    const double dyaw =
+      std::abs(normalize_yaw(state.target_transform.yaw - state.current_transform.yaw));
+    state.remaining_translation_error_m = std::hypot(dx, dy);
+    state.remaining_yaw_error_rad = dyaw;
+    state.correction_active =
+      state.remaining_translation_error_m > map_odom_smoothing_snap_translation_epsilon_m_ ||
+      state.remaining_yaw_error_rad > map_odom_smoothing_snap_yaw_epsilon_rad_;
+    state.safe_for_goal_start = !state.correction_active;
+    if (!state.correction_active) {
+      state.current_transform = state.target_transform;
+      state.current_z = state.target_z;
+      state.current_sequence = state.target_sequence;
+      state.current_source = state.target_source;
+      state.remaining_translation_error_m = 0.0;
+      state.remaining_yaw_error_rad = 0.0;
+    }
+    state.transform = state.current_transform;
+    state.z = state.current_z;
+    state.sequence = state.current_sequence;
+    state.source = state.target_source;
+    map_to_odom_ = state.transform;
+  }
+
+  void update_map_odom_state_from_candidate(
+    const CandidateCorrection & candidate,
+    const bool initial_lock)
+  {
+    std::lock_guard<std::mutex> lock(map_odom_state_mutex_);
+    auto & state = map_odom_state_;
+    const double now_sec = now().seconds();
+    state.target_transform = candidate.transform;
+    state.target_z = candidate_target_z(candidate);
+    state.target_sequence = accepted_result_count_;
+    state.last_accepted_sequence = accepted_result_count_;
     state.accepted_time_sec = last_accepted_sec_;
-    state.source = candidate.source;
+    state.last_correction_accept_time = last_accepted_sec_;
+    state.target_source = candidate.source;
+    state.last_correction_source = candidate.source;
     state.correction_translation_m = candidate.correction_translation_m;
     state.correction_yaw_rad = candidate.correction_yaw_rad;
+    state.last_correction_delta_translation_m = candidate.correction_translation_m;
+    state.last_correction_delta_yaw_rad = candidate.correction_yaw_rad;
     state.valid = true;
     state.correction_paused = correction_paused_;
     state.frozen_due_to_pause = correction_paused_;
+    state.smoothing_enabled = map_odom_smoothing_enabled_;
+    state.smoothing_translation_rate_mps = map_odom_smoothing_translation_rate_mps_;
+    state.smoothing_yaw_rate_radps = map_odom_smoothing_yaw_rate_radps_;
+    state.large_correction_requires_recovery = map_odom_large_correction_requires_recovery_;
 
-    std::lock_guard<std::mutex> lock(map_odom_state_mutex_);
-    map_odom_state_ = state;
+    const bool snap_immediately = initial_lock || !map_odom_smoothing_enabled_;
+    if (snap_immediately || !state.valid || state.current_sequence == 0U) {
+      state.current_transform = state.target_transform;
+      state.current_z = state.target_z;
+      state.current_sequence = state.target_sequence;
+      state.current_source = state.target_source;
+      state.last_step_translation_m = candidate.correction_translation_m;
+      state.last_step_yaw_rad = candidate.correction_yaw_rad;
+      ++online_correction_snap_count_;
+    } else {
+      refresh_map_odom_error_locked(state);
+      if (state.correction_active) {
+        ++online_correction_smoothed_count_;
+      } else {
+        ++online_correction_snap_count_;
+      }
+    }
+    state.last_correction_apply_time = now_sec;
+    refresh_map_odom_error_locked(state);
   }
 
   void update_map_odom_pause_state()
@@ -1203,13 +1353,69 @@ private:
     map_odom_state_.frozen_due_to_pause = correction_paused_ && map_odom_state_.valid;
   }
 
+  void advance_map_odom_state_locked(MapOdomState & state, const double now_sec)
+  {
+    if (!state.valid) {
+      return;
+    }
+    state.smoothing_enabled = map_odom_smoothing_enabled_;
+    state.smoothing_translation_rate_mps = map_odom_smoothing_translation_rate_mps_;
+    state.smoothing_yaw_rate_radps = map_odom_smoothing_yaw_rate_radps_;
+    state.large_correction_requires_recovery = map_odom_large_correction_requires_recovery_;
+    state.last_step_translation_m = 0.0;
+    state.last_step_yaw_rad = 0.0;
+
+    if (!map_odom_smoothing_enabled_ || state.frozen_due_to_pause) {
+      refresh_map_odom_error_locked(state);
+      return;
+    }
+
+    double dt = 1.0 / std::max(1.0, publish_rate_hz_);
+    if (state.last_correction_apply_time > 0.0) {
+      dt = std::clamp(now_sec - state.last_correction_apply_time, 0.0, 0.25);
+      if (dt <= 0.0) {
+        dt = 1.0 / std::max(1.0, publish_rate_hz_);
+      }
+    }
+
+    const double dx = state.target_transform.x - state.current_transform.x;
+    const double dy = state.target_transform.y - state.current_transform.y;
+    const double distance = std::hypot(dx, dy);
+    const double max_translation_step = map_odom_smoothing_translation_rate_mps_ * dt;
+    if (distance <= map_odom_smoothing_snap_translation_epsilon_m_ || distance <= max_translation_step) {
+      state.last_step_translation_m = distance;
+      state.current_transform.x = state.target_transform.x;
+      state.current_transform.y = state.target_transform.y;
+    } else if (distance > 0.0) {
+      const double ratio = max_translation_step / distance;
+      state.current_transform.x += dx * ratio;
+      state.current_transform.y += dy * ratio;
+      state.last_step_translation_m = max_translation_step;
+    }
+
+    const double yaw_error = normalize_yaw(state.target_transform.yaw - state.current_transform.yaw);
+    const double abs_yaw_error = std::abs(yaw_error);
+    const double max_yaw_step = map_odom_smoothing_yaw_rate_radps_ * dt;
+    if (abs_yaw_error <= map_odom_smoothing_snap_yaw_epsilon_rad_ || abs_yaw_error <= max_yaw_step) {
+      state.current_transform.yaw = state.target_transform.yaw;
+      state.last_step_yaw_rad = abs_yaw_error;
+    } else {
+      const double yaw_step = std::copysign(max_yaw_step, yaw_error);
+      state.current_transform.yaw = normalize_yaw(state.current_transform.yaw + yaw_step);
+      state.last_step_yaw_rad = std::abs(yaw_step);
+    }
+
+    state.current_z = state.target_z;
+    state.last_correction_apply_time = now_sec;
+    refresh_map_odom_error_locked(state);
+  }
+
   void apply_candidate(
     const CandidateCorrection & candidate,
     const char * source,
     const std::string & accept_reason)
   {
-    map_to_odom_ = candidate.transform;
-    has_map_to_odom_ = true;
+    const bool initial_lock = !has_map_to_odom_;
     mark_latest_pose_stamp_used();
     last_accepted_correction_translation_m_ = candidate.correction_translation_m;
     last_accepted_correction_yaw_rad_ = candidate.correction_yaw_rad;
@@ -1227,7 +1433,8 @@ private:
     if (candidate.source == "amcl_gated") {
       ++amcl_accepted_count_;
     }
-    update_map_odom_state_from_candidate(candidate);
+    update_map_odom_state_from_candidate(candidate, initial_lock);
+    has_map_to_odom_ = true;
     if (candidate.source == "isaac_triggered") {
       last_isaac_triggered_accept_sec_ = last_accepted_sec_;
       if (amcl_initial_pose_seed_enabled_) {
@@ -1299,14 +1506,15 @@ private:
     if (!has_map_to_odom_ || !has_odom_) {
       return false;
     }
+    const auto current_map_to_odom = current_map_to_odom_snapshot();
     const double odom_x = latest_odom_.pose.pose.position.x;
     const double odom_y = latest_odom_.pose.pose.position.y;
     const double odom_yaw = yaw_from_quaternion(latest_odom_.pose.pose.orientation);
-    const double cos_delta = std::cos(map_to_odom_.yaw);
-    const double sin_delta = std::sin(map_to_odom_.yaw);
-    const double map_x = map_to_odom_.x + (cos_delta * odom_x - sin_delta * odom_y);
-    const double map_y = map_to_odom_.y + (sin_delta * odom_x + cos_delta * odom_y);
-    const double map_yaw = normalize_yaw(map_to_odom_.yaw + odom_yaw);
+    const double cos_delta = std::cos(current_map_to_odom.yaw);
+    const double sin_delta = std::sin(current_map_to_odom.yaw);
+    const double map_x = current_map_to_odom.x + (cos_delta * odom_x - sin_delta * odom_y);
+    const double map_y = current_map_to_odom.y + (sin_delta * odom_x + cos_delta * odom_y);
+    const double map_yaw = normalize_yaw(current_map_to_odom.yaw + odom_yaw);
 
     pose.header = latest_odom_.header;
     pose.header.frame_id = map_frame_;
@@ -1321,9 +1529,11 @@ private:
   void publish_map_to_odom_from_state()
   {
     const auto callback_start = std::chrono::steady_clock::now();
+    const double wall_sec = now().seconds();
     MapOdomState state;
     {
       std::lock_guard<std::mutex> lock(map_odom_state_mutex_);
+      advance_map_odom_state_locked(map_odom_state_, wall_sec);
       state = map_odom_state_;
     }
 
@@ -1348,14 +1558,28 @@ private:
     const auto callback_end = std::chrono::steady_clock::now();
     const double callback_duration_us =
       std::chrono::duration<double, std::micro>(callback_end - callback_start).count();
-    const double wall_sec = now().seconds();
     std::lock_guard<std::mutex> lock(map_odom_publish_stats_mutex_);
     map_odom_publish_callback_duration_us_ = callback_duration_us;
     map_odom_state_valid_snapshot_ = state.valid;
     map_odom_latest_source_ = state.source;
-    map_odom_latest_accepted_sequence_ = state.sequence;
+    map_odom_latest_accepted_sequence_ = state.last_accepted_sequence;
     map_odom_correction_paused_snapshot_ = state.correction_paused;
     map_odom_frozen_due_to_pause_snapshot_ = state.frozen_due_to_pause;
+    map_odom_smoothing_enabled_snapshot_ = state.smoothing_enabled;
+    map_odom_correction_active_snapshot_ = state.correction_active;
+    map_odom_safe_for_goal_start_snapshot_ = state.safe_for_goal_start;
+    map_odom_current_sequence_snapshot_ = state.current_sequence;
+    map_odom_target_sequence_snapshot_ = state.target_sequence;
+    map_odom_last_accepted_sequence_snapshot_ = state.last_accepted_sequence;
+    map_odom_current_source_snapshot_ = state.current_source;
+    map_odom_target_source_snapshot_ = state.target_source;
+    map_odom_remaining_translation_error_m_snapshot_ = state.remaining_translation_error_m;
+    map_odom_remaining_yaw_error_rad_snapshot_ = state.remaining_yaw_error_rad;
+    map_odom_last_step_translation_m_snapshot_ = state.last_step_translation_m;
+    map_odom_last_step_yaw_rad_snapshot_ = state.last_step_yaw_rad;
+    map_odom_last_correction_source_snapshot_ = state.last_correction_source;
+    map_odom_last_correction_accept_time_snapshot_ = state.last_correction_accept_time;
+    map_odom_last_correction_apply_time_snapshot_ = state.last_correction_apply_time;
     if (!published) {
       return;
     }
@@ -1378,7 +1602,8 @@ private:
       }
     }
     map_odom_last_publish_wall_sec_ = wall_sec;
-    map_odom_last_published_sequence_ = state.sequence;
+    map_odom_last_published_sequence_ = state.current_sequence;
+    map_odom_last_published_sequence_snapshot_ = state.current_sequence;
     ++map_odom_publish_count_;
   }
 
@@ -1543,10 +1768,25 @@ private:
     std::uint64_t map_odom_latest_accepted_sequence = 0U;
     std::uint64_t map_odom_last_published_sequence = 0U;
     std::uint64_t map_odom_publish_missed_count = 0U;
+    std::uint64_t map_odom_current_sequence = 0U;
+    std::uint64_t map_odom_target_sequence = 0U;
+    std::uint64_t map_odom_last_accepted_sequence = 0U;
     std::string map_odom_latest_source{"none"};
+    std::string map_odom_current_source{"none"};
+    std::string map_odom_target_source{"none"};
+    std::string map_odom_last_correction_source{"none"};
     bool map_odom_state_valid = false;
     bool map_odom_correction_paused = false;
     bool map_odom_frozen_due_to_pause = false;
+    bool map_odom_smoothing_enabled = false;
+    bool map_odom_correction_active = false;
+    bool map_odom_safe_for_goal_start = true;
+    double map_odom_remaining_translation_error_m = 0.0;
+    double map_odom_remaining_yaw_error_rad = 0.0;
+    double map_odom_last_step_translation_m = 0.0;
+    double map_odom_last_step_yaw_rad = 0.0;
+    double map_odom_last_correction_accept_time = 0.0;
+    double map_odom_last_correction_apply_time = 0.0;
     {
       std::lock_guard<std::mutex> lock(map_odom_publish_stats_mutex_);
       const auto publish_delta = map_odom_publish_count_ - previous_map_odom_publish_count_;
@@ -1559,10 +1799,25 @@ private:
       map_odom_latest_accepted_sequence = map_odom_latest_accepted_sequence_;
       map_odom_last_published_sequence = map_odom_last_published_sequence_;
       map_odom_publish_missed_count = map_odom_publish_missed_count_;
+      map_odom_current_sequence = map_odom_current_sequence_snapshot_;
+      map_odom_target_sequence = map_odom_target_sequence_snapshot_;
+      map_odom_last_accepted_sequence = map_odom_last_accepted_sequence_snapshot_;
       map_odom_latest_source = map_odom_latest_source_;
+      map_odom_current_source = map_odom_current_source_snapshot_;
+      map_odom_target_source = map_odom_target_source_snapshot_;
+      map_odom_last_correction_source = map_odom_last_correction_source_snapshot_;
       map_odom_state_valid = map_odom_state_valid_snapshot_;
       map_odom_correction_paused = map_odom_correction_paused_snapshot_;
       map_odom_frozen_due_to_pause = map_odom_frozen_due_to_pause_snapshot_;
+      map_odom_smoothing_enabled = map_odom_smoothing_enabled_snapshot_;
+      map_odom_correction_active = map_odom_correction_active_snapshot_;
+      map_odom_safe_for_goal_start = map_odom_safe_for_goal_start_snapshot_;
+      map_odom_remaining_translation_error_m = map_odom_remaining_translation_error_m_snapshot_;
+      map_odom_remaining_yaw_error_rad = map_odom_remaining_yaw_error_rad_snapshot_;
+      map_odom_last_step_translation_m = map_odom_last_step_translation_m_snapshot_;
+      map_odom_last_step_yaw_rad = map_odom_last_step_yaw_rad_snapshot_;
+      map_odom_last_correction_accept_time = map_odom_last_correction_accept_time_snapshot_;
+      map_odom_last_correction_apply_time = map_odom_last_correction_apply_time_snapshot_;
     }
 
     const double map_to_odom_age_ms = last_accepted_sec_ > 0.0 ?
@@ -1847,6 +2102,32 @@ private:
         << (map_odom_correction_paused ? "true" : "false")
         << ",\"map_odom_frozen_due_to_pause\":"
         << (map_odom_frozen_due_to_pause ? "true" : "false")
+        << ",\"smoothing_enabled\":" << (map_odom_smoothing_enabled ? "true" : "false")
+        << ",\"correction_active\":" << (map_odom_correction_active ? "true" : "false")
+        << ",\"safe_for_goal_start\":" << (map_odom_safe_for_goal_start ? "true" : "false")
+        << ",\"current_sequence\":" << map_odom_current_sequence
+        << ",\"target_sequence\":" << map_odom_target_sequence
+        << ",\"last_accepted_sequence\":" << map_odom_last_accepted_sequence
+        << ",\"last_published_sequence\":" << map_odom_last_published_sequence
+        << ",\"current_source\":\"" << json_escape(map_odom_current_source)
+        << "\",\"target_source\":\"" << json_escape(map_odom_target_source)
+        << "\",\"remaining_translation_error_m\":" << map_odom_remaining_translation_error_m
+        << ",\"remaining_yaw_error_rad\":" << map_odom_remaining_yaw_error_rad
+        << ",\"last_step_translation_m\":" << map_odom_last_step_translation_m
+        << ",\"last_step_yaw_rad\":" << map_odom_last_step_yaw_rad
+        << ",\"smoothing_translation_rate_mps\":" << map_odom_smoothing_translation_rate_mps_
+        << ",\"smoothing_yaw_rate_radps\":" << map_odom_smoothing_yaw_rate_radps_
+        << ",\"last_correction_delta_translation_m\":"
+        << last_accepted_correction_translation_m_
+        << ",\"last_correction_delta_yaw_rad\":" << last_accepted_correction_yaw_rad_
+        << ",\"last_correction_source\":\"" << json_escape(map_odom_last_correction_source)
+        << "\",\"last_correction_accept_time\":" << map_odom_last_correction_accept_time
+        << ",\"last_correction_apply_time\":" << map_odom_last_correction_apply_time
+        << ",\"large_correction_requires_recovery\":"
+        << (map_odom_large_correction_requires_recovery_ ? "true" : "false")
+        << ",\"large_correction_rejected_count\":" << large_correction_rejected_count_
+        << ",\"online_correction_smoothed_count\":" << online_correction_smoothed_count_
+        << ",\"online_correction_snap_count\":" << online_correction_snap_count_
         << ",\"map_odom_publish_missed_count\":" << map_odom_publish_missed_count
         << ",\"publisher_decoupled_from_correction\":true"
         << ",\"map_odom_publish_gap_warn_ms\":" << map_odom_publish_gap_warn_ms_
@@ -1909,6 +2190,15 @@ private:
   double status_publish_period_sec_{1.0};
   double map_odom_publish_gap_warn_ms_{100.0};
   double map_odom_publish_gap_fail_ms_{250.0};
+  double map_odom_smoothing_publish_rate_hz_{50.0};
+  double map_odom_smoothing_translation_rate_mps_{0.20};
+  double map_odom_smoothing_yaw_rate_radps_{0.25};
+  double map_odom_smoothing_snap_translation_epsilon_m_{0.005};
+  double map_odom_smoothing_snap_yaw_epsilon_rad_{0.005};
+  double map_odom_large_correction_translation_m_{0.50};
+  double map_odom_large_correction_yaw_rad_{0.35};
+  double map_odom_online_hard_reject_translation_m_{0.80};
+  double map_odom_online_hard_reject_yaw_rad_{0.80};
   double amcl_runtime_status_ttl_sec_{5.0};
   double latest_pose_received_sec_{0.0};
   double last_amcl_pose_received_sec_{0.0};
@@ -1956,14 +2246,33 @@ private:
   std::uint64_t map_odom_publish_missed_count_{0U};
   std::uint64_t map_odom_latest_accepted_sequence_{0U};
   std::uint64_t map_odom_last_published_sequence_{0U};
+  std::uint64_t map_odom_current_sequence_snapshot_{0U};
+  std::uint64_t map_odom_target_sequence_snapshot_{0U};
+  std::uint64_t map_odom_last_accepted_sequence_snapshot_{0U};
+  std::uint64_t map_odom_last_published_sequence_snapshot_{0U};
+  std::uint64_t large_correction_rejected_count_{0U};
+  std::uint64_t online_correction_smoothed_count_{0U};
+  std::uint64_t online_correction_snap_count_{0U};
   double map_odom_last_publish_wall_sec_{0.0};
   double map_odom_last_publish_gap_ms_{-1.0};
   double map_odom_publish_gap_max_ms_{0.0};
   double map_odom_publish_callback_duration_us_{0.0};
+  double map_odom_remaining_translation_error_m_snapshot_{0.0};
+  double map_odom_remaining_yaw_error_rad_snapshot_{0.0};
+  double map_odom_last_step_translation_m_snapshot_{0.0};
+  double map_odom_last_step_yaw_rad_snapshot_{0.0};
+  double map_odom_last_correction_accept_time_snapshot_{0.0};
+  double map_odom_last_correction_apply_time_snapshot_{0.0};
   bool map_odom_state_valid_snapshot_{false};
   bool map_odom_correction_paused_snapshot_{false};
   bool map_odom_frozen_due_to_pause_snapshot_{false};
+  bool map_odom_smoothing_enabled_snapshot_{false};
+  bool map_odom_correction_active_snapshot_{false};
+  bool map_odom_safe_for_goal_start_snapshot_{true};
   std::string map_odom_latest_source_{"none"};
+  std::string map_odom_current_source_snapshot_{"none"};
+  std::string map_odom_target_source_snapshot_{"none"};
+  std::string map_odom_last_correction_source_snapshot_{"none"};
   std::string map_frame_;
   std::string odom_frame_;
   std::string base_frame_;
@@ -2006,6 +2315,8 @@ private:
   bool force_accept_next_pose_explicit_trigger_{false};
   bool correction_paused_{false};
   bool triggered_allow_large_correction_{true};
+  bool map_odom_smoothing_enabled_{true};
+  bool map_odom_large_correction_requires_recovery_{true};
   bool last_odom_tf_history_lookup_ok_{false};
   bool latest_odom_tf_fresh_{false};
   std::string last_health_reason_;

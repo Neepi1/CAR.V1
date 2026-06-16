@@ -55,10 +55,10 @@ robot_api_server:
     docking_pre_dock_distance_m: 0.60
     docking_navigation_start_wait_sec: 45.0
     docking_predock_nav_timeout_sec: 180.0
-    docking_relocalize_before_predock: true
-    docking_relocalize_after_predock: true
-    docking_relocalize_after_predock_required: true
-    docking_relocalize_after_fine_docking: true
+    docking_relocalize_before_predock: false
+    docking_relocalize_after_predock: false
+    docking_relocalize_after_predock_required: false
+    docking_relocalize_after_fine_docking: false
     docking_relocalize_after_fine_docking_required: false
     docking_validate_predock_pose_after_relocalization: true
     docking_predock_pose_max_distance_m: 0.35
@@ -168,12 +168,15 @@ robot_api_server:
     # update before every normal same-map goal. Cold/unconfirmed runtime
     # context, stale map-frame pose, undock, docking, or explicit
     # force_relocalize requests still trigger localization.
-    navigation_relocalize_before_goal: true
+    navigation_relocalize_before_goal: false
     navigation_relocalize_before_goal_always: false
-    navigation_relocalize_before_goal_required: true
+    navigation_relocalize_before_goal_required: false
     navigation_relocalize_wait_sec: 8.0
     navigation_goal_result_timeout_sec: 600.0
     navigation_goal_position_success_tolerance_m: 0.20
+    navigation_default_goal_completion_policy: "pose_required"
+    navigation_max_reposition_after_yaw_retry: 1
+    navigation_reposition_after_yaw_drift_timeout_sec: 30.0
     navigation_final_yaw_align_enable: true
     navigation_final_yaw_tolerance_rad: 0.05
     navigation_final_yaw_align_trigger_rad: 0.08

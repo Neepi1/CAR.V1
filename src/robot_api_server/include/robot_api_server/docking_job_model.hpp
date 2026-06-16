@@ -22,6 +22,7 @@ struct DockingJob
   std::string approach_direction{"reverse"};
   std::string contact_frame{"charge_contact_link"};
   std::string sensor_frame{"gs2_link"};
+  std::string goal_completion_policy;
   std::string predock_pose_id;
   std::string approach_source{"computed_from_dock_pose"};
   std::string detail;
@@ -49,6 +50,7 @@ struct DockingJob
   bool resume_navigation{true};
   bool nav_goal_sent{false};
   bool nav_goal_succeeded{false};
+  bool dock_staging_handoff_ready{false};
   bool predock_pose_verified{false};
   bool predock_xy_ok{false};
   bool predock_base_yaw_ok{false};
@@ -79,6 +81,12 @@ struct DockingJob
   std::string fine_entry_detail;
   bool global_correction_paused{false};
   std::string pause_reason;
+  bool post_predock_settle_complete{false};
+  bool ordinary_final_yaw_align_active{false};
+  bool predock_yaw_align_active{false};
+  bool cmd_owner_conflict_detected{false};
+  bool final_yaw_align_blocked_by_docking{false};
+  bool docking_blocked_by_final_yaw_align{false};
   std::string display_pose_source;
   double display_pose_x{0.0};
   double display_pose_y{0.0};
