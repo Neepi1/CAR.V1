@@ -11,9 +11,14 @@ critical_nav2_lifecycle_nodes() {
     /controller_server \
     /planner_server \
     /bt_navigator \
-    /behavior_server \
     /velocity_smoother \
     /collision_monitor
+}
+
+nav2_lifecycle_node_active() {
+  local node_name="$1"
+  local timeout_sec="${2:-8}"
+  runtime_readiness_probe lifecycle-active "${node_name}" "${timeout_sec}"
 }
 
 write_runtime_map_context() {
@@ -45,6 +50,7 @@ message = sys.argv[3]
 data = {
     "schema": "njrh.runtime_map_context.v1",
     "state": state,
+    "startup_stage": os.environ.get("NJRH_RUNTIME_STARTUP_STAGE", ""),
     "confirmed": confirmed,
     "message": message,
     "map_id": os.environ.get("NJRH_MAP_ID", ""),
@@ -58,13 +64,14 @@ for key, env_key in (
     ("localization_mode", "NJRH_RUNTIME_LOCALIZATION_MODE"),
     ("last_triggered_relocalization_ok", "NJRH_RUNTIME_LAST_TRIGGERED_RELOCALIZATION_OK"),
     ("map_to_odom_age_ms", "NJRH_RUNTIME_MAP_TO_ODOM_AGE_MS"),
+    ("startup_elapsed_sec", "NJRH_RUNTIME_STARTUP_ELAPSED_SEC"),
 ):
     value = os.environ.get(env_key, "")
     if value == "":
         continue
     if key == "last_triggered_relocalization_ok":
         data[key] = value.lower() in ("1", "true", "yes", "on")
-    elif key == "map_to_odom_age_ms":
+    elif key in ("map_to_odom_age_ms", "startup_elapsed_sec"):
         try:
             data[key] = float(value)
         except ValueError:
@@ -86,10 +93,90 @@ finally:
 PY
 }
 
-nav2_lifecycle_node_active() {
-  local node_name="$1"
-  local timeout_sec="${2:-8}"
-  runtime_readiness_probe lifecycle-active "${node_name}" "${timeout_sec}"
+nav2_lifecycle_manager_reported_active() {
+  local log_files=(
+    "${NJRH_NAVIGATION_RESUME_LOG_FILE:-/tmp/njrh_navigation_resume.log}"
+    "${NJRH_RUNTIME_LOG_DIR:-}/resident_navigation_runtime.log"
+    "${NJRH_RUNTIME_LOG_DIR:-}/nav2_navigation.log"
+  )
+  local log_file
+  for log_file in "${log_files[@]}"; do
+    [[ -n "${log_file}" && -f "${log_file}" ]] || continue
+    if python3 - "${log_file}" <<'PY'
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as file:
+        lines = file.readlines()
+except OSError:
+    raise SystemExit(1)
+
+start_index = 0
+for index, line in enumerate(lines):
+    if "STARTUP_STAGE stage=nav2_layer_started" in line:
+        start_index = index
+
+for line in lines[start_index:]:
+    if "lifecycle_manager_navigation" in line and "Managed nodes are active" in line:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+    then
+      return 0
+    fi
+  done
+  return 1
+}
+
+nav2_point_navigation_core_reported_active() {
+  local log_files=(
+    "${NJRH_NAVIGATION_RESUME_LOG_FILE:-/tmp/njrh_navigation_resume.log}"
+    "${NJRH_RUNTIME_LOG_DIR:-}/resident_navigation_runtime.log"
+    "${NJRH_RUNTIME_LOG_DIR:-}/nav2_navigation.log"
+  )
+  local log_file
+  for log_file in "${log_files[@]}"; do
+    [[ -n "${log_file}" && -f "${log_file}" ]] || continue
+    if python3 - "${log_file}" <<'PY'
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as file:
+        lines = file.readlines()
+except OSError:
+    raise SystemExit(1)
+
+start_index = 0
+for index, line in enumerate(lines):
+    if "STARTUP_STAGE stage=nav2_layer_started" in line:
+        start_index = index
+
+for line in lines[start_index:]:
+    if "point-navigation core nodes are active" in line:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+    then
+      return 0
+    fi
+  done
+  return 1
+}
+
+nav2_critical_processes_running() {
+  local patterns=(
+    "__node:=controller_server"
+    "__node:=planner_server"
+    "__node:=bt_navigator"
+    "__node:=velocity_smoother"
+    "__node:=collision_monitor"
+  )
+  local pattern
+  for pattern in "${patterns[@]}"; do
+    pgrep -f "${pattern}" >/dev/null 2>&1 || return 1
+  done
 }
 
 map_server_asset_matches_current_floor() {
@@ -147,10 +234,35 @@ navigation_map_source_diagnostics() {
 
 standard_nav_stack_lifecycle_active() {
   local timeout_sec="${1:-8}"
+  local deadline=$((SECONDS + timeout_sec))
   local node_name
-  for node_name in $(critical_nav2_lifecycle_nodes); do
-    nav2_lifecycle_node_active "${node_name}" "${timeout_sec}" || return 1
+  local core_active
+  while (( SECONDS < deadline )); do
+    core_active=1
+    if nav2_critical_processes_running && nav2_point_navigation_core_reported_active; then
+      echo "[runtime-overlay] Nav2 repo lifecycle sequence reported point-navigation core nodes active and critical processes are running" >&2
+      return 0
+    fi
+    if nav2_critical_processes_running; then
+      while IFS= read -r node_name; do
+        nav2_lifecycle_node_active "${node_name}" "${NJRH_NAV2_CORE_LIFECYCLE_ACTIVE_CHECK_TIMEOUT_SEC:-1}" >/dev/null 2>&1 || {
+          core_active=0
+          break
+        }
+      done < <(critical_nav2_lifecycle_nodes)
+      if [[ "${core_active}" -eq 1 ]]; then
+        echo "[runtime-overlay] Nav2 point-navigation core lifecycle nodes are active and critical processes are running" >&2
+        return 0
+      fi
+    fi
+    if nav2_critical_processes_running && nav2_lifecycle_manager_reported_active; then
+      echo "[runtime-overlay] Nav2 lifecycle manager reported managed nodes active and critical processes are running" >&2
+      return 0
+    fi
+    sleep 0.5
   done
+  echo "[runtime-overlay] Nav2 point-navigation core lifecycle nodes did not become active before timeout" >&2
+  return 1
 }
 
 navigation_ready_gate() {

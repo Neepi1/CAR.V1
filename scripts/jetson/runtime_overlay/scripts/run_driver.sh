@@ -13,7 +13,12 @@ njrh_load_local_perception_input_profile
 njrh_load_pointcloud_accel_profile
 njrh_load_pointcloud_ingress_profile
 
-CONFIG_FILE="${NJRH_HESAI_CONFIG_FILE:-${UPSTREAM_WS}/src/hesai_lidar_ros2/config/config.yaml}"
+DEFAULT_HESAI_CONFIG_FILE="${UPSTREAM_WS}/src/hesai_lidar_ros2/config/config.yaml"
+REPO_HESAI_CONFIG_FILE="${NJRH_PROJECT_ROOT}/src/third_party/hesai_lidar_ros2_overlay/config/config.yaml"
+CONFIG_FILE="${NJRH_HESAI_CONFIG_FILE:-${DEFAULT_HESAI_CONFIG_FILE}}"
+if [[ -z "${NJRH_HESAI_CONFIG_FILE:-}" && ! -f "${CONFIG_FILE}" && -f "${REPO_HESAI_CONFIG_FILE}" ]]; then
+  CONFIG_FILE="${REPO_HESAI_CONFIG_FILE}"
+fi
 HESAI_ACCEL_DRIVER_CONFIG="${NJRH_HESAI_ACCEL_DRIVER_CONFIG:-${NJRH_OVERLAY_ROOT}/config/hesai_accel_driver.yaml}"
 export DRIVER_PROFILE="${DRIVER_PROFILE:-mapping}"
 export NJRH_HESAI_UPSTREAM_DRIVER_PROFILE="${NJRH_HESAI_UPSTREAM_DRIVER_PROFILE:-navigation}"
@@ -50,6 +55,10 @@ UPSTREAM_DRIVER_PROFILE="${NJRH_HESAI_UPSTREAM_DRIVER_PROFILE}"
 
 njrh_print_pointcloud_accel_profile
 njrh_print_local_perception_profile
+if [[ "${NJRH_ENABLE_LOCAL_POINTCLOUD_COMPAT_OUTPUT:-false}" != "true" ]]; then
+  RESOLVED_AXIS_LOCAL_OUTPUT_TOPIC=""
+  RESOLVED_AXIS_LOCAL_OUTPUT_TOPIC_SOURCE="disabled_by_standard_scan_obstacle_path"
+fi
 
 [[ -f "${CONFIG_FILE}" ]] || {
   echo "[runtime-overlay] driver config missing: ${CONFIG_FILE}" >&2

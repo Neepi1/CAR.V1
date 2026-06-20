@@ -93,6 +93,66 @@ wait_for_local_state_required_processes() {
   local_state_required_processes_running
 }
 
+canonical_wait_for_pid_exit() {
+  local pid="$1"
+  local attempts="${2:-20}"
+  local i
+  for ((i = 0; i < attempts; i += 1)); do
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+canonical_descendant_pids() {
+  local root_pid="$1"
+  local child_pid
+  local child_pids
+  child_pids="$(pgrep -P "${root_pid}" 2>/dev/null || true)"
+  for child_pid in ${child_pids}; do
+    printf '%s\n' "${child_pid}"
+    canonical_descendant_pids "${child_pid}"
+  done
+}
+
+terminate_canonical_helper_pid() {
+  local helper_name="$1"
+  local helper_pid="$2"
+  local int_attempts="${3:-${CANONICAL_HELPER_STOP_INT_ATTEMPTS:-20}}"
+  local term_attempts="${4:-${CANONICAL_HELPER_STOP_TERM_ATTEMPTS:-20}}"
+  [[ -n "${helper_pid}" ]] || return 0
+  if ! kill -0 "${helper_pid}" 2>/dev/null; then
+    wait "${helper_pid}" 2>/dev/null || true
+    return 0
+  fi
+
+  echo "[runtime-overlay] stopping ${helper_name} helper pid=${helper_pid}" >&2
+  kill -INT "${helper_pid}" 2>/dev/null || true
+  if canonical_wait_for_pid_exit "${helper_pid}" "${int_attempts}"; then
+    wait "${helper_pid}" 2>/dev/null || true
+    return 0
+  fi
+
+  echo "[runtime-overlay] ${helper_name} helper ignored SIGINT; escalating to SIGTERM" >&2
+  kill -TERM "${helper_pid}" 2>/dev/null || true
+  if canonical_wait_for_pid_exit "${helper_pid}" "${term_attempts}"; then
+    wait "${helper_pid}" 2>/dev/null || true
+    return 0
+  fi
+
+  echo "[runtime-overlay] ${helper_name} helper did not exit after SIGTERM; killing helper process tree" >&2
+  local descendant_pids
+  descendant_pids="$(canonical_descendant_pids "${helper_pid}")"
+  if [[ -n "${descendant_pids}" ]]; then
+    kill -KILL ${descendant_pids} 2>/dev/null || true
+  fi
+  kill -KILL "${helper_pid}" 2>/dev/null || true
+  canonical_wait_for_pid_exit "${helper_pid}" 10 || true
+  wait "${helper_pid}" 2>/dev/null || true
+}
+
 local_state_endpoint_ready() {
   local timeout_sec="${1:-8}"
   local mode="${LOCAL_STATE_MODE:-${NAV_LOCAL_STATE_MODE:-${NJRH_NAV_LOCAL_STATE_MODE:-ekf}}}"
@@ -161,8 +221,19 @@ canonical_helper_start_ready() {
   local helper_name="$1"
   case "${helper_name}" in
     local_state*|robot_local_state*)
-      wait_for_local_state_required_processes "${LOCAL_STATE_PROCESS_START_TIMEOUT_SEC:-8}" &&
-        local_state_runtime_ready "${LOCAL_STATE_START_READY_TIMEOUT_SEC:-12}"
+      wait_for_local_state_required_processes "${LOCAL_STATE_PROCESS_START_TIMEOUT_SEC:-12}" || return 1
+      case "${NJRH_LOCAL_STATE_START_READY_MODE:-fresh_tf}" in
+        endpoint)
+          local_state_endpoint_ready "${LOCAL_STATE_START_READY_TIMEOUT_SEC:-12}"
+          ;;
+        fresh_tf)
+          local_state_runtime_ready "${LOCAL_STATE_START_READY_TIMEOUT_SEC:-12}"
+          ;;
+        *)
+          echo "[runtime-overlay] unsupported NJRH_LOCAL_STATE_START_READY_MODE=${NJRH_LOCAL_STATE_START_READY_MODE}; expected endpoint|fresh_tf" >&2
+          return 1
+          ;;
+      esac
       ;;
     *)
       # A just-started helper only has to stay alive. Topic/TF/service checks
@@ -260,9 +331,16 @@ start_canonical_helper() {
     return 1
   fi
   if ! canonical_helper_start_ready "${helper_name}"; then
+    if LOCAL_STATE_REUSE_READY_TIMEOUT_SEC="${LOCAL_STATE_READY_RECHECK_TIMEOUT_SEC:-12}" canonical_helper_ready "${helper_name}"; then
+      echo "[runtime-overlay] helper became ready during final recheck: ${helper_name}" >&2
+      disown "${helper_pid}" 2>/dev/null || true
+      forget_canonical_helper_pid "${helper_pid}"
+      echo "[runtime-overlay] helper launched: ${helper_name} (pid=${helper_pid}, cleanup_owner=common)" >&2
+      return 0
+    fi
     echo "[runtime-overlay] helper child process did not become ready: ${helper_name}. Check ${helper_log}" >&2
-    kill -INT "${helper_pid}" 2>/dev/null || true
-    wait "${helper_pid}" 2>/dev/null || true
+    terminate_canonical_helper_pid "${helper_name}" "${helper_pid}"
+    forget_canonical_helper_pid "${helper_pid}"
     return 1
   fi
   # Canonical TF/local-state helpers are common-service dependencies. Keep a

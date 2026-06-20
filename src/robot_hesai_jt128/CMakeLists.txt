@@ -5,6 +5,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(tf2 REQUIRED)
@@ -13,6 +14,7 @@ find_package(tf2_ros REQUIRED)
 ament_export_include_directories(include)
 ament_export_dependencies(
   geometry_msgs
+  nav_msgs
   rclcpp
   sensor_msgs
   std_msgs
@@ -29,6 +31,7 @@ target_include_directories(pointcloud_accel_core PUBLIC
 ament_target_dependencies(
   pointcloud_accel_core
   geometry_msgs
+  nav_msgs
   rclcpp
   sensor_msgs
   std_msgs
@@ -47,12 +50,14 @@ target_link_libraries(pointcloud_accel_axis_node pointcloud_accel_core)
 ament_target_dependencies(
   pointcloud_accel_axis_node
   rclcpp
+  nav_msgs
   sensor_msgs)
 add_executable(hesai_accel_driver_node src/hesai_accel_driver_node.cpp)
 target_include_directories(hesai_accel_driver_node PRIVATE include)
 target_link_libraries(hesai_accel_driver_node pointcloud_accel_core)
 ament_target_dependencies(
   hesai_accel_driver_node
+  nav_msgs
   rclcpp)
 add_executable(pointcloud_downsample_node src/pointcloud_downsample_node.cpp)
 ament_target_dependencies(pointcloud_downsample_node rclcpp sensor_msgs)

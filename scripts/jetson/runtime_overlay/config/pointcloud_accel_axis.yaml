@@ -12,27 +12,33 @@ pointcloud_accel_axis_node:
     flatscan_output_topic: /flatscan
     status_publish_period_sec: 1.0
 
-    # /lidar_points is always full-density/full-fields. The compact settings
-    # below affect only navigation/debug branches and never the canonical trunk.
+    # /lidar_points is always full-density/full-fields. Production navigation
+    # no longer publishes compact PointCloud2 obstacle branches; /scan is the
+    # only local obstacle observation output.
     accel_profile: ipc_worker
-    local_output_topic: /_internal/lidar_points_local
-    local_compact_enabled: true
+    local_output_topic: ""
+    local_compact_enabled: false
     local_compact_fields: xyzi
     local_compact_stride: 4
     local_compact_max_rate_hz: 12.0
     local_output_qos_depth: 1
-    nav_output_topic: /lidar_points_nav
-    nav_compact_enabled: true
+    nav_output_topic: ""
+    nav_compact_enabled: false
     nav_compact_fields: xyzi
     nav_compact_stride: 4
     nav_compact_max_rate_hz: 10.0
     nav_output_qos_depth: 1
 
-    local_worker_enabled: true
-    worker_local_enabled: true
-    obstacle_output_topic: /perception/obstacle_points
-    clearing_output_topic: /perception/clearing_points
+    # Local dynamic obstacle handling now uses Nav2's native LaserScan source
+    # on /scan. Keep the scan worker enabled below, but do not publish the
+    # previous custom local PointCloud2 obstacle or clearing clouds.
+    local_worker_enabled: false
+    worker_local_enabled: false
     local_worker_output_frame_id: base_link
+    local_worker_restamp_to_now: true
+    local_worker_stamp_source: local_odom
+    local_worker_stamp_odom_topic: /local_state/odometry
+    local_worker_stamp_max_odom_age_sec: 0.25
     local_worker_rate_hz: 12.0
     local_worker_range_min: 0.5
     local_worker_range_max: 5.50
@@ -54,19 +60,22 @@ pointcloud_accel_axis_node:
     clearing_worker_min_z: -0.30
     clearing_worker_max_z: 1.40
     clearing_worker_point_stride: 2
-    clearing_worker_max_points: 15000
+    clearing_worker_max_points: 30000
     clearing_worker_virtual_rays_enabled: true
     clearing_worker_virtual_ray_angle_resolution_deg: 1.0
+    clearing_worker_virtual_ray_min_angle_deg: -110.0
+    clearing_worker_virtual_ray_max_angle_deg: 110.0
+    clearing_worker_virtual_rays_allow_self_mask_endpoints: true
     clearing_worker_virtual_ray_range: 8.00
-    clearing_worker_virtual_ray_range_steps: [0.50, 1.00, 2.00, 3.50, 5.50, 8.00]
-    clearing_worker_virtual_ray_endpoint_z_values: [-0.10, 0.05, 0.20, 0.40, 0.60, 0.85, 1.10, 1.30]
+    clearing_worker_virtual_ray_range_steps: [0.10, 0.15, 0.20, 0.35, 0.50, 0.75, 1.00, 1.50, 2.50, 4.00, 6.00, 8.00]
+    clearing_worker_virtual_ray_endpoint_z_values: [-0.10, 0.05, 0.20, 0.40, 0.60, 0.80, 1.00, 1.20, 1.40]
 
     scan_worker_enabled: true
     worker_scan_enabled: true
     scan_output_topic: /scan
     scan_worker_frame_id: lidar_level_link
     scan_worker_rate_hz: 15.0
-    scan_worker_min_height: -0.75
+    scan_worker_min_height: -0.50
     scan_worker_max_height: 0.35
     scan_worker_angle_min: -3.141592653589793
     scan_worker_angle_max: 3.141592653589793

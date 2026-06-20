@@ -90,7 +90,7 @@ run_check() {
 
 printf '[runtime-overlay] commercial runtime readiness check\n'
 
-run_check check_process "jt128_driver" "hesai_ros_driver_node"
+run_check check_process "jt128_driver" "hesai_ros_driver_node|hesai_accel_driver_node|jt128_accel_driver_node"
 if [[ "${NJRH_NAV_LOCAL_STATE_MODE:-ekf}" == "fastlio" || "${NJRH_FASTLIO_AUTOSTART:-false}" == "true" ]]; then
   run_check check_process "fastlio_mapping" "fast_lio fastlio_mapping|laser_mapping"
 else
@@ -99,7 +99,6 @@ fi
 run_check check_process "robot_local_state" "ekf_node --ros-args.*__node:=robot_local_state|robot_localization/ekf_node|robot_local_state/local_state_node|local_state_node --ros-args"
 run_check check_process "localization_bridge" "robot_localization_bridge/localization_bridge_node|localization_bridge_node --ros-args"
 run_check check_process "robot_safety" "robot_safety/robot_safety_node|robot_safety_node --ros-args"
-run_check check_process "local_perception" "robot_local_perception/local_perception_node|local_perception_node --ros-args"
 
 run_check check_node "/robot_api_server"
 run_check check_node "/robot_floor_manager"
@@ -119,7 +118,7 @@ run_check check_lifecycle_active "/velocity_smoother" 12
 run_check check_lifecycle_active "/collision_monitor" 12
 
 run_check check_topic "/local_state/odometry" 10
-run_check check_topic "/perception/obstacle_points" 10
+run_check check_topic "/scan" 10
 run_check check_topic_once "/safety/status" 10
 run_check check_tf "odom" "base_link" 10
 run_check check_tf "map" "odom" 10

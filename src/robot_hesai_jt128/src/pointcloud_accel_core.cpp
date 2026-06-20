@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <memory>
@@ -23,6 +24,7 @@
 #endif
 
 #include "geometry_msgs/msg/transform_stamped.hpp"
+#include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp/qos.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
@@ -333,6 +335,10 @@ struct WorkerDiagnostics
   double clearing_output_header_age_ms{-1.0};
   double clearing_output_source_age_ms{-1.0};
   double clearing_output_publish_delay_ms{-1.0};
+  double stamp_odom_header_age_ms{-1.0};
+  std::uint64_t stamp_fallback_count{0U};
+  std::size_t last_obstacle_points{0U};
+  std::size_t last_clearing_points{0U};
   double scan_output_header_age_ms{-1.0};
   double scan_output_source_age_ms{-1.0};
 };
@@ -342,6 +348,16 @@ struct ClearingRayBin
   bool has_return{false};
   double range_xy{0.0};
   double angle_rad{0.0};
+};
+
+enum class LocalWorkerHeaderStampSource : int
+{
+  Uninitialized = 0,
+  PublishTime = 1,
+  SourceStamp = 2,
+  LocalOdom = 3,
+  SourceStampFallbackMissingLocalOdom = 4,
+  SourceStampFallbackStaleLocalOdom = 5,
 };
 
 }  // namespace
@@ -379,29 +395,33 @@ public:
         0.0, 0.0, 1.0,
       });
 
-    node_.declare_parameter<std::string>("local_output_topic", "/_internal/lidar_points_local");
+    node_.declare_parameter<std::string>("local_output_topic", "");
     node_.declare_parameter<int>("local_output_stride", 4);
     node_.declare_parameter<int>("local_output_publish_every_n", 1);
     node_.declare_parameter<std::string>("local_compact_fields", "xyzi");
-    node_.declare_parameter<bool>("local_compact_enabled", true);
+    node_.declare_parameter<bool>("local_compact_enabled", false);
     node_.declare_parameter<int>("local_compact_stride", 4);
     node_.declare_parameter<double>("local_compact_max_rate_hz", 12.0);
     node_.declare_parameter<int>("local_output_qos_depth", 1);
 
-    node_.declare_parameter<std::string>("nav_output_topic", "/lidar_points_nav");
+    node_.declare_parameter<std::string>("nav_output_topic", "");
     node_.declare_parameter<int>("nav_output_stride", 4);
     node_.declare_parameter<int>("nav_output_publish_every_n", 2);
     node_.declare_parameter<std::string>("nav_compact_fields", "xyzi");
-    node_.declare_parameter<bool>("nav_compact_enabled", true);
+    node_.declare_parameter<bool>("nav_compact_enabled", false);
     node_.declare_parameter<int>("nav_compact_stride", 4);
     node_.declare_parameter<double>("nav_compact_max_rate_hz", 10.0);
     node_.declare_parameter<int>("nav_output_qos_depth", 1);
 
-    node_.declare_parameter<bool>("worker_local_enabled", true);
-    node_.declare_parameter<bool>("local_worker_enabled", true);
-    node_.declare_parameter<std::string>("obstacle_output_topic", "/perception/obstacle_points");
-    node_.declare_parameter<std::string>("clearing_output_topic", "/perception/clearing_points");
+    node_.declare_parameter<bool>("worker_local_enabled", false);
+    node_.declare_parameter<bool>("local_worker_enabled", false);
+    node_.declare_parameter<std::string>("obstacle_output_topic", "");
+    node_.declare_parameter<std::string>("clearing_output_topic", "");
     node_.declare_parameter<std::string>("local_worker_output_frame_id", "base_link");
+    node_.declare_parameter<bool>("local_worker_restamp_to_now", true);
+    node_.declare_parameter<std::string>("local_worker_stamp_source", "");
+    node_.declare_parameter<std::string>("local_worker_stamp_odom_topic", "/local_state/odometry");
+    node_.declare_parameter<double>("local_worker_stamp_max_odom_age_sec", 0.25);
     node_.declare_parameter<double>("local_worker_rate_hz", 12.0);
     node_.declare_parameter<double>("local_worker_range_min", 0.5);
     node_.declare_parameter<double>("local_worker_range_max", 5.5);
@@ -423,16 +443,19 @@ public:
     node_.declare_parameter<double>("clearing_worker_min_z", -0.30);
     node_.declare_parameter<double>("clearing_worker_max_z", 1.40);
     node_.declare_parameter<int>("clearing_worker_point_stride", 2);
-    node_.declare_parameter<int>("clearing_worker_max_points", 15000);
+    node_.declare_parameter<int>("clearing_worker_max_points", 30000);
     node_.declare_parameter<bool>("clearing_worker_virtual_rays_enabled", true);
     node_.declare_parameter<double>("clearing_worker_virtual_ray_angle_resolution_deg", 1.0);
+    node_.declare_parameter<double>("clearing_worker_virtual_ray_min_angle_deg", -110.0);
+    node_.declare_parameter<double>("clearing_worker_virtual_ray_max_angle_deg", 110.0);
+    node_.declare_parameter<bool>("clearing_worker_virtual_rays_allow_self_mask_endpoints", true);
     node_.declare_parameter<double>("clearing_worker_virtual_ray_range", 8.0);
     node_.declare_parameter<std::vector<double>>(
       "clearing_worker_virtual_ray_range_steps",
-      std::vector<double>{0.50, 1.00, 2.00, 3.50, 5.50, 8.00});
+      std::vector<double>{0.10, 0.15, 0.20, 0.35, 0.50, 0.75, 1.00, 1.50, 2.50, 4.00, 6.00, 8.00});
     node_.declare_parameter<std::vector<double>>(
       "clearing_worker_virtual_ray_endpoint_z_values",
-      std::vector<double>{-0.10, 0.05, 0.20, 0.40, 0.60, 0.85, 1.10, 1.30});
+      std::vector<double>{-0.10, 0.05, 0.20, 0.40, 0.60, 0.80, 1.00, 1.20, 1.40});
 
     node_.declare_parameter<bool>("worker_scan_enabled", true);
     node_.declare_parameter<bool>("scan_worker_enabled", true);
@@ -476,10 +499,16 @@ public:
     sanitize_compact_fields(local_compact_fields_);
     sanitize_compact_fields(nav_compact_fields_);
 
-    worker_local_enabled_ =
-      node_.get_parameter("worker_local_enabled").as_bool() &&
-      node_.get_parameter("local_worker_enabled").as_bool() &&
-      profile_uses_workers(accel_profile_);
+    const bool local_worker_requested =
+      node_.get_parameter("worker_local_enabled").as_bool() ||
+      node_.get_parameter("local_worker_enabled").as_bool();
+    worker_local_enabled_ = false;
+    if (local_worker_requested) {
+      RCLCPP_WARN(
+        node_.get_logger(),
+        "PointCloud2 local obstacle worker is disabled: Nav2 local marking+clearing uses /scan; "
+        "local PointCloud2 obstacle and clearing outputs will not be published");
+    }
     worker_scan_enabled_ =
       node_.get_parameter("worker_scan_enabled").as_bool() &&
       node_.get_parameter("scan_worker_enabled").as_bool() &&
@@ -487,6 +516,15 @@ public:
     obstacle_output_topic_ = node_.get_parameter("obstacle_output_topic").as_string();
     clearing_output_topic_ = node_.get_parameter("clearing_output_topic").as_string();
     local_worker_output_frame_id_ = node_.get_parameter("local_worker_output_frame_id").as_string();
+    local_worker_restamp_to_now_ = node_.get_parameter("local_worker_restamp_to_now").as_bool();
+    local_worker_stamp_source_ = normalize_local_worker_stamp_source(
+      node_.get_parameter("local_worker_stamp_source").as_string());
+    if (local_worker_stamp_source_.empty()) {
+      local_worker_stamp_source_ = local_worker_restamp_to_now_ ? "now" : "source";
+    }
+    local_worker_stamp_odom_topic_ = node_.get_parameter("local_worker_stamp_odom_topic").as_string();
+    local_worker_stamp_max_odom_age_sec_ =
+      std::max(0.01, node_.get_parameter("local_worker_stamp_max_odom_age_sec").as_double());
     local_worker_rate_hz_ = std::max(node_.get_parameter("local_worker_rate_hz").as_double(), 0.1);
     local_worker_range_min_ = node_.get_parameter("local_worker_range_min").as_double();
     local_worker_range_max_ = node_.get_parameter("local_worker_range_max").as_double();
@@ -508,7 +546,7 @@ public:
     clearing_worker_min_z_ = node_.get_parameter("clearing_worker_min_z").as_double();
     clearing_worker_max_z_ = node_.get_parameter("clearing_worker_max_z").as_double();
     clearing_worker_point_stride_ = positive_size_param("clearing_worker_point_stride", 2U);
-    clearing_worker_max_points_ = positive_size_param("clearing_worker_max_points", 15000U);
+    clearing_worker_max_points_ = positive_size_param("clearing_worker_max_points", 30000U);
     clearing_worker_virtual_rays_enabled_ =
       node_.get_parameter("clearing_worker_virtual_rays_enabled").as_bool();
     clearing_worker_virtual_ray_angle_resolution_rad_ =
@@ -516,6 +554,18 @@ public:
       node_.get_parameter("clearing_worker_virtual_ray_angle_resolution_deg").as_double(),
       0.2,
       10.0) * kPi / 180.0;
+    clearing_worker_virtual_ray_min_angle_rad_ =
+      std::clamp(
+      node_.get_parameter("clearing_worker_virtual_ray_min_angle_deg").as_double(),
+      -180.0,
+      180.0) * kPi / 180.0;
+    clearing_worker_virtual_ray_max_angle_rad_ =
+      std::clamp(
+      node_.get_parameter("clearing_worker_virtual_ray_max_angle_deg").as_double(),
+      -180.0,
+      180.0) * kPi / 180.0;
+    clearing_worker_virtual_rays_allow_self_mask_endpoints_ =
+      node_.get_parameter("clearing_worker_virtual_rays_allow_self_mask_endpoints").as_bool();
     clearing_worker_virtual_ray_range_ =
       std::max(clearing_worker_range_min_, node_.get_parameter("clearing_worker_virtual_ray_range").as_double());
     clearing_worker_virtual_ray_ranges_ =
@@ -557,6 +607,14 @@ public:
         obstacle_output_topic_, make_qos(1U, RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT));
       clearing_publisher_ = node_.create_publisher<sensor_msgs::msg::PointCloud2>(
         clearing_output_topic_, make_qos(1U, RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT));
+      if (local_worker_stamp_source_ == "local_odom" && !local_worker_stamp_odom_topic_.empty()) {
+        rclcpp::QoS odom_qos{rclcpp::KeepLast(10)};
+        odom_qos.best_effort();
+        odom_qos.durability_volatile();
+        local_worker_odom_subscription_ = node_.create_subscription<nav_msgs::msg::Odometry>(
+          local_worker_stamp_odom_topic_, odom_qos,
+          std::bind(&PointCloudAccelCore::Impl::handle_local_worker_odom, this, std::placeholders::_1));
+      }
     }
     if (worker_scan_enabled_) {
       scan_publisher_ = node_.create_publisher<sensor_msgs::msg::LaserScan>(
@@ -649,6 +707,62 @@ private:
     }
   }
 
+  static std::string normalize_local_worker_stamp_source(const std::string & raw_source)
+  {
+    auto source = lower_copy(raw_source);
+    if (source == "publish_time" || source == "restamp_to_now") {
+      return "now";
+    }
+    if (source == "source_stamp") {
+      return "source";
+    }
+    if (source == "local_state_odom" || source == "local_odometry" || source == "odom") {
+      return "local_odom";
+    }
+    if (source == "now" || source == "source" || source == "local_odom") {
+      return source;
+    }
+    if (source.empty()) {
+      return source;
+    }
+    RCLCPP_WARN(
+      rclcpp::get_logger("pointcloud_accel_core"),
+      "unknown local_worker_stamp_source '%s', falling back to legacy local_worker_restamp_to_now behavior",
+      raw_source.c_str());
+    return "";
+  }
+
+  static const char * local_worker_header_stamp_source_label(const LocalWorkerHeaderStampSource source)
+  {
+    switch (source) {
+      case LocalWorkerHeaderStampSource::PublishTime:
+        return "publish_time";
+      case LocalWorkerHeaderStampSource::SourceStamp:
+        return "source_stamp";
+      case LocalWorkerHeaderStampSource::LocalOdom:
+        return "local_odom";
+      case LocalWorkerHeaderStampSource::SourceStampFallbackMissingLocalOdom:
+        return "source_stamp_fallback_missing_local_odom";
+      case LocalWorkerHeaderStampSource::SourceStampFallbackStaleLocalOdom:
+        return "source_stamp_fallback_stale_local_odom";
+      case LocalWorkerHeaderStampSource::Uninitialized:
+      default:
+        return "uninitialized";
+    }
+  }
+
+  void set_local_worker_header_stamp_source(const LocalWorkerHeaderStampSource source)
+  {
+    local_worker_last_header_stamp_source_.store(static_cast<int>(source), std::memory_order_relaxed);
+  }
+
+  const char * current_local_worker_header_stamp_source_label() const
+  {
+    return local_worker_header_stamp_source_label(
+      static_cast<LocalWorkerHeaderStampSource>(
+        local_worker_last_header_stamp_source_.load(std::memory_order_relaxed)));
+  }
+
   bool lookup_transform(
     const std::string & target_frame,
     const std::string & source_frame,
@@ -686,6 +800,57 @@ private:
         target_frame.c_str(), source_frame.c_str(), ex.what());
       return false;
     }
+  }
+
+  void handle_local_worker_odom(const nav_msgs::msg::Odometry::SharedPtr msg)
+  {
+    if (!msg || stamp_to_sec(msg->header.stamp) <= 0.0) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(local_worker_odom_mutex_);
+    latest_local_worker_odom_stamp_ = msg->header.stamp;
+    latest_local_worker_odom_receive_time_ = Clock::now();
+    has_latest_local_worker_odom_stamp_ = true;
+    ++local_worker_odom_stamp_count_;
+  }
+
+  builtin_interfaces::msg::Time resolve_local_worker_output_stamp(
+    const builtin_interfaces::msg::Time & source_stamp)
+  {
+    const auto now = node_.now();
+    local_worker_.stamp_odom_header_age_ms = -1.0;
+
+    if (local_worker_stamp_source_ == "source") {
+      set_local_worker_header_stamp_source(LocalWorkerHeaderStampSource::SourceStamp);
+      return source_stamp;
+    }
+    if (local_worker_stamp_source_ == "local_odom") {
+      builtin_interfaces::msg::Time odom_stamp;
+      bool has_odom = false;
+      {
+        std::lock_guard<std::mutex> lock(local_worker_odom_mutex_);
+        has_odom = has_latest_local_worker_odom_stamp_;
+        odom_stamp = latest_local_worker_odom_stamp_;
+      }
+      if (has_odom) {
+        const auto odom_stamp_sec = stamp_to_sec(odom_stamp);
+        const auto odom_age_sec = now.seconds() - odom_stamp_sec;
+        local_worker_.stamp_odom_header_age_ms = odom_age_sec * 1000.0;
+        if (odom_stamp_sec > 0.0 && odom_age_sec >= 0.0 && odom_age_sec <= local_worker_stamp_max_odom_age_sec_) {
+          set_local_worker_header_stamp_source(LocalWorkerHeaderStampSource::LocalOdom);
+          return odom_stamp;
+        }
+      }
+      ++local_worker_.stamp_fallback_count;
+      set_local_worker_header_stamp_source(
+        has_odom ?
+        LocalWorkerHeaderStampSource::SourceStampFallbackStaleLocalOdom :
+        LocalWorkerHeaderStampSource::SourceStampFallbackMissingLocalOdom);
+      return source_stamp;
+    }
+
+    set_local_worker_header_stamp_source(LocalWorkerHeaderStampSource::PublishTime);
+    return stamp_to_msg(now);
   }
 
   static builtin_interfaces::msg::Time stamp_to_msg(const rclcpp::Time & stamp)
@@ -1189,8 +1354,8 @@ private:
 
   std::pair<double, double> clearing_virtual_ray_angle_bounds() const
   {
-    if (local_worker_min_angle_rad_ <= local_worker_max_angle_rad_) {
-      return {local_worker_min_angle_rad_, local_worker_max_angle_rad_};
+    if (clearing_worker_virtual_ray_min_angle_rad_ <= clearing_worker_virtual_ray_max_angle_rad_) {
+      return {clearing_worker_virtual_ray_min_angle_rad_, clearing_worker_virtual_ray_max_angle_rad_};
     }
     return {-kPi, kPi};
   }
@@ -1276,7 +1441,7 @@ private:
           endpoint.y = y;
           endpoint.z = static_cast<float>(z_value);
           endpoint.intensity = 0.0F;
-          if (in_self_mask(endpoint)) {
+          if (!clearing_worker_virtual_rays_allow_self_mask_endpoints_ && in_self_mask(endpoint)) {
             continue;
           }
           local_worker_clearing_points_.push_back(endpoint);
@@ -1405,7 +1570,9 @@ private:
     }
     auto header = header_from_buffer(*buffer);
     header.frame_id = local_worker_output_frame_id_;
+    header.stamp = resolve_local_worker_output_stamp(header.stamp);
     fill_xyzi_cloud(local_worker_obstacle_points_, header, true, obstacle_output_msg_, local_worker_);
+    local_worker_.last_obstacle_points = local_worker_obstacle_points_.size();
     local_worker_.last_obstacle_output_bytes = obstacle_output_msg_.data.size();
     const auto obstacle_ready = Clock::now();
     local_worker_.obstacle_output_source_age_ms = age_ms_from_ros_stamp(node_.now().seconds(), buffer->stamp);
@@ -1427,6 +1594,7 @@ private:
         build_virtual_clearing_points();
       }
       fill_xyzi_cloud(local_worker_clearing_points_, header, true, clearing_output_msg_, local_worker_);
+      local_worker_.last_clearing_points = local_worker_clearing_points_.size();
       local_worker_.last_clearing_output_bytes = clearing_output_msg_.data.size();
       const auto clearing_ready = Clock::now();
       local_worker_.clearing_output_source_age_ms = age_ms_from_ros_stamp(node_.now().seconds(), buffer->stamp);
@@ -1671,17 +1839,31 @@ private:
            << " local_worker_reused_buffer=" << (local_worker_.reused_output_buffer ? "true" : "false")
            << " local_worker_lock_wait_ms_max=" << local_worker_.lock_wait_ms_max
            << " obstacle_output_last_bytes=" << local_worker_.last_obstacle_output_bytes
+           << " obstacle_output_last_points=" << local_worker_.last_obstacle_points
            << " obstacle_output_header_age_ms=" << local_worker_.obstacle_output_header_age_ms
            << " obstacle_output_source_age_ms=" << local_worker_.obstacle_output_source_age_ms
            << " obstacle_output_publish_delay_ms=" << local_worker_.obstacle_output_publish_delay_ms
            << " obstacle_output_frame_id=" << local_worker_output_frame_id_
-           << " obstacle_output_header_stamp_source=source_stamp"
+           << " obstacle_output_header_stamp_source=" << current_local_worker_header_stamp_source_label()
            << " clearing_output_last_bytes=" << local_worker_.last_clearing_output_bytes
+           << " clearing_output_last_points=" << local_worker_.last_clearing_points
            << " clearing_output_header_age_ms=" << local_worker_.clearing_output_header_age_ms
            << " clearing_output_source_age_ms=" << local_worker_.clearing_output_source_age_ms
            << " clearing_output_publish_delay_ms=" << local_worker_.clearing_output_publish_delay_ms
            << " clearing_output_frame_id=" << local_worker_output_frame_id_
-           << " clearing_output_header_stamp_source=source_stamp"
+           << " clearing_output_header_stamp_source=" << current_local_worker_header_stamp_source_label()
+           << " local_worker_stamp_source=" << local_worker_stamp_source_
+           << " local_worker_stamp_odom_topic=" << local_worker_stamp_odom_topic_
+           << " local_worker_stamp_max_odom_age_ms=" << (local_worker_stamp_max_odom_age_sec_ * 1000.0)
+           << " local_worker_stamp_odom_header_age_ms=" << local_worker_.stamp_odom_header_age_ms
+           << " local_worker_stamp_odom_count=" << local_worker_odom_stamp_count_
+           << " local_worker_stamp_fallback_count=" << local_worker_.stamp_fallback_count
+           << " clearing_virtual_ray_min_angle_deg=" <<
+             (clearing_worker_virtual_ray_min_angle_rad_ * 180.0 / kPi)
+           << " clearing_virtual_ray_max_angle_deg=" <<
+             (clearing_worker_virtual_ray_max_angle_rad_ * 180.0 / kPi)
+           << " clearing_virtual_rays_allow_self_mask_endpoints=" <<
+             (clearing_worker_virtual_rays_allow_self_mask_endpoints_ ? "true" : "false")
            << " scan_worker_tick_hz=" << static_cast<double>(scan_tick_delta) / elapsed_sec
            << " scan_worker_processed_hz=" << static_cast<double>(scan_processed_delta) / elapsed_sec
            << " scan_worker_scan_publish_hz=" << static_cast<double>(scan_delta) / elapsed_sec
@@ -1785,6 +1967,17 @@ private:
   std::string obstacle_output_topic_;
   std::string clearing_output_topic_;
   std::string local_worker_output_frame_id_;
+  bool local_worker_restamp_to_now_{true};
+  std::string local_worker_stamp_source_{"now"};
+  std::string local_worker_stamp_odom_topic_{"/local_state/odometry"};
+  double local_worker_stamp_max_odom_age_sec_{0.25};
+  std::atomic<int> local_worker_last_header_stamp_source_{
+    static_cast<int>(LocalWorkerHeaderStampSource::Uninitialized)};
+  std::mutex local_worker_odom_mutex_;
+  builtin_interfaces::msg::Time latest_local_worker_odom_stamp_{};
+  Clock::time_point latest_local_worker_odom_receive_time_{};
+  bool has_latest_local_worker_odom_stamp_{false};
+  std::uint64_t local_worker_odom_stamp_count_{0U};
   double local_worker_rate_hz_{12.0};
   double local_worker_range_min_{0.5};
   double local_worker_range_max_{5.5};
@@ -1806,13 +1999,17 @@ private:
   double clearing_worker_min_z_{-0.30};
   double clearing_worker_max_z_{1.40};
   std::size_t clearing_worker_point_stride_{2U};
-  std::size_t clearing_worker_max_points_{15000U};
+  std::size_t clearing_worker_max_points_{30000U};
   bool clearing_worker_virtual_rays_enabled_{true};
   double clearing_worker_virtual_ray_angle_resolution_rad_{kPi / 180.0};
+  double clearing_worker_virtual_ray_min_angle_rad_{-110.0 * kPi / 180.0};
+  double clearing_worker_virtual_ray_max_angle_rad_{110.0 * kPi / 180.0};
+  bool clearing_worker_virtual_rays_allow_self_mask_endpoints_{true};
   double clearing_worker_virtual_ray_range_{8.0};
-  std::vector<double> clearing_worker_virtual_ray_ranges_{0.50, 1.00, 2.00, 3.50, 5.50, 8.00};
+  std::vector<double> clearing_worker_virtual_ray_ranges_{
+    0.10, 0.15, 0.20, 0.35, 0.50, 0.75, 1.00, 1.50, 2.50, 4.00, 6.00, 8.00};
   std::vector<double> clearing_worker_virtual_ray_endpoint_z_values_{
-    -0.10, 0.05, 0.20, 0.40, 0.60, 0.85, 1.10, 1.30};
+    -0.10, 0.05, 0.20, 0.40, 0.60, 0.80, 1.00, 1.20, 1.40};
 
   std::string scan_output_topic_;
   std::string scan_worker_frame_id_;
@@ -1899,6 +2096,7 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr scan_publisher_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_publisher_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr accel_status_publisher_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr local_worker_odom_subscription_;
   rclcpp::TimerBase::SharedPtr status_timer_;
   std::thread local_worker_thread_;
   std::thread scan_worker_thread_;

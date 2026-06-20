@@ -39,6 +39,7 @@ def generate_launch_description():
     use_composition = LaunchConfiguration("use_composition")
     log_level = LaunchConfiguration("log_level")
     nav_lifecycle_start_delay = LaunchConfiguration("nav_lifecycle_start_delay")
+    navigation_lifecycle_autostart = LaunchConfiguration("navigation_lifecycle_autostart")
 
     default_params_file = PathJoinSubstitution(
         [FindPackageShare("robot_nav_config"), "config", "nav2.yaml"]
@@ -49,13 +50,75 @@ def generate_launch_description():
     default_speed_mask_yaml = PathJoinSubstitution(
         [FindPackageShare("robot_nav_config"), "config", "neutral_speed_mask.yaml"]
     )
+    enable_speed_filter = os.environ.get("NJRH_ENABLE_SPEED_FILTER", "false").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    enable_costmap_filter_servers = os.environ.get(
+        "NJRH_NAV2_COSTMAP_FILTER_SERVERS_ENABLED", "true"
+    ).lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
-    filter_lifecycle_nodes = [
-        "keepout_filter_mask_server",
-        "keepout_costmap_filter_info_server",
-        "speed_filter_mask_server",
-        "speed_costmap_filter_info_server",
-    ]
+    filter_lifecycle_nodes = []
+    costmap_filter_nodes = []
+    if enable_costmap_filter_servers:
+        filter_lifecycle_nodes.extend(
+            [
+                "keepout_filter_mask_server",
+                "keepout_costmap_filter_info_server",
+            ]
+        )
+        costmap_filter_nodes.extend(
+            [
+                Node(
+                    package="nav2_map_server",
+                    executable="map_server",
+                    name="keepout_filter_mask_server",
+                    output="screen",
+                    respawn=use_respawn,
+                    respawn_delay=2.0,
+                    parameters=[
+                        {"use_sim_time": use_sim_time},
+                        {"yaml_filename": keepout_mask_yaml},
+                        {"topic_name": "/keepout_filter_mask"},
+                        {"frame_id": "map"},
+                    ],
+                    arguments=["--ros-args", "--log-level", log_level],
+                    prefix=cpu_affinity_prefix("nav2_map_server"),
+                ),
+                Node(
+                    package="nav2_map_server",
+                    executable="costmap_filter_info_server",
+                    name="keepout_costmap_filter_info_server",
+                    output="screen",
+                    respawn=use_respawn,
+                    respawn_delay=2.0,
+                    parameters=[
+                        {"use_sim_time": use_sim_time},
+                        {"type": 0},
+                        {"filter_info_topic": "/costmap_filter_info/keepout"},
+                        {"mask_topic": "/keepout_filter_mask"},
+                        {"base": 0.0},
+                        {"multiplier": 1.0},
+                    ],
+                    arguments=["--ros-args", "--log-level", log_level],
+                    prefix=cpu_affinity_prefix("nav2_map_server"),
+                ),
+            ]
+        )
+    if enable_speed_filter:
+        filter_lifecycle_nodes.extend(
+            [
+                "speed_filter_mask_server",
+                "speed_costmap_filter_info_server",
+            ]
+        )
 
     navigation_lifecycle_nodes = [
         "controller_server",
@@ -94,56 +157,9 @@ def generate_launch_description():
         "arguments": ["--ros-args", "--log-level", log_level],
     }
 
-    return LaunchDescription(
-        [
-            SetEnvironmentVariable("RCUTILS_LOGGING_BUFFERED_STREAM", "1"),
-            DeclareLaunchArgument("namespace", default_value=""),
-            DeclareLaunchArgument("use_sim_time", default_value="false"),
-            DeclareLaunchArgument("autostart", default_value="true"),
-            DeclareLaunchArgument("params_file", default_value=default_params_file),
-            DeclareLaunchArgument("keepout_mask_yaml", default_value=default_keepout_mask_yaml),
-            DeclareLaunchArgument("speed_mask_yaml", default_value=default_speed_mask_yaml),
-            DeclareLaunchArgument("use_respawn", default_value="False"),
-            DeclareLaunchArgument("use_composition", default_value="False"),
-            DeclareLaunchArgument(
-                "nav_lifecycle_start_delay",
-                default_value=os.environ.get("NJRH_NAV_LIFECYCLE_START_DELAY_SEC", "18.0"),
-            ),
-            DeclareLaunchArgument("log_level", default_value="info"),
-            Node(
-                package="nav2_map_server",
-                executable="map_server",
-                name="keepout_filter_mask_server",
-                output="screen",
-                respawn=use_respawn,
-                respawn_delay=2.0,
-                parameters=[
-                    {"use_sim_time": use_sim_time},
-                    {"yaml_filename": keepout_mask_yaml},
-                    {"topic_name": "/keepout_filter_mask"},
-                    {"frame_id": "map"},
-                ],
-                arguments=["--ros-args", "--log-level", log_level],
-                prefix=cpu_affinity_prefix("nav2_map_server"),
-            ),
-            Node(
-                package="nav2_map_server",
-                executable="costmap_filter_info_server",
-                name="keepout_costmap_filter_info_server",
-                output="screen",
-                respawn=use_respawn,
-                respawn_delay=2.0,
-                parameters=[
-                    {"use_sim_time": use_sim_time},
-                    {"type": 0},
-                    {"filter_info_topic": "/costmap_filter_info/keepout"},
-                    {"mask_topic": "/keepout_filter_mask"},
-                    {"base": 0.0},
-                    {"multiplier": 1.0},
-                ],
-                arguments=["--ros-args", "--log-level", log_level],
-                prefix=cpu_affinity_prefix("nav2_map_server"),
-            ),
+    speed_filter_nodes = []
+    if enable_speed_filter:
+        speed_filter_nodes = [
             Node(
                 package="nav2_map_server",
                 executable="map_server",
@@ -178,6 +194,48 @@ def generate_launch_description():
                 arguments=["--ros-args", "--log-level", log_level],
                 prefix=cpu_affinity_prefix("nav2_map_server"),
             ),
+        ]
+    filter_lifecycle_manager_nodes = []
+    if filter_lifecycle_nodes:
+        filter_lifecycle_manager_nodes = [
+            Node(
+                package="nav2_lifecycle_manager",
+                executable="lifecycle_manager",
+                name="lifecycle_manager_costmap_filters",
+                output="screen",
+                arguments=["--ros-args", "--log-level", log_level],
+                prefix=cpu_affinity_prefix("nav2_lifecycle_manager"),
+                parameters=[
+                    {"use_sim_time": use_sim_time},
+                    {"autostart": autostart},
+                    {"bond_timeout": 0.0},
+                    {"node_names": filter_lifecycle_nodes},
+                ],
+            )
+        ]
+
+    return LaunchDescription(
+        [
+            SetEnvironmentVariable("RCUTILS_LOGGING_BUFFERED_STREAM", "1"),
+            DeclareLaunchArgument("namespace", default_value=""),
+            DeclareLaunchArgument("use_sim_time", default_value="false"),
+            DeclareLaunchArgument("autostart", default_value="true"),
+            DeclareLaunchArgument("params_file", default_value=default_params_file),
+            DeclareLaunchArgument("keepout_mask_yaml", default_value=default_keepout_mask_yaml),
+            DeclareLaunchArgument("speed_mask_yaml", default_value=default_speed_mask_yaml),
+            DeclareLaunchArgument("use_respawn", default_value="False"),
+            DeclareLaunchArgument("use_composition", default_value="False"),
+            DeclareLaunchArgument(
+                "navigation_lifecycle_autostart",
+                default_value=os.environ.get("NJRH_NAVIGATION_LIFECYCLE_AUTOSTART", "true"),
+            ),
+            DeclareLaunchArgument(
+                "nav_lifecycle_start_delay",
+                default_value=os.environ.get("NJRH_NAV_LIFECYCLE_START_DELAY_SEC", "2.0"),
+            ),
+            DeclareLaunchArgument("log_level", default_value="info"),
+            *costmap_filter_nodes,
+            *speed_filter_nodes,
             # This runtime path stays non-composed intentionally so the field overlay
             # can keep deterministic process ownership for crash / restart handling.
             Node(
@@ -236,20 +294,7 @@ def generate_launch_description():
                 remappings=remappings,
                 **with_cpu_affinity("collision_monitor", node_kwargs),
             ),
-            Node(
-                package="nav2_lifecycle_manager",
-                executable="lifecycle_manager",
-                name="lifecycle_manager_costmap_filters",
-                output="screen",
-                arguments=["--ros-args", "--log-level", log_level],
-                prefix=cpu_affinity_prefix("nav2_lifecycle_manager"),
-                parameters=[
-                    {"use_sim_time": use_sim_time},
-                    {"autostart": autostart},
-                    {"bond_timeout": 0.0},
-                    {"node_names": filter_lifecycle_nodes},
-                ],
-            ),
+            *filter_lifecycle_manager_nodes,
             TimerAction(
                 period=nav_lifecycle_start_delay,
                 actions=[
@@ -262,7 +307,7 @@ def generate_launch_description():
                         prefix=cpu_affinity_prefix("nav2_lifecycle_manager"),
                         parameters=[
                             {"use_sim_time": use_sim_time},
-                            {"autostart": autostart},
+                            {"autostart": navigation_lifecycle_autostart},
                             {"bond_timeout": 0.0},
                             {"node_names": navigation_lifecycle_nodes},
                         ],

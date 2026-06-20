@@ -29,6 +29,8 @@ DASHBOARD_HOST="${NJRH_DASHBOARD_HOST:-}"
 ROBOT_API_SERVER_PORT="${NJRH_ROBOT_API_SERVER_PORT:-8080}"
 ROBOT_API_READY_TIMEOUT_SEC="${NJRH_ROBOT_API_READY_TIMEOUT_SEC:-120}"
 ROBOT_API_READY_POLL_SEC="${NJRH_ROBOT_API_READY_POLL_SEC:-1}"
+ROBOT_NAV_READY_TIMEOUT_SEC="${NJRH_ROBOT_NAV_READY_TIMEOUT_SEC:-120}"
+ROBOT_NAV_READY_POLL_SEC="${NJRH_ROBOT_NAV_READY_POLL_SEC:-1}"
 DASHBOARD_RUNTIME_ROOT="${NJRH_DASHBOARD_RUNTIME_ROOT:-${WORKSPACE_CONTAINER}/scripts/jetson/runtime_overlay}"
 DASHBOARD_LOG_RELATIVE="${NJRH_DASHBOARD_LOG_RELATIVE:-web_dashboard/runtime_logs/njrh_dashboard.out.log}"
 DASHBOARD_TRACE_RELATIVE="${NJRH_DASHBOARD_TRACE_RELATIVE:-web_dashboard/runtime_logs/dashboard_trace.log}"
@@ -253,6 +255,54 @@ robot_api_http_ready() {
   curl "${curl_args[@]}" "http://127.0.0.1:${ROBOT_API_SERVER_PORT}/api/v1/status" >/dev/null 2>&1
 }
 
+resident_navigation_autostart_expected() {
+  [[ "${NJRH_RESIDENT_NAVIGATION_AUTOSTART:-auto}" != "false" ]] || return 1
+  if [[ "${NJRH_RESIDENT_NAVIGATION_AUTOSTART:-auto}" == "true" && -n "${NJRH_FLOOR_ID:-}" ]]; then
+    return 0
+  fi
+  container_running || return 1
+  docker exec -u "${RUNTIME_USER}" "$CONTAINER_NAME" test -f "${WORKSPACE_CONTAINER}/maps_release/last_navigation_map.json"
+}
+
+resident_navigation_context_status() {
+  docker exec -u "${RUNTIME_USER}" "$CONTAINER_NAME" python3 -c '
+import json
+import pathlib
+import sys
+
+path = pathlib.Path("/tmp/njrh_runtime_map_context.json")
+if not path.exists():
+    print("missing runtime map context")
+    sys.exit(2)
+try:
+    data = json.loads(path.read_text())
+except Exception as exc:
+    print(f"invalid runtime map context: {exc}")
+    sys.exit(2)
+
+state = data.get("state", "")
+confirmed = bool(data.get("confirmed", False))
+stage = data.get("startup_stage", "")
+elapsed = data.get("startup_elapsed_sec", "")
+message = data.get("message", "")
+map_id = data.get("map_id", "")
+if state == "ready" and confirmed:
+    print(f"ready startup_elapsed_sec={elapsed} stage={stage} map_id={map_id}")
+    sys.exit(0)
+if state == "failed":
+    print(f"failed stage={stage} startup_elapsed_sec={elapsed} message={message}")
+    sys.exit(3)
+print(f"starting state={state} confirmed={confirmed} stage={stage} startup_elapsed_sec={elapsed} message={message}")
+sys.exit(2)
+'
+}
+
+clear_stale_runtime_context() {
+  container_running || return 0
+  docker exec -u "${RUNTIME_USER}" "$CONTAINER_NAME" /bin/bash -lc \
+    'rm -f /tmp/njrh_runtime_map_context.json /tmp/njrh_amcl_runtime_status.env /tmp/njrh_amcl_scan_admission.pid 2>/dev/null || true'
+}
+
 kill_dashboard_processes() {
   docker exec "$CONTAINER_NAME" /bin/bash -lc \
     "ps -eo pid=,args= | grep 'python3 .*dashboard_server.py' | grep -v grep | awk '{print \$1}' | xargs -r kill -INT 2>/dev/null || true"
@@ -403,6 +453,8 @@ common_services_running() {
 }
 
 start_common_services() {
+  local runtime_start_epoch
+  runtime_start_epoch="${SECONDS}"
   container_running || start_container
   wait_for_container_ready
   prepare_runtime_overlay_permissions
@@ -411,18 +463,114 @@ start_common_services() {
   ensure_gs2_device_in_container
   if common_services_running; then
     wait_for_robot_api
+    wait_for_resident_navigation_runtime "${runtime_start_epoch}"
     echo "[njrh-container] common services already running"
     return
   fi
+  clear_stale_runtime_context
   docker exec -u "${RUNTIME_USER}" --workdir "${DASHBOARD_RUNTIME_ROOT}" "$CONTAINER_NAME" \
     /bin/bash -lc "mkdir -p '${DASHBOARD_RUNTIME_ROOT}/web_dashboard/runtime_logs'; cd '${DASHBOARD_RUNTIME_ROOT}'; nohup env ROBOT_API_TOKEN='${ROBOT_API_TOKEN:-}' ROBOT_API_SERVER_PORT='${ROBOT_API_SERVER_PORT}' bash scripts/run_common_services.sh > '${DASHBOARD_RUNTIME_ROOT}/web_dashboard/runtime_logs/common_services.out.log' 2>&1 </dev/null &"
   sleep 2
   if common_services_running; then
     wait_for_robot_api
+    wait_for_resident_navigation_runtime "${runtime_start_epoch}"
     echo "[njrh-container] common services started"
   else
     die "common services did not stay running"
   fi
+}
+
+stop_detached_runtime_processes() {
+  docker exec -i "$CONTAINER_NAME" python3 - <<'PY'
+import os
+import pathlib
+import signal
+import time
+
+patterns = (
+    "run_navigation_runtime_services.sh",
+    "run_nav2_navigation.sh",
+    "standard_navigation.launch.py",
+    "controller_server --ros-args",
+    "planner_server --ros-args",
+    "bt_navigator --ros-args",
+    "behavior_server --ros-args",
+    "smoother_server --ros-args",
+    "velocity_smoother --ros-args",
+    "collision_monitor --ros-args",
+    "waypoint_follower --ros-args",
+    "lifecycle_manager_navigation",
+    "lifecycle_manager_costmap_filters",
+    "run_occupancy_grid_localization.sh",
+    "occupancy_localization.launch.py",
+    "robot_localization_bridge/localization_bridge_node",
+    "robot_global_localization/global_localization_node",
+    "occupancy_grid_localizer_container",
+    "nav2_amcl amcl",
+    "amcl --ros-args",
+    "amcl_scan_admission_node",
+    "run_robot_api_server_supervised.sh",
+    "robot_api_server/robot_api_server_node",
+)
+skip_tokens = ("docker exec", "python3 -", "stop_detached_runtime_processes")
+self_pid = os.getpid()
+
+
+def cmdline_for(pid: int) -> str:
+    try:
+        raw = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\0", b" ").decode(errors="replace").strip()
+
+
+pids = []
+for proc in pathlib.Path("/proc").glob("[0-9]*"):
+    pid = int(proc.name)
+    if pid == self_pid:
+        continue
+    cmdline = cmdline_for(pid)
+    if not cmdline:
+        continue
+    if any(token in cmdline for token in skip_tokens):
+        continue
+    if any(pattern in cmdline for pattern in patterns):
+        pids.append(pid)
+
+pids = sorted(set(pids))
+if pids:
+    print("[njrh-container] stopping detached runtime/navigation pids:", " ".join(map(str, pids)))
+for sig, wait_sec in (
+    (signal.SIGINT, float(os.environ.get("NJRH_RUNTIME_STOP_INT_WAIT_SEC", "2"))),
+    (signal.SIGTERM, float(os.environ.get("NJRH_RUNTIME_STOP_TERM_WAIT_SEC", "2"))),
+):
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            pass
+    time.sleep(wait_sec)
+
+for pid in pids:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        continue
+    except PermissionError:
+        continue
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+for path in ("/tmp/njrh_runtime_map_context.json", "/tmp/njrh_amcl_runtime_status.env"):
+    try:
+        pathlib.Path(path).unlink()
+    except FileNotFoundError:
+        pass
+PY
 }
 
 stop_common_services() {
@@ -476,6 +624,7 @@ for pid in ${common_pids}; do
   kill -KILL "${pid}" 2>/dev/null || true
 done
 '
+  stop_detached_runtime_processes
   echo "[njrh-container] common services stopped"
 }
 
@@ -503,6 +652,34 @@ wait_for_robot_api() {
     return 0
   fi
   die "robot_api_server did not become ready on port ${ROBOT_API_SERVER_PORT} within ${ROBOT_API_READY_TIMEOUT_SEC}s"
+}
+
+wait_for_resident_navigation_runtime() {
+  resident_navigation_autostart_expected || {
+    echo "[njrh-container] resident navigation autostart not expected; skipping navigation ready wait"
+    return 0
+  }
+
+  local start_epoch="$1"
+  local deadline=$((start_epoch + ROBOT_NAV_READY_TIMEOUT_SEC))
+  local status=""
+  local rc=0
+  while (( SECONDS < deadline )); do
+    status="$(resident_navigation_context_status 2>&1)" && {
+      echo "[njrh-container] resident navigation ready: ${status}"
+      return 0
+    }
+    rc=$?
+    if [[ "${rc}" -eq 3 ]]; then
+      die "resident navigation failed during startup: ${status}"
+    fi
+    sleep "${ROBOT_NAV_READY_POLL_SEC}"
+  done
+  status="$(resident_navigation_context_status 2>&1)" && {
+    echo "[njrh-container] resident navigation ready: ${status}"
+    return 0
+  }
+  die "resident navigation did not become ready within ${ROBOT_NAV_READY_TIMEOUT_SEC}s from start-runtime; last status: ${status}"
 }
 
 print_status() {

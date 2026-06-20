@@ -26,10 +26,14 @@ Usage:
 
 Profiles:
   baseline                    Current production file, print only by default.
-  pose_progress_only          PoseProgressChecker, rotate_to_goal_heading=false, threshold=1.20.
-  relaxed_shim_1p8            Same, but angular_dist_threshold=1.80.
-  relaxed_shim_2p2            Same, but angular_dist_threshold=2.20.
-  no_start_shim_diagnostic    Same, but angular_dist_threshold=3.20. Diagnostic only.
+  pose_progress_only          Legacy diagnostic: rotate_to_goal_heading=false, threshold=1.20.
+  relaxed_shim_1p8            Legacy diagnostic with angular_dist_threshold=1.80.
+  relaxed_shim_2p2            Legacy diagnostic with angular_dist_threshold=2.20.
+  no_start_shim_diagnostic    Legacy diagnostic with angular_dist_threshold=3.20.
+
+Phase N3 production uses rotate_to_goal_heading=true. These profiles are kept
+only for explicit rollback/diagnostic A/B and must not be applied as the
+ordinary production profile.
 
 This script only changes the runtime Nav2 YAML when --apply is passed. It only
 restarts the runtime when --restart is also passed. It does not change

@@ -27,7 +27,7 @@ docking:
       park_topic: /ranger_mini3/park
       reverse_enable_topic: /ranger_mini3/docking_allow_reverse
       use_crab_mode: true
-      crab_forced_mode: crab
+      crab_forced_mode: side_slip
       release_forced_mode: auto
       park_on_docked: true
 
@@ -100,7 +100,7 @@ docking:
       kyaw: -0.70
       lateral_deadband_m: 0.005
       yaw_deadband_deg: 1.0
-      min_align_speed_mps: 0.035
+      min_align_speed_mps: 0.025
       min_lateral_speed_mps: 0.025
       max_lateral_speed_mps: 0.04
       lateral_priority_threshold_m: 0.010

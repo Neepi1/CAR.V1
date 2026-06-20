@@ -77,7 +77,7 @@ public:
     const double legacy_rate_hz = declare_parameter<double>("rate_hz", max_rate_hz_);
     max_rate_hz_ = std::max(0.1, legacy_rate_hz);
 
-    max_scan_age_ms_ = declare_parameter<double>("max_scan_age_ms", 250.0);
+    max_scan_age_ms_ = declare_parameter<double>("max_scan_age_ms", 1000.0);
     const double legacy_max_age_ms = declare_parameter<double>("max_age_ms", max_scan_age_ms_);
     max_scan_age_ms_ = std::max(0.0, legacy_max_age_ms);
 
@@ -282,7 +282,7 @@ private:
   std::string target_frame_;
   std::string frame_required_;
   double max_rate_hz_{5.0};
-  double max_scan_age_ms_{250.0};
+  double max_scan_age_ms_{1000.0};
   double tf_wait_timeout_ms_{20.0};
   bool require_tf_available_{true};
   bool preserve_stamp_{true};

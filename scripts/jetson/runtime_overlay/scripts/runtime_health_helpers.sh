@@ -66,7 +66,7 @@ checks = {
     "map_odom_tf_ready": bool(summary.get("map_odom_tf_ready")),
     "localization_bridge_endpoint": bool(summary.get("localization_bridge_endpoint_ready")),
     "safety_status_fresh": bool(summary.get("safety_status_fresh")),
-    "perception_obstacle_fresh": bool(summary.get("perception_obstacle_fresh")),
+    "local_scan_fresh": bool(summary.get("local_scan_fresh")),
     "local_costmap_fresh": bool(summary.get("local_costmap_fresh")),
     "global_costmap_fresh": bool(summary.get("global_costmap_fresh")),
     "map_fresh": bool(summary.get("map_fresh")),
@@ -76,7 +76,7 @@ checks = {
         or bool(services.get("/trigger_grid_search_localization")),
     "floor_switch_service": bool(summary.get("floor_switch_service"))
         or bool(services.get("/floor_manager/switch_floor")),
-    "obstacle_topic_seen": bool((topics.get("/perception/obstacle_points") or {}).get("last_received_at")),
+    "scan_topic_seen": bool((topics.get("/scan") or {}).get("last_received_at")),
     "odom_base_tf_seen": "odom->base_link" in tf_edges,
     "map_odom_tf_seen": "map->odom" in tf_edges,
 }

@@ -124,24 +124,17 @@ latest_value() {
 echo "${PREFIX} collecting read-only timestamp diagnostics"
 
 accel_status_raw="$(timeout 12 ros2 topic echo /lidar/pointcloud_accel_status --once --field data 2>/dev/null | plain_status_data || true)"
-local_status_raw="$(timeout 12 ros2 topic echo /perception/local_perception_status --once --field data 2>/dev/null | plain_status_data || true)"
-obstacle_header="$(header_once /perception/obstacle_points)"
-clearing_header="$(header_once /perception/clearing_points)"
+scan_header="$(header_once /scan)"
 
-obstacle_frame="$(header_frame "${obstacle_header}")"
-obstacle_sec="$(header_sec "${obstacle_header}")"
-obstacle_nsec="$(header_nanosec "${obstacle_header}")"
-obstacle_header_age_once_ms="$(header_age_ms "${obstacle_sec}" "${obstacle_nsec}")"
-clearing_frame="$(header_frame "${clearing_header}")"
-clearing_sec="$(header_sec "${clearing_header}")"
-clearing_nsec="$(header_nanosec "${clearing_header}")"
-clearing_header_age_once_ms="$(header_age_ms "${clearing_sec}" "${clearing_nsec}")"
+scan_frame="$(header_frame "${scan_header}")"
+scan_sec="$(header_sec "${scan_header}")"
+scan_nsec="$(header_nanosec "${scan_header}")"
+scan_header_age_once_ms="$(header_age_ms "${scan_sec}" "${scan_nsec}")"
 
 global_frame="$(param_value /local_costmap/local_costmap global_frame)"
 robot_base_frame="$(param_value /local_costmap/local_costmap robot_base_frame)"
-obstacle_sensor_frame="$(param_value /local_costmap/local_costmap voxel_layer.obstacle_points.sensor_frame)"
-clearing_sensor_frame="$(param_value /local_costmap/local_costmap voxel_layer.clearing_points.sensor_frame)"
-tf_filter_tolerance="$(param_value /local_costmap/local_costmap voxel_layer.tf_filter_tolerance)"
+scan_sensor_frame="$(param_value /local_costmap/local_costmap obstacle_layer.scan.sensor_frame)"
+tf_filter_tolerance="$(param_value /local_costmap/local_costmap obstacle_layer.tf_filter_tolerance)"
 controller_state="$(timeout 5 ros2 lifecycle get /controller_server 2>/dev/null || true)"
 
 tf_echo_output="$(timeout 6 ros2 run tf2_ros tf2_echo odom base_link 2>&1 | head -60 || true)"
@@ -167,17 +160,15 @@ clearing_output_header_age_ms="$(status_value "${accel_status_raw}" clearing_out
 clearing_output_source_age_ms="$(status_value "${accel_status_raw}" clearing_output_source_age_ms)"
 scan_output_header_age_ms="$(status_value "${accel_status_raw}" scan_output_header_age_ms)"
 scan_output_source_age_ms="$(status_value "${accel_status_raw}" scan_output_source_age_ms)"
+scan_output_frame_id="$(status_value "${accel_status_raw}" scan_output_frame_id)"
 suspect_over_100="$(status_value "${accel_status_raw}" tf_drop_suspect_obstacle_header_age_over_100ms_count)"
 suspect_over_200="$(status_value "${accel_status_raw}" tf_drop_suspect_obstacle_header_age_over_200ms_count)"
 
-if [[ -z "${obstacle_output_header_age_ms}" ]]; then
-  obstacle_output_header_age_ms="${obstacle_header_age_once_ms}"
+if [[ -z "${scan_output_header_age_ms}" ]]; then
+  scan_output_header_age_ms="${scan_header_age_once_ms}"
 fi
-if [[ -z "${clearing_output_header_age_ms}" ]]; then
-  clearing_output_header_age_ms="${clearing_header_age_once_ms}"
-fi
-if [[ -z "${obstacle_output_frame_id}" ]]; then
-  obstacle_output_frame_id="${obstacle_frame}"
+if [[ -z "${scan_output_frame_id}" ]]; then
+  scan_output_frame_id="${scan_frame}"
 fi
 
 case_id="CASE_G_UNKNOWN_NEEDS_BAG"
@@ -192,13 +183,13 @@ elif [[ "${global_frame}" != "odom" || "${robot_base_frame}" != "base_link" ]]; 
   case_id="CASE_F_FRAME_MISMATCH"
   case_detail="local_costmap frame contract is not odom/base_link"
   result="FAIL"
-elif [[ "${obstacle_frame}" != "base_link" && "${obstacle_output_frame_id}" != "base_link" ]]; then
+elif [[ "${scan_frame}" != "lidar_level_link" && "${scan_output_frame_id}" != "lidar_level_link" ]]; then
   case_id="CASE_F_FRAME_MISMATCH"
-  case_detail="obstacle output frame is not base_link"
+  case_detail="scan output frame is not lidar_level_link"
   result="FAIL"
-elif [[ "${obstacle_sensor_frame}" != "base_link" || "${clearing_sensor_frame}" != "base_link" ]]; then
+elif [[ "${scan_sensor_frame}" != "lidar_level_link" ]]; then
   case_id="CASE_F_FRAME_MISMATCH"
-  case_detail="local costmap sensor_frame contract is not base_link"
+  case_detail="local costmap scan sensor_frame contract is not lidar_level_link"
   result="FAIL"
 elif [[ -n "${raw_header_age_ms}" ]] && float_gt "${raw_header_age_ms}" 150; then
   case_id="CASE_A_RAW_STAMP_ALREADY_OLD"
@@ -210,22 +201,22 @@ elif [[ -n "${raw_header_age_ms}" && -n "${latest_stamp_age_ms}" && -n "${latest
   case_id="CASE_B_INTERNAL_BUFFER_STALE"
   case_detail="raw header age is normal but latest internal buffer stamp/update age is stale"
   result="WARN"
-elif [[ -n "${latest_update_age_ms}" && -n "${obstacle_output_header_age_ms}" && -n "${obstacle_output_source_age_ms}" ]] &&
+elif [[ -n "${latest_update_age_ms}" && -n "${scan_output_header_age_ms}" && -n "${scan_output_source_age_ms}" ]] &&
   float_le "${latest_update_age_ms}" 150 &&
-  float_gt "${obstacle_output_header_age_ms}" 150 &&
-  float_abs_diff_le "${obstacle_output_header_age_ms}" "${obstacle_output_source_age_ms}" 50; then
+  float_gt "${scan_output_header_age_ms}" 150 &&
+  float_abs_diff_le "${scan_output_header_age_ms}" "${scan_output_source_age_ms}" 50; then
   case_id="CASE_C_OUTPUT_REUSES_OLD_SOURCE_STAMP"
-  case_detail="obstacle output reuses a source stamp that is older than the TF cache window seen by local costmap"
+  case_detail="scan output reuses a source stamp that is older than the TF cache window seen by local costmap"
   result="WARN"
-elif [[ "${drop_count}" -gt 0 && -n "${obstacle_output_header_age_ms}" ]] &&
-  float_le "${obstacle_output_header_age_ms}" 100; then
+elif [[ "${drop_count}" -gt 0 && -n "${scan_output_header_age_ms}" ]] &&
+  float_le "${scan_output_header_age_ms}" 100; then
   case_id="CASE_D_TF_CACHE_TIME_AHEAD"
-  case_detail="obstacle header age is fresh but MessageFilter still reports earlier-than-cache"
+  case_detail="scan header age is fresh but MessageFilter still reports earlier-than-cache"
   result="WARN"
-elif [[ "${drop_count}" -eq 0 && -n "${obstacle_output_header_age_ms}" ]] &&
-  float_le "${obstacle_output_header_age_ms}" 150; then
+elif [[ "${drop_count}" -eq 0 && -n "${scan_output_header_age_ms}" ]] &&
+  float_le "${scan_output_header_age_ms}" 150; then
   case_id="CASE_E_STARTUP_TF_CACHE_WARMUP"
-  case_detail="no current MessageFilter drop was found and current obstacle stamp is within 150ms; prior drops were likely startup TF cache warm-up if they only appeared during activation"
+  case_detail="no current MessageFilter drop was found and current scan stamp is within 150ms; prior drops were likely startup TF cache warm-up if they only appeared during activation"
   result="PASS"
 fi
 
@@ -247,10 +238,10 @@ else
   fail "local_costmap frames global_frame=${global_frame:-missing} robot_base_frame=${robot_base_frame:-missing}"
 fi
 
-if [[ "${obstacle_sensor_frame}" == "base_link" && "${clearing_sensor_frame}" == "base_link" ]]; then
-  pass "local_costmap obstacle/clearing sensor_frame=base_link"
+if [[ "${scan_sensor_frame}" == "lidar_level_link" ]]; then
+  pass "local_costmap scan sensor_frame=lidar_level_link"
 else
-  fail "sensor_frame mismatch obstacle=${obstacle_sensor_frame:-missing} clearing=${clearing_sensor_frame:-missing}"
+  fail "sensor_frame mismatch scan=${scan_sensor_frame:-missing}"
 fi
 
 if grep -q 'Translation:' <<<"${tf_echo_output}"; then
@@ -273,9 +264,8 @@ fi
   echo "| --- | --- |"
   echo "| local_costmap.global_frame | ${global_frame:-missing} |"
   echo "| local_costmap.robot_base_frame | ${robot_base_frame:-missing} |"
-  echo "| obstacle_points.sensor_frame | ${obstacle_sensor_frame:-missing} |"
-  echo "| clearing_points.sensor_frame | ${clearing_sensor_frame:-missing} |"
-  echo "| voxel_layer.tf_filter_tolerance | ${tf_filter_tolerance:-missing_or_unsupported} |"
+  echo "| scan.sensor_frame | ${scan_sensor_frame:-missing} |"
+  echo "| obstacle_layer.tf_filter_tolerance | ${tf_filter_tolerance:-missing_or_unsupported} |"
   echo "| controller_server | ${controller_state:-missing} |"
   echo
   echo "## Timestamp Metrics"
@@ -285,22 +275,16 @@ fi
   echo "| raw_header_age_ms | ${raw_header_age_ms:-missing} |"
   echo "| latest_internal_buffer_stamp_age_ms | ${latest_stamp_age_ms:-missing} |"
   echo "| latest_internal_buffer_update_age_ms | ${latest_update_age_ms:-missing} |"
-  echo "| obstacle_output_header_age_ms | ${obstacle_output_header_age_ms:-missing} |"
-  echo "| obstacle_output_source_age_ms | ${obstacle_output_source_age_ms:-missing} |"
-  echo "| obstacle_header_once_age_ms | ${obstacle_header_age_once_ms:-missing} |"
-  echo "| clearing_output_header_age_ms | ${clearing_output_header_age_ms:-missing} |"
-  echo "| clearing_output_source_age_ms | ${clearing_output_source_age_ms:-missing} |"
-  echo "| clearing_header_once_age_ms | ${clearing_header_age_once_ms:-missing} |"
   echo "| scan_output_header_age_ms | ${scan_output_header_age_ms:-missing} |"
   echo "| scan_output_source_age_ms | ${scan_output_source_age_ms:-missing} |"
+  echo "| scan_header_once_age_ms | ${scan_header_age_once_ms:-missing} |"
   echo
   echo "## Frames And Counters"
   echo
   echo "| key | value |"
   echo "| --- | --- |"
-  echo "| obstacle_header.frame_id | ${obstacle_frame:-missing} |"
-  echo "| obstacle_output_frame_id | ${obstacle_output_frame_id:-missing} |"
-  echo "| clearing_header.frame_id | ${clearing_frame:-missing} |"
+  echo "| scan_header.frame_id | ${scan_frame:-missing} |"
+  echo "| scan_output_frame_id | ${scan_output_frame_id:-missing} |"
   echo "| latest_internal_buffer_seq | ${latest_seq:-missing} |"
   echo "| tf_drop_suspect_obstacle_header_age_over_100ms_count | ${suspect_over_100:-missing} |"
   echo "| tf_drop_suspect_obstacle_header_age_over_200ms_count | ${suspect_over_200:-missing} |"
@@ -310,12 +294,6 @@ fi
   echo
   echo '```text'
   echo "${accel_status_raw:-missing}"
-  echo '```'
-  echo
-  echo "## Local Perception Status"
-  echo
-  echo '```text'
-  echo "${local_status_raw:-missing}"
   echo '```'
   echo
   echo "## TF Echo odom -> base_link"
@@ -357,15 +335,14 @@ fi
       echo "Fix frame_id/sensor_frame contract."
       ;;
     *)
-      echo "Record a short bag with /tf, /local_state/odometry, /perception/obstacle_points, /perception/clearing_points, and local costmap logs."
+      echo "Record a short bag with /tf, /local_state/odometry, /scan, and local costmap logs."
       ;;
   esac
 } >"${REPORT}"
 
 echo "${PREFIX} report=${REPORT}"
 echo "${PREFIX} raw_header_age_ms=${raw_header_age_ms:-missing} latest_internal_buffer_stamp_age_ms=${latest_stamp_age_ms:-missing} latest_internal_buffer_update_age_ms=${latest_update_age_ms:-missing}"
-echo "${PREFIX} obstacle_output_header_age_ms=${obstacle_output_header_age_ms:-missing} obstacle_output_source_age_ms=${obstacle_output_source_age_ms:-missing}"
-echo "${PREFIX} clearing_output_header_age_ms=${clearing_output_header_age_ms:-missing} clearing_output_source_age_ms=${clearing_output_source_age_ms:-missing}"
+echo "${PREFIX} scan_output_header_age_ms=${scan_output_header_age_ms:-missing} scan_output_source_age_ms=${scan_output_source_age_ms:-missing}"
 echo "${PREFIX} tf_monitor=see_report drop_count=${drop_count}"
 
 if [[ "${fail_count}" -gt 0 ]]; then

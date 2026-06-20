@@ -75,7 +75,7 @@ else
 fi
 
 if [[ "${missing}" -gt 0 ]]; then
-  echo "[nitros-env] NITROS navigation branch is unavailable; use NJRH_POINTCLOUD_ACCEL_PROFILE=ipc_worker or legacy." >&2
+  echo "[nitros-env] NITROS navigation branch is unavailable; use NJRH_POINTCLOUD_ACCEL_PROFILE=ipc_worker." >&2
   exit 3
 fi
 

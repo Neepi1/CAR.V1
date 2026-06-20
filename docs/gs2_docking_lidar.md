@@ -19,7 +19,7 @@ Recommended docking use:
 Nav2 reaches pre_dock_pose
 robot_docking_manager reads /dock/gs2_scan
 robot_docking_manager estimates dock lateral/yaw/distance error
-robot_docking_manager forces Ranger crab mode for centimeter-level lateral correction
+robot_docking_manager requests Ranger side-slip and sends low-speed x/y/yaw correction
 robot_safety arbitrates final low-speed command
 BMS charging state confirms contact
 ```
@@ -38,7 +38,7 @@ robot_docking_manager
 
 Do not publish docking control directly to `/cmd_vel_safe` or `/cmd_vel`; that would bypass the final safety arbiter.
 
-The current field profile prioritizes stable contact over aggressive correction: `use_yaw_fit=true`, `filter_alpha=0.25`, `lateral_deadband_m=0.005`, `lateral_command_sign=-1.0`, `kyaw=-0.70`, `min_lateral_speed_mps=0.025`, `max_lateral_speed_mps=0.04`, `max_forward_while_lateral_mps=0.000`, and `lock_lateral_during_final_insert=true`. The negative lateral sign matches the current GS2 mounting where the detected charger `y` sign is opposite the vehicle correction direction. The negative yaw gain matches the fitted dock-face slope sign from the current GS2 mount, so a negative fitted `yaw_deg` commands a positive body yaw correction. This makes docking three-stage: correct lateral/yaw first, lock lateral velocity to zero, then crawl straight forward. The minimum lateral speed is intentional because the downstream Ranger mode controller drops lateral commands below its deadband. If the robot visibly oscillates sideways, reduce `controller.ky_lateral` first; if it rotates away from the dock angle instead of squaring up, flip the sign of `controller.kyaw` before changing the magnitude.
+The current field profile prioritizes stable contact over aggressive correction: `mode.use_crab_mode=true`, `mode.crab_forced_mode=side_slip`, `use_yaw_fit=true`, `filter_alpha=0.25`, `lateral_deadband_m=0.005`, `lateral_command_sign=-1.0`, `kyaw=-0.70`, `min_lateral_speed_mps=0.025`, `max_lateral_speed_mps=0.04`, `max_forward_while_lateral_mps=0.000`, and `lock_lateral_during_final_insert=true`. The negative lateral sign matches the current GS2 mounting where the detected charger `y` sign is opposite the vehicle correction direction. The negative yaw gain matches the fitted dock-face slope sign from the current GS2 mount, so a negative fitted `yaw_deg` commands a positive body yaw correction. This makes docking three-stage: correct lateral/yaw first with `linear.y`, lock lateral velocity to zero, then crawl straight forward. If the robot visibly oscillates sideways, reduce `controller.ky_lateral` first; if it rotates away from the dock angle instead of squaring up, flip the sign of `controller.kyaw` before changing the magnitude.
 
 Mounting rule:
 
@@ -62,7 +62,7 @@ positive_electrode_position: upper
 negative_electrode_position: lower
 ```
 
-The positive and negative strips are already height-aligned with the dock contacts, so docking control is a planar `x/y/yaw` problem. Because the Ranger Mini 3 supports four-wheel steering, the docking controller uses crab `linear.y` for lateral correction instead of Ackermann steering when `/docking/start` is active. The controller must target `charge_contact_link -> dock_contact_link`, not `base_link -> dock_contact_link`. Once `/battery_state.current` exceeds the configured charging threshold, docking control must stop immediately even if the controller has not reached the contact-verification state.
+The positive and negative strips are already height-aligned with the dock contacts, so docking control is a planar `x/y/yaw` problem. Because the Ranger Mini 3 supports lateral motion, the docking controller uses `linear.y` for left/right body correction when `/docking/start` is active. `ranger_mini3_mode_controller` keeps normal navigation lateral commands rejected, but allows docking lateral commands while `/ranger_mini3/forced_mode=side_slip` is active. The controller must target `charge_contact_link -> dock_contact_link`, not `base_link -> dock_contact_link`. Once `/battery_state.current` exceeds the configured charging threshold, docking control must stop immediately even if the controller has not reached the contact-verification state.
 
 RViz validation:
 

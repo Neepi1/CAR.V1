@@ -50,8 +50,9 @@ Phase O1 keeps the existing `/ranger_mini3/desired_motion_mode` topic type as
 - `MOTION_MODE_SPINNING = 2`
 - `MOTION_MODE_SIDE_SLIP = 3`
 
-The mode controller maps its legacy internal decisions to that enum:
-`dual_ackermann -> 0`, `crab -> 1`, `spin -> 2`, and `park -> 0` with zero velocity.
+The mode controller maps its internal decisions to that enum:
+`dual_ackermann -> 0`, `crab/parallel -> 1`, `spin -> 2`, `side_slip -> 3`, and
+`park -> 0` with zero velocity.
 Pure yaw commands, including RotationShim/final-yaw-align output after `robot_safety`,
 therefore publish desired `MOTION_MODE_SPINNING`.
 
@@ -65,10 +66,11 @@ hint.
 
 ## Current Policy
 
-- In `official_passthrough`, preserve normal `linear.x`, `linear.y`, and `angular.z` from `/cmd_vel_safe`.
+- In `official_passthrough`, preserve normal `linear.x`, `linear.y`, and `angular.z` from `/cmd_vel_safe` only when policy allows it.
 - Clamp reverse commands out during navigation; `linear.x < 0` becomes zero unless a fresh docking or mapping-teleop reverse permission is present.
 - Reject lateral output by default when `lateral_policy=reject`, reporting `diff_reason=lateral_not_allowed`.
-- `/ranger_mini3/forced_mode` is diagnostic-only in official passthrough except `park`, which publishes zero.
+- `/ranger_mini3/forced_mode=side_slip` or legacy `crab` is the docking-only lateral exception in official passthrough. While active, `linear.y` is preserved and desired motion mode is `MOTION_MODE_SIDE_SLIP=3`; normal navigation still rejects lateral commands.
+- `/ranger_mini3/forced_mode=park` publishes zero.
 - In `custom`, keep the legacy Ackermann yaw-rate/curvature shaping, low-speed spin hysteresis, and crab/parallel handling for rollback diagnostics.
 - Reverse permission is short-lived (`reverse_enable_timeout_s`, default `0.75 s`) and tracked per source, so an idle App teleop publisher cannot cancel a live docking undock permit.
 

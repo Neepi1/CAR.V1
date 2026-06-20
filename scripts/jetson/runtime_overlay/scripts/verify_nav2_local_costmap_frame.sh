@@ -154,18 +154,18 @@ check_local_state_odom() {
 
 check_obstacle_subscribers() {
   local info
-  info="$(timeout 8 ros2 topic info -v /perception/obstacle_points 2>&1 || true)"
+  info="$(timeout 8 ros2 topic info -v /scan 2>&1 || true)"
 
   if grep -Eq "Node name: local_costmap|/local_costmap/local_costmap" <<<"${info}"; then
-    pass "/perception/obstacle_points has local_costmap subscriber"
+    pass "/scan has local_costmap subscriber"
   else
-    fail "/perception/obstacle_points is missing local_costmap subscriber"
+    fail "/scan is missing local_costmap subscriber"
   fi
 
   if grep -Eq "Node name: collision_monitor|/collision_monitor" <<<"${info}"; then
-    pass "/perception/obstacle_points has collision_monitor subscriber"
+    pass "/scan has collision_monitor subscriber"
   else
-    fail "/perception/obstacle_points is missing collision_monitor subscriber"
+    fail "/scan is missing collision_monitor subscriber"
   fi
 }
 

@@ -14,6 +14,7 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -255,13 +256,14 @@ public:
     tf_listener_(tf_buffer_)
   {
     declare_parameter<bool>("mock_mode", true);
-    mode_topic_ = declare_parameter<std::string>("mode_topic", "/robot_mode");
-    input_topic_ = declare_parameter<std::string>("input_topic", "/lidar_points");
+    const bool enabled = declare_parameter<bool>("enabled", false);
+    mode_topic_ = declare_parameter<std::string>("mode_topic", "");
+    input_topic_ = declare_parameter<std::string>("input_topic", "");
     input_reliable_ = declare_parameter<bool>("input_reliable", false);
     input_qos_depth_ = static_cast<int>(std::max<std::int64_t>(
       declare_parameter<std::int64_t>("input_qos_depth", 1), 1));
-    output_topic_ = declare_parameter<std::string>("output_topic", "/perception/obstacle_points");
-    clearing_output_topic_ = declare_parameter<std::string>("clearing_output_topic", "/perception/clearing_points");
+    output_topic_ = declare_parameter<std::string>("output_topic", "");
+    clearing_output_topic_ = declare_parameter<std::string>("clearing_output_topic", "");
     output_frame_id_ = declare_parameter<std::string>("output_frame_id", "base_link");
     input_frame_id_override_ = declare_parameter<std::string>("input_frame_id_override", "");
     input_transform_use_latest_ = declare_parameter<bool>("input_transform_use_latest", true);
@@ -273,7 +275,7 @@ public:
           0.0, 1.0, 0.0,
           0.0, 0.0, 1.0}));
     output_stamp_tf_target_frame_ = declare_parameter<std::string>("output_stamp_tf_target_frame", "odom");
-    output_stamp_odom_topic_ = declare_parameter<std::string>("output_stamp_odom_topic", "/local_state/odometry");
+    output_stamp_odom_topic_ = declare_parameter<std::string>("output_stamp_odom_topic", "");
     current_mode_ = declare_parameter<std::string>("mode", "NORMAL");
     restamp_to_now_ = declare_parameter<bool>("restamp_to_now", true);
     restamp_to_latest_tf_ = declare_parameter<bool>("restamp_to_latest_tf", false);
@@ -349,7 +351,7 @@ public:
     if (clearing_virtual_ray_endpoint_z_values_.empty()) {
       clearing_virtual_ray_endpoint_z_values_.push_back(0.5 * (clearing_min_z_ + clearing_max_z_));
     }
-    status_topic_ = declare_parameter<std::string>("status_topic", "/perception/local_perception_status");
+    status_topic_ = declare_parameter<std::string>("status_topic", "");
     status_publish_period_sec_ =
       std::max(declare_parameter<double>("status_publish_period_sec", 2.0), 0.0);
     publish_debug_log_ = declare_parameter<bool>("publish_debug_log", false);
@@ -360,6 +362,17 @@ public:
       current_mode_ = supported_modes_.front();
     }
     profiles_ = loadProfiles(supported_modes_);
+
+    if (!enabled) {
+      RCLCPP_WARN(
+        get_logger(),
+        "robot_local_perception is retired and disabled by default; Nav2 production marking+clearing uses /scan");
+      return;
+    }
+    if (input_topic_.empty() || output_topic_.empty() || clearing_output_topic_.empty()) {
+      throw std::runtime_error(
+        "robot_local_perception enabled=true requires explicit input_topic, output_topic, and clearing_output_topic");
+    }
 
     auto output_qos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile();
     auto input_qos = rclcpp::QoS(rclcpp::KeepLast(input_qos_depth_)).durability_volatile();

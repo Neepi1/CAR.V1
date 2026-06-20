@@ -31,7 +31,8 @@ enum class MotionMode : int {
   kDualAckermann = 0,
   kCrab = 1,
   kSpin = 2,
-  kPark = 3,
+  kSideSlip = 3,
+  kPark = 4,
 };
 
 struct RangerCommand {
@@ -88,6 +89,8 @@ std::string legacyModeName(MotionMode mode) {
       return "crab";
     case MotionMode::kSpin:
       return "spin";
+    case MotionMode::kSideSlip:
+      return "side_slip";
     case MotionMode::kPark:
       return "park";
   }
@@ -102,6 +105,8 @@ RangerMotionMode desiredRangerMode(MotionMode mode) {
       return RangerMotionMode::PARALLEL;
     case MotionMode::kSpin:
       return RangerMotionMode::SPINNING;
+    case MotionMode::kSideSlip:
+      return RangerMotionMode::SIDE_SLIP;
     case MotionMode::kPark:
       return RangerMotionMode::DUAL_ACKERMAN;
   }
@@ -386,10 +391,14 @@ class RangerMini3ModeController : public rclcpp::Node {
       mode == "front_rear_ackermann" || mode == "motion_mode_dual_ackerman" || mode == "0")
     {
       forced_policy_ = "dual_ackermann";
-    } else if (mode == "crab" || mode == "lateral" || mode == "sideways" || mode == "parallel" ||
+    } else if (mode == "parallel" ||
       mode == "motion_mode_parallel" || mode == "1")
     {
       forced_policy_ = "crab";
+    } else if (mode == "crab" || mode == "lateral" || mode == "sideways" ||
+      mode == "side_slip" || mode == "sideslip" || mode == "motion_mode_side_slip" || mode == "3")
+    {
+      forced_policy_ = "side_slip";
     } else if (mode == "spin" || mode == "spinning" || mode == "motion_mode_spinning" || mode == "2") {
       forced_policy_ = "spin";
     } else if (mode == "park") {
@@ -398,7 +407,7 @@ class RangerMini3ModeController : public rclcpp::Node {
       warnThrottled(
         "bad_mode",
         "Unknown forced mode '" + input +
-        "'. Use auto, dual_ackerman, parallel/crab, spinning/spin, park, or official enum code 0/1/2.");
+        "'. Use auto, dual_ackerman, parallel, side_slip/crab/lateral, spinning/spin, park, or official enum code 0/1/2/3.");
       return;
     }
     RCLCPP_INFO(get_logger(), "forced mode set to %s", forced_policy_.empty() ? "auto" : forced_policy_.c_str());
@@ -477,6 +486,10 @@ class RangerMini3ModeController : public rclcpp::Node {
     return policy == "allow" || policy == "crab" || policy == "parallel";
   }
 
+  bool forcedLateralAllowed() const {
+    return forced_policy_ == "crab" || forced_policy_ == "parallel" || forced_policy_ == "side_slip";
+  }
+
   PublishDecision computeOfficialPassthrough(const std::chrono::steady_clock::time_point now) {
     PublishDecision decision;
     decision.state = "ok";
@@ -508,7 +521,9 @@ class RangerMini3ModeController : public rclcpp::Node {
     }
 
     if (!forced_policy_.empty()) {
-      decision.reason = "forced_mode diagnostic-only under official_passthrough";
+      decision.reason = forcedLateralAllowed() ?
+        "forced lateral mode active under official_passthrough" :
+        "forced_mode diagnostic-only under official_passthrough";
     }
 
     if (decision.output.linear.x < 0.0 && !effectiveAllowReverse(now)) {
@@ -516,9 +531,16 @@ class RangerMini3ModeController : public rclcpp::Node {
       appendDiffReason(decision.diff_reason, "reverse_not_allowed");
     }
 
-    if (std::abs(decision.output.linear.y) >= lateral_eps_ && !lateralAllowed()) {
+    if (std::abs(decision.output.linear.y) >= lateral_eps_ && !lateralAllowed() &&
+      !forcedLateralAllowed())
+    {
       decision.output.linear.y = 0.0;
       appendDiffReason(decision.diff_reason, "lateral_not_allowed");
+    }
+
+    if (std::abs(decision.output.linear.y) >= lateral_eps_) {
+      decision.predicted_mode = forced_policy_ == "side_slip" ?
+        MotionMode::kSideSlip : MotionMode::kCrab;
     }
 
     return decision;
@@ -562,6 +584,10 @@ class RangerMini3ModeController : public rclcpp::Node {
     if (policy == "crab" || policy == "lateral" || policy == "sideways" || policy == "parallel") {
       resetSpinHysteresis();
       return makeCrab(vx, vy, wz, reverse_allowed);
+    }
+    if (policy == "side_slip") {
+      resetSpinHysteresis();
+      return makeSideSlip(vx, vy, wz, reverse_allowed);
     }
     if (policy == "spin") {
       resetSpinHysteresis();
@@ -620,6 +646,12 @@ class RangerMini3ModeController : public rclcpp::Node {
     command.linear_mps = clamp(vx, -max_linear_high_angle_mps_, max_linear_high_angle_mps_);
     command.lateral_mps = clamp(vy, -max_lateral_mps_, max_lateral_mps_);
     command.yaw_radps = clamp(wz, -max_crab_yaw_radps_, max_crab_yaw_radps_);
+    return command;
+  }
+
+  RangerCommand makeSideSlip(double vx, double vy, double wz, bool reverse_allowed) const {
+    RangerCommand command = makeCrab(vx, vy, wz, reverse_allowed);
+    command.mode = MotionMode::kSideSlip;
     return command;
   }
 
@@ -738,6 +770,7 @@ class RangerMini3ModeController : public rclcpp::Node {
         msg.angular.z = command.yaw_radps;
         return msg;
       case MotionMode::kCrab:
+      case MotionMode::kSideSlip:
         msg.linear.x = command.linear_mps;
         msg.linear.y = command.lateral_mps;
         msg.angular.z = command.yaw_radps;

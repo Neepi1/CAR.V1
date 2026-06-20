@@ -33,10 +33,15 @@ map_server_publishing_requested_map() {
   map_topic_matches_yaml "${map_yaml}" >/dev/null 2>&1
 }
 
+localization_map_external_lifecycle_bringup_enabled() {
+  [[ "${NJRH_LOCALIZATION_MAP_EXTERNAL_LIFECYCLE_BRINGUP:-false}" == "true" ]]
+}
+
 ensure_map_server_active() {
   local map_yaml="${1:-}"
   local timeout_sec="${2:-30}"
   local deadline=$((SECONDS + timeout_sec))
+  local external_wait_logged=0
 
   if [[ -n "${map_yaml}" ]] && map_server_publishing_requested_map "${map_yaml}"; then
     echo "[runtime-overlay] requested map is already published on /map; continuing without waiting for /map_server discovery" >&2
@@ -72,10 +77,24 @@ ensure_map_server_active() {
         echo "[runtime-overlay] /map_server is active but has not published requested map yet" >&2
         ;;
       unconfigured*)
-        timeout 5 ros2 lifecycle set /map_server configure >/dev/null 2>&1 || true
+        if localization_map_external_lifecycle_bringup_enabled; then
+          if [[ "${external_wait_logged}" -eq 0 ]]; then
+            echo "[runtime-overlay] external lifecycle_bringup is managing /map_server; waiting for active/map publication" >&2
+            external_wait_logged=1
+          fi
+        else
+          timeout 5 ros2 lifecycle set /map_server configure >/dev/null 2>&1 || true
+        fi
         ;;
       inactive*)
-        timeout 5 ros2 lifecycle set /map_server activate >/dev/null 2>&1 || true
+        if localization_map_external_lifecycle_bringup_enabled; then
+          if [[ "${external_wait_logged}" -eq 0 ]]; then
+            echo "[runtime-overlay] external lifecycle_bringup is managing /map_server; waiting for active/map publication" >&2
+            external_wait_logged=1
+          fi
+        else
+          timeout 5 ros2 lifecycle set /map_server activate >/dev/null 2>&1 || true
+        fi
         ;;
       *)
         if [[ -n "${map_yaml}" ]] && map_server_publishing_requested_map "${map_yaml}"; then
@@ -108,6 +127,18 @@ wait_for_occupancy_grid() {
 wait_for_global_costmap_static() {
   local timeout_sec="${1:-35}"
   local min_cells="${2:-101}"
+  if [[ "${NJRH_GLOBAL_COSTMAP_FULL_MESSAGE_GATE:-false}" != "true" ]]; then
+    runtime_readiness_probe lifecycle-active "/global_costmap/global_costmap" "${timeout_sec}" || {
+      echo "[runtime-overlay] global costmap lifecycle was not active in time" >&2
+      return 1
+    }
+    runtime_readiness_probe topic-publisher "/global_costmap/costmap" "${NJRH_GLOBAL_COSTMAP_PUBLISHER_READY_TIMEOUT_SEC:-15}" || {
+      echo "[runtime-overlay] global costmap publisher was not ready in time" >&2
+      return 1
+    }
+    echo "[runtime-overlay] global costmap lifecycle and costmap publisher are ready; full OccupancyGrid message gate is deferred" >&2
+    return 0
+  fi
 
   runtime_readiness_probe occupancy-grid "/global_costmap/costmap" "${timeout_sec}" "${min_cells}" "${min_cells}" || {
     echo "[runtime-overlay] global costmap did not resize from static map in time" >&2

@@ -36,6 +36,8 @@ preserves the original `LaserScan.header.stamp`, frame id, angular metadata, and
 ranges. It drops scans older than `NJRH_AMCL_SCAN_MAX_AGE_MS` and scans whose
 `odom <- scan_frame` transform is unavailable at the original scan stamp, then
 limits the admitted stream to `NJRH_AMCL_SCAN_RATE_HZ` (default 5 Hz). `/scan`
+admission defaults to a one-second age window so AMCL can use bounded historical
+scans with TF history without rewriting timestamps.
 remains available to other consumers, and `/flatscan` remains an Isaac
 `FlatScan` topic, not an AMCL input. The only `map -> odom` publisher remains
 `robot_localization_bridge`; the only `odom -> base_link` publisher remains

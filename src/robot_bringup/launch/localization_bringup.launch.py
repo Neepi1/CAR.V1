@@ -65,7 +65,6 @@ def generate_launch_description():
             include("robot_description", "description.launch.py"),
             include("robot_chassis_bridge", "chassis_bridge.launch.py"),
             include("robot_hesai_jt128", "jt128.launch.py"),
-            include("robot_local_perception", "local_perception.launch.py"),
             include("robot_local_state", "local_state.launch.py"),
             include("robot_global_localization", "global_localization.launch.py"),
             include("robot_localization_bridge", "localization_bridge.launch.py"),

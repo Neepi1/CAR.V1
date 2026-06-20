@@ -55,6 +55,9 @@ struct DockingJob
   bool predock_xy_ok{false};
   bool predock_base_yaw_ok{false};
   bool predock_contact_yaw_ok{false};
+  bool predock_yaw_verified_by_nav2{false};
+  bool reverse_yaw_offset_applied{false};
+  bool contact_frame_available{false};
   bool predock_yaw_align_attempted{false};
   bool predock_yaw_aligned{false};
   bool predock_yaw_align_succeeded{false};
@@ -74,6 +77,13 @@ struct DockingJob
   std::string predock_yaw_align_failure_code;
   bool fine_entry_checked{false};
   bool fine_entry_ok{false};
+  bool fine_bridge_settle_started{false};
+  bool fine_bridge_settle_complete{false};
+  double fine_bridge_settle_duration_sec{0.0};
+  double fine_bridge_settle_remaining_translation_m{0.0};
+  double fine_bridge_settle_remaining_yaw_rad{0.0};
+  std::string fine_bridge_settle_failure_code;
+  std::string fine_bridge_settle_detail;
   double fine_entry_distance_m{-1.0};
   double fine_entry_base_yaw_error_rad{0.0};
   double fine_entry_contact_yaw_error_rad{0.0};
@@ -108,6 +118,9 @@ struct DockingJob
   bool post_undock_settle_started{false};
   bool post_undock_settle_complete{false};
   std::string post_undock_settle_failure_reason;
+  bool post_undock_navigation_readiness_failed{false};
+  std::string post_undock_navigation_readiness_failure_code;
+  std::string post_undock_navigation_readiness_detail;
   bool pending_goal_held_for_post_undock_settle{false};
   bool pending_goal_released_after_post_undock_settle{false};
   bool using_triggered_baseline_only{false};

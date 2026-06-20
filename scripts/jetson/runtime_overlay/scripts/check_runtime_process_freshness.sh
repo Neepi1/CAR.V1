@@ -122,8 +122,6 @@ status=0
 
 POINTCLOUD_AXIS_BIN="${NJRH_POINTCLOUD_REMAP_CPP_BIN:-${NJRH_PROJECT_ROOT}/install/robot_hesai_jt128/lib/robot_hesai_jt128/pointcloud_axis_remap_node}"
 POINTCLOUD_AXIS_SRC="${NJRH_PROJECT_ROOT}/src/robot_hesai_jt128/src/pointcloud_axis_remap_node.cpp"
-LOCAL_PERCEPTION_BIN="${NJRH_LOCAL_PERCEPTION_CPP_BIN:-${NJRH_PROJECT_ROOT}/install/robot_local_perception/lib/robot_local_perception/local_perception_node}"
-LOCAL_PERCEPTION_SRC="${NJRH_PROJECT_ROOT}/src/robot_local_perception/src/local_perception_node.cpp"
 API_BIN="${NJRH_ROBOT_API_SERVER_BIN:-${NJRH_PROJECT_ROOT}/install/robot_api_server/lib/robot_api_server/robot_api_server_node}"
 API_SRC="${NJRH_PROJECT_ROOT}/src/robot_api_server/src/robot_api_server_node.cpp"
 
@@ -132,14 +130,10 @@ echo "[process-freshness] runtime_log_dir=${NJRH_RUNTIME_LOG_DIR}"
 echo "[process-freshness] check_all=${CHECK_ALL}"
 
 check_binary_against_source pointcloud_axis_remap "${POINTCLOUD_AXIS_BIN}" "${POINTCLOUD_AXIS_SRC}" || status=1
-check_binary_against_source robot_local_perception "${LOCAL_PERCEPTION_BIN}" "${LOCAL_PERCEPTION_SRC}" ||
-  { [[ "${CHECK_ALL}" == "true" ]] && status=1 || true; }
 check_binary_against_source robot_api_server "${API_BIN}" "${API_SRC}" ||
   { [[ "${CHECK_ALL}" == "true" ]] && status=1 || true; }
 
 check_processes_for_binary pointcloud_axis_remap "pointcloud_axis_remap" "${POINTCLOUD_AXIS_BIN}" || status=1
-check_processes_for_binary robot_local_perception "local_perception_node|robot_local_perception/local_perception_node" "${LOCAL_PERCEPTION_BIN}" ||
-  { [[ "${CHECK_ALL}" == "true" ]] && status=1 || true; }
 check_processes_for_binary robot_api_server "robot_api_server_node|robot_api_server/robot_api_server_node" "${API_BIN}" ||
   { [[ "${CHECK_ALL}" == "true" ]] && status=1 || true; }
 

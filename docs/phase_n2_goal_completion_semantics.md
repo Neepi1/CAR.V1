@@ -10,16 +10,16 @@ Phase N2 separates three concepts that were previously easy to mix together:
 
 `goal_completion_policy` is exposed in `/api/v1/navigation/state` and accepted on normal navigation requests when appropriate.
 
-- `pose_required`: default for normal delivery points. The API may run mission-layer `final_yaw_align`, then succeeds only after final pose verification. If final yaw alignment exceeds the existing XY drift guard, the API may run one `REPOSITION_AFTER_YAW_DRIFT` retry to the original target.
+- `pose_required`: default for normal delivery points. Phase N3 supersedes the N2 API-owned final-yaw step: ordinary delivery yaw is completed by Nav2 native `RotationShimController + SimpleGoalChecker` before action success, then the API performs read-only final pose verification. The legacy API `final_yaw_align` path remains only behind explicit emergency fallback configuration.
 - `position_only`: explicit opt-out for engineering cases where final heading is irrelevant. A fresh XY verification completes the goal. The API does not run mission-layer `final_yaw_align`.
-- `dock_staging`: reserved for `/api/v1/docking/start`. A predock Nav2 result only means the robot reached the staging pose. Ordinary `final_yaw_align` is forbidden; docking owns yaw through `PREDOCK_POSE_VERIFY` and `PREDOCK_YAW_ALIGN`.
+- `dock_staging`: reserved for `/api/v1/docking/start`. The predock Nav2 result must complete XY plus yaw before GS2 fine docking can start. Ordinary `final_yaw_align` is forbidden; the API performs read-only `PREDOCK_POSE_VERIFY`, and `PREDOCK_YAW_ALIGN_RECOVERY` is only an explicit fallback.
 
 ## App State Rules
 
 The App should show arrival success only when `task_complete=true`.
 
 - During `position_reached_yaw_aligning`, show a heading-alignment state, not task success.
-- During `REPOSITION_AFTER_YAW_DRIFT`, show a short reposition/reverify state.
+- If a legacy emergency fallback explicitly enables `REPOSITION_AFTER_YAW_DRIFT`, show a short reposition/reverify state. It is not part of the default ordinary navigation path.
 - For `position_only`, `position_reached=true` and `final_pose_verified=true` can happen immediately after Nav2 result verification.
 - For `pose_required`, `position_reached=true` alone is not enough.
 
@@ -41,7 +41,7 @@ The navigation goal JSON includes:
 Ordinary final yaw and docking predock yaw are separate owners.
 
 - Ordinary `final_yaw_align` may publish only to `/cmd_vel_nav` or `/cmd_vel_collision_checked`.
-- `PREDOCK_YAW_ALIGN` must publish to `/cmd_vel_docking`.
+- Explicit `PREDOCK_YAW_ALIGN_RECOVERY` must publish only to `/cmd_vel_docking`.
 - The two owners must not be active at the same time.
 - If docking starts while ordinary final yaw is active, the API requests cancellation, sends a zero burst on the ordinary final-yaw stream, waits briefly for the owner to release, and then lets docking proceed.
 
@@ -59,12 +59,14 @@ Fine docking is allowed only after all staging conditions are true:
 
 - `goal_completion_policy == dock_staging`
 - predock XY is verified
+- `predock_pose_verified == true`
 - `predock_yaw_aligned == true`
 - post-predock handoff settle is complete; post-predock relocalization is only part of this gate when explicitly enabled
 - GS2 scan is fresh
+- bridge `map->odom` smoothing has settled in `FINE_DOCKING_BRIDGE_SETTLE`
 - global correction pause is applied
 
-If fine-entry yaw is too large, the state machine retries `PREDOCK_YAW_ALIGN` or restaging according to the existing retry budget instead of calling GS2 fine docking directly.
+If fine-entry yaw is too large, the state machine fails by default instead of calling GS2 fine docking directly. It may enter `PREDOCK_YAW_ALIGN_RECOVERY` only when the explicit fallback config is enabled.
 
 ## Verification
 
@@ -80,6 +82,19 @@ Live observation during a normal navigation:
 bash scripts/jetson/runtime_overlay/scripts/observe_navigation_final_yaw_align.sh \
   --duration-sec 180 \
   --label nav_goal_1
+```
+
+Phase V1 adds the current combined validation path for normal delivery
+semantics. It observes an already-running navigation and checks that
+`pose_required` completion is not reported until `task_complete=true`:
+
+```bash
+bash scripts/jetson/runtime_overlay/scripts/observe_pose_required_navigation.sh \
+  --duration-sec 180
+
+bash scripts/jetson/runtime_overlay/scripts/run_v1_navigation_docking_validation.sh \
+  --observe-only \
+  --duration-sec 120
 ```
 
 Rollback is a code/config revert of Phase N2 files. This phase does not change Nav2 controller/planner plugins, MPPI, progress checker, TF tolerances, pointcloud QoS/DDS, FAST-LIO2, Ranger odom, EKF, or the `robot_safety` speed chain.

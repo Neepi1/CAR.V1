@@ -30,7 +30,7 @@ from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid, Odometry
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 from tf2_msgs.msg import TFMessage
 
@@ -74,7 +74,7 @@ class RuntimeHealthGuard(Node):
         self.odom_fresh_sec = _env_float("NJRH_RUNTIME_HEALTH_ODOM_FRESH_SEC", 0.75)
         self.tf_fresh_sec = _env_float("NJRH_RUNTIME_HEALTH_TF_FRESH_SEC", 0.25)
         self.map_tf_fresh_sec = _env_float("NJRH_RUNTIME_HEALTH_MAP_TF_FRESH_SEC", 1.0)
-        self.perception_fresh_sec = _env_float("NJRH_RUNTIME_HEALTH_PERCEPTION_FRESH_SEC", 1.0)
+        self.scan_fresh_sec = _env_float("NJRH_RUNTIME_HEALTH_SCAN_FRESH_SEC", 1.0)
         self.observe_heavy_topics = os.environ.get(
             "NJRH_RUNTIME_HEALTH_OBSERVE_HEAVY_TOPICS", "false"
         ).lower() in {"1", "true", "yes", "on"}
@@ -90,8 +90,7 @@ class RuntimeHealthGuard(Node):
         self._init_topic("/fastlio/base_odometry", "nav_msgs/msg/Odometry")
         self._init_topic("/Odometry", "nav_msgs/msg/Odometry")
         self._init_topic("/safety/status", "std_msgs/msg/String")
-        self._init_topic("/perception/obstacle_points", "sensor_msgs/msg/PointCloud2")
-        self._init_topic("/perception/clearing_points", "sensor_msgs/msg/PointCloud2")
+        self._init_topic("/scan", "sensor_msgs/msg/LaserScan")
         self._init_topic("/map", "nav_msgs/msg/OccupancyGrid")
         self._init_topic("/global_costmap/costmap", "nav_msgs/msg/OccupancyGrid")
         self._init_topic("/local_costmap/costmap", "nav_msgs/msg/OccupancyGrid")
@@ -101,19 +100,8 @@ class RuntimeHealthGuard(Node):
         self._make_subscription(Odometry, "/fastlio/base_odometry", self._on_topic("/fastlio/base_odometry"), self._reliable_qos())
         self._make_subscription(Odometry, "/Odometry", self._on_topic("/Odometry"), self._best_effort_qos())
         self._make_subscription(String, "/safety/status", self._on_topic("/safety/status"), self._reliable_qos())
+        self._make_subscription(LaserScan, "/scan", self._on_topic("/scan"), self._best_effort_qos())
         if self.observe_heavy_topics:
-            self._make_subscription(
-                PointCloud2,
-                "/perception/obstacle_points",
-                self._on_topic("/perception/obstacle_points"),
-                self._best_effort_qos(),
-            )
-            self._make_subscription(
-                PointCloud2,
-                "/perception/clearing_points",
-                self._on_topic("/perception/clearing_points"),
-                self._best_effort_qos(),
-            )
             self._make_subscription(OccupancyGrid, "/map", self._on_topic("/map"), self._transient_qos())
             self._make_subscription(
                 OccupancyGrid,
@@ -326,9 +314,7 @@ class RuntimeHealthGuard(Node):
             "map_odom_tf_ready": map_odom_tf_ready,
             "localization_bridge_endpoint_ready": bridge_endpoint,
             "safety_status_fresh": self._topic_fresh("/safety/status", self.topic_fresh_sec),
-            "perception_obstacle_fresh": self._topic_fresh(
-                "/perception/obstacle_points", self.perception_fresh_sec
-            ),
+            "local_scan_fresh": self._topic_fresh("/scan", self.scan_fresh_sec),
             "local_costmap_fresh": self._topic_fresh("/local_costmap/costmap", self.topic_fresh_sec),
             "global_costmap_fresh": self._topic_fresh("/global_costmap/costmap", self.topic_fresh_sec),
             "map_fresh": _bool_topic(self.topics.get("/map", {})),

@@ -14,11 +14,10 @@ INGRESS_PROFILE_FILE="${NJRH_POINTCLOUD_INGRESS_PROFILE_FILE:-${NJRH_OVERLAY_ROO
 
 usage() {
   cat <<'EOF'
-Usage: set_pointcloud_accel_profile.sh [--profile legacy|ipc_worker|nitros] [--ingress-profile separate_process|driver_integrated] [--print] [--restart]
+Usage: set_pointcloud_accel_profile.sh [--profile ipc_worker|nitros] [--ingress-profile separate_process|driver_integrated] [--print] [--restart]
 
 Profiles:
-  legacy      Current verified branch topology and one-command rollback.
-  ipc_worker  Same-process navigation workers; /lidar_points remains full trunk.
+  ipc_worker  Same-process scan worker; /lidar_points remains full trunk and /scan feeds Nav2 local obstacles.
   nitros      Isaac ROS NITROS navigation-branch skeleton; never replaces /lidar_points.
 
 Ingress:
@@ -61,7 +60,11 @@ done
 
 if [[ -n "${PROFILE}" ]]; then
   case "${PROFILE}" in
-    legacy|ipc_worker|nitros) ;;
+    ipc_worker|nitros) ;;
+    legacy)
+      echo "[pointcloud-accel] legacy profile was removed; use --profile ipc_worker for /scan-based Nav2 marking+clearing" >&2
+      exit 2
+      ;;
     *)
       echo "[pointcloud-accel] invalid profile: ${PROFILE}" >&2
       usage >&2
@@ -70,14 +73,14 @@ if [[ -n "${PROFILE}" ]]; then
   esac
   if [[ "${PROFILE}" == "nitros" ]]; then
     if ! bash "${SCRIPT_DIR}/check_isaac_ros_nitros_env.sh"; then
-      echo "[pointcloud-accel] NITROS profile was not written. Use --profile ipc_worker or --profile legacy." >&2
+      echo "[pointcloud-accel] NITROS profile was not written. Use --profile ipc_worker." >&2
       exit 3
     fi
   fi
   mkdir -p "$(dirname "${PROFILE_FILE}")"
   {
     echo "# Runtime-selected pointcloud acceleration profile."
-    echo "# Valid values: legacy, ipc_worker, nitros"
+    echo "# Valid values: ipc_worker, nitros"
     printf 'export NJRH_POINTCLOUD_ACCEL_PROFILE="${NJRH_POINTCLOUD_ACCEL_PROFILE:-%s}"\n' "${PROFILE}"
   } >"${PROFILE_FILE}"
   export NJRH_POINTCLOUD_ACCEL_PROFILE="${PROFILE}"
@@ -116,7 +119,6 @@ cat <<'EOF'
 [pointcloud-accel] Validation commands:
 [pointcloud-accel]   bash scripts/jetson/runtime_overlay/scripts/verify_pointcloud_accel_profile.sh
 [pointcloud-accel]   timeout 12 ros2 topic echo /lidar/axis_remap_status --field data
-[pointcloud-accel]   ros2 topic hz /perception/obstacle_points
 [pointcloud-accel]   ros2 topic hz /scan
 [pointcloud-accel]   ros2 topic hz /flatscan
 EOF

@@ -21,10 +21,10 @@ njrh_load_local_perception_input_profile() {
     profile_source="environment"
   fi
 
-  local profile="${NJRH_LOCAL_PERCEPTION_INPUT_PROFILE:-local_branch}"
-  local branch_topic="${NJRH_LOCAL_PERCEPTION_LOCAL_BRANCH_TOPIC:-/_internal/lidar_points_local}"
-  local branch_stride="${NJRH_LOCAL_PERCEPTION_LOCAL_BRANCH_STRIDE:-2}"
-  local branch_publish_every_n="${NJRH_LOCAL_PERCEPTION_LOCAL_BRANCH_PUBLISH_EVERY_N:-1}"
+  local profile="${NJRH_LOCAL_PERCEPTION_INPUT_PROFILE:-disabled}"
+  local branch_topic=""
+  local branch_stride="1"
+  local branch_publish_every_n="1"
 
   if ! njrh_int_ge "${branch_stride}" 1; then
     echo "[runtime-overlay] invalid NJRH_LOCAL_PERCEPTION_LOCAL_BRANCH_STRIDE=${branch_stride}" >&2
@@ -41,39 +41,31 @@ njrh_load_local_perception_input_profile() {
   local profile_axis_local_output_publish_every_n="1"
 
   case "${profile}" in
-    local_branch)
-      profile_input_topic="${branch_topic}"
-      profile_axis_local_output_topic="${branch_topic}"
-      profile_axis_local_output_stride="${branch_stride}"
-      profile_axis_local_output_publish_every_n="${branch_publish_every_n}"
+    disabled)
+      profile_input_topic=""
+      profile_axis_local_output_topic=""
+      profile_axis_local_output_stride="1"
+      profile_axis_local_output_publish_every_n="1"
       ;;
-    trunk)
-      profile_input_topic="/lidar_points"
+    local_branch|trunk)
+      echo "[runtime-overlay] retired NJRH_LOCAL_PERCEPTION_INPUT_PROFILE=${profile}; forcing disabled because Nav2 uses /scan" >&2
+      profile="disabled"
+      profile_input_topic=""
       profile_axis_local_output_topic=""
       profile_axis_local_output_stride="1"
       profile_axis_local_output_publish_every_n="1"
       ;;
     *)
-      echo "[runtime-overlay] invalid NJRH_LOCAL_PERCEPTION_INPUT_PROFILE=${profile}; expected local_branch or trunk" >&2
+      echo "[runtime-overlay] invalid NJRH_LOCAL_PERCEPTION_INPUT_PROFILE=${profile}; expected disabled" >&2
       return 2
       ;;
   esac
 
-  if [[ "${ROBOT_LOCAL_PERCEPTION_INPUT_TOPIC+x}" == "x" ]]; then
-    RESOLVED_LOCAL_PERCEPTION_INPUT_TOPIC="${ROBOT_LOCAL_PERCEPTION_INPUT_TOPIC}"
-    RESOLVED_LOCAL_PERCEPTION_INPUT_TOPIC_SOURCE="ROBOT_LOCAL_PERCEPTION_INPUT_TOPIC"
-  else
-    RESOLVED_LOCAL_PERCEPTION_INPUT_TOPIC="${profile_input_topic}"
-    RESOLVED_LOCAL_PERCEPTION_INPUT_TOPIC_SOURCE="profile"
-  fi
+  RESOLVED_LOCAL_PERCEPTION_INPUT_TOPIC="${profile_input_topic}"
+  RESOLVED_LOCAL_PERCEPTION_INPUT_TOPIC_SOURCE="disabled"
 
-  if [[ "${NJRH_POINTCLOUD_AXIS_LOCAL_OUTPUT_TOPIC+x}" == "x" ]]; then
-    RESOLVED_AXIS_LOCAL_OUTPUT_TOPIC="${NJRH_POINTCLOUD_AXIS_LOCAL_OUTPUT_TOPIC}"
-    RESOLVED_AXIS_LOCAL_OUTPUT_TOPIC_SOURCE="NJRH_POINTCLOUD_AXIS_LOCAL_OUTPUT_TOPIC"
-  else
-    RESOLVED_AXIS_LOCAL_OUTPUT_TOPIC="${profile_axis_local_output_topic}"
-    RESOLVED_AXIS_LOCAL_OUTPUT_TOPIC_SOURCE="profile"
-  fi
+  RESOLVED_AXIS_LOCAL_OUTPUT_TOPIC="${profile_axis_local_output_topic}"
+  RESOLVED_AXIS_LOCAL_OUTPUT_TOPIC_SOURCE="disabled"
 
   if [[ "${NJRH_POINTCLOUD_AXIS_LOCAL_OUTPUT_STRIDE+x}" == "x" ]]; then
     RESOLVED_AXIS_LOCAL_OUTPUT_STRIDE="${NJRH_POINTCLOUD_AXIS_LOCAL_OUTPUT_STRIDE}"
@@ -117,9 +109,12 @@ njrh_load_local_perception_input_profile() {
 
 njrh_print_local_perception_profile() {
   echo "[runtime-overlay] selected local perception profile=${NJRH_LOCAL_PERCEPTION_INPUT_PROFILE} source=${NJRH_LOCAL_PERCEPTION_INPUT_PROFILE_SOURCE}" >&2
+  if [[ "${NJRH_LOCAL_PERCEPTION_INPUT_PROFILE}" == "disabled" ]]; then
+    echo "[runtime-overlay] local perception PointCloud2 obstacle branch is disabled; /scan is the Nav2 local obstacle source" >&2
+    return 0
+  fi
   echo "[runtime-overlay] local perception input_topic=${RESOLVED_LOCAL_PERCEPTION_INPUT_TOPIC} source=${RESOLVED_LOCAL_PERCEPTION_INPUT_TOPIC_SOURCE}" >&2
   echo "[runtime-overlay] axis local_output_topic=${RESOLVED_AXIS_LOCAL_OUTPUT_TOPIC:-<disabled>} source=${RESOLVED_AXIS_LOCAL_OUTPUT_TOPIC_SOURCE}" >&2
   echo "[runtime-overlay] axis local_output_stride=${RESOLVED_AXIS_LOCAL_OUTPUT_STRIDE} source=${RESOLVED_AXIS_LOCAL_OUTPUT_STRIDE_SOURCE}" >&2
   echo "[runtime-overlay] axis local_output_publish_every_n=${RESOLVED_AXIS_LOCAL_OUTPUT_PUBLISH_EVERY_N} source=${RESOLVED_AXIS_LOCAL_OUTPUT_PUBLISH_EVERY_N_SOURCE}" >&2
 }
-

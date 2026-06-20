@@ -139,7 +139,6 @@ done
 
 echo "[pointcloud-cpu-pressure] pointcloud and navigation thread placement:"
 print_threads_for_pattern "pointcloud_axis_remap" "pointcloud_axis_remap"
-print_threads_for_pattern "robot_local_perception" "local_perception_node|robot_local_perception"
 print_threads_for_pattern "nav_cloud_preprocessor" "nav_cloud_preprocessor"
 print_threads_for_pattern "pointcloud_to_laserscan" "pointcloud_to_laserscan"
 print_threads_for_pattern "scan_republisher" "scan_republisher_node"
@@ -158,20 +157,9 @@ fi
 
 warnings=0
 axis_cpus="$(cpus_for_pattern "pointcloud_axis_remap")"
-local_cpus="$(cpus_for_pattern "local_perception_node|robot_local_perception")"
 nav_cpus="$(cpus_for_pattern "nav_cloud_preprocessor|pointcloud_to_laserscan|scan_republisher_node|laser_scan_to_flatscan")"
 localizer_cpus="$(cpus_for_pattern "robot_global_localization|occupancy_grid_localizer|isaac.*localizer")"
 nav2_cpus="$(cpus_for_pattern "controller_server|local_costmap|global_costmap|collision_monitor")"
-
-if [[ -n "${local_cpus}" && -n "${nav_cpus}" ]] && sets_overlap "${local_cpus}" "${nav_cpus}"; then
-  echo "[pointcloud-cpu-pressure] WARN robot_local_perception overlaps nav scan chain on CPU(s): local=${local_cpus} nav=${nav_cpus}"
-  warnings=$((warnings + 1))
-fi
-
-if [[ -n "${local_cpus}" && -n "${localizer_cpus}" ]] && sets_overlap "${local_cpus}" "${localizer_cpus}"; then
-  echo "[pointcloud-cpu-pressure] WARN robot_local_perception overlaps localization/localizer on CPU(s): local=${local_cpus} localizer=${localizer_cpus}"
-  warnings=$((warnings + 1))
-fi
 
 if [[ -n "${axis_cpus}" && -n "${nav2_cpus}" ]] && sets_overlap "${axis_cpus}" "${nav2_cpus}"; then
   echo "[pointcloud-cpu-pressure] WARN pointcloud_axis_remap CPU overlaps Nav2/controller/costmap work: axis=${axis_cpus} nav2=${nav2_cpus}"
@@ -206,16 +194,5 @@ if [[ -n "${swap_used_mb}" ]] && awk -v value="${swap_used_mb}" 'BEGIN {exit(val
   warnings=$((warnings + 1))
 fi
 
-local_status="$(status_once /perception/local_perception_status)"
-local_processing_avg="$(field_latest "${local_status}" processing_ms_avg || true)"
-local_timer_hz="$(field_latest "${local_status}" timer_tick_hz || field_latest "${local_status}" process_timer_hz || true)"
-local_processed_hz="$(field_latest "${local_status}" processed_cloud_hz || true)"
-if [[ -n "${local_processing_avg}" && -n "${local_processed_hz}" ]] &&
-  float_lt "${local_processing_avg}" 10.0 && float_lt "${local_processed_hz}" 10.0
-then
-  echo "[pointcloud-cpu-pressure] WARN local perception processing_ms_avg is low but processed_hz is low: processing_ms_avg=${local_processing_avg} timer_hz=${local_timer_hz:-missing} processed_hz=${local_processed_hz}"
-  warnings=$((warnings + 1))
-fi
-
 echo "[pointcloud-cpu-pressure] WARN_COUNT=${warnings}"
-echo "[pointcloud-cpu-pressure] local_cpus=${local_cpus:-missing} nav_cpus=${nav_cpus:-missing} localizer_cpus=${localizer_cpus:-missing} axis_cpus=${axis_cpus:-missing}"
+echo "[pointcloud-cpu-pressure] nav_cpus=${nav_cpus:-missing} localizer_cpus=${localizer_cpus:-missing} axis_cpus=${axis_cpus:-missing}"

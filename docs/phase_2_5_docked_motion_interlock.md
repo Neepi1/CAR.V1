@@ -8,6 +8,12 @@ BMS charging contact, `/docking/status`, backend docking job state, and the
 persistent `docking_contact_latch.json` written by `robot_api_server` and
 `robot_docking_manager`.
 
+Full-charge charger idle is still a docked-occupancy problem, not a Nav2
+progress-checker problem. After the runtime has observed real charging/contact
+evidence, it preserves that session as `source=charging_session`; later BMS
+`no_contact`, `current=0`, or `present=false` cannot by itself prove that the
+robot has left the dock.
+
 Normal navigation still enters `POST /api/v1/navigation/goal`. Before any
 `NavigateToPose` goal is sent, the API evaluates `pre_navigation_dock_check`.
 If docked, charging, contact, or the dock latch is active, the API must call

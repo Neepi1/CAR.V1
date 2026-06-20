@@ -31,8 +31,9 @@ robot_api_server:
     mapping_2d_log_file: "/tmp/njrh_mapping2d_slam_toolbox.log"
     mapping_lidar_rps_xps_state_dir: "/tmp/njrh_slam2d_lidar_rps_xps"
     navigation_resume_command: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/run_navigation_runtime_services.sh"
-    navigation_resume_log_file: "/tmp/njrh_navigation_resume.log"
+    navigation_resume_log_file: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/web_dashboard/runtime_logs/resident_navigation_runtime.log"
     runtime_map_context_file: "/tmp/njrh_runtime_map_context.json"
+    navigation_resume_starting_context_ttl_sec: 300.0
     amcl_runtime_status_file: "/tmp/njrh_amcl_runtime_status.env"
     amcl_runtime_status_ttl_sec: 5.0
     last_navigation_map_file: "/workspaces/njrh-v3/workspace1/maps_release/last_navigation_map.json"
@@ -82,8 +83,9 @@ robot_api_server:
     docking_default_sensor_frame: "gs2_link"
     docking_max_retries: 2
     predock_yaw_align_enabled: true
+    predock_yaw_align_fallback_enabled: true
     predock_yaw_align_cmd_topic: "/cmd_vel_docking"
-    predock_yaw_align_tolerance_rad: 0.035
+    predock_yaw_align_tolerance_rad: 0.105
     predock_yaw_align_trigger_rad: 0.08
     predock_yaw_align_hard_fail_rad: 0.80
     predock_yaw_align_timeout_sec: 10.0
@@ -101,8 +103,13 @@ robot_api_server:
     fine_docking_entry_require_predock_yaw_aligned: true
     fine_docking_entry_max_distance_m: 0.35
     fine_docking_entry_max_lateral_m: 0.12
-    fine_docking_entry_max_yaw_rad: 0.12
+    fine_docking_entry_max_yaw_rad: 0.105
     fine_docking_retry_on_yaw_reject: true
+    docking_fine_wait_for_bridge_smoothing_enabled: true
+    docking_fine_bridge_smoothing_wait_timeout_ms: 60000
+    docking_fine_bridge_smoothing_sample_period_ms: 100
+    docking_fine_bridge_smoothing_stable_samples: 3
+    docking_fine_bridge_smoothing_zero_cmd_during_wait: true
     docking_pause_global_correction_during_fine: true
     localization_bridge_correction_pause_service: "/robot_localization_bridge/set_correction_paused"
     mode_controller_status_topic: "/ranger_mini3_mode_controller/status"
@@ -174,9 +181,23 @@ robot_api_server:
     navigation_goal_result_timeout_sec: 600.0
     navigation_goal_position_success_tolerance_m: 0.20
     navigation_default_goal_completion_policy: "pose_required"
-    navigation_max_reposition_after_yaw_retry: 1
+    navigation_max_reposition_after_yaw_retry: 0
     navigation_reposition_after_yaw_drift_timeout_sec: 30.0
-    navigation_final_yaw_align_enable: true
+    nav2_native_goal_completion_enabled: true
+    nav2_rotation_shim_enabled: true
+    api_final_yaw_align_fallback_enabled: false
+    post_nav2_final_verify_enabled: false
+    post_nav2_final_verify_wait_bridge_smoothing: false
+    post_nav2_final_verify_bridge_wait_timeout_ms: 2000
+    post_nav2_final_verify_bridge_wait_sample_period_ms: 100
+    post_nav2_final_verify_max_retry_count: 0
+    post_nav2_final_verify_acceptance_slack_m: 0.0
+    post_nav2_final_verify_xy_retry_min_error_m: 0.20
+    post_nav2_final_verify_xy_retry_max_error_m: 0.60
+    post_nav2_final_verify_yaw_retry_if_failed: false
+    post_nav2_final_verify_retry_uses_same_nav2_goal: false
+    post_nav2_final_verify_api_velocity_correction_enabled: false
+    navigation_final_yaw_align_enable: false
     navigation_final_yaw_tolerance_rad: 0.05
     navigation_final_yaw_align_trigger_rad: 0.08
     navigation_final_yaw_align_speed_radps: 0.25
@@ -186,10 +207,10 @@ robot_api_server:
     navigation_final_yaw_align_timeout_sec: 8.0
     navigation_final_yaw_align_max_xy_drift_m: 0.08
     navigation_final_yaw_align_require_fresh_pose: true
-    # First field version keeps final yaw on /cmd_vel_collision_checked:
-    # robot_safety remains authoritative, but collision_monitor is bypassed
-    # until a dedicated cmd_vel_nav mux is introduced.
+    # Legacy emergency fallback only. Ordinary pose_required navigation XY+yaw
+    # completion is owned by Nav2 RotationShim + SimpleGoalChecker before
+    # action success.
     navigation_final_yaw_align_cmd_topic: "/cmd_vel_collision_checked"
     navigation_final_yaw_align_bypass_collision_monitor: true
     navigation_final_yaw_align_zero_cmd_count: 3
-    navigation_lifecycle_check_timeout_sec: 0.35
+    navigation_lifecycle_check_timeout_sec: 1.5

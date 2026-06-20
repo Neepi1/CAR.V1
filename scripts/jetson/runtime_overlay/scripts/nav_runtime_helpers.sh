@@ -44,36 +44,6 @@ helper_process_running() {
   pgrep -f "${pattern}" >/dev/null 2>&1
 }
 
-local_perception_runtime_config_ready() {
-  local restamp_to_now
-  local restamp_to_latest_tf
-  local require_output_stamp_tf
-  local input_reliable
-  local input_qos_depth
-  local input_transform_use_latest
-  local max_output_tf_stamp_age_sec
-  local output_stamp_tf_backoff_sec
-  local output_stamp_forward_sec
-  restamp_to_now="$(timeout 3 ros2 param get /robot_local_perception restamp_to_now 2>/dev/null || true)"
-  restamp_to_latest_tf="$(timeout 3 ros2 param get /robot_local_perception restamp_to_latest_tf 2>/dev/null || true)"
-  require_output_stamp_tf="$(timeout 3 ros2 param get /robot_local_perception require_output_stamp_tf 2>/dev/null || true)"
-  input_reliable="$(timeout 3 ros2 param get /robot_local_perception input_reliable 2>/dev/null || true)"
-  input_qos_depth="$(timeout 3 ros2 param get /robot_local_perception input_qos_depth 2>/dev/null || true)"
-  input_transform_use_latest="$(timeout 3 ros2 param get /robot_local_perception input_transform_use_latest 2>/dev/null || true)"
-  max_output_tf_stamp_age_sec="$(timeout 3 ros2 param get /robot_local_perception max_output_tf_stamp_age_sec 2>/dev/null || true)"
-  output_stamp_tf_backoff_sec="$(timeout 3 ros2 param get /robot_local_perception output_stamp_tf_backoff_sec 2>/dev/null || true)"
-  output_stamp_forward_sec="$(timeout 3 ros2 param get /robot_local_perception output_stamp_forward_sec 2>/dev/null || true)"
-  [[ "${restamp_to_now}" == *"False"* ]] || return 1
-  [[ "${restamp_to_latest_tf}" == *"False"* ]] || return 1
-  [[ "${require_output_stamp_tf}" == *"False"* ]] || return 1
-  [[ "${input_reliable}" == *"False"* ]] || return 1
-  [[ "${input_qos_depth}" == *"1"* ]] || return 1
-  [[ "${input_transform_use_latest}" == *"True"* ]] || return 1
-  [[ "${max_output_tf_stamp_age_sec}" == *"0.25"* ]] || return 1
-  [[ "${output_stamp_tf_backoff_sec}" == *"0.0"* ]] || return 1
-  [[ "${output_stamp_forward_sec}" == *"0.0"* ]] || return 1
-}
-
 helper_ready() {
   # Runtime startup must not depend on ROS graph probes. Reuse is process based;
   # detailed readiness belongs to diagnostics and API goal admission.
@@ -113,7 +83,7 @@ cleanup_stale_overlay_helper() {
 kill_overlay_pattern() {
   local pattern="$1"
   pkill -INT -f "$pattern" 2>/dev/null || true
-  sleep 1
+  sleep "${NJRH_OVERLAY_HELPER_STOP_INT_WAIT_SEC:-0.5}"
   pkill -9 -f "$pattern" 2>/dev/null || true
 }
 
@@ -134,12 +104,13 @@ stop_existing_standard_nav_stack() {
     "__node:=collision_monitor"
     "__node:=lifecycle_manager_costmap_filters"
     "__node:=lifecycle_manager_navigation"
+    "/opt/ros/humble/lib/nav2_util/lifecycle_bringup"
   )
   local pattern
   for pattern in "${patterns[@]}"; do
     pkill -INT -f "${pattern}" 2>/dev/null || true
   done
-  sleep 1
+  sleep "${NJRH_STANDARD_NAV_STACK_STOP_INT_WAIT_SEC:-0.5}"
   for pattern in "${patterns[@]}"; do
     pkill -9 -f "${pattern}" 2>/dev/null || true
   done
@@ -208,6 +179,12 @@ stop_existing_overlay_nav_helpers() {
 start_overlay_helper() {
   local helper_name="$1"
   shift
+  case "${helper_name}" in
+    local_perception*)
+      echo "[runtime-overlay] ${helper_name} disabled: production local obstacle marking+clearing uses /scan, not robot_local_perception PointCloud2 topics" >&2
+      return 0
+      ;;
+  esac
   local helper_log="${NJRH_RUNTIME_LOG_DIR}/${helper_name}.log"
   local helper_pattern=""
   if helper_pattern="$(helper_process_pattern "${helper_name}")"; then
@@ -224,7 +201,7 @@ start_overlay_helper() {
   "$@" >>"${helper_log}" 2>&1 &
   local helper_pid=$!
   helper_pids+=("${helper_pid}")
-  sleep 1
+  sleep "${NJRH_OVERLAY_HELPER_START_SETTLE_SEC:-0.2}"
   if ! kill -0 "${helper_pid}" 2>/dev/null; then
     echo "[runtime-overlay] helper failed to stay alive: ${helper_name}. Check ${helper_log}" >&2
     return 1
@@ -303,17 +280,17 @@ local_costmap_tf_drop_count() {
   printf '%s\n' "${total}"
 }
 
-wait_for_transformable_obstacle_points() {
+wait_for_transformable_local_scan() {
   local timeout_sec="${1:-20}"
   local required_good="${NJRH_LOCAL_COSTMAP_REQUIRED_GOOD_OBSERVATIONS:-3}"
-  runtime_readiness_probe transformable-obstacle-points "${timeout_sec}" "${required_good}"
+  runtime_readiness_probe transformable-scan "${timeout_sec}" "${required_good}"
 }
 
 wait_for_local_costmap_observation_ready() {
   local timeout_sec="${1:-20}"
 
-  wait_for_topic_message "/perception/obstacle_points" "${timeout_sec}" || {
-    echo "[runtime-overlay] obstacle_points_no_publisher_or_message" >&2
+  wait_for_topic_message "/scan" "${timeout_sec}" || {
+    echo "[runtime-overlay] scan_no_publisher_or_message" >&2
     return 1
   }
   wait_for_fresh_tf_transform "odom" "base_link" "${timeout_sec}" "${NJRH_NAV_TF_MAX_AGE_SEC:-0.25}" || {
@@ -324,10 +301,10 @@ wait_for_local_costmap_observation_ready() {
     echo "[runtime-overlay] local_costmap_costmap_no_update" >&2
     return 1
   }
-  wait_for_transformable_obstacle_points "${timeout_sec}" || {
-    echo "[runtime-overlay] local_costmap_observation_tf_not_transformable" >&2
+  wait_for_transformable_local_scan "${timeout_sec}" || {
+    echo "[runtime-overlay] local_costmap_scan_tf_not_transformable" >&2
     return 1
   }
 
-  echo "[runtime-overlay] local costmap observation ready: costmap updates observed and fresh obstacle clouds are TF-valid" >&2
+  echo "[runtime-overlay] local costmap observation ready: costmap updates observed and fresh /scan is TF-valid" >&2
 }

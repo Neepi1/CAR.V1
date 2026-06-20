@@ -10,8 +10,9 @@ Fixed Nav2 and canonical TF defaults for the first production-oriented scaffold.
 - Fallback controller: `nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController`
 - Smoother: `nav2_smoother::SimpleSmoother`
 - Progress checker: `nav2_controller::PoseProgressChecker`
-- Goal checker: `nav2_controller::SimpleGoalChecker`
-- Local obstacle topic: `/perception/obstacle_points`
+- Goal checker: `nav2_controller::SimpleGoalChecker` with `stateful=false`
+  so XY remains checked while terminal yaw is being satisfied.
+- Local obstacle topic: `/scan`
 - `suppress_third_party_tf`: true
 
 ## Notes

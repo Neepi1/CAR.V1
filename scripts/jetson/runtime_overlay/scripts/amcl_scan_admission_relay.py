@@ -66,7 +66,7 @@ class AmclScanAdmissionRelay(Node):
             0.0,
             float(
                 self.declare_parameter(
-                    "max_age_ms", _env_float("NJRH_AMCL_SCAN_MAX_AGE_MS", 250.0), numeric_param
+                    "max_age_ms", _env_float("NJRH_AMCL_SCAN_MAX_AGE_MS", 1000.0), numeric_param
                 ).value
             ),
         )

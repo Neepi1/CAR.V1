@@ -46,9 +46,12 @@ bridge_cpp="${WORKSPACE_ROOT}/src/robot_localization_bridge/src/localization_bri
 
 for phase in \
   DOCK_REQUESTED RESOLVE_DOCK_PROFILE BEFORE_PREDOCK_RELOCALIZE BEFORE_PREDOCK_SETTLE \
-  NAV_TO_STAGING STAGING_NAV_SUCCEEDED PREDOCK_POSE_VERIFY PREDOCK_YAW_ALIGN \
-  PREDOCK_YAW_ALIGN_SETTLE AFTER_PREDOCK_RELOCALIZE AFTER_PREDOCK_SETTLE \
-  GS2_DOCK_DETECT FINE_DOCKING_ENTRY_CHECK FINE_ALIGN RESTAGE_RETRY; do
+  NAV_TO_STAGING_NATIVE_NAV2 STAGING_NAV2_GOAL_SUCCEEDED PREDOCK_POSE_VERIFY \
+  PREDOCK_NATIVE_GOAL_VERIFY_FAILED PREDOCK_YAW_ALIGN_RECOVERY \
+  PREDOCK_YAW_ALIGN_RECOVERY_SETTLE AFTER_PREDOCK_RELOCALIZE AFTER_PREDOCK_SETTLE \
+  GS2_DOCK_DETECT FINE_DOCKING_BRIDGE_SETTLE PREDOCK_POSE_VERIFY_AFTER_BRIDGE_SETTLE \
+  PREDOCK_YAW_ALIGN_AFTER_BRIDGE_SETTLE PREDOCK_YAW_ALIGN_AFTER_BRIDGE_SETTLE_VERIFY \
+  FINE_DOCKING_ENTRY_CHECK FINE_ALIGN RESTAGE_RETRY; do
   require_text "${api_cpp}" "${phase}"
 done
 
@@ -60,6 +63,9 @@ done
 
 for code in \
   DOCK_FAILED_PREDOCK_NAV DOCK_FAILED_PREDOCK_RELOCALIZATION DOCK_FAILED_PREDOCK_SETTLE \
+  PREDOCK_NATIVE_GOAL_VERIFY_FAILED PREDOCK_YAW_NOT_ALIGNED_AFTER_NAV2 \
+  PREDOCK_POSE_DRIFTED_AFTER_BRIDGE_SETTLE PREDOCK_YAW_NOT_ALIGNED_AFTER_BRIDGE_SETTLE \
+  DOCK_FAILED_FINE_LOCALIZATION_TRANSITION_TIMEOUT \
   PREDOCK_YAW_NOT_ALIGNED PREDOCK_YAW_HARD_FAIL PREDOCK_YAW_ALIGN_TIMEOUT \
   PREDOCK_YAW_ALIGN_MODE_SWITCHING_TIMEOUT PREDOCK_YAW_ALIGN_NO_YAW_MOTION \
   GS2_DOCK_DETECT_TIMEOUT FINE_DOCKING_ENTRY_CONDITION_FAILED \
@@ -73,7 +79,7 @@ require_text "${api_cpp}" "create_publisher<geometry_msgs::msg::Twist>(predock_y
 require_text "${api_cpp}" "mode_controller_status_topic_"
 require_text "${api_cpp}" "actual_motion_mode_code == 2"
 require_text "${api_cpp}" "docking_gs2_scan_topic_"
-require_text "${api_cpp}" "set_global_correction_paused_for_docking(job_id, true, \"docking_fine\""
+require_text "${api_cpp}" "set_global_correction_paused_for_docking(job_id, true, \"docking_fine_entry\""
 require_text "${api_cpp}" "set_global_correction_paused_for_docking("
 require_text "${bridge_cpp}" "correction_pause_service"
 require_text "${bridge_cpp}" "GLOBAL_CORRECTION_PAUSED"
@@ -81,15 +87,19 @@ require_text "${bridge_cpp}" "global_correction_paused"
 
 for field in \
   dock_profile_id approach_direction contact_frame sensor_frame max_retries retry_count \
+  predock_yaw_verified_by_nav2 reverse_yaw_offset_applied contact_frame_available \
+  fine_bridge_settle_started fine_bridge_settle_complete fine_bridge_settle_failure_code \
   predock_yaw_aligned predock_yaw_align_failure_code fine_entry_checked fine_entry_failure_code \
   global_correction_paused pause_reason display_pose_source; do
   require_text "${job_hpp}" "${field}"
 done
 
 for key in \
-  docking_framework_state_machine_enabled predock_yaw_align_enabled predock_yaw_align_cmd_topic \
+  docking_framework_state_machine_enabled predock_yaw_align_enabled \
+  predock_yaw_align_fallback_enabled predock_yaw_align_cmd_topic \
   predock_yaw_align_require_actual_spin fine_docking_entry_require_gs2_fresh \
   fine_docking_entry_require_predock_yaw_aligned docking_pause_global_correction_during_fine \
+  docking_fine_wait_for_bridge_smoothing_enabled docking_fine_bridge_smoothing_wait_timeout_ms \
   localization_bridge_correction_pause_service mode_controller_status_topic; do
   require_text "${api_cfg}" "${key}"
 done

@@ -94,7 +94,7 @@ public:
         charging_detected_ = battery_indicates_charging(*msg);
         charging_contact_detected_ = battery_indicates_charging_contact(*msg);
         if (charging_contact_detected_) {
-          update_dock_contact_latch(true, "docking_manager_bms", "charging_contact", "");
+          update_dock_contact_latch(true, "charging_session", "bms_charging_observed", "");
         }
         if (charging_detected_ && docking_is_active()) {
           docked_stop("docked_charging_detected");
@@ -209,7 +209,7 @@ private:
     reverse_enable_topic_ =
       declare_parameter<std::string>("mode.reverse_enable_topic", "/ranger_mini3/docking_allow_reverse");
     use_crab_mode_ = declare_parameter<bool>("mode.use_crab_mode", true);
-    crab_forced_mode_ = declare_parameter<std::string>("mode.crab_forced_mode", "crab");
+    crab_forced_mode_ = declare_parameter<std::string>("mode.crab_forced_mode", "side_slip");
     release_forced_mode_ = declare_parameter<std::string>("mode.release_forced_mode", "auto");
     park_on_docked_ = declare_parameter<bool>("mode.park_on_docked", true);
 
@@ -261,7 +261,7 @@ private:
     kyaw_ = declare_parameter<double>("controller.kyaw", 0.0);
     lateral_deadband_m_ = declare_parameter<double>("controller.lateral_deadband_m", 0.010);
     yaw_deadband_rad_ = deg_to_rad(declare_parameter<double>("controller.yaw_deadband_deg", 1.0));
-    min_align_speed_mps_ = declare_parameter<double>("controller.min_align_speed_mps", 0.035);
+    min_align_speed_mps_ = declare_parameter<double>("controller.min_align_speed_mps", 0.025);
     min_lateral_speed_mps_ = declare_parameter<double>("controller.min_lateral_speed_mps", 0.025);
     max_lateral_speed_mps_ = declare_parameter<double>("controller.max_lateral_speed_mps", 0.04);
     lateral_priority_threshold_m_ = declare_parameter<double>("controller.lateral_priority_threshold_m", 0.020);
@@ -1195,7 +1195,7 @@ private:
   std::string forced_mode_topic_;
   std::string park_topic_;
   std::string reverse_enable_topic_;
-  std::string crab_forced_mode_{"crab"};
+  std::string crab_forced_mode_{"side_slip"};
   std::string release_forced_mode_{"auto"};
   bool use_crab_mode_{true};
   bool park_on_docked_{true};
@@ -1242,7 +1242,7 @@ private:
   double kyaw_{0.0};
   double lateral_deadband_m_{0.010};
   double yaw_deadband_rad_{deg_to_rad(1.0)};
-  double min_align_speed_mps_{0.035};
+  double min_align_speed_mps_{0.025};
   double min_lateral_speed_mps_{0.025};
   double max_lateral_speed_mps_{0.04};
   double lateral_priority_threshold_m_{0.020};

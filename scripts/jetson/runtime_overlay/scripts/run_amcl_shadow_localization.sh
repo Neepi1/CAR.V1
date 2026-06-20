@@ -14,6 +14,7 @@ LOG_FILE="${NJRH_AMCL_LOG_FILE:-${NJRH_RUNTIME_LOG_DIR}/amcl_shadow_localization
 PARAMS_FILE="${NJRH_AMCL_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/amcl_shadow.yaml}"
 SEED_SERVICE="${NJRH_AMCL_SEED_SERVICE:-/robot_localization_bridge/seed_amcl_initial_pose}"
 AMCL_NODE_NAME="${NJRH_AMCL_NODE_NAME:-amcl}"
+AMCL_BIN="${NJRH_AMCL_BIN:-/opt/ros/humble/lib/nav2_amcl/amcl}"
 SCAN_RELAY_IMPL="${NJRH_AMCL_SCAN_ADMISSION_IMPL:-cpp}"
 SCAN_RELAY_CPP_BIN="${NJRH_AMCL_SCAN_ADMISSION_CPP_BIN:-${NJRH_PROJECT_ROOT}/install/robot_localization_bridge/lib/robot_localization_bridge/amcl_scan_admission_node}"
 SCAN_RELAY_SCRIPT="${NJRH_AMCL_SCAN_ADMISSION_SCRIPT:-${SCRIPT_DIR}/amcl_scan_admission_relay.py}"
@@ -39,10 +40,11 @@ AMCL_NOMOTION_PROBE_USED=false
 AMCL_NOMOTION_POSE_RECEIVED=false
 AMCL_NOMOTION_POSE_COUNT=0
 AMCL_NOMOTION_POSE_HEADER_AGE_MS=""
+AMCL_STATIC_STANDBY_ACCEPTED=false
 
 usage() {
   cat <<'USAGE'
-Usage: run_amcl_shadow_localization.sh [--restart|--stop|--print|--start-resident|--complete-readiness] [--mode disabled|shadow|gated]
+Usage: run_amcl_shadow_localization.sh [--restart|--stop|--print|--start-resident|--complete-readiness|--heartbeat] [--mode disabled|shadow|gated]
 
 Starts the AMCL candidate localization node. AMCL never publishes TF in this
 profile; robot_localization_bridge remains the only map->odom owner. When AMCL
@@ -64,6 +66,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --complete-readiness)
       ACTION="complete"
+      shift
+      ;;
+    --heartbeat)
+      ACTION="heartbeat"
       shift
       ;;
     --stop)
@@ -121,12 +127,16 @@ print_config() {
   echo "NJRH_AMCL_RUNTIME_STATUS_TTL_SEC=${NJRH_AMCL_RUNTIME_STATUS_TTL_SEC:-5.0}"
   echo "NJRH_AMCL_LOG_FILE=${LOG_FILE}"
   echo "NJRH_AMCL_SEED_SERVICE=${SEED_SERVICE}"
+  echo "NJRH_AMCL_BIN=${AMCL_BIN}"
   echo "NJRH_AMCL_NOMOTION_PROBE=${NOMOTION_PROBE}"
   echo "AMCL_NOMOTION_UPDATE_RESPONSE_TIMEOUT_SEC=${AMCL_NOMOTION_UPDATE_RESPONSE_TIMEOUT_SEC:-${NJRH_AMCL_NOMOTION_UPDATE_RESPONSE_TIMEOUT_SEC:-5.0}}"
   echo "AMCL_NOMOTION_UPDATE_ACCEPT_RECEIVED_AFTER_CALL=${AMCL_NOMOTION_UPDATE_ACCEPT_RECEIVED_AFTER_CALL:-${NJRH_AMCL_NOMOTION_UPDATE_ACCEPT_RECEIVED_AFTER_CALL:-true}}"
   echo "AMCL_SEED_READINESS_DO_NOT_REQUIRE_FRESH_HEADER_WHEN_STATIC=${AMCL_SEED_READINESS_DO_NOT_REQUIRE_FRESH_HEADER_WHEN_STATIC:-${NJRH_AMCL_SEED_READINESS_DO_NOT_REQUIRE_FRESH_HEADER_WHEN_STATIC:-true}}"
   echo "AMCL_CORRECTION_MAX_POSE_AGE_SEC=${AMCL_CORRECTION_MAX_POSE_AGE_SEC:-${NJRH_AMCL_CORRECTION_MAX_POSE_AGE_SEC:-1.0}}"
   echo "NJRH_AMCL_TF_WARMUP_SEC=${NJRH_AMCL_TF_WARMUP_SEC:-3.0}"
+  echo "NJRH_AMCL_LIFECYCLE_TRANSITION_TIMEOUT_SEC=${NJRH_AMCL_LIFECYCLE_TRANSITION_TIMEOUT_SEC:-8}"
+  echo "NJRH_AMCL_LIFECYCLE_POST_TRANSITION_STATE_WAIT_SEC=${NJRH_AMCL_LIFECYCLE_POST_TRANSITION_STATE_WAIT_SEC:-2}"
+  echo "NJRH_AMCL_PARAM_READY_TIMEOUT_SEC=${NJRH_AMCL_PARAM_READY_TIMEOUT_SEC:-5}"
   echo "NJRH_AMCL_SEED_RETRY_COUNT=${NJRH_AMCL_SEED_RETRY_COUNT:-5}"
   echo "NJRH_AMCL_SCAN_ADMISSION_ENABLED=${NJRH_AMCL_SCAN_ADMISSION_ENABLED:-true}"
   echo "NJRH_AMCL_SCAN_INPUT_TOPIC=${NJRH_AMCL_SCAN_INPUT_TOPIC:-/scan}"
@@ -134,10 +144,12 @@ print_config() {
   echo "NJRH_AMCL_EFFECTIVE_SCAN_TOPIC=$(effective_scan_topic)"
   echo "NJRH_AMCL_SCAN_RATE_HZ=${NJRH_AMCL_SCAN_RATE_HZ:-5.0}"
   echo "NJRH_AMCL_SCAN_PRESERVE_STAMP=${NJRH_AMCL_SCAN_PRESERVE_STAMP:-true}"
-  echo "NJRH_AMCL_SCAN_MAX_AGE_MS=${NJRH_AMCL_SCAN_MAX_AGE_MS:-250}"
+  echo "NJRH_AMCL_SCAN_MAX_AGE_MS=${NJRH_AMCL_SCAN_MAX_AGE_MS:-1000}"
   echo "NJRH_AMCL_SCAN_TARGET_FRAME=${NJRH_AMCL_SCAN_TARGET_FRAME:-odom}"
   echo "NJRH_AMCL_SCAN_ADMISSION_IMPL=${SCAN_RELAY_IMPL}"
   echo "NJRH_AMCL_SCAN_ADMISSION_CPP_BIN=${SCAN_RELAY_CPP_BIN}"
+  echo "NJRH_AMCL_STATIC_STANDBY_SKIP_SCAN_FRESH_WAIT=${NJRH_AMCL_STATIC_STANDBY_SKIP_SCAN_FRESH_WAIT:-true}"
+  echo "NJRH_AMCL_STATIC_STANDBY_SKIP_SCAN_ADMISSION_READY_WAIT=${NJRH_AMCL_STATIC_STANDBY_SKIP_SCAN_ADMISSION_READY_WAIT:-true}"
   echo "NJRH_CPUSET_AMCL=${NJRH_CPUSET_AMCL:-${NJRH_CPUSET_LOCALIZATION:-6}}"
   echo "NJRH_CPUSET_AMCL_SCAN_ADMISSION=${NJRH_CPUSET_AMCL_SCAN_ADMISSION:-${NJRH_CPUSET_LOCALIZATION:-6}}"
 }
@@ -160,6 +172,35 @@ write_status_line() {
   local key="$1"
   local value="${2:-}"
   printf '%s=%s\n' "${key}" "$(env_quote "${value}")"
+}
+
+source_status_file_if_valid() {
+  local file="$1"
+  [[ -f "${file}" ]] || return 0
+  if ! bash -n "${file}" >/dev/null 2>&1; then
+    echo "[runtime-overlay] ignoring invalid AMCL runtime status file: ${file}" >&2
+    return 1
+  fi
+  # shellcheck disable=SC1090
+  if ! source "${file}"; then
+    echo "[runtime-overlay] failed to source AMCL runtime status file: ${file}" >&2
+    return 1
+  fi
+}
+
+status_file_value() {
+  local file="$1"
+  local key="$2"
+  [[ -f "${file}" ]] || return 0
+  awk -F= -v key="${key}" '
+    $1 == key {
+      value = $2
+      gsub(/^"/, "", value)
+      gsub(/"$/, "", value)
+      print value
+      exit
+    }
+  ' "${file}" 2>/dev/null || true
 }
 
 topic_publisher_count() {
@@ -262,14 +303,6 @@ write_amcl_runtime_status() {
   local ready="$2"
   local degraded="$3"
   local reason="${4:-}"
-  local state="AMCL_FAILED"
-  case "${start_result}" in
-    disabled) state="AMCL_DISABLED" ;;
-    ready) state="AMCL_READY" ;;
-    degraded) state="AMCL_DEGRADED" ;;
-    waiting_seed) state="AMCL_WAITING_SEED" ;;
-    failed) state="AMCL_FAILED" ;;
-  esac
 
   mkdir -p "$(dirname "${STATUS_FILE}")"
   local amcl_pid=""
@@ -290,6 +323,7 @@ write_amcl_runtime_status() {
   local amcl_correction_ready=false
   local amcl_static_standby=false
   local amcl_not_moving_no_update_ok=false
+  local graph_probe_enabled="${NJRH_AMCL_STATUS_GRAPH_PROBE_ENABLED:-false}"
 
   amcl_pid="$(validated_pid_from_file "${PID_FILE}" amcl 2>/dev/null || true)"
   if [[ -z "${amcl_pid}" ]]; then
@@ -307,36 +341,88 @@ write_amcl_runtime_status() {
     scan_alive=true
   fi
 
-  amcl_node_exists && amcl_node=true
-  status_lifecycle_active && lifecycle_active=true
-  amcl_pose_publishers="$(topic_publisher_count "${NJRH_AMCL_POSE_TOPIC:-/amcl_pose}")"
-  scan_status_publishers="$(topic_publisher_count "${NJRH_AMCL_SCAN_ADMISSION_STATUS_TOPIC:-/amcl_scan_admission/status}")"
-  scan_amcl_publishers="$(topic_publisher_count "${NJRH_AMCL_SCAN_OUTPUT_TOPIC:-/scan_amcl}")"
-  amcl_pose_age_ms="$(amcl_pose_age_ms_once)"
-  map_owner="$(timeout 4 ros2 topic echo --once --field data /localization/bridge_status 2>/dev/null \
-    | python3 -c 'import json,sys; s=sys.stdin.read().strip(); print(json.loads(s).get("map_to_odom_publisher_owner","") if s else "")' 2>/dev/null || true)"
+  if [[ "${graph_probe_enabled}" == "true" ]]; then
+    amcl_node_exists && amcl_node=true
+    status_lifecycle_active && lifecycle_active=true
+    amcl_pose_publishers="$(topic_publisher_count "${NJRH_AMCL_POSE_TOPIC:-/amcl_pose}")"
+    scan_status_publishers="$(topic_publisher_count "${NJRH_AMCL_SCAN_ADMISSION_STATUS_TOPIC:-/amcl_scan_admission/status}")"
+    scan_amcl_publishers="$(topic_publisher_count "${NJRH_AMCL_SCAN_OUTPUT_TOPIC:-/scan_amcl}")"
+    amcl_pose_age_ms="$(amcl_pose_age_ms_once)"
+    map_owner="$(timeout 4 ros2 topic echo --once --field data /localization/bridge_status 2>/dev/null \
+      | python3 -c 'import json,sys; s=sys.stdin.read().strip(); print(json.loads(s).get("map_to_odom_publisher_owner","") if s else "")' 2>/dev/null || true)"
+  else
+    if [[ "${amcl_pid_alive}" == "true" ]]; then
+      amcl_node=true
+      lifecycle_active=true
+      amcl_pose_publishers="1"
+    fi
+    if [[ "${scan_alive}" == "true" ]]; then
+      scan_status_publishers="1"
+      scan_amcl_publishers="1"
+    fi
+  fi
   status_stamp_sec="$(date +%s)"
 
-  if [[ "${amcl_pid_alive}" == "true" && "${amcl_node}" == "true" && "${lifecycle_active}" == "true" ]]; then
+  if [[ "${amcl_pid_alive}" == "true" && "${lifecycle_active}" == "true" ]]; then
     amcl_process_ready=true
   fi
-  if [[ "${AMCL_SEED_SUCCEEDED}" == "true" || "${AMCL_SEED_RESPONSE_OK}" == "true" ]]; then
+  if [[ "${start_result}" != "failed" && "${start_result}" != "stopped" ]]; then
+    local existing_seed_succeeded=""
+    local existing_seed_response_ok=""
+    local existing_static_standby=""
+    local existing_nomotion_pose_received=""
+    existing_seed_succeeded="$(status_file_value "${STATUS_FILE}" AMCL_SEED_SUCCEEDED)"
+    existing_seed_response_ok="$(status_file_value "${STATUS_FILE}" AMCL_SEED_RESPONSE_OK)"
+    existing_static_standby="$(status_file_value "${STATUS_FILE}" AMCL_STATIC_STANDBY_ACCEPTED)"
+    existing_nomotion_pose_received="$(status_file_value "${STATUS_FILE}" AMCL_NOMOTION_POSE_RECEIVED)"
+    [[ "${AMCL_SEED_SUCCEEDED}" != "true" && "${existing_seed_succeeded}" == "true" ]] && AMCL_SEED_SUCCEEDED=true
+    [[ "${AMCL_SEED_RESPONSE_OK}" != "true" && "${existing_seed_response_ok}" == "true" ]] && AMCL_SEED_RESPONSE_OK=true
+    [[ "${AMCL_STATIC_STANDBY_ACCEPTED}" != "true" && "${existing_static_standby}" == "true" ]] && AMCL_STATIC_STANDBY_ACCEPTED=true
+    [[ "${AMCL_NOMOTION_POSE_RECEIVED}" != "true" && "${existing_nomotion_pose_received}" == "true" ]] && AMCL_NOMOTION_POSE_RECEIVED=true
+  fi
+  if [[ "${AMCL_SEED_SUCCEEDED}" == "true" || "${AMCL_SEED_RESPONSE_OK}" == "true" || "${AMCL_STATIC_STANDBY_ACCEPTED}" == "true" ]]; then
     amcl_seeded=true
   fi
-  if [[ "${AMCL_NOMOTION_POSE_RECEIVED}" == "true" && "${amcl_process_ready}" == "true" && "${amcl_seeded}" == "true" ]]; then
+  local effective_start_result="${start_result}"
+  local effective_ready="${ready}"
+  local effective_reason="${reason}"
+  if [[ "${MODE}" != "disabled" && "${start_result}" == "ready" && "${amcl_seeded}" != "true" ]]; then
+    effective_start_result="waiting_seed"
+    effective_ready=false
+    if [[ -z "${effective_reason}" ]]; then
+      effective_reason="AMCL seed has not completed"
+    fi
+  fi
+
+  local state="AMCL_FAILED"
+  case "${effective_start_result}" in
+    disabled) state="AMCL_DISABLED" ;;
+    ready) state="AMCL_READY" ;;
+    degraded) state="AMCL_DEGRADED" ;;
+    waiting_seed) state="AMCL_WAITING_SEED" ;;
+    failed) state="AMCL_FAILED" ;;
+  esac
+
+  if [[ "${AMCL_STATIC_STANDBY_ACCEPTED}" == "true" && "${amcl_process_ready}" == "true" && "${amcl_seeded}" == "true" ]]; then
     amcl_tracking_ready=true
     amcl_correction_ready=false
     amcl_static_standby=true
     amcl_not_moving_no_update_ok=true
-  elif [[ "${ready}" == "true" && "${amcl_process_ready}" == "true" && "${scan_alive}" == "true" ]]; then
+  elif [[ "${AMCL_NOMOTION_POSE_RECEIVED}" == "true" && "${amcl_process_ready}" == "true" && "${amcl_seeded}" == "true" ]]; then
+    amcl_tracking_ready=true
+    amcl_correction_ready=false
+    amcl_static_standby=true
+    amcl_not_moving_no_update_ok=true
+  elif [[ "${effective_ready}" == "true" && "${amcl_process_ready}" == "true" && "${scan_alive}" == "true" && "${amcl_seeded}" == "true" ]]; then
     amcl_tracking_ready=true
     amcl_correction_ready=true
   fi
-  if [[ "${amcl_process_ready}" == "true" && "${amcl_seeded}" == "true" && "${ready}" != "true" ]]; then
+  if [[ "${amcl_process_ready}" == "true" && "${amcl_seeded}" == "true" && "${effective_ready}" != "true" ]]; then
     amcl_static_standby=true
     amcl_not_moving_no_update_ok=true
   fi
 
+  local tmp_file="${STATUS_FILE}.tmp.$$"
   {
     write_status_line AMCL_STATUS_STAMP_SEC "${status_stamp_sec}"
     write_status_line AMCL_STATUS_AGE_MS "0"
@@ -344,10 +430,10 @@ write_amcl_runtime_status() {
     write_status_line AMCL_STATUS_TTL_SEC "${NJRH_AMCL_RUNTIME_STATUS_TTL_SEC:-5.0}"
     write_status_line AMCL_MODE "${MODE}"
     write_status_line AMCL_STATE "${state}"
-    write_status_line AMCL_START_RESULT "${start_result}"
-    write_status_line AMCL_READY "${ready}"
+    write_status_line AMCL_START_RESULT "${effective_start_result}"
+    write_status_line AMCL_READY "${effective_ready}"
     write_status_line AMCL_DEGRADED "${degraded}"
-    write_status_line AMCL_FAILURE_REASON "${reason}"
+    write_status_line AMCL_FAILURE_REASON "${effective_reason}"
     write_status_line AMCL_NODE_EXISTS "${amcl_node}"
     write_status_line AMCL_LIFECYCLE_ACTIVE "${lifecycle_active}"
     write_status_line AMCL_PID "${amcl_pid}"
@@ -371,14 +457,16 @@ write_amcl_runtime_status() {
     write_status_line AMCL_NOMOTION_POSE_RECEIVED "${AMCL_NOMOTION_POSE_RECEIVED}"
     write_status_line AMCL_NOMOTION_POSE_COUNT "${AMCL_NOMOTION_POSE_COUNT}"
     write_status_line AMCL_NOMOTION_POSE_HEADER_AGE_MS "${AMCL_NOMOTION_POSE_HEADER_AGE_MS}"
+    write_status_line AMCL_STATIC_STANDBY_ACCEPTED "${AMCL_STATIC_STANDBY_ACCEPTED}"
     write_status_line AMCL_TRACKING_READY "${amcl_tracking_ready}"
     write_status_line AMCL_CORRECTION_READY "${amcl_correction_ready}"
     write_status_line AMCL_STATIC_STANDBY "${amcl_static_standby}"
     write_status_line AMCL_NOT_MOVING_NO_UPDATE_OK "${amcl_not_moving_no_update_ok}"
-    write_status_line AMCL_DEGRADED_REASON "${reason}"
+    write_status_line AMCL_DEGRADED_REASON "${effective_reason}"
     write_status_line MAP_TO_ODOM_OWNER "${map_owner}"
     write_status_line TIMESTAMP "$(date -Is)"
-  } >"${STATUS_FILE}"
+  } >"${tmp_file}"
+  mv -f "${tmp_file}" "${STATUS_FILE}"
 }
 
 finish_amcl_status() {
@@ -403,6 +491,66 @@ finish_amcl_status() {
       ;;
   esac
   return "${code}"
+}
+
+load_existing_amcl_runtime_status() {
+  source_status_file_if_valid "${STATUS_FILE}" || true
+}
+
+amcl_resident_processes_alive() {
+  local amcl_pid=""
+  amcl_pid="$(validated_pid_from_file "${PID_FILE}" amcl 2>/dev/null || true)"
+  [[ -n "${amcl_pid}" ]] || return 1
+  pid_alive "${amcl_pid}" || return 1
+  if scan_admission_enabled; then
+    local scan_pid=""
+    scan_pid="$(validated_pid_from_file "${SCAN_RELAY_PID_FILE}" scan_admission 2>/dev/null || true)"
+    [[ -n "${scan_pid}" ]] || return 1
+    pid_alive "${scan_pid}" || return 1
+  fi
+  return 0
+}
+
+heartbeat_amcl_runtime_status() {
+  if [[ "${MODE}" == "disabled" ]]; then
+    write_amcl_runtime_status disabled true false ""
+    return 0
+  fi
+
+  local period_sec="${NJRH_AMCL_RUNTIME_STATUS_HEARTBEAT_SEC:-2.0}"
+  echo "[runtime-overlay] AMCL status heartbeat started status_file=${STATUS_FILE} period_sec=${period_sec}" >&2
+  while true; do
+    load_existing_amcl_runtime_status
+    if amcl_resident_processes_alive; then
+      local existing_ready=""
+      local existing_seed_succeeded=""
+      local existing_seed_response_ok=""
+      local existing_static_standby=""
+      local existing_tracking_ready=""
+      existing_ready="$(status_file_value "${STATUS_FILE}" AMCL_READY)"
+      existing_seed_succeeded="$(status_file_value "${STATUS_FILE}" AMCL_SEED_SUCCEEDED)"
+      existing_seed_response_ok="$(status_file_value "${STATUS_FILE}" AMCL_SEED_RESPONSE_OK)"
+      existing_static_standby="$(status_file_value "${STATUS_FILE}" AMCL_STATIC_STANDBY_ACCEPTED)"
+      existing_tracking_ready="$(status_file_value "${STATUS_FILE}" AMCL_TRACKING_READY)"
+      if [[ "${existing_seed_succeeded}" == "true" || "${existing_static_standby}" == "true" || "${existing_tracking_ready}" == "true" || "${existing_ready}" == "true" ]]; then
+        AMCL_SEED_SUCCEEDED=true
+      fi
+      if [[ "${existing_seed_response_ok}" == "true" ]]; then
+        AMCL_SEED_RESPONSE_OK=true
+      fi
+      if [[ "${existing_static_standby}" == "true" || "${existing_tracking_ready}" == "true" || "${existing_ready}" == "true" ]]; then
+        AMCL_STATIC_STANDBY_ACCEPTED=true
+      fi
+      if [[ "${AMCL_SEED_SUCCEEDED}" == "true" || "${AMCL_SEED_RESPONSE_OK}" == "true" || "${AMCL_STATIC_STANDBY_ACCEPTED}" == "true" ]]; then
+        write_amcl_runtime_status ready true false ""
+      else
+        write_amcl_runtime_status waiting_seed false false "resident AMCL is alive; waiting for initial pose seed"
+      fi
+    else
+      write_amcl_runtime_status failed false true "AMCL_HEARTBEAT_PROCESS_NOT_ALIVE"
+    fi
+    sleep "${period_sec}"
+  done
 }
 
 wait_for_pid_exit() {
@@ -461,6 +609,22 @@ scan_relay_python_process_pids() {
     awk '/amcl_scan_admission_relay.py/ && !/awk/ {print $1}' || true
 }
 
+amcl_heartbeat_process_pids() {
+  local self_pid="$$"
+  ps -eo pid=,args= |
+    awk -v self_pid="${self_pid}" '
+      $1 != self_pid && /run_amcl_shadow_localization.sh/ && /--heartbeat/ && !/awk/ {print $1}
+    ' || true
+}
+
+amcl_nonstop_runner_process_pids() {
+  local self_pid="$$"
+  ps -eo pid=,args= |
+    awk -v self_pid="${self_pid}" '
+      $1 != self_pid && /run_amcl_shadow_localization.sh/ && !/--stop/ && !/awk/ {print $1}
+    ' || true
+}
+
 scan_relay_pid_matches_impl() {
   local pid="$1"
   local impl="$2"
@@ -501,16 +665,49 @@ stop_scan_admission_relay() {
   if [[ -n "${extra_pids}" ]]; then
     echo "[runtime-overlay] stopping remaining AMCL scan admission relay processes: ${extra_pids}" >&2
     kill -INT ${extra_pids} 2>/dev/null || true
-    sleep 1
+    sleep "${NJRH_AMCL_SCAN_ADMISSION_STOP_INT_WAIT_SEC:-0.3}"
     extra_pids="$(scan_relay_process_pids)"
     [[ -z "${extra_pids}" ]] || kill -TERM ${extra_pids} 2>/dev/null || true
   fi
   rm -f "${SCAN_RELAY_PID_FILE}"
 }
 
+stop_amcl_heartbeat_processes() {
+  local extra_pids
+  extra_pids="$(amcl_heartbeat_process_pids)"
+  if [[ -n "${extra_pids}" ]]; then
+    echo "[runtime-overlay] stopping remaining AMCL runtime status heartbeat processes: ${extra_pids}" >&2
+    kill -INT ${extra_pids} 2>/dev/null || true
+    sleep "${NJRH_AMCL_HEARTBEAT_STOP_INT_WAIT_SEC:-0.3}"
+    extra_pids="$(amcl_heartbeat_process_pids)"
+    [[ -z "${extra_pids}" ]] || kill -TERM ${extra_pids} 2>/dev/null || true
+  fi
+}
+
+stop_amcl_runner_processes() {
+  local extra_pids
+  extra_pids="$(amcl_nonstop_runner_process_pids)"
+  if [[ -n "${extra_pids}" ]]; then
+    echo "[runtime-overlay] stopping remaining AMCL runner processes: ${extra_pids}" >&2
+    kill -INT ${extra_pids} 2>/dev/null || true
+    sleep "${NJRH_AMCL_RUNNER_STOP_INT_WAIT_SEC:-0.3}"
+    extra_pids="$(amcl_nonstop_runner_process_pids)"
+    [[ -z "${extra_pids}" ]] || kill -TERM ${extra_pids} 2>/dev/null || true
+    sleep "${NJRH_AMCL_RUNNER_STOP_TERM_WAIT_SEC:-0.3}"
+    extra_pids="$(amcl_nonstop_runner_process_pids)"
+    if [[ -n "${extra_pids}" ]]; then
+      echo "[runtime-overlay] AMCL runner processes ignored SIGTERM; killing exact pids: ${extra_pids}" >&2
+      kill -KILL ${extra_pids} 2>/dev/null || true
+      sleep "${NJRH_AMCL_RUNNER_STOP_KILL_WAIT_SEC:-0.2}"
+    fi
+  fi
+}
+
 stop_amcl() {
+  stop_amcl_runner_processes
+  stop_amcl_heartbeat_processes
   stop_scan_admission_relay
-  timeout 5 ros2 lifecycle set "/${AMCL_NODE_NAME}" shutdown >/dev/null 2>&1 || true
+  timeout "${NJRH_AMCL_LIFECYCLE_SHUTDOWN_TIMEOUT_SEC:-2}" ros2 lifecycle set "/${AMCL_NODE_NAME}" shutdown >/dev/null 2>&1 || true
 
   local pid=""
   pid="$(amcl_pid_from_file 2>/dev/null || true)"
@@ -520,7 +717,7 @@ stop_amcl() {
   if [[ -n "${extra_pids}" ]]; then
     echo "[runtime-overlay] stopping remaining AMCL processes: ${extra_pids}" >&2
     kill -INT ${extra_pids} 2>/dev/null || true
-    sleep "${NJRH_AMCL_STOP_INT_WAIT_SEC:-1}"
+    sleep "${NJRH_AMCL_STOP_INT_WAIT_SEC:-0.3}"
     extra_pids="$(amcl_process_pids)"
     [[ -z "${extra_pids}" ]] || kill -TERM ${extra_pids} 2>/dev/null || true
   fi
@@ -534,13 +731,25 @@ wait_for_amcl_node() {
 
 amcl_param_value() {
   local param="$1"
-  timeout 5 ros2 param get "/${AMCL_NODE_NAME}" "${param}" 2>/dev/null || true
+  timeout "${NJRH_AMCL_PARAM_GET_TIMEOUT_SEC:-3}" ros2 param get "/${AMCL_NODE_NAME}" "${param}" 2>/dev/null || true
+}
+
+amcl_cmdline_tf_broadcast_false() {
+  local pid=""
+  pid="$(amcl_pid_from_file 2>/dev/null || true)"
+  if [[ -z "${pid}" ]]; then
+    pid="$(amcl_process_pids | first_process_pid || true)"
+  fi
+  [[ -n "${pid}" && -r "/proc/${pid}/cmdline" ]] || return 1
+  local args
+  args="$(tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null || true)"
+  [[ "${args}" == *"tf_broadcast:=false"* || "${args}" == *"tf_broadcast:=False"* ]]
 }
 
 wait_for_amcl_tf_broadcast_false() {
-  local timeout_sec="${NJRH_AMCL_PARAM_READY_TIMEOUT_SEC:-15}"
+  local timeout_sec="${NJRH_AMCL_PARAM_READY_TIMEOUT_SEC:-5}"
   local timeout_int="${timeout_sec%.*}"
-  [[ -n "${timeout_int}" ]] || timeout_int=15
+  [[ -n "${timeout_int}" ]] || timeout_int=5
   local deadline=$(( $(date +%s) + timeout_int ))
   local tf_broadcast=""
   local last_tf_broadcast=""
@@ -562,19 +771,27 @@ wait_for_amcl_tf_broadcast_false() {
   done
 
   echo "[runtime-overlay] AMCL tf_broadcast did not become readable as false within ${timeout_sec}s: ${last_tf_broadcast:-missing}" >&2
+  if amcl_cmdline_tf_broadcast_false; then
+    echo "[runtime-overlay] AMCL tf_broadcast parameter service was not readable, but process launch argument is tf_broadcast:=false; continuing" >&2
+    return 0
+  fi
   return 1
 }
 
 request_amcl_lifecycle_transition() {
   local transition_id="$1"
   local transition_label="$2"
-  local timeout_sec="${3:-20}"
+  local timeout_sec="${3:-8}"
   local output
   output="$(timeout "${timeout_sec}" ros2 service call \
     "/${AMCL_NODE_NAME}/change_state" \
     lifecycle_msgs/srv/ChangeState \
     "{transition: {id: ${transition_id}, label: ${transition_label}}}" 2>&1 || true)"
   if grep -Eq 'success[=:][[:space:]]*(True|true)|success:[[:space:]]*true' <<<"${output}"; then
+    return 0
+  fi
+  if amcl_lifecycle_transition_state_reached "${transition_label}"; then
+    echo "[runtime-overlay] /${AMCL_NODE_NAME} lifecycle transition ${transition_label} response was not reliable, but state reached target" >&2
     return 0
   fi
   echo "[runtime-overlay] /${AMCL_NODE_NAME} lifecycle transition ${transition_label} failed: ${output}" >&2
@@ -609,6 +826,30 @@ amcl_lifecycle_state() {
   printf 'unknown\n'
 }
 
+amcl_lifecycle_transition_state_reached() {
+  local transition_label="$1"
+  local timeout_sec="${NJRH_AMCL_LIFECYCLE_POST_TRANSITION_STATE_WAIT_SEC:-3}"
+  local timeout_int="${timeout_sec%.*}"
+  [[ -n "${timeout_int}" ]] || timeout_int=3
+  (( timeout_int >= 1 )) || timeout_int=1
+  local deadline=$(( $(date +%s) + timeout_int ))
+  local state=""
+  while true; do
+    state="$(amcl_lifecycle_state 2>/dev/null || true)"
+    case "${transition_label}" in
+      configure)
+        [[ "${state}" == inactive* || "${state}" == active* ]] && return 0
+        ;;
+      activate)
+        [[ "${state}" == active* ]] && return 0
+        ;;
+    esac
+    [[ "$(date +%s)" -ge "${deadline}" ]] && break
+    sleep 0.2
+  done
+  return 1
+}
+
 activate_amcl_lifecycle() {
   wait_for_amcl_node "${NJRH_AMCL_NODE_WAIT_SEC:-15}" || {
     echo "[runtime-overlay] /${AMCL_NODE_NAME} did not appear after start" >&2
@@ -618,11 +859,11 @@ activate_amcl_lifecycle() {
   local state
   state="$(amcl_lifecycle_state)"
   if [[ "${state}" != active* && "${state}" != inactive* ]]; then
-    request_amcl_lifecycle_transition 1 configure "${NJRH_AMCL_LIFECYCLE_TRANSITION_TIMEOUT_SEC:-20}" || return 1
+    request_amcl_lifecycle_transition 1 configure "${NJRH_AMCL_LIFECYCLE_TRANSITION_TIMEOUT_SEC:-8}" || return 1
   fi
   state="$(amcl_lifecycle_state)"
   if [[ "${state}" != active* ]]; then
-    request_amcl_lifecycle_transition 3 activate "${NJRH_AMCL_LIFECYCLE_TRANSITION_TIMEOUT_SEC:-20}" || return 1
+    request_amcl_lifecycle_transition 3 activate "${NJRH_AMCL_LIFECYCLE_TRANSITION_TIMEOUT_SEC:-8}" || return 1
   fi
   state="$(amcl_lifecycle_state)"
   if [[ "${state}" != active* ]]; then
@@ -674,19 +915,53 @@ seed_amcl_initial_pose() {
   local retry_count="${NJRH_AMCL_SEED_RETRY_COUNT:-5}"
   local retry_period_ms="${NJRH_AMCL_SEED_RETRY_PERIOD_MS:-300}"
   local wait_sec="${NJRH_AMCL_SEED_SERVICE_WAIT_SEC:-8}"
+  local call_timeout_sec="${NJRH_AMCL_SEED_CALL_TIMEOUT_SEC:-8}"
   local attempt
   for ((attempt = 1; attempt <= retry_count; attempt += 1)); do
-    if ! wait_for_ros_service "${SEED_SERVICE}" "${wait_sec}" >/dev/null 2>&1; then
-      echo "[runtime-overlay] AMCL seed service unavailable attempt=${attempt}/${retry_count}: ${SEED_SERVICE}" >&2
-    else
-      local output
-      output="$(timeout "${NJRH_AMCL_SEED_CALL_TIMEOUT_SEC:-8}" ros2 service call \
-        "${SEED_SERVICE}" std_srvs/srv/Trigger "{}" 2>&1 || true)"
-      echo "[runtime-overlay] AMCL initial pose seed attempt=${attempt}/${retry_count}: ${output}" >&2
-      if grep -Eiq "success[:=][[:space:]]*true|success=True" <<<"${output}"; then
-        AMCL_SEED_SUCCEEDED=true
-        return 0
-      fi
+    local output
+    local wait_int="${wait_sec%.*}"
+    local call_int="${call_timeout_sec%.*}"
+    [[ -n "${wait_int}" ]] || wait_int=8
+    [[ -n "${call_int}" ]] || call_int=8
+    output="$(timeout "$((wait_int + call_int + 4))" python3 - "${SEED_SERVICE}" "${wait_sec}" "${call_timeout_sec}" <<'PY' 2>&1 || true
+import sys
+import time
+
+import rclpy
+from std_srvs.srv import Trigger
+
+service = sys.argv[1]
+wait_sec = float(sys.argv[2])
+call_timeout_sec = float(sys.argv[3])
+
+rclpy.init()
+node = rclpy.create_node("amcl_seed_initial_pose_client")
+client = node.create_client(Trigger, service)
+try:
+    if not client.wait_for_service(timeout_sec=wait_sec):
+        print(f"success=False message='service unavailable: {service}'")
+        raise SystemExit(2)
+    future = client.call_async(Trigger.Request())
+    deadline = time.monotonic() + call_timeout_sec
+    while rclpy.ok() and not future.done() and time.monotonic() < deadline:
+        rclpy.spin_once(node, timeout_sec=0.05)
+    if not future.done():
+        print(f"success=False message='service call timeout: {service}'")
+        raise SystemExit(3)
+    response = future.result()
+    success = bool(response.success)
+    message = str(response.message)
+    print(f"success={success} message={message!r}")
+    raise SystemExit(0 if success else 4)
+finally:
+    node.destroy_node()
+    rclpy.shutdown()
+PY
+)"
+    echo "[runtime-overlay] AMCL initial pose seed attempt=${attempt}/${retry_count}: ${output}" >&2
+    if grep -Eiq "success[:=][[:space:]]*true|success=True" <<<"${output}"; then
+      AMCL_SEED_SUCCEEDED=true
+      return 0
     fi
     sleep "$(awk -v ms="${retry_period_ms}" 'BEGIN {printf "%.3f", ms / 1000.0}')"
   done
@@ -753,13 +1028,13 @@ start_scan_admission_relay() {
   local scan_input_topic
   local scan_output_topic
   scan_rate_hz="$(awk -v v="${NJRH_AMCL_SCAN_RATE_HZ:-5.0}" 'BEGIN {printf "%.3f", v + 0.0}')"
-  scan_max_age_ms="$(awk -v v="${NJRH_AMCL_SCAN_MAX_AGE_MS:-250.0}" 'BEGIN {printf "%.3f", v + 0.0}')"
+  scan_max_age_ms="$(awk -v v="${NJRH_AMCL_SCAN_MAX_AGE_MS:-1000.0}" 'BEGIN {printf "%.3f", v + 0.0}')"
   scan_wait_for_tf_timeout_ms="$(awk -v v="${NJRH_AMCL_SCAN_WAIT_FOR_TF_TIMEOUT_MS:-20.0}" 'BEGIN {printf "%.3f", v + 0.0}')"
   scan_input_topic="${NJRH_AMCL_SCAN_INPUT_TOPIC:-/scan}"
   scan_output_topic="${NJRH_AMCL_SCAN_OUTPUT_TOPIC:-/scan_amcl}"
   local relay_cmd=()
   if [[ "${SCAN_RELAY_IMPL}" == "cpp" ]]; then
-    relay_cmd=(ros2 run robot_localization_bridge amcl_scan_admission_node --ros-args
+    relay_cmd=("${SCAN_RELAY_CPP_BIN}" --ros-args
       -p "input_topic:=${scan_input_topic}" \
       -p "output_topic:=${scan_output_topic}" \
       -p "status_topic:=${NJRH_AMCL_SCAN_ADMISSION_STATUS_TOPIC:-/amcl_scan_admission/status}" \
@@ -816,7 +1091,8 @@ wait_for_scan_admission_status_ready() {
   scan_admission_enabled || return 0
   local timeout_sec="${NJRH_AMCL_SCAN_ADMISSION_READY_TIMEOUT_SEC:-8}"
   local status_topic="${NJRH_AMCL_SCAN_ADMISSION_STATUS_TOPIC:-/amcl_scan_admission/status}"
-  timeout "$(( ${timeout_sec%.*} + 3 ))" python3 - "${status_topic}" "${timeout_sec}" <<'PY' 2>/dev/null
+  local min_ready_hz="${NJRH_AMCL_SCAN_ADMISSION_READY_MIN_HZ:-0.5}"
+  timeout "$(( ${timeout_sec%.*} + 3 ))" python3 - "${status_topic}" "${timeout_sec}" "${min_ready_hz}" <<'PY' 2>/dev/null
 import json
 import sys
 
@@ -826,9 +1102,17 @@ from std_msgs.msg import String
 
 topic = sys.argv[1]
 timeout_sec = float(sys.argv[2])
+min_ready_hz = float(sys.argv[3])
 rclpy.init()
 node = rclpy.create_node("amcl_scan_admission_ready_waiter")
-state = {"ready": False, "last": None}
+state = {"ready": False, "last": None, "ready_status": None}
+
+blocking_errors = (
+    "AMCL_SCAN_TF_UNAVAILABLE",
+    "AMCL_SCAN_FRAME_MISMATCH",
+    "AMCL_SCAN_FUTURE_STAMP",
+    "AMCL_SCAN_WARMUP",
+)
 
 def on_msg(msg):
     state["last"] = msg.data
@@ -836,7 +1120,15 @@ def on_msg(msg):
         data = json.loads(msg.data)
     except Exception:
         return
-    if data.get("enabled") is True and float(data.get("hz", 0.0) or 0.0) > 0.0 and str(data.get("last_error", "none")) in ("", "none"):
+    last_error = str(data.get("last_error", "none") or "none")
+    if data.get("enabled") is not True:
+        return
+    if any(last_error.startswith(error) for error in blocking_errors):
+        return
+    hz = float(data.get("hz", 0.0) or 0.0)
+    published_count = int(data.get("published_count", 0) or 0)
+    if hz >= min_ready_hz and published_count > 0:
+        state["ready_status"] = data
         state["ready"] = True
 
 node.create_subscription(String, topic, on_msg, 10)
@@ -848,8 +1140,21 @@ rclpy.shutdown()
 if not state["ready"]:
     print(f"not_ready last={state['last']}")
     raise SystemExit(1)
-print("ready")
+print(f"ready status={json.dumps(state['ready_status'], sort_keys=True)}")
 PY
+}
+
+wait_for_fresh_amcl_scan_input() {
+  local topic="${NJRH_AMCL_SCAN_INPUT_TOPIC:-/scan}"
+  local timeout_sec="${NJRH_AMCL_SCAN_FRESH_WAIT_SEC:-20}"
+  local max_age_sec="${NJRH_AMCL_SCAN_FRESH_MAX_AGE_SEC:-1.0}"
+  local max_future_sec="${NJRH_AMCL_SCAN_FRESH_MAX_FUTURE_SEC:-0.05}"
+  runtime_readiness_probe \
+    fresh-header-topic \
+    "${topic}" \
+    "${timeout_sec}" \
+    "${max_age_sec}" \
+    "${max_future_sec}"
 }
 
 request_amcl_nomotion_update_and_wait_for_pose() {
@@ -933,13 +1238,42 @@ print(f"fresh age={result['age']}")
 PY
 }
 
+amcl_static_standby_fast_seed_enabled() {
+  [[ "${NJRH_AMCL_STATIC_STANDBY_WITHOUT_POSE_OK:-true}" == "true" &&
+    "${NJRH_AMCL_STATIC_STANDBY_SKIP_POSE_WAIT:-true}" == "true" &&
+    "${NJRH_AMCL_STATIC_STANDBY_SKIP_SCAN_FRESH_WAIT:-true}" == "true" ]]
+}
+
 complete_amcl_readiness_sequence() {
   wait_for_amcl_tf_warmup true || return 1
+  if amcl_static_standby_fast_seed_enabled; then
+    echo "[runtime-overlay] AMCL static standby fast seed: skipping /scan fresh wait; scan relay status still gates TF/frame/rate readiness" >&2
+  else
+    wait_for_fresh_amcl_scan_input || return 6
+  fi
   start_scan_admission_relay || return 2
-  wait_for_scan_admission_status_ready || return 3
+  if amcl_static_standby_fast_seed_enabled &&
+    [[ "${NJRH_AMCL_STATIC_STANDBY_SKIP_SCAN_ADMISSION_READY_WAIT:-true}" == "true" ]]; then
+    echo "[runtime-overlay] AMCL static standby fast seed: scan admission relay is running; status readiness remains asynchronous until scans are admitted" >&2
+  else
+    wait_for_scan_admission_status_ready || return 3
+  fi
   seed_amcl_initial_pose || return 4
   if [[ "${NJRH_AMCL_READY_REQUIRE_FRESH_POSE:-true}" == "true" ]]; then
-    wait_for_amcl_pose_fresh_or_nomotion_update || return 5
+    if [[ "${NJRH_AMCL_STATIC_STANDBY_WITHOUT_POSE_OK:-true}" == "true" &&
+          "${NJRH_AMCL_STATIC_STANDBY_SKIP_POSE_WAIT:-true}" == "true" ]]; then
+      AMCL_STATIC_STANDBY_ACCEPTED=true
+      echo "[runtime-overlay] AMCL static standby accepted immediately after seed; correction remains pending until AMCL publishes a candidate" >&2
+    else
+      if ! wait_for_amcl_pose_fresh_or_nomotion_update; then
+        if [[ "${NJRH_AMCL_STATIC_STANDBY_WITHOUT_POSE_OK:-true}" == "true" ]]; then
+          AMCL_STATIC_STANDBY_ACCEPTED=true
+          echo "[runtime-overlay] AMCL static standby accepted after seed without a fresh/no-motion pose; correction remains pending until AMCL publishes a candidate" >&2
+        else
+          return 5
+        fi
+      fi
+    fi
   fi
 }
 
@@ -950,6 +1284,10 @@ start_amcl_node() {
   fi
   [[ -f "${PARAMS_FILE}" ]] || {
     echo "[runtime-overlay] AMCL params file missing: ${PARAMS_FILE}" >&2
+    return 1
+  }
+  [[ -x "${AMCL_BIN}" ]] || {
+    echo "[runtime-overlay] AMCL binary missing or not executable: ${AMCL_BIN}" >&2
     return 1
   }
 
@@ -979,7 +1317,7 @@ start_amcl_node() {
 
   echo "[runtime-overlay] starting AMCL mode=${MODE}; params=${PARAMS_FILE}; scan_topic=$(effective_scan_topic); cpuset=${amcl_cpuset}" >&2
   : >"${LOG_FILE}"
-  nohup taskset -c "${amcl_cpuset}" ros2 run nav2_amcl amcl --ros-args \
+  nohup taskset -c "${amcl_cpuset}" "${AMCL_BIN}" --ros-args \
     --params-file "${PARAMS_FILE}" \
     -p "scan_topic:=$(effective_scan_topic)" \
     -p "tf_broadcast:=false" \
@@ -1060,6 +1398,10 @@ start_amcl() {
         fi
         exit_code="${AMCL_EXIT_POSE_MISSING}"
         ;;
+      6)
+        reason="/scan did not become fresh before AMCL scan admission"
+        exit_code="${AMCL_EXIT_GATED_NOT_READY}"
+        ;;
     esac
     if [[ "${MODE}" == "shadow" ]]; then
       amcl_warn "${reason}; continuing triggered localization baseline as visible degraded shadow mode"
@@ -1090,6 +1432,9 @@ case "${ACTION}" in
     ;;
   complete)
     start_amcl
+    ;;
+  heartbeat)
+    heartbeat_amcl_runtime_status
     ;;
   start)
     start_amcl

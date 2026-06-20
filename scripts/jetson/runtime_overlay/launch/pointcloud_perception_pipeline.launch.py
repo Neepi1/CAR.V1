@@ -22,15 +22,12 @@ def cpu_affinity_prefix(service_name: str) -> str | None:
 def generate_launch_description():
     overlay_root = Path(os.environ.get("NJRH_OVERLAY_ROOT", "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay"))
     pointcloud_params_default = overlay_root / "config" / "jt128_canonical_pointcloud_remap.yaml"
-    local_perception_params_default = overlay_root / "config" / "local_perception.yaml"
 
     pointcloud_params = LaunchConfiguration("pointcloud_params")
-    local_perception_params = LaunchConfiguration("local_perception_params")
 
     return LaunchDescription(
         [
             DeclareLaunchArgument("pointcloud_params", default_value=str(pointcloud_params_default)),
-            DeclareLaunchArgument("local_perception_params", default_value=str(local_perception_params_default)),
             ComposableNodeContainer(
                 name="pointcloud_perception_pipeline",
                 namespace="",
@@ -44,13 +41,6 @@ def generate_launch_description():
                         plugin="PointCloudAxisRemapNode",
                         name="pointcloud_axis_remap",
                         parameters=[pointcloud_params],
-                        extra_arguments=[{"use_intra_process_comms": True}],
-                    ),
-                    ComposableNode(
-                        package="robot_local_perception",
-                        plugin="LocalPerceptionNode",
-                        name="robot_local_perception",
-                        parameters=[local_perception_params],
                         extra_arguments=[{"use_intra_process_comms": True}],
                     ),
                 ],

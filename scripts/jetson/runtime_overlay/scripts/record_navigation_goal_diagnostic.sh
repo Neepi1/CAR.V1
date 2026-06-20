@@ -257,8 +257,7 @@ start_logged "api_navigation_state_poll.jsonl" api_poll_loop
 
 start_timeout_logged "hz_local_state_odometry" ros2 topic hz /local_state/odometry --window 20
 start_timeout_logged "hz_wheel_odom" ros2 topic hz /wheel/odom --window 20
-start_timeout_logged "hz_obstacle_points" ros2 topic hz /perception/obstacle_points --window 20
-start_timeout_logged "hz_clearing_points" ros2 topic hz /perception/clearing_points --window 20
+start_timeout_logged "hz_scan" ros2 topic hz /scan --window 20
 start_timeout_logged "hz_local_costmap" ros2 topic hz /local_costmap/costmap --window 20
 start_timeout_logged "hz_cmd_vel_nav_raw" ros2 topic hz /cmd_vel_nav_raw --window 20
 start_timeout_logged "hz_cmd_vel_nav" ros2 topic hz /cmd_vel_nav --window 20
@@ -282,7 +281,7 @@ start_logged "nav2_lifecycle_before" bash -lc \
   'for node in /controller_server /bt_navigator /local_costmap/local_costmap /planner_server; do echo "## ${node}"; timeout 6 ros2 lifecycle get "${node}"; done'
 start_logged "nav2_params_before" bash -lc \
   'timeout 6 ros2 param get /controller_server progress_checker.required_movement_radius; timeout 6 ros2 param get /controller_server progress_checker.movement_time_allowance; timeout 6 ros2 param get /local_costmap/local_costmap global_frame; timeout 6 ros2 param get /local_costmap/local_costmap robot_base_frame; timeout 6 ros2 param get /local_costmap/local_costmap publish_frequency; timeout 6 ros2 param get /local_costmap/local_costmap update_frequency'
-start_logged "obstacle_topic_info_before" timeout 8 ros2 topic info -v /perception/obstacle_points
+start_logged "scan_topic_info_before" timeout 8 ros2 topic info -v /scan
 start_logged "cmd_topic_info_before" bash -lc \
   'for topic in /cmd_vel_nav_raw /cmd_vel_nav /cmd_vel_collision_checked /cmd_vel; do echo "## ${topic}"; timeout 6 ros2 topic info -v "${topic}"; done'
 
@@ -323,7 +322,7 @@ api_snapshot "api_after"
 run_logged "ros_topics_after" timeout 8 ros2 topic list -t
 run_logged "nav2_lifecycle_after" bash -lc \
   'for node in /controller_server /bt_navigator /local_costmap/local_costmap /planner_server; do echo "## ${node}"; timeout 6 ros2 lifecycle get "${node}"; done'
-run_logged "obstacle_topic_info_after" timeout 8 ros2 topic info -v /perception/obstacle_points
+run_logged "scan_topic_info_after" timeout 8 ros2 topic info -v /scan
 run_logged "cmd_topic_info_after" bash -lc \
   'for topic in /cmd_vel_nav_raw /cmd_vel_nav /cmd_vel_collision_checked /cmd_vel; do echo "## ${topic}"; timeout 6 ros2 topic info -v "${topic}"; done'
 

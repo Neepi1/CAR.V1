@@ -253,7 +253,7 @@ else
   printf 'skipped; rerun with --capture-tf true when this high-churn capture is explicitly needed\n' >"${REPORT_DIR}/tf_map_base_link.log"
 fi
 
-start_timeout_logged "hz_obstacle_points" ros2 topic hz /perception/obstacle_points --window 20
+start_timeout_logged "hz_scan" ros2 topic hz /scan --window 20
 start_timeout_logged "hz_local_costmap" ros2 topic hz /local_costmap/costmap --window 20
 
 if [[ "${BAG}" == "true" ]]; then
@@ -284,7 +284,7 @@ trap - EXIT INT TERM
 run_logged "api_after" bash -lc "curl -fsS '${API_URL}/api/v1/navigation/state'; echo; curl -fsS '${API_URL}/api/v1/robot/pose'; echo"
 run_logged "topic_info_cmd_chain" bash -lc \
   'for topic in /cmd_vel_nav_raw /cmd_vel_nav /cmd_vel_collision_checked /cmd_vel_safe /cmd_vel; do echo "## ${topic}"; timeout 6 ros2 topic info -v "${topic}"; done'
-run_logged "topic_info_obstacle" timeout 8 ros2 topic info -v /perception/obstacle_points
+run_logged "topic_info_scan" timeout 8 ros2 topic info -v /scan
 
 python3 - "${REPORT_DIR}" "${REPORT_FILE}" "${DURATION_SEC}" <<'PY'
 import json
@@ -463,7 +463,7 @@ with report.open("w", encoding="utf-8") as f:
             f"net_xy={metrics['net_xy']:.6f} dyaw={metrics['dyaw']:.6f}\n"
         )
     f.write("\n## Topic Rates\n")
-    f.write(f"- /perception/obstacle_points hz: `{last_average('hz_obstacle_points.log')}`\n")
+    f.write(f"- /scan hz: `{last_average('hz_scan.log')}`\n")
     f.write(f"- /local_costmap/costmap hz: `{last_average('hz_local_costmap.log')}`\n")
     f.write("\n## Safety Status Samples\n")
     f.write(f"- {dict(status_values)}\n")

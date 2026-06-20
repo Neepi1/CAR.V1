@@ -164,6 +164,12 @@ if ! ros2 pkg prefix robot_localization >/dev/null 2>&1; then
   echo "[runtime-overlay] install ros-humble-robot-localization in the NJRH-car image/container." >&2
   exit 1
 fi
+ROBOT_LOCALIZATION_PREFIX="$(ros2 pkg prefix robot_localization)"
+EKF_NODE_BIN="${ROBOT_LOCALIZATION_PREFIX}/lib/robot_localization/ekf_node"
+[[ -x "${EKF_NODE_BIN}" ]] || {
+  echo "[runtime-overlay] robot_localization EKF binary missing or not executable: ${EKF_NODE_BIN}" >&2
+  exit 1
+}
 
 [[ -x "${NODE_BIN}" ]] || {
   echo "[runtime-overlay] compiled local state node missing or not executable: ${NODE_BIN}" >&2
@@ -236,7 +242,7 @@ else
 fi
 
 echo "[runtime-overlay] starting robot_local_state EKF profile=${EKF_PROFILE} params=${EKF_PARAMS_FILE}" >&2
-njrh_start_affined_background ekf_pid robot_local_state ros2 run robot_localization ekf_node --ros-args \
+njrh_start_affined_background ekf_pid robot_local_state "${EKF_NODE_BIN}" --ros-args \
   --params-file "${EKF_PARAMS_FILE}" \
   -r __node:=robot_local_state \
   -r /odometry/filtered:=/local_state/odometry

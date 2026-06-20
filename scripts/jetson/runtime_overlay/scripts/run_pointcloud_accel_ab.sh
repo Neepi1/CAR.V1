@@ -14,7 +14,7 @@ DO_RESTORE=false
 
 usage() {
   cat <<'EOF'
-Usage: run_pointcloud_accel_ab.sh --profile legacy|ipc_worker|nitros [--ingress-profile separate_process|driver_integrated] [--duration-sec SEC] [--apply] [--restart] [--restore]
+Usage: run_pointcloud_accel_ab.sh --profile ipc_worker|nitros [--ingress-profile separate_process|driver_integrated] [--duration-sec SEC] [--apply] [--restart] [--restore]
 
 Without --apply this script only records the current runtime. With --restore it
 switches back to the profile that was active before this A/B run.
@@ -63,7 +63,11 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 case "${PROFILE}" in
-  legacy|ipc_worker|nitros) ;;
+  ipc_worker|nitros) ;;
+  legacy)
+    echo "[pointcloud-accel-ab] legacy profile was removed; use --profile ipc_worker for /scan-based Nav2 marking+clearing" >&2
+    exit 2
+    ;;
   *)
     echo "[pointcloud-accel-ab] valid --profile is required" >&2
     usage >&2
@@ -233,7 +237,6 @@ while (( SECONDS - sample_start < DURATION_SEC )); do
     echo "sample_t=$((SECONDS - sample_start))"
     status_once /lidar/axis_remap_status
     status_once /lidar/pointcloud_accel_status
-    status_once /perception/local_perception_status
     cpu_subset_usage
     echo
   } >>"${sample_out}"
@@ -249,8 +252,6 @@ fi
 
 topic_info_file /lidar_points lidar "${tmp_dir}"
 topic_info_file /jt128/vendor/points_raw vendor_raw "${tmp_dir}"
-topic_info_file /perception/obstacle_points obstacle "${tmp_dir}"
-topic_info_file /perception/clearing_points clearing "${tmp_dir}"
 topic_info_file /scan scan "${tmp_dir}"
 topic_info_file /flatscan flatscan "${tmp_dir}"
 topic_info_file /points_nav points_nav "${tmp_dir}"
@@ -258,10 +259,6 @@ topic_info_file /lidar_points_nav lidar_points_nav "${tmp_dir}"
 
 axis_status="$(status_once /lidar/axis_remap_status)"
 accel_status="$(status_once /lidar/pointcloud_accel_status)"
-local_status=""
-if [[ "${actual_profile}" == "legacy" ]]; then
-  local_status="$(status_once /perception/local_perception_status)"
-fi
 status_field() {
   local text="$1"
   local key="$2"
@@ -300,12 +297,9 @@ flatscan_publishers="$(topic_count_from_file "${tmp_dir}/flatscan.info" "Publish
 flatscan_subscribers="$(topic_count_from_file "${tmp_dir}/flatscan.info" "Subscription count")"
 trunk_owner="$(publisher_nodes_from_file "${tmp_dir}/lidar.info")"
 vendor_raw_owner="$(publisher_nodes_from_file "${tmp_dir}/vendor_raw.info")"
-obstacle_owner="$(publisher_nodes_from_file "${tmp_dir}/obstacle.info")"
-clearing_owner="$(publisher_nodes_from_file "${tmp_dir}/clearing.info")"
 points_nav_owner="$(publisher_nodes_from_file "${tmp_dir}/points_nav.info")"
 scan_owner="$(publisher_nodes_from_file "${tmp_dir}/scan.info")"
 flatscan_owner="$(publisher_nodes_from_file "${tmp_dir}/flatscan.info")"
-obstacle_hz="$(light_hz /perception/obstacle_points)"
 scan_hz="$(light_hz /scan)"
 flatscan_hz="$(light_hz /flatscan)"
 flatscan_helper_pid="missing"
@@ -342,7 +336,7 @@ binary_running="$(awk '
 overall_result="PASS"
 if [[ "${verify_result}" != "PASS" || "${fastlio}" != "false" ]]; then
   overall_result="FAIL"
-elif [[ -z "${obstacle_hz}" || -z "${scan_hz}" || -z "${flatscan_hz}" ]]; then
+elif [[ -z "${scan_hz}" || -z "${flatscan_hz}" ]]; then
   overall_result="WARN"
 fi
 flatscan_case="OK"
@@ -353,16 +347,8 @@ elif [[ -z "${flatscan_hz}" ]]; then
   flatscan_case="CASE_FLATSCAN_HZ_MISSING"
 fi
 
-legacy_scan_chain_recovered="n/a"
 ipc_no_points_nav_production="n/a"
-if [[ "${actual_profile}" == "legacy" ]]; then
-  legacy_scan_chain_recovered="false"
-  if grep -Eq '(^|, )nav_cloud_preprocessor($|, )' <<<"${points_nav_owner}" \
-    && grep -Eq '(^|, )scan_republisher($|, )' <<<"${scan_owner}" \
-    && grep -Eq '(^|, )laser_scan_to_flatscan($|, )' <<<"${flatscan_owner}"; then
-    legacy_scan_chain_recovered="true"
-  fi
-elif [[ "${actual_profile}" == "ipc_worker" || "${actual_profile}" == "nitros" ]]; then
+if [[ "${actual_profile}" == "ipc_worker" || "${actual_profile}" == "nitros" ]]; then
   ipc_no_points_nav_production="false"
   if [[ "${points_nav_publishers:-0}" == "0" ]]; then
     ipc_no_points_nav_production="true"
@@ -392,8 +378,6 @@ fi
   echo "- /jt128/vendor/points_raw publisher_count: ${vendor_raw_publishers:-missing}"
   echo "- /jt128/vendor/points_raw subscriber_count: ${vendor_raw_subscribers:-missing}"
   echo "- /jt128/vendor/points_raw owner: ${vendor_raw_owner:-missing}"
-  echo "- obstacle owner: ${obstacle_owner:-missing}"
-  echo "- clearing owner: ${clearing_owner:-missing}"
   echo "- points_nav owner: ${points_nav_owner:-missing}"
   echo "- scan owner: ${scan_owner:-missing}"
   echo "- flatscan owner: ${flatscan_owner:-missing}"
@@ -408,7 +392,6 @@ fi
   echo "- /scan subscribers: ${scan_subscribers:-0}"
   echo "- /flatscan publishers: ${flatscan_publishers:-0}"
   echo "- /flatscan subscribers: ${flatscan_subscribers:-0}"
-  echo "- obstacle_hz: ${obstacle_hz:-missing}"
   echo "- scan_hz: ${scan_hz:-missing}"
   echo "- flatscan_hz: ${flatscan_hz:-missing}"
   echo "- helper_status_file: ${helper_status_file}"
@@ -424,30 +407,21 @@ fi
   echo "- scan_worker_full_cloud_copy_count: ${scan_worker_full_cloud_copy_count:-missing}"
   echo "- local_worker_intermediate_pointcloud_build_count: ${local_worker_intermediate_pointcloud_build_count:-missing}"
   echo "- scan_worker_intermediate_pointcloud_build_count: ${scan_worker_intermediate_pointcloud_build_count:-missing}"
-  echo "- legacy scan chain recovered: ${legacy_scan_chain_recovered}"
   echo "- ipc_worker no production /points_nav hop: ${ipc_no_points_nav_production}"
   echo "- Nav2 lifecycle: ${nav2_lifecycle:-unavailable}"
   echo "- FAST-LIO2 residual: ${fastlio}"
   echo
   echo "## Topology"
-  case "${actual_profile}" in
-    legacy)
-      echo "- /lidar_points full trunk"
-      echo "- /_internal/lidar_points_local -> robot_local_perception -> /perception/*"
-      echo "- /lidar_points_nav -> /points_nav -> /scan -> /flatscan"
-      ;;
-    ipc_worker|nitros)
-      if [[ "${actual_ingress_profile}" == "driver_integrated" ]]; then
-        echo "- driver_integrated path: hesai_accel_driver_node -> AccelCore"
-        echo "- /jt128/vendor/points_raw is not a production input in this path"
-      else
-        echo "- /lidar_points full trunk"
-        echo "- pointcloud_accel_axis_node workers -> /perception/* and /scan"
-        echo "- /_internal/lidar_points_local and /lidar_points_nav compact debug/compat only"
-        echo "- /points_nav is not production"
-      fi
-      ;;
-  esac
+  if [[ "${actual_ingress_profile}" == "driver_integrated" ]]; then
+    echo "- driver_integrated path: hesai_accel_driver_node -> AccelCore"
+    echo "- /jt128/vendor/points_raw is not a production input in this path"
+  else
+    echo "- /lidar_points full trunk"
+    echo "- pointcloud_accel_axis_node scan worker -> /scan"
+    echo "- /lidar_points_nav compact debug/compat only"
+    echo "- /points_nav is not production"
+  fi
+  echo "- retired local PointCloud2 obstacle publishers are not part of production"
   echo
   echo "## Verify Output"
   echo '```text'

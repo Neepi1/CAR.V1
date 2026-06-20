@@ -47,11 +47,13 @@ struct RuntimeMapContext
 {
   bool confirmed{false};
   std::string state;
+  std::string startup_stage;
   std::string message;
   std::string map_id;
   std::string display_name;
   std::string building_id;
   std::string floor_id;
+  double updated_at_sec{0.0};
 };
 
 struct MapYamlInfo

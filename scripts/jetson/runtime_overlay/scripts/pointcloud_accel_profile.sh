@@ -12,11 +12,16 @@ njrh_load_pointcloud_accel_profile() {
     profile_source="environment"
   fi
 
-  local profile="${NJRH_POINTCLOUD_ACCEL_PROFILE:-legacy}"
+  local profile="${NJRH_POINTCLOUD_ACCEL_PROFILE:-ipc_worker}"
   case "${profile}" in
-    legacy|ipc_worker|nitros) ;;
+    ipc_worker|nitros) ;;
+    legacy)
+      echo "[runtime-overlay] NJRH_POINTCLOUD_ACCEL_PROFILE=legacy has been removed from production." >&2
+      echo "[runtime-overlay] Use ipc_worker: Nav2 local costmap/collision_monitor consume /scan for standard marking+clearing." >&2
+      return 2
+      ;;
     *)
-      echo "[runtime-overlay] invalid NJRH_POINTCLOUD_ACCEL_PROFILE=${profile}; expected legacy, ipc_worker, or nitros" >&2
+      echo "[runtime-overlay] invalid NJRH_POINTCLOUD_ACCEL_PROFILE=${profile}; expected ipc_worker or nitros" >&2
       return 2
       ;;
   esac
@@ -46,12 +51,6 @@ njrh_load_pointcloud_ingress_profile() {
       ;;
   esac
 
-  if [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE:-legacy}" == "legacy" && "${ingress_profile}" != "separate_process" ]]; then
-    echo "[runtime-overlay] forcing pointcloud ingress separate_process for legacy accel profile" >&2
-    ingress_profile="separate_process"
-    profile_source="legacy_forced_separate_process"
-  fi
-
   export NJRH_POINTCLOUD_INGRESS_PROFILE="${ingress_profile}"
   export NJRH_POINTCLOUD_INGRESS_PROFILE_SOURCE="${profile_source}"
   export NJRH_POINTCLOUD_INGRESS_PROFILE_FILE_RESOLVED="${profile_file}"
@@ -63,14 +62,11 @@ njrh_print_pointcloud_accel_profile() {
     echo "[runtime-overlay] pointcloud ingress profile=${NJRH_POINTCLOUD_INGRESS_PROFILE} source=${NJRH_POINTCLOUD_INGRESS_PROFILE_SOURCE:-unknown}" >&2
   fi
   case "${NJRH_POINTCLOUD_ACCEL_PROFILE}" in
-    legacy)
-      echo "[runtime-overlay] topology: /lidar_points full trunk; /_internal/lidar_points_local -> robot_local_perception; /lidar_points_nav -> /points_nav -> /scan -> /flatscan" >&2
-      ;;
     ipc_worker)
       if [[ "${NJRH_POINTCLOUD_INGRESS_PROFILE:-separate_process}" == "driver_integrated" ]]; then
-        echo "[runtime-overlay] topology: driver_integrated ingress; Hesai decode feeds AccelCore in the same process" >&2
+        echo "[runtime-overlay] topology: driver_integrated ingress; Hesai decode feeds AccelCore; local costmap/collision_monitor consume /scan" >&2
       else
-        echo "[runtime-overlay] topology: /lidar_points full trunk; same-process workers publish /perception/* and /scan; /flatscan comes from laser_scan_to_flatscan" >&2
+        echo "[runtime-overlay] topology: /lidar_points full trunk; same-process scan worker publishes /scan; /flatscan comes from laser_scan_to_flatscan" >&2
       fi
       ;;
     nitros)

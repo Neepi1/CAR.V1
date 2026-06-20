@@ -10,7 +10,7 @@ LIDAR_TOPIC="${NJRH_VERIFY_POINTCLOUD_LIDAR_TOPIC:-/lidar_points}"
 MIN_RAW_HZ="${NJRH_VERIFY_POINTCLOUD_MIN_RAW_HZ:-18.0}"
 MIN_LIDAR_HZ="${NJRH_VERIFY_POINTCLOUD_MIN_LIDAR_HZ:-18.0}"
 MIN_LIDAR_WARN_HZ="${NJRH_VERIFY_POINTCLOUD_MIN_LIDAR_WARN_HZ:-10.0}"
-OPTIONAL_TOPICS="${NJRH_VERIFY_POINTCLOUD_OPTIONAL_TOPICS:-/lidar_points_nav /points_nav /scan /flatscan /perception/obstacle_points /perception/clearing_points}"
+OPTIONAL_TOPICS="${NJRH_VERIFY_POINTCLOUD_OPTIONAL_TOPICS:-/lidar_points_nav /points_nav /scan /flatscan}"
 
 tmp_dir="$(mktemp -d /tmp/njrh_pointcloud_rates_XXXXXX)"
 trap 'rm -rf "${tmp_dir}"' EXIT
@@ -82,7 +82,7 @@ if [[ -s "${tmp_dir}/lidar.rate" ]]; then
     status=1
   fi
   if ! float_ge "${lidar_rate}" "${MIN_LIDAR_WARN_HZ}"; then
-    echo "[pointcloud-rates] FAIL /lidar_points dropped below ${MIN_LIDAR_WARN_HZ} Hz while local perception may be active"
+    echo "[pointcloud-rates] FAIL /lidar_points dropped below ${MIN_LIDAR_WARN_HZ} Hz"
     status=1
   fi
 else

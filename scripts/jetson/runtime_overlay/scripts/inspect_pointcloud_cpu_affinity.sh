@@ -103,14 +103,12 @@ print_thermal_and_clock_snapshot() {
   done
 }
 
-echo "[pointcloud-cpu] profile=${NJRH_LOCAL_PERCEPTION_INPUT_PROFILE}"
-echo "[pointcloud-cpu] resolved local input=${RESOLVED_LOCAL_PERCEPTION_INPUT_TOPIC}"
+echo "[pointcloud-cpu] local PointCloud2 obstacle profile=${NJRH_LOCAL_PERCEPTION_INPUT_PROFILE} (retired)"
 echo "[pointcloud-cpu] resolved axis local_output_topic=${RESOLVED_AXIS_LOCAL_OUTPUT_TOPIC:-<disabled>}"
 echo "[pointcloud-cpu] current NJRH_CPUSET_* values:"
 env | awk -F= '/^NJRH_CPUSET_/ {print "[pointcloud-cpu]   " $1 "=" $2}' | sort
 
 print_threads_for_pattern "pointcloud_axis_remap" "pointcloud_axis_remap"
-print_threads_for_pattern "robot_local_perception" "local_perception_node|robot_local_perception"
 print_threads_for_pattern "nav_cloud_preprocessor" "nav_cloud_preprocessor"
 print_threads_for_pattern "pointcloud_to_laserscan" "pointcloud_to_laserscan"
 print_threads_for_pattern "scan_republisher" "scan_republisher_node"
@@ -125,22 +123,6 @@ fi
 
 print_thermal_and_clock_snapshot
 
-local_status="$(status_once /perception/local_perception_status)"
-local_input_topic="$(field_value "${local_status}" input_topic || true)"
-local_input_hz="$(field_value "${local_status}" input_callback_hz || true)"
-echo "[pointcloud-cpu] local input_topic=${local_input_topic:-missing} input_callback_hz=${local_input_hz:-missing}"
-
-local_cpus="$(cpus_for_pattern "local_perception_node|robot_local_perception")"
 nav_cpus="$(cpus_for_pattern "nav_cloud_preprocessor")"
 laser_cpus="$(cpus_for_pattern "pointcloud_to_laserscan")"
 localizer_cpus="$(cpus_for_pattern "robot_global_localization|occupancy_grid_localizer|isaac.*localizer")"
-
-if [[ "${local_input_topic:-}" == "${RESOLVED_AXIS_LOCAL_OUTPUT_TOPIC}" && -n "${local_input_hz:-}" ]] &&
-  awk -v value="${local_input_hz}" 'BEGIN {exit(value + 0.0 < 10.0 ? 0 : 1)}'
-then
-  if [[ -n "${local_cpus}" && "${local_cpus}" == "${nav_cpus}" && "${local_cpus}" == "${laser_cpus}" && "${local_cpus}" == "${localizer_cpus}" ]]; then
-    echo "[pointcloud-cpu] WARN local_branch is enabled but local input <10Hz and pointcloud/localizer workers are concentrated on CPU ${local_cpus}"
-  else
-    echo "[pointcloud-cpu] WARN local_branch is enabled but local input <10Hz; inspect CPU contention and DDS transport"
-  fi
-fi

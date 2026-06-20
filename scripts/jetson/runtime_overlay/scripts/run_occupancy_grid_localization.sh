@@ -29,7 +29,10 @@ LOCALIZATION_POINTS_INITIAL_WAIT_SEC="${NJRH_LOCALIZATION_POINTS_INITIAL_WAIT_SE
 LOCALIZATION_POINTS_RETRY_WAIT_SEC="${NJRH_LOCALIZATION_POINTS_RETRY_WAIT_SEC:-20}"
 LOCALIZATION_POINTS_REPAIR_WAIT_SEC="${NJRH_LOCALIZATION_POINTS_REPAIR_WAIT_SEC:-60}"
 LOCALIZATION_POINTS_DRIVER_REPAIR="${NJRH_LOCALIZATION_POINTS_DRIVER_REPAIR:-true}"
+LOCALIZATION_FLATSCAN_READY_TIMEOUT="${NJRH_LOCALIZATION_FLATSCAN_READY_TIMEOUT_SEC:-75}"
 MAP_SERVER_READY_TIMEOUT="${NJRH_LOCALIZATION_MAP_SERVER_READY_TIMEOUT:-75}"
+LOCALIZATION_MAP_EXTERNAL_LIFECYCLE_BRINGUP="${NJRH_LOCALIZATION_MAP_EXTERNAL_LIFECYCLE_BRINGUP:-true}"
+LOCALIZATION_MAP_LIFECYCLE_BRINGUP_TIMEOUT_SEC="${NJRH_LOCALIZATION_MAP_LIFECYCLE_BRINGUP_TIMEOUT_SEC:-90}"
 LOCALIZATION_REUSE_READY_STACK="${NJRH_LOCALIZATION_REUSE_READY_STACK:-false}"
 ISAAC_LOCALIZATION_MODE="${NJRH_ISAAC_LOCALIZATION_MODE:-triggered}"
 case "${ISAAC_LOCALIZATION_MODE}" in
@@ -41,6 +44,7 @@ case "${ISAAC_LOCALIZATION_MODE}" in
     ;;
 esac
 LOCALIZER_FLATSCAN_TOPIC="${NJRH_ISAAC_LOCALIZER_FLATSCAN_TOPIC:-/flatscan}"
+export NJRH_LOCALIZATION_MAP_EXTERNAL_LIFECYCLE_BRINGUP="${LOCALIZATION_MAP_EXTERNAL_LIFECYCLE_BRINGUP}"
 
 if [[ -n "${NJRH_FLOOR_ID:-}" || -n "${NAV2_FLOOR_ID:-}" ]]; then
   resolve_floor_assets "${NJRH_BUILDING_ID:-${NAV2_BUILDING_ID:-building_1}}" "${NJRH_FLOOR_ID:-${NAV2_FLOOR_ID:-}}"
@@ -119,11 +123,11 @@ patterns=(
   "map_to_odom_tf_bridge"
   "map_server"
   "lifecycle_manager_map"
+  "/opt/ros/humble/lib/nav2_util/lifecycle_bringup map_server"
 )
 if [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" == "legacy" ]]; then
   patterns+=(
     "jt128_nav_sensing.launch.py"
-    "laser_scan_to_flatscan"
     "pointcloud_to_laserscan_node"
     "pointcloud_to_laserscan"
     "robot_hesai_jt128/scan_republisher_node"
@@ -168,6 +172,7 @@ cleanup_localization_stack_patterns() {
 stop_existing_canonical_tf_publishers
 
 localization_pid=""
+map_lifecycle_bringup_pid=""
 localization_exit_code=0
 launch_args=(
   "map_yaml:=${NAV2_MAP_YAML}"
@@ -186,6 +191,12 @@ else
     "flatscan_topic:=${LOCALIZER_FLATSCAN_TOPIC}"
   )
   echo "[runtime-overlay] pointcloud accel profile=${NJRH_POINTCLOUD_ACCEL_PROFILE}; occupancy localization reuses /scan and /flatscan from pointcloud_accel_pipeline instead of launching /points_nav legacy sensing; localizer_flatscan_topic=${LOCALIZER_FLATSCAN_TOPIC}" >&2
+  if [[ "${LOCALIZATION_MAP_EXTERNAL_LIFECYCLE_BRINGUP}" == "true" ]]; then
+    launch_args+=("map_lifecycle_manager_enabled:=false")
+    echo "[runtime-overlay] localization map_server lifecycle manager disabled; external lifecycle_bringup will activate map_server" >&2
+  else
+    launch_args+=("map_lifecycle_manager_enabled:=true")
+  fi
 fi
 
 wait_for_child_exit() {
@@ -220,6 +231,40 @@ terminate_child() {
   wait "${pid}" 2>/dev/null || true
 }
 
+localization_map_external_lifecycle_bringup_enabled() {
+  [[ "${LOCALIZATION_MAP_EXTERNAL_LIFECYCLE_BRINGUP}" == "true" ]]
+}
+
+start_map_server_lifecycle_with_nav2_util() {
+  localization_map_external_lifecycle_bringup_enabled || return 0
+  [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" != "legacy" ]] || {
+    echo "[runtime-overlay] localization map_server external lifecycle bringup skipped for legacy localization profile" >&2
+    return 0
+  }
+
+  local node_timeout="${NJRH_LOCALIZATION_MAP_LIFECYCLE_NODE_TIMEOUT_SEC:-30}"
+  local sequence_args=(--per-node-timeout-sec "${node_timeout}")
+  if [[ "${NJRH_LOCALIZATION_MAP_LIFECYCLE_TRUST_CHANGE_STATE_RESPONSE:-true}" == "true" ]]; then
+    sequence_args+=(--trust-change-state-response)
+  fi
+
+  echo "[runtime-overlay] starting localization map_server lifecycle with repo lifecycle sequence timeout=${LOCALIZATION_MAP_LIFECYCLE_BRINGUP_TIMEOUT_SEC}s node_timeout=${node_timeout}s" >&2
+  timeout --kill-after="${NJRH_LOCALIZATION_MAP_LIFECYCLE_BRINGUP_KILL_AFTER_SEC:-5}" \
+    "${LOCALIZATION_MAP_LIFECYCLE_BRINGUP_TIMEOUT_SEC}" \
+    python3 "${SCRIPT_DIR}/nav2_lifecycle_sequence.py" \
+      "${sequence_args[@]}" \
+      map_server &
+  map_lifecycle_bringup_pid=$!
+  if wait "${map_lifecycle_bringup_pid}"; then
+    map_lifecycle_bringup_pid=""
+    echo "[runtime-overlay] localization map_server repo lifecycle sequence: map_server active" >&2
+    return 0
+  fi
+  map_lifecycle_bringup_pid=""
+  echo "[runtime-overlay] localization map_server repo lifecycle sequence failed or timed out" >&2
+  return 1
+}
+
 repair_jt128_navigation_points() {
   if [[ "${LOCALIZATION_POINTS_DRIVER_REPAIR}" != "true" ]]; then
     return 1
@@ -248,17 +293,27 @@ pointcloud_accel_pipeline_runtime_running() {
   pgrep -f "run_pointcloud_accel_pipeline.sh|pointcloud_accel_axis_node|laser_scan_to_flatscan" >/dev/null 2>&1
 }
 
+flatscan_publisher_ready_for_localization() {
+  wait_for_topic_publisher_from_node "${LOCALIZER_FLATSCAN_TOPIC}" "laser_scan_to_flatscan" "$1"
+}
+
 ensure_pointcloud_accel_pipeline_for_localization() {
   [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" != "legacy" ]] || return 0
   if pointcloud_accel_pipeline_runtime_running; then
-    echo "[runtime-overlay] pointcloud accel pipeline already running for localization profile=${NJRH_POINTCLOUD_ACCEL_PROFILE}" >&2
-    return 0
+    if flatscan_publisher_ready_for_localization "${LOCALIZATION_FLATSCAN_READY_TIMEOUT}"; then
+      echo "[runtime-overlay] pointcloud accel pipeline already running with ${LOCALIZER_FLATSCAN_TOPIC} publisher for localization profile=${NJRH_POINTCLOUD_ACCEL_PROFILE}" >&2
+      return 0
+    fi
+    echo "[runtime-overlay] pointcloud accel pipeline is running but ${LOCALIZER_FLATSCAN_TOPIC} publisher is missing; restarting profile=${NJRH_POINTCLOUD_ACCEL_PROFILE}" >&2
+    bash "${SCRIPT_DIR}/set_pointcloud_accel_profile.sh" --profile "${NJRH_POINTCLOUD_ACCEL_PROFILE}" --restart >&2
+    flatscan_publisher_ready_for_localization "${LOCALIZATION_FLATSCAN_READY_TIMEOUT}"
+    return $?
   fi
   echo "[runtime-overlay] starting pointcloud accel pipeline for localization profile=${NJRH_POINTCLOUD_ACCEL_PROFILE}" >&2
   start_overlay_helper "pointcloud_accel_pipeline_localization" env \
     NJRH_FORCE_RESTART_DRIVER="${NJRH_POINTCLOUD_ACCEL_FORCE_RESTART_DRIVER:-false}" \
     bash "${SCRIPT_DIR}/run_pointcloud_accel_pipeline.sh"
-  sleep "${NJRH_POINTCLOUD_ACCEL_START_SETTLE_SEC:-3}"
+  flatscan_publisher_ready_for_localization "${LOCALIZATION_FLATSCAN_READY_TIMEOUT}"
 }
 
 if [[ -n "${NAV2_LOCALIZER_PARAMS}" ]]; then
@@ -267,6 +322,15 @@ fi
 
 cleanup() {
   trap - EXIT INT TERM
+  if [[ -n "${map_lifecycle_bringup_pid}" ]]; then
+    kill -INT "${map_lifecycle_bringup_pid}" 2>/dev/null || true
+    sleep 0.5
+    kill -TERM "${map_lifecycle_bringup_pid}" 2>/dev/null || true
+    sleep 0.5
+    kill -KILL "${map_lifecycle_bringup_pid}" 2>/dev/null || true
+    wait "${map_lifecycle_bringup_pid}" 2>/dev/null || true
+    map_lifecycle_bringup_pid=""
+  fi
   terminate_child "${localization_pid}" "occupancy localization launch"
   cleanup_localization_stack_patterns
   cleanup_overlay_helpers
@@ -317,6 +381,8 @@ echo "[runtime-overlay] Isaac localization mode=triggered; AMCL owns continuous 
 
 ros2 launch "${LAUNCH_FILE}" "${launch_args[@]}" &
 localization_pid=$!
+
+start_map_server_lifecycle_with_nav2_util || exit 1
 
 wait "${localization_pid}" || localization_exit_code=$?
 exit "${localization_exit_code}"

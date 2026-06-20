@@ -202,9 +202,9 @@ else
   pass "no FAST-LIO2-like navigation residue detected"
 fi
 
-obstacle_info="$(ros2 topic info -v /perception/obstacle_points 2>&1 || true)"
-echo "$obstacle_info" | grep -q "Node name: local_costmap" && pass "local_costmap subscribes /perception/obstacle_points" || fail "local_costmap subscriber missing on /perception/obstacle_points"
-echo "$obstacle_info" | grep -q "Node name: collision_monitor" && pass "collision_monitor subscribes /perception/obstacle_points" || fail "collision_monitor subscriber missing on /perception/obstacle_points"
+scan_info="$(ros2 topic info -v /scan 2>&1 || true)"
+echo "$scan_info" | grep -q "Node name: local_costmap" && pass "local_costmap subscribes /scan" || fail "local_costmap subscriber missing on /scan"
+echo "$scan_info" | grep -q "Node name: collision_monitor" && pass "collision_monitor subscribes /scan" || fail "collision_monitor subscriber missing on /scan"
 
 state_json="$(curl -fsS "${API_URL}/api/v1/navigation/state" 2>/dev/null || true)"
 if [[ -n "$state_json" ]]; then

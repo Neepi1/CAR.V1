@@ -101,6 +101,7 @@ export NJRH_OVERLAY_ROOT="$OVERLAY_ROOT"
 export NJRH_PROJECT_ROOT="$PROJECT_ROOT"
 export NJRH_FASTLIO_PATCHED_OVERLAY="${NJRH_FASTLIO_PATCHED_OVERLAY:-${PROJECT_ROOT}/.runtime/fast_lio_overlay/install}"
 export NJRH_JT128_NAV_TOOLS_PATCHED_OVERLAY="${NJRH_JT128_NAV_TOOLS_PATCHED_OVERLAY:-${PROJECT_ROOT}/.runtime/jt128_nav_tools_overlay/install}"
+export NJRH_RANGER_BASE_PATCHED_OVERLAY="${NJRH_RANGER_BASE_PATCHED_OVERLAY:-${PROJECT_ROOT}/.runtime/ranger_base_overlay/install}"
 export NJRH_UPSTREAM_ROOT="$UPSTREAM_ROOT"
 export NJRH_UPSTREAM_HOST_ROOT="$UPSTREAM_HOST_ROOT"
 export NJRH_MAPS_DIR="${NJRH_MAPS_DIR:-${OVERLAY_ROOT}/maps}"
@@ -143,6 +144,9 @@ if [[ "${NJRH_COMMON_ENV_SETUP_DONE:-}" != "1" ]] || project_overlay_missing; th
   if [[ -f "${UPSTREAM_ROOT}/install/local_setup.bash" ]]; then
     source "${UPSTREAM_ROOT}/install/local_setup.bash"
   fi
+  if [[ -f "${NJRH_RANGER_BASE_PATCHED_OVERLAY}/local_setup.bash" ]]; then
+    source "${NJRH_RANGER_BASE_PATCHED_OVERLAY}/local_setup.bash"
+  fi
   if [[ -f "${NJRH_FASTLIO_PATCHED_OVERLAY}/local_setup.bash" ]]; then
     source "${NJRH_FASTLIO_PATCHED_OVERLAY}/local_setup.bash"
   fi
@@ -183,8 +187,108 @@ runtime_readiness_probe_bin() {
   printf '%s\n' "${candidate}"
 }
 
+runtime_readiness_probe_output_reports_success() {
+  local command="$1"
+  local output="$2"
+  case "${command}" in
+    service)
+      [[ "${output}" == *"[runtime-overlay] service ready:"* ]]
+      ;;
+    node)
+      [[ "${output}" == *"[runtime-overlay] node ready:"* ]]
+      ;;
+    topic-publisher)
+      [[ "${output}" == *"[runtime-overlay] topic publisher ready:"* ]]
+      ;;
+    publisher-from-node)
+      [[ "${output}" == *"[runtime-overlay] publisher ready:"* ]]
+      ;;
+    topic)
+      [[ "${output}" == *"[runtime-overlay] topic message ready:"* ]]
+      ;;
+    fresh-header-topic)
+      [[ "${output}" == *"[runtime-overlay] fresh stamped topic ready:"* ]]
+      ;;
+    tf)
+      [[ "${output}" == *"[runtime-overlay] TF ready:"* ]]
+      ;;
+    fresh-tf)
+      [[ "${output}" == *"[runtime-overlay] fresh TF ready:"* ]]
+      ;;
+    transformable-scan)
+      [[ "${output}" == *"[runtime-overlay] transformable scan observations ready:"* ]]
+      ;;
+    local-state-endpoint)
+      [[ "${output}" == *"[runtime-overlay] robot_local_state endpoint ready"* ]]
+      ;;
+    lifecycle-active)
+      [[ "${output}" == *"[runtime-overlay] lifecycle node active:"* ]]
+      ;;
+    occupancy-grid)
+      [[ "${output}" == *"[runtime-overlay] "*" ready:"* ]]
+      ;;
+    map-topic-matches-yaml)
+      [[ "${output}" == *"[runtime-overlay] /map matches requested map yaml:"* ]]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 runtime_readiness_probe() {
   local probe
   probe="$(runtime_readiness_probe_bin)" || return $?
-  "${probe}" "$@"
+  local command="${1:-}"
+  local timeout_sec="${NJRH_RUNTIME_READINESS_PROBE_PROCESS_TIMEOUT_SEC:-}"
+  if [[ -z "${timeout_sec}" ]]; then
+    local requested_timeout=""
+    case "${command}" in
+      service|node|topic-publisher|topic|fresh-header-topic|lifecycle-active|occupancy-grid|map-topic-matches-yaml)
+        requested_timeout="${3:-}"
+        ;;
+      publisher-from-node|tf|fresh-tf)
+        requested_timeout="${4:-}"
+        ;;
+      transformable-scan|local-state-endpoint)
+        requested_timeout="${2:-}"
+        ;;
+      *)
+        requested_timeout="30"
+        ;;
+    esac
+    timeout_sec="$(
+      python3 - "${requested_timeout}" "${NJRH_RUNTIME_READINESS_PROBE_SHUTDOWN_GRACE_SEC:-5}" <<'PY'
+import sys
+
+try:
+    requested = float(sys.argv[1])
+except Exception:
+    requested = 30.0
+try:
+    grace = float(sys.argv[2])
+except Exception:
+    grace = 5.0
+print(max(1.0, requested + grace))
+PY
+    )"
+  fi
+  local output=""
+  local rc=0
+  set +e
+  output="$(
+    timeout --kill-after="${NJRH_RUNTIME_READINESS_PROBE_KILL_AFTER_SEC:-2}" \
+      "${timeout_sec}" "${probe}" "$@" 2>&1
+  )"
+  rc=$?
+  set -e
+  [[ -z "${output}" ]] || printf '%s\n' "${output}" >&2
+  if [[ "${rc}" -eq 0 ]]; then
+    return 0
+  fi
+  if runtime_readiness_probe_output_reports_success "${command}" "${output}"; then
+    echo "[runtime-overlay] ${command} readiness probe reported success but did not exit cleanly; continuing after bounded timeout" >&2
+    return 0
+  fi
+  return "${rc}"
 }

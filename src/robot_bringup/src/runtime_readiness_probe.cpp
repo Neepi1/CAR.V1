@@ -568,8 +568,8 @@ bool wait_for_fresh_tf(const rclcpp::Node::SharedPtr & node, const std::string &
   return false;
 }
 
-bool wait_for_transformable_obstacle_points(const rclcpp::Node::SharedPtr & node,
-                                            double timeout_sec, int required_good)
+bool wait_for_transformable_scan(const rclcpp::Node::SharedPtr & node,
+                                 double timeout_sec, int required_good)
 {
   auto buffer = std::make_shared<tf2_ros::Buffer>(node->get_clock());
   auto listener = std::make_shared<tf2_ros::TransformListener>(*buffer, node, false);
@@ -588,10 +588,10 @@ bool wait_for_transformable_obstacle_points(const rclcpp::Node::SharedPtr & node
   int seen = 0;
   int good = 0;
   std::string last_error;
-  auto on_cloud = [&](const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+  auto on_scan = [&](const sensor_msgs::msg::LaserScan::SharedPtr msg) {
       ++seen;
       if (msg->header.frame_id.empty()) {
-        last_error = "empty cloud frame_id";
+        last_error = "empty scan frame_id";
         return;
       }
       try {
@@ -603,23 +603,23 @@ bool wait_for_transformable_obstacle_points(const rclcpp::Node::SharedPtr & node
       }
     };
 
-  auto sub = node->create_subscription<sensor_msgs::msg::PointCloud2>(
-    "/perception/obstacle_points",
+  auto sub = node->create_subscription<sensor_msgs::msg::LaserScan>(
+    "/scan",
     qos_profile(RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT, RMW_QOS_POLICY_DURABILITY_VOLATILE),
-    on_cloud);
+    on_scan);
 
   while (rclcpp::ok() && Clock::now() < deadline && good < required_good) {
     spin_slice(node);
   }
 
   if (good >= required_good) {
-    std::cerr << "[runtime-overlay] transformable obstacle observations ready: "
-              << good << "/" << seen << " fresh clouds are TF-valid "
+    std::cerr << "[runtime-overlay] transformable scan observations ready: "
+              << good << "/" << seen << " scans are TF-valid "
               << "(tf_buffer_warmup=" << warmup_sec << "s)\n";
     return true;
   }
 
-  std::cerr << "[runtime-overlay] transformable obstacle observations not ready: good="
+  std::cerr << "[runtime-overlay] transformable scan observations not ready: good="
             << good << " seen=" << seen << " tf_buffer_warmup=" << warmup_sec
             << "s last_error=" << (last_error.empty() ? "none" : last_error) << "\n";
   return false;
@@ -812,6 +812,17 @@ bool wait_for_map_topic_matches_yaml(const rclcpp::Node::SharedPtr & node,
   return false;
 }
 
+[[noreturn]] void exit_probe(int code)
+{
+  std::cout.flush();
+  std::cerr.flush();
+  // This probe is a short-lived startup helper. On the Jetson runtime, Fast DDS
+  // shutdown can occasionally block after a readiness condition has already
+  // been observed, which freezes the parent startup script. Let the OS reclaim
+  // DDS resources instead of making runtime readiness depend on clean shutdown.
+  std::_Exit(code);
+}
+
 void print_usage()
 {
   std::cerr
@@ -825,7 +836,7 @@ void print_usage()
     << "  fresh-header-topic <topic> <timeout_sec> <max_age_sec> <max_future_sec>\n"
     << "  tf <target_frame> <source_frame> <timeout_sec>\n"
     << "  fresh-tf <target_frame> <source_frame> <timeout_sec> <max_age_sec>\n"
-    << "  transformable-obstacle-points <timeout_sec> <required_good>\n"
+    << "  transformable-scan <timeout_sec> <required_good>\n"
     << "  local-state-endpoint <timeout_sec> <mode>\n"
     << "  lifecycle-active <node_name> <timeout_sec>\n"
     << "  occupancy-grid <topic> <timeout_sec> <min_width> <min_height>\n"
@@ -868,8 +879,8 @@ int main(int argc, char ** argv)
       ok = wait_for_fresh_tf(
         node, argv[2], argv[3], parse_double(argv[4], "timeout_sec"),
         parse_double(argv[5], "max_age_sec"));
-    } else if (command == "transformable-obstacle-points" && argc == 4) {
-      ok = wait_for_transformable_obstacle_points(
+    } else if (command == "transformable-scan" && argc == 4) {
+      ok = wait_for_transformable_scan(
         node, parse_double(argv[2], "timeout_sec"), std::max(1, parse_int(argv[3],
         "required_good")));
     } else if (command == "local-state-endpoint" && argc == 4) {
@@ -889,17 +900,12 @@ int main(int argc, char ** argv)
         "timeout_sec"));
     } else {
       print_usage();
-      rclcpp::shutdown();
-      return 2;
+      exit_probe(2);
     }
 
-    rclcpp::shutdown();
-    return ok ? 0 : 1;
+    exit_probe(ok ? 0 : 1);
   } catch (const std::exception & exc) {
     std::cerr << "[runtime-overlay] runtime_readiness_probe error: " << exc.what() << "\n";
-    if (rclcpp::ok()) {
-      rclcpp::shutdown();
-    }
-    return 2;
+    exit_probe(2);
   }
 }

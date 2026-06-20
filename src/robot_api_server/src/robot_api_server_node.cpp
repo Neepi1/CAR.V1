@@ -291,10 +291,19 @@ bool latch_source_is_bms(const std::string & source)
   return lower_copy(source) == "bms";
 }
 
+bool latch_source_is_charging_session(const std::string & source)
+{
+  const auto normalized = lower_copy(source);
+  return normalized == "charging_session" || normalized == "docking_manager_bms";
+}
+
 bool latch_source_is_docking_evidence(const std::string & source)
 {
   const auto normalized = lower_copy(source);
-  return normalized == "docking_job" || normalized == "docking_status";
+  return normalized == "docking_job" ||
+    normalized == "docking_status" ||
+    normalized == "docking_manager" ||
+    normalized == "charging_session";
 }
 
 bool latch_source_is_manual_evidence(const std::string & source)
@@ -303,6 +312,23 @@ bool latch_source_is_manual_evidence(const std::string & source)
   return normalized == "manual" ||
     normalized == "manual_confirm" ||
     normalized == "manual_clear";
+}
+
+std::string dock_latch_source_strength(const std::string & source)
+{
+  if (latch_source_is_charging_session(source) || latch_source_is_docking_evidence(source)) {
+    return "strong";
+  }
+  if (latch_source_is_manual_evidence(source)) {
+    return "manual";
+  }
+  if (latch_source_is_bms(source)) {
+    return "weak";
+  }
+  if (source.empty() || lower_copy(source) == "none" || lower_copy(source) == "unknown") {
+    return "none";
+  }
+  return "unknown";
 }
 
 }  // namespace
@@ -373,9 +399,15 @@ public:
       "navigation_resume_command",
       "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/run_navigation_runtime_services.sh");
     navigation_resume_log_file_ =
-      declare_parameter<std::string>("navigation_resume_log_file", "/tmp/njrh_navigation_resume.log");
+      declare_parameter<std::string>(
+      "navigation_resume_log_file",
+      "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/web_dashboard/runtime_logs/resident_navigation_runtime.log");
     runtime_map_context_file_ =
       declare_parameter<std::string>("runtime_map_context_file", "/tmp/njrh_runtime_map_context.json");
+    navigation_resume_starting_context_ttl_sec_ = std::clamp(
+      declare_parameter<double>("navigation_resume_starting_context_ttl_sec", 300.0),
+      10.0,
+      900.0);
     amcl_runtime_status_file_ =
       declare_parameter<std::string>("amcl_runtime_status_file", "/tmp/njrh_amcl_runtime_status.env");
     amcl_runtime_status_ttl_sec_ =
@@ -495,6 +527,46 @@ public:
         navigation_default_goal_completion_policy_.c_str());
       navigation_default_goal_completion_policy_ = "pose_required";
     }
+    nav2_native_goal_completion_enabled_ =
+      declare_parameter<bool>("nav2_native_goal_completion_enabled", true);
+    nav2_rotation_shim_enabled_ =
+      declare_parameter<bool>("nav2_rotation_shim_enabled", true);
+    api_final_yaw_align_fallback_enabled_ =
+      declare_parameter<bool>("api_final_yaw_align_fallback_enabled", false);
+    post_nav2_final_verify_enabled_ =
+      declare_parameter<bool>("post_nav2_final_verify_enabled", false);
+    post_nav2_final_verify_wait_bridge_smoothing_ =
+      declare_parameter<bool>("post_nav2_final_verify_wait_bridge_smoothing", false);
+    post_nav2_final_verify_bridge_wait_timeout_ms_ = std::clamp(
+      static_cast<int>(declare_parameter<int>("post_nav2_final_verify_bridge_wait_timeout_ms", 2000)),
+      100,
+      10000);
+    post_nav2_final_verify_bridge_wait_sample_period_ms_ = std::clamp(
+      static_cast<int>(declare_parameter<int>("post_nav2_final_verify_bridge_wait_sample_period_ms", 100)),
+      20,
+      1000);
+    post_nav2_final_verify_max_retry_count_ = std::clamp(
+      static_cast<int>(declare_parameter<int>("post_nav2_final_verify_max_retry_count", 0)),
+      0,
+      3);
+    post_nav2_final_verify_acceptance_slack_m_ = std::clamp(
+      declare_parameter<double>("post_nav2_final_verify_acceptance_slack_m", 0.0),
+      0.0,
+      0.20);
+    post_nav2_final_verify_xy_retry_min_error_m_ = std::clamp(
+      declare_parameter<double>("post_nav2_final_verify_xy_retry_min_error_m", 0.20),
+      0.0,
+      2.0);
+    post_nav2_final_verify_xy_retry_max_error_m_ = std::clamp(
+      declare_parameter<double>("post_nav2_final_verify_xy_retry_max_error_m", 0.60),
+      post_nav2_final_verify_xy_retry_min_error_m_,
+      3.0);
+    post_nav2_final_verify_yaw_retry_if_failed_ =
+      declare_parameter<bool>("post_nav2_final_verify_yaw_retry_if_failed", false);
+    post_nav2_final_verify_retry_uses_same_nav2_goal_ =
+      declare_parameter<bool>("post_nav2_final_verify_retry_uses_same_nav2_goal", false);
+    post_nav2_final_verify_api_velocity_correction_enabled_ =
+      declare_parameter<bool>("post_nav2_final_verify_api_velocity_correction_enabled", false);
     navigation_max_reposition_after_yaw_retry_ = static_cast<int>(
       std::clamp(declare_parameter<int>("navigation_max_reposition_after_yaw_retry", 1), 0L, 3L));
     navigation_reposition_after_yaw_drift_timeout_sec_ = std::clamp(
@@ -503,6 +575,9 @@ public:
       navigation_goal_result_timeout_sec_);
     navigation_final_yaw_align_enable_ =
       declare_parameter<bool>("navigation_final_yaw_align_enable", true);
+    if (!api_final_yaw_align_fallback_enabled_) {
+      navigation_final_yaw_align_enable_ = false;
+    }
     navigation_final_yaw_tolerance_rad_ =
       std::clamp(declare_parameter<double>("navigation_final_yaw_tolerance_rad", 0.05), 0.01, 1.57);
     navigation_final_yaw_align_trigger_rad_ = std::max(
@@ -546,7 +621,7 @@ public:
     navigation_final_yaw_align_zero_cmd_count_ = static_cast<int>(
       std::clamp(declare_parameter<int>("navigation_final_yaw_align_zero_cmd_count", 3), 1L, 10L));
     navigation_lifecycle_check_timeout_sec_ =
-      std::clamp(declare_parameter<double>("navigation_lifecycle_check_timeout_sec", 0.35), 0.05, 3.0);
+      std::clamp(declare_parameter<double>("navigation_lifecycle_check_timeout_sec", 1.5), 0.05, 3.0);
     docking_navigation_start_wait_sec_ =
       std::max(service_timeout_sec_, declare_parameter<double>("docking_navigation_start_wait_sec", 45.0));
     docking_predock_nav_timeout_sec_ =
@@ -660,6 +735,8 @@ public:
       std::clamp(static_cast<int>(declare_parameter<int>("docking_max_retries", 2)), 0, 5);
     predock_yaw_align_enabled_ =
       declare_parameter<bool>("predock_yaw_align_enabled", true);
+    predock_yaw_align_fallback_enabled_ =
+      declare_parameter<bool>("predock_yaw_align_fallback_enabled", true);
     predock_yaw_align_cmd_topic_ =
       declare_parameter<std::string>("predock_yaw_align_cmd_topic", "/cmd_vel_docking");
     if (predock_yaw_align_cmd_topic_ != "/cmd_vel_docking") {
@@ -670,7 +747,7 @@ public:
       predock_yaw_align_cmd_topic_ = "/cmd_vel_docking";
     }
     predock_yaw_align_tolerance_rad_ =
-      std::clamp(declare_parameter<double>("predock_yaw_align_tolerance_rad", 0.035), 0.005, 0.35);
+      std::clamp(declare_parameter<double>("predock_yaw_align_tolerance_rad", 0.105), 0.005, 0.35);
     predock_yaw_align_trigger_rad_ = std::max(
       predock_yaw_align_tolerance_rad_,
       std::clamp(declare_parameter<double>("predock_yaw_align_trigger_rad", 0.08), 0.005, 0.80));
@@ -706,11 +783,27 @@ public:
     fine_docking_entry_max_distance_m_ =
       std::max(0.02, declare_parameter<double>("fine_docking_entry_max_distance_m", docking_predock_pose_max_distance_m_));
     fine_docking_entry_max_yaw_rad_ =
-      std::max(0.005, declare_parameter<double>("fine_docking_entry_max_yaw_rad", 0.12));
+      std::max(0.005, declare_parameter<double>("fine_docking_entry_max_yaw_rad", 0.105));
     fine_docking_entry_max_lateral_m_ =
       std::max(0.005, declare_parameter<double>("fine_docking_entry_max_lateral_m", 0.12));
     fine_docking_retry_on_yaw_reject_ =
       declare_parameter<bool>("fine_docking_retry_on_yaw_reject", true);
+    docking_fine_wait_for_bridge_smoothing_enabled_ =
+      declare_parameter<bool>("docking_fine_wait_for_bridge_smoothing_enabled", true);
+    docking_fine_bridge_smoothing_wait_timeout_ms_ = std::clamp(
+      static_cast<int>(declare_parameter<int>("docking_fine_bridge_smoothing_wait_timeout_ms", 60000)),
+      100,
+      60000);
+    docking_fine_bridge_smoothing_sample_period_ms_ = std::clamp(
+      static_cast<int>(declare_parameter<int>("docking_fine_bridge_smoothing_sample_period_ms", 100)),
+      20,
+      1000);
+    docking_fine_bridge_smoothing_stable_samples_ = std::clamp(
+      static_cast<int>(declare_parameter<int>("docking_fine_bridge_smoothing_stable_samples", 3)),
+      1,
+      20);
+    docking_fine_bridge_smoothing_zero_cmd_during_wait_ =
+      declare_parameter<bool>("docking_fine_bridge_smoothing_zero_cmd_during_wait", true);
     docking_pause_global_correction_during_fine_ =
       declare_parameter<bool>("docking_pause_global_correction_during_fine", true);
     localization_bridge_correction_pause_service_ = declare_parameter<std::string>(
@@ -889,6 +982,7 @@ private:
     std::string updated_at;
     double age_sec{-1.0};
     bool source_bms{false};
+    bool source_charging_session{false};
     bool stale{false};
     bool contradicted_by_live_state{false};
   };
@@ -914,6 +1008,11 @@ private:
     bool dock_contact_latch_contradicted_by_live_state{false};
     bool dock_contact_latch_auto_cleared{false};
     std::string dock_contact_latch_clear_reason;
+    std::string dock_contact_latch_source_strength{"none"};
+    bool charging_session_latched{false};
+    double charging_session_age_sec{-1.0};
+    std::string charging_session_last_confirmed_at;
+    bool full_charge_idle_on_dock{false};
     bool live_docking_state_undocked{false};
     bool live_bms_charging_contact_stable{false};
     bool strong_live_docked{false};
@@ -926,6 +1025,9 @@ private:
     std::string docked_state_class{"UNKNOWN"};
     std::vector<std::string> docked_evidence;
     std::vector<std::string> docked_warnings;
+    std::string dock_occupancy_state{"UNKNOWN"};
+    std::vector<std::string> dock_occupancy_evidence;
+    std::string dock_occupancy_reason{"no_dock_evidence"};
     std::string auto_undock_reason{"not_docked"};
   };
 
@@ -961,6 +1063,21 @@ private:
     std::string started_at;
     std::string completed_at;
     std::string goal_completion_policy{"pose_required"};
+    bool native_nav2_goal_completion{true};
+    bool api_final_yaw_align_enabled{false};
+    bool post_nav2_final_verify_enabled{false};
+    bool post_nav2_final_verify_wait_bridge_smoothing{false};
+    double post_nav2_final_verify_bridge_wait_elapsed_ms{0.0};
+    bool post_nav2_final_verify_bridge_wait_timeout{false};
+    int final_verify_retry_count{0};
+    std::string final_verify_retry_reason;
+    int final_verify_retry_max_count{0};
+    bool final_verify_retry_goal_sent{false};
+    double final_verify_xy_error_m{-1.0};
+    double final_verify_yaw_error_rad{-1.0};
+    bool final_verify_failure_is_terminal{false};
+    bool post_nav2_final_verify_api_velocity_correction_enabled{false};
+    bool nav2_rotation_shim_enabled{true};
     double target_x{0.0};
     double target_y{0.0};
     double target_yaw{0.0};
@@ -1035,6 +1152,15 @@ private:
     std::string detail;
   };
 
+  struct PostNav2BridgeWaitResult
+  {
+    bool waited{false};
+    bool timeout{false};
+    bool canceled{false};
+    double elapsed_ms{0.0};
+    std::string detail;
+  };
+
   struct PredockPoseVerification
   {
     RobotPoseSnapshot pose;
@@ -1042,6 +1168,7 @@ private:
     bool xy_ok{false};
     bool base_yaw_ok{false};
     bool contact_yaw_ok{false};
+    bool contact_frame_available{false};
     double distance_m{-1.0};
     double expected_base_yaw{0.0};
     double expected_contact_yaw{0.0};
@@ -1109,6 +1236,7 @@ private:
     std::string map_odom_latest_source{"none"};
     bool map_odom_state_valid{false};
     bool map_odom_correction_paused{false};
+    std::string correction_pause_reason{"none"};
     bool map_odom_frozen_due_to_pause{false};
     bool publisher_decoupled_from_correction{false};
     bool smoothing_enabled{false};
@@ -1139,6 +1267,7 @@ private:
     bool amcl_static_standby{false};
     bool amcl_tracking_ready{false};
     bool amcl_correction_ready{false};
+    bool amcl_correction_pending{false};
     bool amcl_not_moving_no_update_ok{false};
     bool amcl_scan_admission_enabled{false};
     bool amcl_scan_admission_alive{false};
@@ -1606,6 +1735,24 @@ private:
     return failure_code;
   }
 
+  void record_post_undock_navigation_readiness_failure_locked(
+    const std::string & failure_code,
+    const std::string & detail)
+  {
+    docking_job_.post_undock_navigation_readiness_failed = true;
+    docking_job_.post_undock_navigation_readiness_failure_code = failure_code;
+    docking_job_.post_undock_navigation_readiness_detail = detail;
+    docking_job_.pending_goal_held_for_post_undock_settle = true;
+    docking_job_.pending_goal_released_after_post_undock_settle = false;
+  }
+
+  void clear_post_undock_navigation_readiness_failure_locked()
+  {
+    docking_job_.post_undock_navigation_readiness_failed = false;
+    docking_job_.post_undock_navigation_readiness_failure_code.clear();
+    docking_job_.post_undock_navigation_readiness_detail.clear();
+  }
+
   PostRelocalizationSettleResult wait_for_post_relocalization_settle_barrier(
     const std::uint64_t expected_sequence,
     const std::string & reason,
@@ -1941,6 +2088,14 @@ private:
   double dock_contact_latch_age_sec(const DockContactLatchSnapshot & snapshot) const
   {
     const auto stamp = !snapshot.latched_at.empty() ? snapshot.latched_at : snapshot.updated_at;
+    try {
+      std::size_t parsed = 0U;
+      const double seconds = std::stod(stamp, &parsed);
+      if (parsed == stamp.size() && std::isfinite(seconds)) {
+        return std::max(0.0, wall_time_seconds() - seconds);
+      }
+    } catch (const std::exception &) {
+    }
     const auto stamp_seconds = parse_utc_iso8601_seconds(stamp);
     if (!stamp_seconds) {
       return -1.0;
@@ -1951,6 +2106,7 @@ private:
   void refresh_dock_contact_latch_derived_fields(DockContactLatchSnapshot & snapshot) const
   {
     snapshot.source_bms = latch_source_is_bms(snapshot.source);
+    snapshot.source_charging_session = latch_source_is_charging_session(snapshot.source);
     snapshot.age_sec = dock_contact_latch_age_sec(snapshot);
     snapshot.stale =
       snapshot.valid &&
@@ -2096,13 +2252,13 @@ private:
     (void)stable_duration_sec;
     update_dock_contact_latch(
       true,
-      "bms",
-      "bms_charging_contact:" + charging_contact.reason,
+      "charging_session",
+      "bms_charging_observed:" + charging_contact.reason,
       "",
       "",
       "",
       "",
-      "stable_bms_contact");
+      "charging_session_latch_from_stable_bms_contact");
   }
 
   void handle_bms_state(const sensor_msgs::msg::BatteryState::SharedPtr msg)
@@ -2238,6 +2394,8 @@ private:
       json_bool_value(msg->data, "map_odom_state_valid", false);
     snapshot.map_odom_correction_paused =
       json_bool_value(msg->data, "map_odom_correction_paused", false);
+    snapshot.correction_pause_reason =
+      json_string_value(msg->data, "correction_pause_reason").value_or("none");
     snapshot.map_odom_frozen_due_to_pause =
       json_bool_value(msg->data, "map_odom_frozen_due_to_pause", false);
     snapshot.publisher_decoupled_from_correction =
@@ -2287,6 +2445,8 @@ private:
       json_bool_value(msg->data, "amcl_tracking_ready", false);
     snapshot.amcl_correction_ready =
       json_bool_value(msg->data, "amcl_correction_ready", false);
+    snapshot.amcl_correction_pending =
+      json_bool_value(msg->data, "amcl_correction_pending", false);
     snapshot.amcl_not_moving_no_update_ok =
       json_bool_value(msg->data, "amcl_not_moving_no_update_ok", false);
     snapshot.amcl_scan_admission_enabled =
@@ -2333,9 +2493,11 @@ private:
     return "normal";
   }
 
-  bool bridge_safe_for_goal_start(const std::string & context, std::string & detail) const
+  bool bridge_status_safe_for_goal_start(
+    const BridgeStatusSnapshot & bridge,
+    const std::string & context,
+    std::string & detail) const
   {
-    const auto bridge = bridge_status_snapshot();
     if (!bridge.available) {
       detail = "LOCALIZATION_DEGRADED: bridge_status unavailable before " + context;
       return false;
@@ -2347,6 +2509,34 @@ private:
     if (bridge_localization_degraded_blocks_goal_start(bridge)) {
       detail = "LOCALIZATION_DEGRADED: " +
         (bridge.amcl_degraded_reason.empty() ? std::string("bridge localization degraded") : bridge.amcl_degraded_reason);
+      return false;
+    }
+    const bool amcl_static_pending_is_standby =
+      bridge.amcl_static_standby && bridge.amcl_not_moving_no_update_ok;
+    if (bridge.amcl_input_enabled && bridge.amcl_correction_pending && !amcl_static_pending_is_standby) {
+      std::ostringstream out;
+      out << std::fixed << std::setprecision(3)
+          << "LOCALIZATION_TRANSITION_ACTIVE: AMCL correction pending before "
+          << context
+          << " correction_ready=" << (bridge.amcl_correction_ready ? "true" : "false")
+          << " static_standby=" << (bridge.amcl_static_standby ? "true" : "false")
+          << " tracking_ready=" << (bridge.amcl_tracking_ready ? "true" : "false")
+          << " status_source=" << bridge.amcl_status_source
+          << " status_age_ms=" << bridge.amcl_status_age_ms;
+      detail = out.str();
+      return false;
+    }
+    if (bridge.amcl_input_enabled && bridge.amcl_tracking_ready &&
+      !bridge.amcl_correction_ready && !bridge.amcl_static_standby)
+    {
+      std::ostringstream out;
+      out << std::fixed << std::setprecision(3)
+          << "LOCALIZATION_DEGRADED: AMCL correction not ready before "
+          << context
+          << " static_standby=false"
+          << " status_source=" << bridge.amcl_status_source
+          << " status_age_ms=" << bridge.amcl_status_age_ms;
+      detail = out.str();
       return false;
     }
     if (!bridge.safe_for_goal_start) {
@@ -2363,6 +2553,154 @@ private:
     }
     detail = "bridge safe_for_goal_start=true before " + context;
     return true;
+  }
+
+  bool bridge_safe_for_goal_start(const std::string & context, std::string & detail) const
+  {
+    return bridge_status_safe_for_goal_start(bridge_status_snapshot(), context, detail);
+  }
+
+  bool bridge_detail_is_transition_active(const std::string & detail) const
+  {
+    return detail.rfind("LOCALIZATION_TRANSITION_ACTIVE:", 0) == 0;
+  }
+
+  void update_fine_bridge_settle_job_state(
+    const std::uint64_t job_id,
+    const bool started,
+    const bool complete,
+    const std::string & failure_code,
+    const std::string & detail,
+    const double duration_sec,
+    const BridgeStatusSnapshot & bridge)
+  {
+    std::lock_guard<std::mutex> lock(docking_job_mutex_);
+    if (docking_job_.id != job_id || docking_job_.state != "running") {
+      return;
+    }
+    docking_job_.fine_bridge_settle_started = started;
+    docking_job_.fine_bridge_settle_complete = complete;
+    docking_job_.fine_bridge_settle_failure_code = failure_code;
+    docking_job_.fine_bridge_settle_detail = detail;
+    docking_job_.fine_bridge_settle_duration_sec = duration_sec;
+    docking_job_.fine_bridge_settle_remaining_translation_m =
+      bridge.available ? bridge.remaining_translation_error_m : -1.0;
+    docking_job_.fine_bridge_settle_remaining_yaw_rad =
+      bridge.available ? bridge.remaining_yaw_error_rad : -1.0;
+    docking_job_.detail = detail;
+  }
+
+  bool wait_for_bridge_smoothing_before_fine_docking(
+    const std::uint64_t job_id,
+    std::string & failure_code,
+    std::string & detail)
+  {
+    if (!docking_fine_wait_for_bridge_smoothing_enabled_) {
+      const bool ok = bridge_safe_for_goal_start("docking fine docking", detail);
+      failure_code = ok ? "NONE" : "DOCK_FAILED_LOCALIZATION_NOT_READY";
+      return ok;
+    }
+
+    set_docking_job_phase(job_id, "FINE_DOCKING_BRIDGE_SETTLE");
+    set_docking_runtime_state(
+      true,
+      "FINE_DOCKING_BRIDGE_SETTLE",
+      "waiting for bridge map->odom smoothing before fine docking");
+
+    const auto started = std::chrono::steady_clock::now();
+    const auto deadline = started + std::chrono::milliseconds(docking_fine_bridge_smoothing_wait_timeout_ms_);
+    const auto sample_period = std::chrono::milliseconds(docking_fine_bridge_smoothing_sample_period_ms_);
+    int stable_samples = 0;
+    BridgeStatusSnapshot last_bridge;
+    std::string last_detail;
+
+    while (std::chrono::steady_clock::now() <= deadline) {
+      if (docking_cancel_requested(job_id)) {
+        failure_code = "CANCELLED_BY_APP";
+        detail = "CANCELLED_BY_APP: docking canceled during fine bridge smoothing wait";
+        update_fine_bridge_settle_job_state(
+          job_id,
+          true,
+          false,
+          failure_code,
+          detail,
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(),
+          last_bridge);
+        return false;
+      }
+
+      if (docking_fine_bridge_smoothing_zero_cmd_during_wait_) {
+        clear_teleop_command();
+        publish_teleop_zero();
+        publish_predock_yaw_align_command(geometry_msgs::msg::Twist{});
+      }
+
+      last_bridge = bridge_status_snapshot();
+      std::string sample_detail;
+      const bool safe = bridge_status_safe_for_goal_start(last_bridge, "docking fine docking", sample_detail);
+      last_detail = sample_detail;
+      const double elapsed_sec =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+      if (safe) {
+        ++stable_samples;
+        std::ostringstream progress;
+        progress << "bridge smoothing settled before docking fine docking"
+                 << " stable_samples=" << stable_samples << "/"
+                 << docking_fine_bridge_smoothing_stable_samples_
+                 << " elapsed_sec=" << std::fixed << std::setprecision(3) << elapsed_sec
+                 << "; " << sample_detail;
+        update_fine_bridge_settle_job_state(
+          job_id,
+          true,
+          stable_samples >= docking_fine_bridge_smoothing_stable_samples_,
+          "",
+          progress.str(),
+          elapsed_sec,
+          last_bridge);
+        if (stable_samples >= docking_fine_bridge_smoothing_stable_samples_) {
+          failure_code = "NONE";
+          detail = progress.str();
+          return true;
+        }
+      } else {
+        stable_samples = 0;
+        update_fine_bridge_settle_job_state(
+          job_id,
+          true,
+          false,
+          "",
+          sample_detail,
+          elapsed_sec,
+          last_bridge);
+        if (!bridge_detail_is_transition_active(sample_detail)) {
+          failure_code = "DOCK_FAILED_LOCALIZATION_NOT_READY";
+          detail = sample_detail;
+          return false;
+        }
+      }
+      std::this_thread::sleep_for(sample_period);
+    }
+
+    failure_code = "DOCK_FAILED_FINE_LOCALIZATION_TRANSITION_TIMEOUT";
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(3)
+        << "bridge smoothing did not settle before docking fine docking"
+        << " timeout_ms=" << docking_fine_bridge_smoothing_wait_timeout_ms_
+        << " remaining_translation=" << last_bridge.remaining_translation_error_m
+        << " remaining_yaw=" << last_bridge.remaining_yaw_error_rad
+        << " current_sequence=" << last_bridge.current_sequence
+        << " target_sequence=" << last_bridge.target_sequence
+        << " last_detail=" << last_detail;
+    detail = out.str();
+    update_fine_bridge_settle_job_state(
+      job_id,
+      true,
+      false,
+      failure_code,
+      detail,
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(),
+      last_bridge);
+    return false;
   }
 
   bool bridge_localization_degraded_blocks_goal_start(const BridgeStatusSnapshot & bridge) const
@@ -2759,6 +3097,22 @@ private:
     return snapshot;
   }
 
+  NavigationLifecycleSnapshot navigation_goal_admission_snapshot()
+  {
+    NavigationLifecycleSnapshot snapshot;
+    const bool action_ready =
+      navigate_to_pose_client_ && navigate_to_pose_client_->action_server_is_ready();
+    if (action_ready) {
+      snapshot.active = true;
+      snapshot.detail =
+        "navigation action server ready; lifecycle service probes are diagnostics only";
+    } else {
+      snapshot.active = false;
+      snapshot.detail = "navigation action server unavailable: " + navigate_to_pose_action_;
+    }
+    return snapshot;
+  }
+
   double normalizeYawError(const double yaw_error) const
   {
     return normalize_angle(yaw_error);
@@ -2767,6 +3121,11 @@ private:
   double computeExpectedStagingYaw(const DockingJob & job) const
   {
     return normalize_angle(job.approach_yaw);
+  }
+
+  bool predock_yaw_align_fallback_allowed() const
+  {
+    return predock_yaw_align_enabled_ && predock_yaw_align_fallback_enabled_;
   }
 
   double computePredockYawError(const double current_base_yaw, const double expected_base_yaw) const
@@ -2793,6 +3152,7 @@ private:
     }
     check.pose_available = true;
     check.current_base_yaw = normalize_angle(check.pose.yaw);
+    check.contact_frame_available = false;
     check.current_contact_yaw = check.current_base_yaw;
 
     const double dx = check.pose.x - job.approach_x;
@@ -2815,6 +3175,13 @@ private:
         << " yaw_tolerance=" << predock_yaw_align_tolerance_rad_
         << " pose=(" << check.pose.x << "," << check.pose.y << "," << check.pose.yaw << ")"
         << " approach=(" << job.approach_x << "," << job.approach_y << "," << job.approach_yaw << ")"
+        << " dock_insertion_yaw_map=" << job.dock_yaw
+        << " expected_base_yaw_at_predock=" << check.expected_base_yaw
+        << " expected_contact_yaw_at_predock=" << check.expected_contact_yaw
+        << " current_base_yaw_map=" << check.current_base_yaw
+        << " current_contact_yaw_map=" << check.current_contact_yaw
+        << " reverse_yaw_offset_applied=" << (job.reverse_yaw_offset_applied ? "true" : "false")
+        << " contact_frame_available=" << (check.contact_frame_available ? "true" : "false")
         << " contact_yaw_source=base_link_aligned_" << job.contact_frame;
     check.detail = out.str();
     return check;
@@ -2843,10 +3210,15 @@ private:
     if (docking_job_.id != job_id || docking_job_.state != "running") {
       return;
     }
-    docking_job_.predock_pose_verified = check.pose_available;
+    const bool verified =
+      check.pose_available && check.xy_ok && check.base_yaw_ok && check.contact_yaw_ok;
+    docking_job_.predock_pose_verified = verified;
     docking_job_.predock_xy_ok = check.xy_ok;
     docking_job_.predock_base_yaw_ok = check.base_yaw_ok;
     docking_job_.predock_contact_yaw_ok = check.contact_yaw_ok;
+    docking_job_.predock_yaw_verified_by_nav2 =
+      verified && docking_job_.nav_goal_succeeded && !docking_job_.predock_yaw_align_attempted;
+    docking_job_.contact_frame_available = check.contact_frame_available;
     docking_job_.predock_distance_m = check.distance_m;
     docking_job_.predock_expected_base_yaw = check.expected_base_yaw;
     docking_job_.predock_expected_contact_yaw = check.expected_contact_yaw;
@@ -2866,7 +3238,7 @@ private:
       return;
     }
     docking_job_.predock_yaw_align_attempted = result.attempted;
-    docking_job_.predock_yaw_align_succeeded = result.succeeded;
+    docking_job_.predock_yaw_align_succeeded = result.attempted && result.succeeded;
     docking_job_.predock_yaw_aligned = result.succeeded;
     docking_job_.predock_yaw_align_required_actual_spin = result.actual_spin_required;
     docking_job_.predock_yaw_align_initial_error_rad = result.initial_error_rad;
@@ -2875,6 +3247,9 @@ private:
     docking_job_.predock_yaw_align_observed_yaw_motion_rad = result.observed_yaw_motion_rad;
     docking_job_.predock_yaw_align_detail = result.detail;
     docking_job_.predock_yaw_align_failure_code = result.succeeded ? "" : result.failure_code;
+    if (result.attempted) {
+      docking_job_.predock_yaw_verified_by_nav2 = false;
+    }
     if (!result.succeeded) {
       docking_job_.last_error_code = result.failure_code;
       docking_job_.last_error_detail = result.detail;
@@ -2912,14 +3287,25 @@ private:
     const std::string & code,
     const std::string & detail)
   {
-    std::lock_guard<std::mutex> lock(docking_job_mutex_);
-    if (docking_job_.id != job_id) {
-      return;
+    bool release_pause_after_finish = false;
+    {
+      std::lock_guard<std::mutex> lock(docking_job_mutex_);
+      if (docking_job_.id != job_id) {
+        return;
+      }
+      docking_job_.failure_code = code;
+      docking_job_.last_error_code = code;
+      docking_job_.last_error_detail = detail;
+      release_pause_after_finish = finish_docking_job_locked(false, "failed", code + ": " + detail);
     }
-    docking_job_.failure_code = code;
-    docking_job_.last_error_code = code;
-    docking_job_.last_error_detail = detail;
-    finish_docking_job_locked(false, "failed", code + ": " + detail);
+    if (release_pause_after_finish) {
+      std::string release_detail;
+      (void)set_global_correction_paused_for_docking(
+        job_id,
+        false,
+        "docking_job_finished_" + code,
+        release_detail);
+    }
   }
 
   void publish_predock_yaw_align_command(const geometry_msgs::msg::Twist & twist)
@@ -3004,6 +3390,76 @@ private:
     return ok;
   }
 
+  static bool docking_phase_owns_fine_correction_pause(const std::string & phase)
+  {
+    return phase == "FINE_DOCKING_ENTRY_CHECK" ||
+      phase == "FINE_ALIGN" ||
+      phase == "fine_docking" ||
+      phase == "relocalize_after_fine_docking";
+  }
+
+  static bool bridge_status_has_docking_fine_pause(const BridgeStatusSnapshot & bridge)
+  {
+    return bridge.available &&
+      (bridge.map_odom_correction_paused || bridge.map_odom_frozen_due_to_pause) &&
+      bridge.correction_pause_reason == "docking_fine";
+  }
+
+  bool release_stale_docking_fine_pause_if_needed(
+    const std::string & context,
+    std::string & detail)
+  {
+    const auto bridge = bridge_status_snapshot();
+    const bool bridge_has_fine_pause = bridge_status_has_docking_fine_pause(bridge);
+    std::uint64_t job_id = 0U;
+    bool job_has_pause = false;
+    bool active_fine_owner = false;
+    std::string state;
+    std::string phase;
+    {
+      std::lock_guard<std::mutex> lock(docking_job_mutex_);
+      job_id = docking_job_.id;
+      job_has_pause = docking_job_.global_correction_paused;
+      state = docking_job_.state;
+      phase = docking_job_.phase;
+      active_fine_owner = docking_job_.state == "running" &&
+        docking_job_.global_correction_paused &&
+        docking_phase_owns_fine_correction_pause(docking_job_.phase);
+    }
+
+    if (active_fine_owner) {
+      detail = "active docking fine job still owns global correction pause before " + context +
+        " state=" + state + " phase=" + phase;
+      return false;
+    }
+    if (!job_has_pause && !bridge_has_fine_pause) {
+      detail = "no stale docking_fine correction pause before " + context;
+      return true;
+    }
+
+    std::string release_detail;
+    const bool ok = set_global_correction_paused_for_docking(
+      job_id,
+      false,
+      "stale_docking_fine_pause_" + context,
+      release_detail);
+    std::ostringstream out;
+    out << "stale docking_fine correction pause cleanup before " << context
+        << " ok=" << (ok ? "true" : "false")
+        << " job_had_pause=" << (job_has_pause ? "true" : "false")
+        << " bridge_had_pause=" << (bridge_has_fine_pause ? "true" : "false")
+        << " state=" << state
+        << " phase=" << phase
+        << " detail=" << release_detail;
+    detail = out.str();
+    if (ok) {
+      RCLCPP_WARN(get_logger(), "%s", detail.c_str());
+    } else {
+      RCLCPP_ERROR(get_logger(), "%s", detail.c_str());
+    }
+    return ok;
+  }
+
   PredockYawAlignResult run_predock_yaw_align(
     const std::uint64_t job_id,
     const double expected_yaw,
@@ -3014,11 +3470,11 @@ private:
     result.actual_spin_required = predock_yaw_align_require_actual_spin_;
     result.initial_error_rad = initial_check.base_yaw_error_rad;
     result.final_error_rad = initial_check.base_yaw_error_rad;
-    if (!predock_yaw_align_enabled_) {
+    if (!predock_yaw_align_fallback_allowed()) {
       result.succeeded = result.final_error_rad <= predock_yaw_align_trigger_rad_;
-      result.failure_code = result.succeeded ? "NONE" : "PREDOCK_YAW_NOT_ALIGNED";
-      result.detail = result.succeeded ? "predock yaw align disabled; yaw already within trigger" :
-        "predock yaw align disabled and yaw is outside trigger";
+      result.failure_code = result.succeeded ? "NONE" : "PREDOCK_YAW_NOT_ALIGNED_AFTER_NAV2";
+      result.detail = result.succeeded ? "predock yaw align fallback disabled; yaw already within trigger" :
+        "predock yaw align fallback disabled; Nav2 native predock goal did not finish within yaw tolerance";
       return result;
     }
     if (!initial_check.pose_available) {
@@ -3256,6 +3712,7 @@ private:
       std::fabs(-std::sin(approach_yaw) * dx + std::cos(approach_yaw) * dy) : -1.0;
     std::string current_policy = job.goal_completion_policy;
     bool dock_staging_handoff_ready = job.dock_staging_handoff_ready;
+    bool predock_pose_verified = job.predock_pose_verified;
     bool post_predock_settle_complete = job.post_predock_settle_complete;
     bool global_correction_pause_applied = job.global_correction_paused;
     {
@@ -3263,6 +3720,7 @@ private:
       if (docking_job_.id == job.id) {
         current_policy = docking_job_.goal_completion_policy;
         dock_staging_handoff_ready = docking_job_.dock_staging_handoff_ready;
+        predock_pose_verified = docking_job_.predock_pose_verified;
         post_predock_settle_complete = docking_job_.post_predock_settle_complete;
         global_correction_pause_applied = docking_job_.global_correction_paused;
       }
@@ -3273,6 +3731,7 @@ private:
         << "fine docking entry check"
         << " goal_completion_policy=" << current_policy
         << " dock_staging_handoff_ready=" << (dock_staging_handoff_ready ? "true" : "false")
+        << " predock_pose_verified=" << (predock_pose_verified ? "true" : "false")
         << " post_predock_settle_complete=" << (post_predock_settle_complete ? "true" : "false")
         << " global_correction_pause_applied=" << (global_correction_pause_applied ? "true" : "false")
         << " pose_available=" << (check.pose_available ? "true" : "false")
@@ -3289,7 +3748,7 @@ private:
       failure_code = "FINE_DOCKING_ENTRY_CONDITION_FAILED";
       return false;
     }
-    if (!dock_staging_handoff_ready || !post_predock_settle_complete) {
+    if (!dock_staging_handoff_ready || !predock_pose_verified || !post_predock_settle_complete) {
       failure_code = "FINE_DOCKING_ENTRY_CONDITION_FAILED";
       return false;
     }
@@ -4098,6 +4557,14 @@ private:
     const bool effective_amcl_ready =
       bridge_amcl_available ? bridge_status.amcl_ready :
       (amcl_file_authoritative && amcl_status.ready);
+    const bool effective_amcl_correction_ready =
+      bridge_amcl_available ? bridge_status.amcl_correction_ready :
+      (amcl_file_authoritative && amcl_status.correction_ready);
+    const bool effective_amcl_correction_pending =
+      bridge_amcl_available ? bridge_status.amcl_correction_pending :
+      ((amcl_status.available && amcl_status.mode != "disabled") &&
+      effective_amcl_ready &&
+      !effective_amcl_correction_ready);
     const bool effective_amcl_degraded =
       bridge_amcl_available ? bridge_status.localization_degraded :
       (amcl_file_authoritative && (amcl_status.degraded || !amcl_status.ready));
@@ -4116,10 +4583,11 @@ private:
       !effective_amcl_ready;
     const std::string localization_degraded_reason =
       localization_degraded ? effective_amcl_degraded_reason : std::string();
+    std::string bridge_goal_start_detail;
+    const bool effective_safe_for_goal_start =
+      bridge_status_safe_for_goal_start(bridge_status, "status", bridge_goal_start_detail);
     const bool localization_recovery_required =
-      !bridge_status.available ||
-      bridge_localization_degraded_blocks_goal_start(bridge_status) ||
-      !bridge_status.safe_for_goal_start;
+      !effective_safe_for_goal_start && !bridge_detail_is_transition_active(bridge_goal_start_detail);
     bool live_mapping_map_available = false;
     double live_mapping_map_age_sec = 0.0;
     std::uint32_t live_mapping_map_width = 0U;
@@ -4264,6 +4732,8 @@ private:
     body << "\"amcl_correction_ready\":" << ((
       bridge_amcl_available ? bridge_status.amcl_correction_ready : amcl_status.correction_ready
     ) ? "true" : "false") << ",";
+    body << "\"amcl_correction_pending\":"
+         << (effective_amcl_correction_pending ? "true" : "false") << ",";
     body << "\"amcl_not_moving_no_update_ok\":" << ((
       bridge_amcl_available ?
         bridge_status.amcl_not_moving_no_update_ok :
@@ -4280,7 +4750,8 @@ private:
     body << "\"using_triggered_baseline_only\":"
          << (using_triggered_baseline_only ? "true" : "false") << ",";
     body << "\"safe_for_goal_start\":"
-         << (bridge_status.available && bridge_status.safe_for_goal_start ? "true" : "false") << ",";
+         << (effective_safe_for_goal_start ? "true" : "false") << ",";
+    body << "\"goal_start_detail\":" << json_string(bridge_goal_start_detail) << ",";
     body << "\"correction_active\":"
          << (bridge_status.available && bridge_status.correction_active ? "true" : "false") << ",";
     body << "\"smoothing_enabled\":"
@@ -4359,6 +4830,22 @@ private:
   HttpResponse handle_robot_pose(const HttpRequest & request)
   {
     (void)request;
+    const auto runtime_context = read_runtime_map_context();
+    if (runtime_context &&
+      (!runtime_context->confirmed || runtime_context->state == "starting" ||
+      runtime_context->state == "failed"))
+    {
+      std::string detail = "runtime map context is not ready: state=" + runtime_context->state;
+      if (!runtime_context->startup_stage.empty()) {
+        detail += " startup_stage=" + runtime_context->startup_stage;
+      }
+      if (!runtime_context->message.empty()) {
+        detail += " message=" + runtime_context->message;
+      }
+      return {503, "application/json", no_fresh_map_robot_pose_json(
+          tf_map_frame_, tf_base_frame_, detail)};
+    }
+
     std::string error;
     const auto pose = wait_for_current_robot_pose(true, error);
     if (!pose.available) {
@@ -4498,13 +4985,15 @@ private:
     const MapManifest & manifest,
     const std::string & state,
     const bool confirmed,
-    const std::string & message) const
+    const std::string & message,
+    const std::string & startup_stage = "") const
   {
     if (runtime_map_context_file_.empty()) {
       return;
     }
     write_runtime_map_context_file(
-      fs::path(runtime_map_context_file_), manifest, state, confirmed, message, wall_time_seconds());
+      fs::path(runtime_map_context_file_), manifest, state, confirmed, message, wall_time_seconds(),
+      startup_stage);
   }
 
   std::optional<RuntimeMapContext> read_runtime_map_context() const
@@ -5947,6 +6436,26 @@ private:
            context.floor_id == floor_id;
   }
 
+  bool runtime_context_same_resume_request(
+    const RuntimeMapContext & context,
+    const std::string & building_id,
+    const std::string & floor_id,
+    const MapManifest & selected_map) const
+  {
+    return context.map_id == selected_map.map_id &&
+           context.building_id == building_id &&
+           context.floor_id == floor_id;
+  }
+
+  bool runtime_context_starting_is_fresh(const RuntimeMapContext & context) const
+  {
+    if (context.state != "starting" || context.updated_at_sec <= 0.0) {
+      return false;
+    }
+    const double age_sec = wall_time_seconds() - context.updated_at_sec;
+    return age_sec >= 0.0 && age_sec <= navigation_resume_starting_context_ttl_sec_;
+  }
+
   HttpResponse handle_resume_floor_navigation(
     const std::string & building_id,
     const std::string & floor_id,
@@ -5970,13 +6479,14 @@ private:
     const auto existing_context = selected_map ? read_runtime_map_context() : std::nullopt;
     const bool navigate_action_ready =
       navigate_to_pose_client_ && navigate_to_pose_client_->action_server_is_ready();
-    const auto lifecycle = navigation_lifecycle_snapshot();
-    if (selected_map && existing_context &&
-      runtime_context_matches_resume_request(*existing_context, building_id, floor_id, *selected_map))
+    const auto lifecycle = navigation_goal_admission_snapshot();
+    if (selected_map && existing_context && runtime_context_same_resume_request(
+        *existing_context, building_id, floor_id, *selected_map))
     {
-      if (!existing_resume_process_running && !navigate_action_ready && !lifecycle.active) {
-        terminate_navigation_resume_process_locked();
-      } else {
+      const bool context_ready = runtime_context_matches_resume_request(
+        *existing_context, building_id, floor_id, *selected_map);
+      const bool context_starting_fresh = runtime_context_starting_is_fresh(*existing_context);
+      if (context_ready && (existing_resume_process_running || navigate_action_ready || lifecycle.active)) {
         try {
           write_last_navigation_map_selection(*selected_map, "navigation_runtime_reused");
         } catch (const std::exception & exc) {
@@ -6004,6 +6514,34 @@ private:
              << "\"log_file\":" << json_string(navigation_resume_log_file_) << "}";
         return {200, "application/json", body.str()};
       }
+      if (context_starting_fresh) {
+        try {
+          write_last_navigation_map_selection(*selected_map, "navigation_runtime_starting_reused");
+        } catch (const std::exception & exc) {
+          return {500, "application/json", error_json(exc.what())};
+        }
+        const std::string detail = existing_context->message.empty() ?
+          "resident navigation runtime already starting for selected floor" :
+          existing_context->message;
+        set_navigation_runtime_state(true, "starting", detail, false);
+
+        std::ostringstream body;
+        body << "{\"ok\":true,"
+             << "\"state\":\"navigation_runtime_starting_reused\","
+             << "\"pid\":" << navigation_resume_pid_ << ","
+             << "\"building_id\":" << json_string(building_id) << ","
+             << "\"floor_id\":" << json_string(floor_id) << ","
+             << "\"map_id\":" << json_string(selected_map->map_id) << ","
+             << "\"display_name\":" << json_string(selected_map->display_name) << ","
+             << "\"resume_navigation\":true,"
+             << "\"reused\":true,"
+             << "\"external_runtime\":" << (existing_resume_process_running ? "false" : "true") << ","
+             << "\"nav_map_yaml\":" << json_string(assets.nav_map_yaml.string()) << ","
+             << "\"localizer_map_png\":" << json_string(assets.localizer_map_png.string()) << ","
+             << "\"localizer_params_yaml\":" << json_string(assets.localizer_params_yaml.string()) << ","
+             << "\"log_file\":" << json_string(navigation_resume_log_file_) << "}";
+        return {202, "application/json", body.str()};
+      }
     }
 
     terminate_navigation_resume_process_locked();
@@ -6024,6 +6562,7 @@ private:
     if (pid == 0) {
       prepare_child_process(navigation_resume_log_file_);
       ::setenv("NJRH_AMCL_RUNTIME_STATUS_FILE", amcl_runtime_status_file_.c_str(), 1);
+      ::setenv("NJRH_NAVIGATION_RESUME_LOG_FILE", navigation_resume_log_file_.c_str(), 1);
       if (selected_map) {
         ::setenv("NJRH_RUNTIME_MAP_CONTEXT_FILE", runtime_map_context_file_.c_str(), 1);
         ::setenv("NJRH_MAP_ID", selected_map->map_id.c_str(), 1);
@@ -6756,7 +7295,7 @@ private:
       request.query.find("theta") != request.query.end();
 
     const auto dock_check = pre_navigation_dock_check_snapshot();
-    const auto lifecycle = navigation_lifecycle_snapshot();
+    const auto lifecycle = navigation_goal_admission_snapshot();
 
     bool pose_requested = by_pose_id;
     bool pose_ok = false;
@@ -6915,6 +7454,7 @@ private:
     RCLCPP_INFO(
       get_logger(),
       "pre_navigation dock gate source=%s pose_id=%s auto_undock_required=%s can_auto_undock=%s reason=%s "
+      "dock_occupancy_state=%s dock_occupancy_reason=%s "
       "bms_contact=%s bms_stable=%s latch_docked=%s latch_source=%s latch_age=%.3f latch_stale=%s "
       "latch_contradicted=%s latch_valid=%s strong_live_docked=%s docking_state=%s docking_status=%s",
       by_pose_id ? "pose_id" : "direct_pose",
@@ -6922,6 +7462,8 @@ private:
       pre_navigation_dock_check.final_auto_undock_required ? "true" : "false",
       pre_navigation_dock_check.can_auto_undock ? "true" : "false",
       pre_navigation_dock_check.auto_undock_reason.c_str(),
+      pre_navigation_dock_check.dock_occupancy_state.c_str(),
+      pre_navigation_dock_check.dock_occupancy_reason.c_str(),
       pre_navigation_dock_check.bms.contact ? "true" : "false",
       pre_navigation_dock_check.live_bms_charging_contact_stable ? "true" : "false",
       pre_navigation_dock_check.dock_latch_indicates_docked ? "true" : "false",
@@ -7044,19 +7586,14 @@ private:
         pre_navigation_undock_detail,
         pre_navigation_undock))
     {
+      const bool undocked_but_not_ready =
+        pre_navigation_undock_detail.find("post-undock navigation readiness failed") != std::string::npos;
       return navigation_goal_error(
         409,
-        "navigation requires successful undock first: " + pre_navigation_undock_detail,
-        pre_navigation_undock,
-        pre_navigation_undock_detail);
-    }
-
-    const auto lifecycle = navigation_lifecycle_snapshot();
-    if (!lifecycle.active) {
-      set_navigation_runtime_state(true, "degraded", lifecycle.detail, false);
-      return navigation_goal_error(
-        503,
-        lifecycle.detail,
+        std::string(
+          undocked_but_not_ready ?
+          "navigation requires post-undock localization readiness before goal start: " :
+          "navigation requires successful undock first: ") + pre_navigation_undock_detail,
         pre_navigation_undock,
         pre_navigation_undock_detail);
     }
@@ -7073,7 +7610,12 @@ private:
     }
     std::string bridge_goal_start_detail;
     if (!bridge_safe_for_goal_start("navigation goal", bridge_goal_start_detail)) {
-      set_navigation_runtime_state(true, "localization_recovery_required", bridge_goal_start_detail, false);
+      const bool transition_active = bridge_detail_is_transition_active(bridge_goal_start_detail);
+      set_navigation_runtime_state(
+        true,
+        transition_active ? "localization_transition_active" : "localization_recovery_required",
+        bridge_goal_start_detail,
+        transition_active);
       return navigation_goal_error(
         409,
         bridge_goal_start_detail,
@@ -7154,6 +7696,19 @@ private:
       navigation_goal_job_.building_id = building_id.value_or("");
       navigation_goal_job_.floor_id = floor_id.value_or("");
       navigation_goal_job_.goal_completion_policy = goal_completion_policy;
+      navigation_goal_job_.native_nav2_goal_completion =
+        goal_completion_policy == "pose_required" && nav2_native_goal_completion_enabled_;
+      navigation_goal_job_.api_final_yaw_align_enabled =
+        goal_completion_policy == "pose_required" &&
+        api_final_yaw_align_fallback_enabled_ &&
+        navigation_final_yaw_align_enable_;
+      navigation_goal_job_.post_nav2_final_verify_enabled = post_nav2_final_verify_enabled_;
+      navigation_goal_job_.post_nav2_final_verify_wait_bridge_smoothing =
+        post_nav2_final_verify_wait_bridge_smoothing_;
+      navigation_goal_job_.final_verify_retry_max_count = post_nav2_final_verify_max_retry_count_;
+      navigation_goal_job_.post_nav2_final_verify_api_velocity_correction_enabled =
+        post_nav2_final_verify_api_velocity_correction_enabled_;
+      navigation_goal_job_.nav2_rotation_shim_enabled = nav2_rotation_shim_enabled_;
       navigation_goal_job_.target_x = target.x;
       navigation_goal_job_.target_y = target.y;
       navigation_goal_job_.target_yaw = target.yaw;
@@ -7204,6 +7759,15 @@ private:
              << "\"action\":" << json_string(navigate_to_pose_action_) << ","
              << "\"source\":" << json_string(target_source) << ","
              << "\"goal_completion_policy\":" << json_string(goal_completion_policy) << ","
+             << "\"native_nav2_goal_completion\":"
+             << ((goal_completion_policy == "pose_required" && nav2_native_goal_completion_enabled_) ?
+               "true" : "false") << ","
+             << "\"api_final_yaw_align_enabled\":"
+             << ((goal_completion_policy == "pose_required" &&
+               api_final_yaw_align_fallback_enabled_ &&
+               navigation_final_yaw_align_enable_) ? "true" : "false") << ","
+             << "\"nav2_rotation_shim_enabled\":"
+             << (nav2_rotation_shim_enabled_ ? "true" : "false") << ","
              << "\"frame_id\":" << json_string(frame_id) << ","
              << "\"pose_id\":" << json_string(by_pose_id ? pose_id : "") << ",";
     if (building_id) {
@@ -7270,6 +7834,12 @@ private:
         detail = "cannot auto-undock while docking job is running";
         return false;
       }
+    }
+
+    std::string stale_pause_detail;
+    if (!release_stale_docking_fine_pause_if_needed("pre_navigation_undock_start", stale_pause_detail)) {
+      detail = stale_pause_detail;
+      return false;
     }
 
     join_docking_worker();
@@ -7402,8 +7972,13 @@ private:
             docking_job_.pending_goal_released_after_post_undock_settle = true;
             return true;
           }
-          detail = "undocked before navigation but post-undock relocalization did not complete: " +
+          const std::string readiness_detail =
+            !docking_job_.post_undock_navigation_readiness_detail.empty() ?
+            docking_job_.post_undock_navigation_readiness_detail :
             docking_job_.post_undock_relocalization_detail;
+          detail =
+            "undocked before navigation; post-undock navigation readiness failed, Nav2 goal not sent: " +
+            readiness_detail;
           return false;
         }
         if (docking_job_.state == "failed") {
@@ -7713,6 +8288,31 @@ private:
         << ",\"started_at\":" << json_string(job.started_at)
         << ",\"completed_at\":" << json_string(job.completed_at)
         << ",\"goal_completion_policy\":" << json_string(job.goal_completion_policy)
+        << ",\"native_nav2_goal_completion\":"
+        << (job.native_nav2_goal_completion ? "true" : "false")
+        << ",\"api_final_yaw_align_enabled\":"
+        << (job.api_final_yaw_align_enabled ? "true" : "false")
+        << ",\"post_nav2_final_verify_enabled\":"
+        << (job.post_nav2_final_verify_enabled ? "true" : "false")
+        << ",\"post_nav2_final_verify_wait_bridge_smoothing\":"
+        << (job.post_nav2_final_verify_wait_bridge_smoothing ? "true" : "false")
+        << ",\"post_nav2_final_verify_bridge_wait_elapsed_ms\":"
+        << job.post_nav2_final_verify_bridge_wait_elapsed_ms
+        << ",\"post_nav2_final_verify_bridge_wait_timeout\":"
+        << (job.post_nav2_final_verify_bridge_wait_timeout ? "true" : "false")
+        << ",\"final_verify_retry_count\":" << job.final_verify_retry_count
+        << ",\"final_verify_retry_reason\":" << json_string(job.final_verify_retry_reason)
+        << ",\"final_verify_retry_max_count\":" << job.final_verify_retry_max_count
+        << ",\"final_verify_retry_goal_sent\":"
+        << (job.final_verify_retry_goal_sent ? "true" : "false")
+        << ",\"final_verify_xy_error_m\":" << job.final_verify_xy_error_m
+        << ",\"final_verify_yaw_error_rad\":" << job.final_verify_yaw_error_rad
+        << ",\"final_verify_failure_is_terminal\":"
+        << (job.final_verify_failure_is_terminal ? "true" : "false")
+        << ",\"api_velocity_correction_enabled\":"
+        << (job.post_nav2_final_verify_api_velocity_correction_enabled ? "true" : "false")
+        << ",\"nav2_rotation_shim_enabled\":"
+        << (job.nav2_rotation_shim_enabled ? "true" : "false")
         << ",\"target\":{\"x\":" << job.target_x
         << ",\"y\":" << job.target_y
         << ",\"yaw\":" << job.target_yaw << "}"
@@ -7808,6 +8408,8 @@ private:
       navigation_goal_job_.yaw_align_failed =
         final_yaw_align_requested && !final_yaw_align_succeeded && !canceled;
       navigation_goal_job_.task_complete = succeeded && phase == "final_pose_verified";
+      navigation_goal_job_.final_verify_failure_is_terminal =
+        !succeeded && !canceled && phase == "failed_final_pose_verify";
       navigation_goal_job_.ordinary_final_yaw_align_active = false;
     }
     {
@@ -7942,8 +8544,300 @@ private:
     }
     navigation_goal_job_.final_distance_m = check.distance_m;
     navigation_goal_job_.final_yaw_error_rad = check.yaw_error_rad;
+    navigation_goal_job_.final_verify_xy_error_m = check.distance_m;
+    navigation_goal_job_.final_verify_yaw_error_rad = check.yaw_error_rad;
     navigation_goal_job_.position_reached = check.position_reached;
     navigation_goal_job_.final_pose_verify_reason = reason.empty() ? check.reason : reason;
+  }
+
+  void update_post_nav2_bridge_wait_fields(
+    const std::uint64_t job_id,
+    const PostNav2BridgeWaitResult & result)
+  {
+    std::lock_guard<std::mutex> lock(navigation_goal_job_mutex_);
+    if (navigation_goal_job_.id != job_id) {
+      return;
+    }
+    navigation_goal_job_.post_nav2_final_verify_bridge_wait_elapsed_ms = result.elapsed_ms;
+    navigation_goal_job_.post_nav2_final_verify_bridge_wait_timeout = result.timeout;
+    if (!result.detail.empty()) {
+      navigation_goal_job_.detail = result.detail;
+    }
+  }
+
+  PostNav2BridgeWaitResult wait_for_bridge_smoothing_before_final_verify(
+    const std::uint64_t job_id)
+  {
+    PostNav2BridgeWaitResult result;
+    if (!post_nav2_final_verify_enabled_ || !post_nav2_final_verify_wait_bridge_smoothing_) {
+      result.detail = "post-Nav2 final verification bridge smoothing wait disabled";
+      update_post_nav2_bridge_wait_fields(job_id, result);
+      return result;
+    }
+
+    result.waited = true;
+    {
+      std::lock_guard<std::mutex> lock(navigation_goal_job_mutex_);
+      if (navigation_goal_job_.id == job_id && navigation_goal_job_.state == "running") {
+        navigation_goal_job_.phase = "post_nav2_final_verify_wait_bridge_smoothing";
+        navigation_goal_job_.detail = "waiting for bridge map->odom smoothing before final pose verify";
+      }
+    }
+
+    const auto started = std::chrono::steady_clock::now();
+    const auto deadline = started + std::chrono::milliseconds(
+      post_nav2_final_verify_bridge_wait_timeout_ms_);
+    const auto sample_period = std::chrono::milliseconds(
+      post_nav2_final_verify_bridge_wait_sample_period_ms_);
+    std::string last_detail;
+
+    while (std::chrono::steady_clock::now() <= deadline) {
+      std::string cancel_detail;
+      if (navigation_goal_cancel_requested(job_id, cancel_detail)) {
+        result.canceled = true;
+        result.detail =
+          "navigation goal canceled during post-Nav2 bridge smoothing wait: " + cancel_detail;
+        result.elapsed_ms =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+        update_post_nav2_bridge_wait_fields(job_id, result);
+        return result;
+      }
+
+      geometry_msgs::msg::Twist zero;
+      publish_final_yaw_align_command(zero);
+
+      const auto bridge = bridge_status_snapshot();
+      std::string sample_detail;
+      if (bridge_status_safe_for_goal_start(bridge, "post-Nav2 final verification", sample_detail)) {
+        result.elapsed_ms =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(3)
+            << "bridge smoothing settled before post-Nav2 final pose verify"
+            << " elapsed_ms=" << result.elapsed_ms
+            << "; " << sample_detail;
+        result.detail = out.str();
+        update_post_nav2_bridge_wait_fields(job_id, result);
+        return result;
+      }
+      last_detail = sample_detail;
+      std::this_thread::sleep_for(sample_period);
+    }
+
+    result.timeout = true;
+    result.elapsed_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(3)
+        << "bridge smoothing wait timed out before post-Nav2 final pose verify"
+        << " timeout_ms=" << post_nav2_final_verify_bridge_wait_timeout_ms_
+        << " elapsed_ms=" << result.elapsed_ms
+        << " last_detail=" << last_detail;
+    result.detail = out.str();
+    update_post_nav2_bridge_wait_fields(job_id, result);
+    return result;
+  }
+
+  bool post_nav2_final_verify_retry_allowed(
+    const std::uint64_t job_id,
+    const FinalPoseCheck & check,
+    const std::string & goal_completion_policy,
+    std::string & retry_reason,
+    std::string & retry_phase)
+  {
+    retry_reason.clear();
+    retry_phase.clear();
+    if (!post_nav2_final_verify_enabled_ ||
+      !post_nav2_final_verify_retry_uses_same_nav2_goal_ ||
+      !check.pose_available)
+    {
+      return false;
+    }
+    int retry_count = 0;
+    {
+      std::lock_guard<std::mutex> lock(navigation_goal_job_mutex_);
+      if (navigation_goal_job_.id != job_id) {
+        return false;
+      }
+      retry_count = navigation_goal_job_.final_verify_retry_count;
+    }
+    if (retry_count >= post_nav2_final_verify_max_retry_count_) {
+      return false;
+    }
+
+    if (!check.position_reached &&
+      check.distance_m > navigation_goal_position_success_tolerance_m_ &&
+      check.distance_m >= post_nav2_final_verify_xy_retry_min_error_m_ &&
+      check.distance_m <= post_nav2_final_verify_xy_retry_max_error_m_)
+    {
+      retry_reason = "xy_error";
+      retry_phase = "retry_nav2_after_final_verify_xy_error";
+      return true;
+    }
+
+    if (goal_completion_policy == "pose_required" &&
+      post_nav2_final_verify_yaw_retry_if_failed_ &&
+      check.position_reached &&
+      check.yaw_error_rad > navigation_final_yaw_tolerance_rad_)
+    {
+      retry_reason = "yaw_error";
+      retry_phase = "retry_nav2_after_final_verify_yaw_error";
+      return true;
+    }
+    return false;
+  }
+
+  bool post_nav2_final_verify_acceptance_slack_allowed(
+    const std::uint64_t job_id,
+    const FinalPoseCheck & check,
+    std::string & detail)
+  {
+    detail.clear();
+    if (!post_nav2_final_verify_enabled_ || !check.pose_available ||
+      post_nav2_final_verify_acceptance_slack_m_ <= 0.0)
+    {
+      return false;
+    }
+    if (check.position_reached ||
+      check.distance_m <= navigation_goal_position_success_tolerance_m_)
+    {
+      return false;
+    }
+    const double effective_tolerance =
+      navigation_goal_position_success_tolerance_m_ + post_nav2_final_verify_acceptance_slack_m_;
+    if (check.distance_m > effective_tolerance) {
+      return false;
+    }
+
+    int retry_count = 0;
+    {
+      std::lock_guard<std::mutex> lock(navigation_goal_job_mutex_);
+      if (navigation_goal_job_.id != job_id) {
+        return false;
+      }
+      retry_count = navigation_goal_job_.final_verify_retry_count;
+    }
+    if (post_nav2_final_verify_retry_uses_same_nav2_goal_ &&
+      retry_count < post_nav2_final_verify_max_retry_count_)
+    {
+      return false;
+    }
+
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(3)
+        << check.reason
+        << "; accepted after Nav2 retry within post-Nav2 final verify slack"
+        << " effective_position_tolerance=" << effective_tolerance
+        << " base_position_tolerance=" << navigation_goal_position_success_tolerance_m_
+        << " slack=" << post_nav2_final_verify_acceptance_slack_m_
+        << " retry_count=" << retry_count << "/" << post_nav2_final_verify_max_retry_count_;
+    detail = out.str();
+    return true;
+  }
+
+  NavigationRepositionResult run_post_nav2_final_verify_retry(
+    const std::uint64_t job_id,
+    const StoredPose & target,
+    const std::string & retry_reason,
+    const std::string & retry_phase)
+  {
+    NavigationRepositionResult result;
+    result.attempted = true;
+    {
+      std::lock_guard<std::mutex> lock(navigation_goal_job_mutex_);
+      if (navigation_goal_job_.id == job_id) {
+        navigation_goal_job_.phase = retry_phase;
+        navigation_goal_job_.detail =
+          "retrying same Nav2 goal after final pose verify " + retry_reason;
+        navigation_goal_job_.final_verify_retry_reason = retry_reason;
+        navigation_goal_job_.final_verify_retry_goal_sent = false;
+        ++navigation_goal_job_.final_verify_retry_count;
+      }
+    }
+
+    NavigateToPose::Goal goal;
+    goal.pose.header.frame_id = "map";
+    goal.pose.header.stamp = now();
+    goal.pose.pose.position.x = target.x;
+    goal.pose.pose.position.y = target.y;
+    goal.pose.pose.position.z = 0.0;
+    goal.pose.pose.orientation.z = std::sin(target.yaw * 0.5);
+    goal.pose.pose.orientation.w = std::cos(target.yaw * 0.5);
+
+    NavigateGoalHandle::SharedPtr goal_handle;
+    try {
+      std::lock_guard<std::mutex> action_lock(navigate_action_mutex_);
+      if (!navigate_to_pose_client_->wait_for_action_server(service_timeout())) {
+        result.detail = "action unavailable during post-Nav2 final verify retry: " + navigate_to_pose_action_;
+        return result;
+      }
+      auto future = navigate_to_pose_client_->async_send_goal(goal);
+      if (future.wait_for(service_timeout()) != std::future_status::ready) {
+        result.detail = "timed out sending post-Nav2 final verify retry goal";
+        return result;
+      }
+      goal_handle = future.get();
+    } catch (const std::exception & exc) {
+      result.detail = std::string("exception sending post-Nav2 final verify retry goal: ") + exc.what();
+      return result;
+    } catch (...) {
+      result.detail = "unknown exception sending post-Nav2 final verify retry goal";
+      return result;
+    }
+
+    if (!goal_handle) {
+      result.detail = "post-Nav2 final verify retry goal was rejected by Nav2";
+      return result;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(navigation_goal_job_mutex_);
+      if (navigation_goal_job_.id == job_id) {
+        navigation_goal_job_.final_verify_retry_goal_sent = true;
+        navigation_goal_job_.detail =
+          "same Nav2 goal resent after final pose verify " + retry_reason;
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lock(active_nav_goal_mutex_);
+      active_nav_goal_handle_ = goal_handle;
+      active_nav_goal_pose_id_ = target.id;
+      active_nav_goal_building_id_.clear();
+      active_nav_goal_floor_id_.clear();
+    }
+
+    auto result_future = navigate_to_pose_client_->async_get_result(goal_handle);
+    const auto deadline =
+      std::chrono::steady_clock::now() +
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(navigation_goal_result_timeout_sec_));
+    while (result_future.wait_for(100ms) != std::future_status::ready) {
+      std::string cancel_detail;
+      if (navigation_goal_cancel_requested(job_id, cancel_detail)) {
+        std::string action_cancel_detail;
+        cancel_active_navigation_goal(action_cancel_detail);
+        result.canceled = true;
+        result.detail = "post-Nav2 final verify retry canceled: " +
+          cancel_detail + "; " + action_cancel_detail;
+        return result;
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        std::string cancel_detail;
+        cancel_active_navigation_goal(cancel_detail);
+        result.detail = "timed out waiting for post-Nav2 final verify retry result; " + cancel_detail;
+        return result;
+      }
+    }
+
+    const auto action_result = result_future.get();
+    result.nav2_result_code = static_cast<int>(action_result.code);
+    result.nav2_succeeded = action_result.code == rclcpp_action::ResultCode::SUCCEEDED;
+    result.succeeded = result.nav2_succeeded;
+    std::ostringstream detail;
+    detail << "post-Nav2 final verify retry result code " << result.nav2_result_code
+           << " reason=" << retry_reason;
+    result.detail = detail.str();
+    return result;
   }
 
   void update_navigation_goal_final_yaw_fields(
@@ -8371,11 +9265,19 @@ private:
       return;
     }
 
+    std::string goal_completion_policy = "pose_required";
     {
       std::lock_guard<std::mutex> lock(navigation_goal_job_mutex_);
       if (navigation_goal_job_.id == job_id) {
-        navigation_goal_job_.phase = "position_reached_verifying";
-        navigation_goal_job_.detail = "verifying fresh final map->base_link pose after Nav2 result";
+        goal_completion_policy = navigation_goal_job_.goal_completion_policy;
+      }
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(navigation_goal_job_mutex_);
+      if (navigation_goal_job_.id == job_id) {
+        navigation_goal_job_.phase = "final_pose_auditing";
+        navigation_goal_job_.detail = "auditing final map->base_link pose after Nav2 result";
       }
     }
 
@@ -8385,276 +9287,78 @@ private:
     bool position_reached = pose_check.position_reached;
     update_navigation_goal_final_pose_fields(job_id, pose_check, pose_check.reason);
 
-    if (!position_reached) {
+    if (!nav2_succeeded) {
       std::ostringstream detail;
-      if (nav2_succeeded) {
-        detail << "navigation reported success but final position is outside tolerance";
-      } else {
-        detail << "navigation failed with result code " << result_code;
-      }
+      detail << "Nav2 native goal completion failed with result code " << result_code;
       if (pose_check.pose_available) {
-        detail << "; final distance=" << distance << " tolerance="
-               << navigation_goal_position_success_tolerance_m_ << " yaw_error=" << yaw_error;
+        detail << "; final pose check: " << pose_check.reason;
       } else {
         detail << "; " << pose_check.reason;
       }
       finish_navigation_goal_job(
         job_id,
         false,
-        "failed_position",
+        "nav2_failed",
         detail.str(),
         distance,
         yaw_error,
         result_code,
         nav2_succeeded,
-        false,
+        position_reached,
         false,
         false,
         false);
       return;
     }
 
-    std::string goal_completion_policy = "pose_required";
+    const bool audit_position_within_tolerance = pose_check.pose_available && pose_check.position_reached;
+    const bool audit_yaw_within_tolerance =
+      pose_check.pose_available && yaw_error <= navigation_final_yaw_tolerance_rad_;
+    std::ostringstream audit_reason;
+    if (pose_check.pose_available) {
+      audit_reason << pose_check.reason
+                   << "; Nav2 is the single completion owner"
+                   << "; audit_position_within_tolerance="
+                   << (audit_position_within_tolerance ? "true" : "false")
+                   << "; audit_yaw_within_tolerance="
+                   << (audit_yaw_within_tolerance ? "true" : "false");
+    } else {
+      audit_reason << "final pose audit unavailable: " << pose_check.reason
+                   << "; Nav2 is the single completion owner";
+    }
     {
       std::lock_guard<std::mutex> lock(navigation_goal_job_mutex_);
       if (navigation_goal_job_.id == job_id) {
-        goal_completion_policy = navigation_goal_job_.goal_completion_policy;
         navigation_goal_job_.position_reached = true;
         navigation_goal_job_.yaw_align_required = goal_completion_policy == "pose_required";
-      }
-    }
-    if (goal_completion_policy == "position_only") {
-      const std::string verify_reason =
-        "position reached; goal_completion_policy=position_only; final yaw alignment not required";
-      {
-        std::lock_guard<std::mutex> lock(navigation_goal_job_mutex_);
-        if (navigation_goal_job_.id == job_id) {
-          navigation_goal_job_.final_pose_verified = true;
-          navigation_goal_job_.task_complete = true;
-          navigation_goal_job_.final_pose_verify_reason = verify_reason;
-          navigation_goal_job_.yaw_align_required = false;
-          navigation_goal_job_.yaw_align_active = false;
-          navigation_goal_job_.yaw_align_failed = false;
-        }
-      }
-      std::ostringstream detail;
-      detail << "navigation goal reached under position_only policy";
-      if (distance >= 0.0) {
-        detail << "; final distance=" << distance;
-      }
-      if (yaw_error >= 0.0) {
-        detail << " yaw_error=" << yaw_error;
-      }
-      finish_navigation_goal_job(
-        job_id,
-        true,
-        "final_pose_verified",
-        detail.str(),
-        distance,
-        yaw_error,
-        result_code,
-        nav2_succeeded,
-        true,
-        false,
-        false,
-        false);
-      return;
-    }
-
-    bool yaw_align_requested = false;
-    bool yaw_align_attempted = false;
-    bool yaw_align_succeeded = false;
-    bool yaw_align_blocked = false;
-    std::string yaw_blocked_reason;
-    std::string yaw_detail = "final yaw already within tolerance";
-    bool final_pose_verified = true;
-    std::string final_pose_verify_reason = "position and yaw are within final tolerance";
-    std::string final_phase = "final_pose_verified";
-
-    if (yaw_error > navigation_final_yaw_tolerance_rad_) {
-      yaw_align_requested = true;
-      {
-        std::lock_guard<std::mutex> lock(navigation_goal_job_mutex_);
-        if (navigation_goal_job_.id == job_id) {
-          navigation_goal_job_.phase = "position_reached_yaw_aligning";
-          navigation_goal_job_.detail = "position reached; aligning final yaw";
-          navigation_goal_job_.final_distance_m = distance;
-          navigation_goal_job_.final_yaw_error_rad = yaw_error;
-          navigation_goal_job_.position_reached = true;
-          navigation_goal_job_.final_yaw_align_requested = true;
-          navigation_goal_job_.final_yaw_align_initial_yaw_error_rad = yaw_error;
-        }
-      }
-
-      if (!navigation_final_yaw_align_enable_) {
-        yaw_align_blocked = true;
-        yaw_blocked_reason = "disabled";
-        yaw_detail = "final yaw alignment disabled";
-        final_pose_verified = false;
-        final_pose_verify_reason = yaw_detail;
-        final_phase = "failed_final_yaw_align";
-      } else {
-        const auto align_result = run_final_yaw_align(job_id, target, pose_check);
-        yaw_align_attempted = align_result.attempted;
-        yaw_align_succeeded = align_result.succeeded;
-        yaw_align_blocked = align_result.blocked && !align_result.succeeded;
-        yaw_blocked_reason = align_result.blocked_reason;
-        yaw_detail = align_result.detail;
-        update_navigation_goal_final_yaw_fields(job_id, align_result);
-        if (align_result.canceled) {
-          finish_navigation_goal_job(
-            job_id,
-            false,
-            "canceled",
-            yaw_detail,
-            distance,
-            yaw_error,
-            result_code,
-            nav2_succeeded,
-            true,
-            yaw_align_requested,
-            yaw_align_succeeded,
-            yaw_align_blocked);
-          return;
-        }
-
-        {
-          std::lock_guard<std::mutex> lock(navigation_goal_job_mutex_);
-          if (navigation_goal_job_.id == job_id) {
-            navigation_goal_job_.phase = "final_pose_verifying";
-            navigation_goal_job_.detail = "verifying final pose after yaw alignment";
-          }
-        }
-        auto final_check = verify_navigation_final_pose(target, true);
-        distance = final_check.distance_m;
-        yaw_error = final_check.yaw_error_rad;
-        position_reached = final_check.position_reached;
-        update_navigation_goal_final_pose_fields(job_id, final_check, final_check.reason);
-        if (align_result.blocked_reason == "max_xy_drift_exceeded") {
-          int reposition_retry_count = 0;
-          {
-            std::lock_guard<std::mutex> lock(navigation_goal_job_mutex_);
-            if (navigation_goal_job_.id == job_id) {
-              reposition_retry_count = navigation_goal_job_.reposition_after_yaw_drift_retry_count;
-            }
-          }
-          if (reposition_retry_count < navigation_max_reposition_after_yaw_retry_) {
-            const auto reposition = run_reposition_after_yaw_drift(job_id, target);
-            if (reposition.canceled) {
-              finish_navigation_goal_job(
-                job_id,
-                false,
-                "canceled",
-                reposition.detail,
-                distance,
-                yaw_error,
-                reposition.nav2_result_code,
-                reposition.nav2_succeeded,
-                position_reached,
-                yaw_align_requested,
-                yaw_align_succeeded,
-                yaw_align_blocked);
-              return;
-            }
-            auto reposition_check = verify_navigation_final_pose(target, true);
-            distance = reposition_check.distance_m;
-            yaw_error = reposition_check.yaw_error_rad;
-            position_reached = reposition_check.position_reached;
-            update_navigation_goal_final_pose_fields(job_id, reposition_check, reposition_check.reason);
-            if (!reposition.succeeded || !position_reached ||
-              yaw_error > navigation_final_yaw_tolerance_rad_)
-            {
-              std::ostringstream detail;
-              detail << align_result.detail << "; " << reposition.detail
-                     << "; final pose verify after reposition: " << reposition_check.reason;
-              finish_navigation_goal_job(
-                job_id,
-                false,
-                "failed_final_pose_verify",
-                detail.str(),
-                distance,
-                yaw_error,
-                reposition.nav2_result_code,
-                reposition.nav2_succeeded,
-                position_reached,
-                yaw_align_requested,
-                yaw_align_succeeded,
-                yaw_align_blocked);
-              return;
-            }
-            final_pose_verified = true;
-            final_pose_verify_reason =
-              "position and yaw verified after repositioning from final yaw drift";
-            final_phase = "final_pose_verified";
-            yaw_detail = align_result.detail + "; " + reposition.detail;
-          } else {
-            std::ostringstream detail;
-            detail << align_result.detail << "; final pose verify: " << final_check.reason;
-            finish_navigation_goal_job(
-              job_id,
-              false,
-              "failed_final_pose_verify",
-              detail.str(),
-              distance,
-              yaw_error,
-              result_code,
-              nav2_succeeded,
-              position_reached,
-              yaw_align_requested,
-              yaw_align_succeeded,
-              yaw_align_blocked);
-            return;
-          }
-        }
-        if (!position_reached) {
-          std::ostringstream detail;
-          detail << "navigation final pose check failed after yaw alignment";
-          if (final_check.pose_available) {
-            detail << "; final distance=" << distance << " tolerance="
-                   << navigation_goal_position_success_tolerance_m_ << " yaw_error=" << yaw_error;
-          } else {
-            detail << "; " << final_check.reason;
-          }
-          finish_navigation_goal_job(
-            job_id,
-            false,
-            "failed_final_pose_verify",
-            detail.str(),
-            distance,
-            yaw_error,
-            result_code,
-            nav2_succeeded,
-            false,
-            yaw_align_requested,
-            yaw_align_succeeded,
-            yaw_align_blocked);
-          return;
-        }
-
-        if (yaw_error <= navigation_final_yaw_tolerance_rad_) {
-          final_pose_verified = true;
-          final_pose_verify_reason = "position reached and final yaw is within tolerance";
-          final_phase = "final_pose_verified";
-        } else {
-          final_pose_verified = false;
-          final_pose_verify_reason = yaw_detail.empty() ?
-            "position reached but final yaw remains outside tolerance" :
-            yaw_detail;
-          final_phase = "failed_final_pose_verify";
-        }
+        navigation_goal_job_.yaw_align_active = false;
+        navigation_goal_job_.yaw_align_failed = false;
+        navigation_goal_job_.final_yaw_align_requested = false;
+        navigation_goal_job_.final_yaw_align_attempted = false;
+        navigation_goal_job_.final_yaw_align_succeeded = false;
+        navigation_goal_job_.final_yaw_align_blocked = false;
+        navigation_goal_job_.final_yaw_align_blocked_reason.clear();
+        navigation_goal_job_.final_pose_verified = true;
+        navigation_goal_job_.final_pose_verify_reason = audit_reason.str();
+        navigation_goal_job_.final_verify_failure_is_terminal = false;
       }
     }
 
     std::ostringstream detail;
-    if (final_pose_verified) {
-      detail << "navigation goal reached";
-      if (yaw_align_requested) {
-        detail << "; " << yaw_detail;
-      }
-    } else if (yaw_align_requested) {
-      detail << "navigation position reached but pose_required final yaw failed: " << yaw_detail;
+    detail << "navigation goal reached by Nav2 native completion";
+    if (goal_completion_policy == "position_only") {
+      detail << " under position_only policy";
     } else {
-      detail << "navigation position reached but final pose was not verified";
+      detail << " under pose_required policy";
+    }
+    if (pose_check.pose_available &&
+      (!audit_position_within_tolerance || !audit_yaw_within_tolerance))
+    {
+      detail << "; final pose audit warning: " << pose_check.reason;
+    } else if (pose_check.pose_available) {
+      detail << "; final pose audit: " << pose_check.reason;
+    } else {
+      detail << "; " << pose_check.reason;
     }
     if (distance >= 0.0) {
       detail << "; final distance=" << distance;
@@ -8662,35 +9366,20 @@ private:
     if (yaw_error >= 0.0) {
       detail << " yaw_error=" << yaw_error;
     }
-    {
-      std::lock_guard<std::mutex> lock(navigation_goal_job_mutex_);
-      if (navigation_goal_job_.id == job_id) {
-        navigation_goal_job_.final_pose_verified = final_pose_verified;
-        navigation_goal_job_.final_pose_verify_reason = final_pose_verify_reason;
-        navigation_goal_job_.final_yaw_align_requested = yaw_align_requested;
-        navigation_goal_job_.final_yaw_align_attempted = yaw_align_attempted;
-        navigation_goal_job_.final_yaw_align_succeeded = yaw_align_succeeded;
-        navigation_goal_job_.final_yaw_align_blocked = yaw_align_blocked;
-        navigation_goal_job_.final_yaw_align_blocked_reason = yaw_blocked_reason;
-        navigation_goal_job_.final_yaw_align_final_yaw_error_rad = yaw_error;
-        navigation_goal_job_.yaw_align_failed =
-          yaw_align_requested && !yaw_align_succeeded && !final_pose_verified;
-      }
-    }
 
     finish_navigation_goal_job(
       job_id,
-      final_pose_verified,
-      final_phase,
+      true,
+      "final_pose_verified",
       detail.str(),
       distance,
       yaw_error,
       result_code,
       nav2_succeeded,
-      position_reached,
-      yaw_align_requested,
-      yaw_align_succeeded,
-      yaw_align_blocked);
+      true,
+      false,
+      false,
+      false);
   }
 
   HttpResponse handle_navigation_state()
@@ -8698,6 +9387,7 @@ private:
     refresh_navigation_resume_runtime_state(false);
 
     const auto runtime = runtime_mode_snapshot();
+    const auto runtime_context = read_runtime_map_context();
     const auto dock_check = pre_navigation_dock_check_snapshot();
     const auto dock_check_json = pre_navigation_dock_check_json(
       dock_check,
@@ -8714,6 +9404,14 @@ private:
     const bool effective_amcl_ready =
       bridge_amcl_available ? bridge_status.amcl_ready :
       (amcl_file_authoritative && amcl_status.ready);
+    const bool effective_amcl_correction_ready =
+      bridge_amcl_available ? bridge_status.amcl_correction_ready :
+      (amcl_file_authoritative && amcl_status.correction_ready);
+    const bool effective_amcl_correction_pending =
+      bridge_amcl_available ? bridge_status.amcl_correction_pending :
+      ((amcl_status.available && amcl_status.mode != "disabled") &&
+      effective_amcl_ready &&
+      !effective_amcl_correction_ready);
     const bool effective_amcl_degraded =
       bridge_amcl_available ? bridge_status.localization_degraded :
       (amcl_file_authoritative && (amcl_status.degraded || !amcl_status.ready));
@@ -8733,10 +9431,11 @@ private:
     const std::string localization_degraded_reason =
       localization_degraded ? effective_amcl_degraded_reason : std::string();
     const auto active_runtime_mode = active_runtime_mode_from_snapshot(runtime);
+    std::string bridge_goal_start_detail;
+    const bool effective_safe_for_goal_start =
+      bridge_status_safe_for_goal_start(bridge_status, "navigation state", bridge_goal_start_detail);
     const bool localization_recovery_required =
-      !bridge_status.available ||
-      bridge_localization_degraded_blocks_goal_start(bridge_status) ||
-      !bridge_status.safe_for_goal_start;
+      !effective_safe_for_goal_start && !bridge_detail_is_transition_active(bridge_goal_start_detail);
     std::string safety_status;
     bool motion_allowed = false;
     bool have_motion_allowed = false;
@@ -8760,13 +9459,30 @@ private:
               << "\"state\":" << json_string(runtime.navigation_state) << ","
              << "\"navigation_active\":" << (runtime.navigation_active ? "true" : "false") << ","
              << "\"healthy\":" << (runtime.healthy ? "true" : "false") << ","
-             << "\"message\":" << json_string(runtime.message) << ","
+             << "\"message\":" << json_string(runtime.message) << ",";
+    response << "\"runtime_map_context\":";
+    if (runtime_context) {
+      response << "{"
+               << "\"state\":" << json_string(runtime_context->state) << ","
+               << "\"confirmed\":" << (runtime_context->confirmed ? "true" : "false") << ","
+               << "\"startup_stage\":" << json_string(runtime_context->startup_stage) << ","
+               << "\"message\":" << json_string(runtime_context->message) << ","
+               << "\"map_id\":" << json_string(runtime_context->map_id) << ","
+               << "\"building_id\":" << json_string(runtime_context->building_id) << ","
+               << "\"floor_id\":" << json_string(runtime_context->floor_id) << ","
+               << "\"updated_at\":" << runtime_context->updated_at_sec
+               << "}";
+    } else {
+      response << "null";
+    }
+    response << ","
              << "\"localization_degraded\":" << (localization_degraded ? "true" : "false") << ","
              << "\"localization_degraded_reason\":" << json_string(localization_degraded_reason) << ","
               << "\"using_triggered_baseline_only\":"
               << (using_triggered_baseline_only ? "true" : "false") << ","
               << "\"safe_for_goal_start\":"
-              << (bridge_status.available && bridge_status.safe_for_goal_start ? "true" : "false") << ","
+              << (effective_safe_for_goal_start ? "true" : "false") << ","
+              << "\"goal_start_detail\":" << json_string(bridge_goal_start_detail) << ","
               << "\"correction_active\":"
               << (bridge_status.available && bridge_status.correction_active ? "true" : "false") << ","
               << "\"navigation_normal_path_relocalization_enabled\":false,"
@@ -8774,6 +9490,13 @@ private:
               << "\"force_accept_allowed_in_normal_path\":false,"
               << "\"ordinary_navigation_triggered_relocalization\":false,"
               << "\"docking_predock_triggered_relocalization\":false,"
+              << "\"native_nav2_goal_completion\":"
+              << (nav2_native_goal_completion_enabled_ ? "true" : "false") << ","
+              << "\"api_final_yaw_align_enabled\":"
+              << ((api_final_yaw_align_fallback_enabled_ && navigation_final_yaw_align_enable_) ?
+                "true" : "false") << ","
+              << "\"nav2_rotation_shim_enabled\":"
+              << (nav2_rotation_shim_enabled_ ? "true" : "false") << ","
               << "\"localization_recovery_available\":true,"
               << "\"removed_redundant_gates\":["
                  "\"normal_pre_goal_force_accept\","
@@ -8817,6 +9540,8 @@ private:
              << "\"amcl_correction_ready\":" << ((
                bridge_amcl_available ? bridge_status.amcl_correction_ready : amcl_status.correction_ready
              ) ? "true" : "false") << ","
+             << "\"amcl_correction_pending\":"
+             << (effective_amcl_correction_pending ? "true" : "false") << ","
              << "\"amcl_not_moving_no_update_ok\":" << ((
                bridge_amcl_available ?
                  bridge_status.amcl_not_moving_no_update_ok :
@@ -8827,6 +9552,20 @@ private:
              << "\"amcl_pose_publisher_count\":" << amcl_status.pose_publisher_count << ","
              << "\"amcl_scan_admission_status_publisher_count\":"
              << amcl_status.scan_admission_status_publisher_count << ","
+             << "\"dock_occupancy_state\":" << json_string(dock_check.dock_occupancy_state) << ","
+             << "\"dock_occupancy_evidence\":"
+             << json_string_array_fragment(dock_check.dock_occupancy_evidence) << ","
+             << "\"dock_occupancy_reason\":" << json_string(dock_check.dock_occupancy_reason) << ","
+             << "\"charging_session_latched\":"
+             << (dock_check.charging_session_latched ? "true" : "false") << ","
+             << "\"charging_session_age_sec\":"
+             << json_nullable_number(
+               dock_check.charging_session_age_sec >= 0.0,
+               dock_check.charging_session_age_sec) << ","
+             << "\"charging_session_last_confirmed_at\":"
+             << json_string(dock_check.charging_session_last_confirmed_at) << ","
+             << "\"full_charge_idle_on_dock\":"
+             << (dock_check.full_charge_idle_on_dock ? "true" : "false") << ","
              << "\"pre_navigation_dock_check\":" << dock_check_json << ","
              << "\"blocked_by_docked_contact\":"
              << (dock_check.final_auto_undock_required ? "true" : "false") << ","
@@ -9303,6 +10042,8 @@ private:
     std::string post_fine_docking_final_state;
     bool post_fine_docking_ok = false;
     bool post_fine_docking_required = false;
+    std::uint64_t deferred_pause_release_job_id = 0U;
+    std::string deferred_pause_release_reason;
     {
       std::lock_guard<std::mutex> lock(docking_job_mutex_);
       docking_job_.last_status = status;
@@ -9330,6 +10071,15 @@ private:
         }
         return;
       }
+      const auto finish_docking_job_locked_and_defer_pause_release =
+        [&](const bool ok, const std::string & final_state, const std::string & finish_detail,
+          const std::string & release_reason) {
+          const auto finished_job_id = docking_job_.id;
+          if (finish_docking_job_locked(ok, final_state, finish_detail)) {
+            deferred_pause_release_job_id = finished_job_id;
+            deferred_pause_release_reason = release_reason;
+          }
+        };
       if (docking_job_.phase == "relocalize_after_fine_docking") {
         set_docking_runtime_state(
           true,
@@ -9368,7 +10118,11 @@ private:
               "fine docking finished; triggering localization before returning to navigation state");
             return;
           }
-          finish_docking_job_locked(ok, final_state, status);
+          finish_docking_job_locked_and_defer_pause_release(
+            ok,
+            final_state,
+            status,
+            "fine_docking_status_" + final_state);
         };
       if (docking_status_is_undocked(status)) {
         if (undock_relocalize_after_success_ && !docking_job_.post_undock_relocalization_requested) {
@@ -9388,10 +10142,18 @@ private:
             "relocalize_after_undock",
             "undocked by odometry; triggering localization after undock");
         } else if (docking_job_.phase != "relocalize_after_undock") {
-          finish_docking_job_locked(true, "undocked", status);
+          finish_docking_job_locked_and_defer_pause_release(
+            true,
+            "undocked",
+            status,
+            "docking_status_undocked");
         }
       } else if (docking_status_is_undock_failed(status)) {
-        finish_docking_job_locked(false, "failed", status);
+        finish_docking_job_locked_and_defer_pause_release(
+          false,
+          "failed",
+          status,
+          "docking_status_undock_failed");
       } else if (docking_status_is_undocking(status)) {
         docking_job_.phase = "undocking";
         set_docking_runtime_state(true, "undocking", status);
@@ -9406,6 +10168,15 @@ private:
       } else {
         set_docking_runtime_state(true, "fine_docking", status);
       }
+    }
+
+    if (deferred_pause_release_job_id != 0U) {
+      std::string release_detail;
+      (void)set_global_correction_paused_for_docking(
+        deferred_pause_release_job_id,
+        false,
+        "docking_job_finished_" + deferred_pause_release_reason,
+        release_detail);
     }
 
     if (post_undock_job_id != 0U) {
@@ -9579,6 +10350,34 @@ private:
       }
     }
     update_post_undock_localization_visibility(job_id);
+
+    std::string stale_pause_detail;
+    if (!release_stale_docking_fine_pause_if_needed(
+        "post_undock_relocalization_before_trigger",
+        stale_pause_detail))
+    {
+      localization_detail = stale_pause_detail;
+      std::lock_guard<std::mutex> lock(docking_job_mutex_);
+      if (docking_job_.id == job_id && docking_job_.state == "running") {
+        docking_job_.post_undock_relocalization_accepted = false;
+        docking_job_.post_undock_settle_started = false;
+        docking_job_.post_undock_settle_complete = false;
+        docking_job_.post_undock_settle_failure_reason =
+          "POST_UNDOCK_STALE_DOCKING_FINE_PAUSE: " + stale_pause_detail;
+        record_post_undock_navigation_readiness_failure_locked(
+          "POST_UNDOCK_STALE_DOCKING_FINE_PAUSE",
+          stale_pause_detail);
+        docking_job_.post_undock_relocalization_detail = stale_pause_detail;
+        docking_job_.detail = stale_pause_detail;
+        finish_docking_job_locked(
+          true,
+          "undocked",
+          undock_status + "; undock succeeded; post-undock navigation readiness failed: " +
+            stale_pause_detail);
+      }
+      return;
+    }
+
     const bool relocalized = trigger_localization_and_wait_for_result(
       reason,
       localization_detail,
@@ -9627,9 +10426,9 @@ private:
             "post-undock settle passed; pending Nav2 goal can be released" :
             "post-undock settle failed: " + docking_job_.post_undock_settle_failure_reason;
           if (!settle.ok) {
-            docking_job_.failure_code = post_undock_failure_code;
-            docking_job_.last_error_code = post_undock_failure_code;
-            docking_job_.last_error_detail = settle.detail;
+            record_post_undock_navigation_readiness_failure_locked(
+              post_undock_failure_code,
+              settle.detail);
           }
         }
       }
@@ -9643,9 +10442,9 @@ private:
           docking_job_.post_undock_settle_started = false;
           docking_job_.post_undock_settle_complete = false;
           docking_job_.post_undock_settle_failure_reason = post_undock_failure_code + ": " + localization_detail;
-          docking_job_.failure_code = post_undock_failure_code;
-          docking_job_.last_error_code = post_undock_failure_code;
-          docking_job_.last_error_detail = localization_detail;
+          record_post_undock_navigation_readiness_failure_locked(
+            post_undock_failure_code,
+            localization_detail);
         }
       }
       update_post_undock_localization_visibility(job_id);
@@ -9661,6 +10460,7 @@ private:
     if (relocalized && settle_ok) {
       docking_job_.post_undock_settle_complete = true;
       docking_job_.post_undock_settle_failure_reason.clear();
+      clear_post_undock_navigation_readiness_failure_locked();
       finish_docking_job_locked(
         true,
         "undocked",
@@ -9668,16 +10468,16 @@ private:
       return;
     }
     if (required_before_navigation) {
-      if (docking_job_.failure_code.empty()) {
-        docking_job_.failure_code = post_undock_failure_code.empty() ?
-          "POST_UNDOCK_RELOCALIZATION_FAILED" : post_undock_failure_code;
-        docking_job_.last_error_code = docking_job_.failure_code;
-        docking_job_.last_error_detail = localization_detail;
+      if (docking_job_.post_undock_navigation_readiness_failure_code.empty()) {
+        record_post_undock_navigation_readiness_failure_locked(
+          post_undock_failure_code.empty() ? "POST_UNDOCK_RELOCALIZATION_FAILED" : post_undock_failure_code,
+          localization_detail);
       }
       finish_docking_job_locked(
-        false,
-        "failed",
-        undock_status + "; relocalize/settle after undock failed before navigation: " + localization_detail);
+        true,
+        "undocked",
+        undock_status + "; undock succeeded; post-undock navigation readiness failed, pending Nav2 goal held: " +
+          localization_detail);
       return;
     }
     finish_docking_job_locked(
@@ -9705,6 +10505,12 @@ private:
         << (job.post_undock_settle_complete ? "true" : "false")
         << ",\"post_undock_settle_failure_reason\":"
         << json_string(job.post_undock_settle_failure_reason)
+        << ",\"post_undock_navigation_readiness_failed\":"
+        << (job.post_undock_navigation_readiness_failed ? "true" : "false")
+        << ",\"post_undock_navigation_readiness_failure_code\":"
+        << json_string(job.post_undock_navigation_readiness_failure_code)
+        << ",\"post_undock_navigation_readiness_detail\":"
+        << json_string(job.post_undock_navigation_readiness_detail)
         << ",\"pending_goal_held_for_post_undock_settle\":"
         << (job.pending_goal_held_for_post_undock_settle ? "true" : "false")
         << ",\"pending_goal_released_after_post_undock_settle\":"
@@ -9714,7 +10520,9 @@ private:
         << ",\"amcl_ready\":" << (job.amcl_ready ? "true" : "false")
         << ",\"localization_degraded\":"
         << (job.localization_degraded ? "true" : "false")
-        << ",\"failure_code\":" << json_string(job.failure_code)
+        << ",\"failure_code\":"
+        << json_string(job.post_undock_navigation_readiness_failure_code.empty() ?
+          job.failure_code : job.post_undock_navigation_readiness_failure_code)
         << ",\"detail\":" << json_string(job.detail)
         << "}";
     return out.str();
@@ -9734,8 +10542,9 @@ private:
     return docking_job_.id == job_id && docking_job_.cancel_requested;
   }
 
-  void finish_docking_job_locked(const bool ok, const std::string & final_state, const std::string & detail)
+  bool finish_docking_job_locked(const bool ok, const std::string & final_state, const std::string & detail)
   {
+    const bool release_pause_after_finish = docking_job_.global_correction_paused;
     if (ok && (final_state == "docked" || final_state == "charging")) {
       update_dock_contact_latch(true, "docking_job", detail, docking_job_.dock_id);
     } else if (ok && final_state == "undocked") {
@@ -9758,15 +10567,27 @@ private:
         navigation_runtime_state_ = "stopped";
       }
     }
+    return release_pause_after_finish;
   }
 
   void finish_docking_job(const std::uint64_t job_id, const bool ok, const std::string & final_state, const std::string & detail)
   {
-    std::lock_guard<std::mutex> lock(docking_job_mutex_);
-    if (docking_job_.id != job_id) {
-      return;
+    bool release_pause_after_finish = false;
+    {
+      std::lock_guard<std::mutex> lock(docking_job_mutex_);
+      if (docking_job_.id != job_id) {
+        return;
+      }
+      release_pause_after_finish = finish_docking_job_locked(ok, final_state, detail);
     }
-    finish_docking_job_locked(ok, final_state, detail);
+    if (release_pause_after_finish) {
+      std::string release_detail;
+      (void)set_global_correction_paused_for_docking(
+        job_id,
+        false,
+        "docking_job_finished_" + final_state,
+        release_detail);
+    }
   }
 
   void mark_docking_nav_goal_sent(
@@ -9977,7 +10798,7 @@ private:
 
     NavigateGoalHandle::SharedPtr goal_handle;
     try {
-      set_docking_job_phase(job_id, "NAV_TO_STAGING");
+      set_docking_job_phase(job_id, "NAV_TO_STAGING_NATIVE_NAV2");
       std::lock_guard<std::mutex> action_lock(navigate_action_mutex_);
       auto future = navigate_to_pose_client_->async_send_goal(goal);
       if (future.wait_for(service_timeout()) != std::future_status::ready) {
@@ -9998,10 +10819,13 @@ private:
     }
     mark_docking_nav_goal_sent(job_id, goal_handle, job.building_id, job.floor_id);
     set_navigation_runtime_state(true, "navigating", "docking predock navigation accepted");
-    set_docking_runtime_state(true, "NAV_TO_STAGING", "navigating to docking approach pose");
+    set_docking_runtime_state(
+      true,
+      "NAV_TO_STAGING_NATIVE_NAV2",
+      "navigating to docking approach pose with native Nav2 XY+yaw completion");
 
     auto result_future = navigate_to_pose_client_->async_get_result(goal_handle);
-    set_docking_job_phase(job_id, "NAV_TO_STAGING");
+    set_docking_job_phase(job_id, "NAV_TO_STAGING_NATIVE_NAV2");
     const auto predock_deadline = std::chrono::steady_clock::now() +
       std::chrono::duration_cast<std::chrono::steady_clock::duration>(
         std::chrono::duration<double>(docking_predock_nav_timeout_sec_));
@@ -10032,22 +10856,16 @@ private:
         docking_job_.nav_goal_succeeded = true;
       }
     }
-    set_docking_job_phase(job_id, "STAGING_NAV_SUCCEEDED");
-    set_navigation_runtime_state(true, "ready", "predock navigation reached");
+    set_docking_job_phase(job_id, "STAGING_NAV2_GOAL_SUCCEEDED");
+    set_navigation_runtime_state(true, "ready", "predock native Nav2 goal reached");
 
     set_docking_job_phase(job_id, "PREDOCK_POSE_VERIFY");
     set_docking_runtime_state(true, "PREDOCK_POSE_VERIFY", "verifying staging pose before GS2 handoff");
     auto predock_check = evaluate_predock_pose(job);
     record_predock_pose_verification(job_id, predock_check);
-    if (!predock_check.pose_available || !predock_check.xy_ok) {
-      finish_docking_job_with_code(
-        job_id,
-        "FINE_DOCKING_ENTRY_CONDITION_FAILED",
-        predock_check.detail);
-      return;
-    }
 
-    bool predock_yaw_aligned = predock_check.base_yaw_ok && predock_check.contact_yaw_ok;
+    bool predock_yaw_aligned = predock_check.pose_available && predock_check.xy_ok &&
+      predock_check.base_yaw_ok && predock_check.contact_yaw_ok;
     if (predock_yaw_aligned) {
       PredockYawAlignResult already_aligned;
       already_aligned.attempted = false;
@@ -10059,8 +10877,38 @@ private:
       already_aligned.detail = "predock yaw already aligned during pose verify";
       record_predock_yaw_align_result(job_id, already_aligned);
     } else {
-      set_docking_job_phase(job_id, "PREDOCK_YAW_ALIGN");
-      set_docking_runtime_state(true, "PREDOCK_YAW_ALIGN", "aligning staging yaw through /cmd_vel_docking");
+      const bool predock_xy_verified = predock_check.pose_available && predock_check.xy_ok;
+      if (!predock_xy_verified || !predock_yaw_align_fallback_allowed()) {
+        PredockYawAlignResult native_verify_failed;
+        native_verify_failed.attempted = false;
+        native_verify_failed.succeeded = false;
+        native_verify_failed.actual_spin_required = false;
+        native_verify_failed.initial_error_rad = predock_check.base_yaw_error_rad;
+        native_verify_failed.final_error_rad = predock_check.base_yaw_error_rad;
+        native_verify_failed.failure_code =
+          (!predock_check.pose_available || !predock_check.xy_ok) ?
+          "PREDOCK_NATIVE_GOAL_VERIFY_FAILED" : "PREDOCK_YAW_NOT_ALIGNED_AFTER_NAV2";
+        native_verify_failed.detail =
+          "Nav2 predock action succeeded but read-only PREDOCK_POSE_VERIFY failed; " +
+          predock_check.detail;
+        record_predock_yaw_align_result(job_id, native_verify_failed);
+        set_docking_job_phase(job_id, "PREDOCK_NATIVE_GOAL_VERIFY_FAILED");
+        set_docking_runtime_state(
+          true,
+          "PREDOCK_NATIVE_GOAL_VERIFY_FAILED",
+          native_verify_failed.detail);
+        finish_docking_job_with_code(
+          job_id,
+          native_verify_failed.failure_code,
+          native_verify_failed.detail);
+        return;
+      }
+
+      set_docking_job_phase(job_id, "PREDOCK_YAW_ALIGN_RECOVERY");
+      set_docking_runtime_state(
+        true,
+        "PREDOCK_YAW_ALIGN_RECOVERY",
+        "explicit fallback: aligning staging yaw through /cmd_vel_docking");
       auto yaw_result = run_predock_yaw_align(job_id, predock_check.expected_base_yaw, predock_check);
       record_predock_yaw_align_result(job_id, yaw_result);
       if (!yaw_result.succeeded) {
@@ -10068,8 +10916,11 @@ private:
         return;
       }
 
-      set_docking_job_phase(job_id, "PREDOCK_YAW_ALIGN_SETTLE");
-      set_docking_runtime_state(true, "PREDOCK_YAW_ALIGN_SETTLE", "settling after predock yaw alignment");
+      set_docking_job_phase(job_id, "PREDOCK_YAW_ALIGN_RECOVERY_SETTLE");
+      set_docking_runtime_state(
+        true,
+        "PREDOCK_YAW_ALIGN_RECOVERY_SETTLE",
+        "settling after explicit predock yaw alignment fallback");
       std::this_thread::sleep_for(300ms);
       predock_check = evaluate_predock_pose(job);
       record_predock_pose_verification(job_id, predock_check);
@@ -10184,24 +11035,6 @@ private:
       }
     }
 
-    {
-      std::string bridge_goal_start_detail;
-      if (!bridge_safe_for_goal_start("docking fine docking", bridge_goal_start_detail)) {
-        finish_docking_job_with_code(
-          job_id,
-          "DOCK_FAILED_LOCALIZATION_NOT_READY",
-          bridge_goal_start_detail);
-        return;
-      }
-      std::lock_guard<std::mutex> lock(docking_job_mutex_);
-      if (docking_job_.id == job_id && docking_job_.state == "running") {
-        if (!docking_job_.detail.empty()) {
-          docking_job_.detail += "; ";
-        }
-        docking_job_.detail += bridge_goal_start_detail;
-      }
-    }
-
     set_docking_job_phase(job_id, "GS2_DOCK_DETECT");
     if (docking_cancel_requested(job_id)) {
       finish_docking_job(job_id, true, "canceled", "docking canceled before GS2 fine docking");
@@ -10222,6 +11055,121 @@ private:
         (void)set_global_correction_paused_for_docking(job_id, false, reason, resume_detail);
         fine_pause_applied = false;
       };
+
+    {
+      std::string bridge_goal_start_detail;
+      std::string bridge_failure_code;
+      if (!wait_for_bridge_smoothing_before_fine_docking(
+          job_id,
+          bridge_failure_code,
+          bridge_goal_start_detail))
+      {
+        if (bridge_failure_code == "CANCELLED_BY_APP") {
+          finish_docking_job(job_id, true, "canceled", bridge_goal_start_detail);
+          return;
+        }
+        finish_docking_job_with_code(job_id, bridge_failure_code, bridge_goal_start_detail);
+        return;
+      }
+      std::lock_guard<std::mutex> lock(docking_job_mutex_);
+      if (docking_job_.id == job_id && docking_job_.state == "running") {
+        if (!docking_job_.detail.empty()) {
+          docking_job_.detail += "; ";
+        }
+        docking_job_.detail += bridge_goal_start_detail;
+      }
+    }
+
+    set_docking_job_phase(job_id, "PREDOCK_POSE_VERIFY_AFTER_BRIDGE_SETTLE");
+    set_docking_runtime_state(
+      true,
+      "PREDOCK_POSE_VERIFY_AFTER_BRIDGE_SETTLE",
+      "rechecking staging pose after bridge smoothing before GS2 handoff");
+    predock_check = evaluate_predock_pose(job);
+    record_predock_pose_verification(job_id, predock_check);
+    predock_yaw_aligned = predock_check.pose_available && predock_check.xy_ok &&
+      predock_check.base_yaw_ok && predock_check.contact_yaw_ok;
+    if (predock_yaw_aligned) {
+      PredockYawAlignResult post_bridge_aligned;
+      post_bridge_aligned.attempted = false;
+      post_bridge_aligned.succeeded = true;
+      post_bridge_aligned.actual_spin_required = false;
+      post_bridge_aligned.failure_code = "NONE";
+      post_bridge_aligned.initial_error_rad = predock_check.base_yaw_error_rad;
+      post_bridge_aligned.final_error_rad = predock_check.base_yaw_error_rad;
+      post_bridge_aligned.detail = "predock yaw verified after bridge smoothing";
+      record_predock_yaw_align_result(job_id, post_bridge_aligned);
+    } else {
+      const bool predock_xy_verified = predock_check.pose_available && predock_check.xy_ok;
+      if (!predock_xy_verified || !predock_yaw_align_fallback_allowed()) {
+        PredockYawAlignResult post_bridge_failed;
+        post_bridge_failed.attempted = false;
+        post_bridge_failed.succeeded = false;
+        post_bridge_failed.actual_spin_required = false;
+        post_bridge_failed.initial_error_rad = predock_check.base_yaw_error_rad;
+        post_bridge_failed.final_error_rad = predock_check.base_yaw_error_rad;
+        post_bridge_failed.failure_code =
+          (!predock_check.pose_available || !predock_check.xy_ok) ?
+          "PREDOCK_POSE_DRIFTED_AFTER_BRIDGE_SETTLE" :
+          "PREDOCK_YAW_NOT_ALIGNED_AFTER_BRIDGE_SETTLE";
+        post_bridge_failed.detail =
+          "post-bridge smoothing PREDOCK_POSE_VERIFY failed before fine docking; " +
+          predock_check.detail;
+        record_predock_yaw_align_result(job_id, post_bridge_failed);
+        set_docking_job_phase(job_id, "PREDOCK_POSE_VERIFY_AFTER_BRIDGE_SETTLE_FAILED");
+        set_docking_runtime_state(
+          true,
+          "PREDOCK_POSE_VERIFY_AFTER_BRIDGE_SETTLE_FAILED",
+          post_bridge_failed.detail);
+        finish_docking_job_with_code(
+          job_id,
+          post_bridge_failed.failure_code,
+          post_bridge_failed.detail);
+        return;
+      }
+
+      set_docking_job_phase(job_id, "PREDOCK_YAW_ALIGN_AFTER_BRIDGE_SETTLE");
+      set_docking_runtime_state(
+        true,
+        "PREDOCK_YAW_ALIGN_AFTER_BRIDGE_SETTLE",
+        "aligning staging yaw after bridge smoothing before GS2 handoff");
+      auto post_bridge_yaw = run_predock_yaw_align(
+        job_id,
+        predock_check.expected_base_yaw,
+        predock_check);
+      record_predock_yaw_align_result(job_id, post_bridge_yaw);
+      if (!post_bridge_yaw.succeeded) {
+        finish_docking_job_with_code(job_id, post_bridge_yaw.failure_code, post_bridge_yaw.detail);
+        return;
+      }
+
+      set_docking_job_phase(job_id, "PREDOCK_YAW_ALIGN_AFTER_BRIDGE_SETTLE_VERIFY");
+      set_docking_runtime_state(
+        true,
+        "PREDOCK_YAW_ALIGN_AFTER_BRIDGE_SETTLE_VERIFY",
+        "verifying staging pose after post-bridge yaw alignment");
+      std::this_thread::sleep_for(300ms);
+      predock_check = evaluate_predock_pose(job);
+      record_predock_pose_verification(job_id, predock_check);
+      predock_yaw_aligned = predock_check.pose_available && predock_check.xy_ok &&
+        predock_check.base_yaw_ok && predock_check.contact_yaw_ok;
+      if (!predock_yaw_aligned) {
+        finish_docking_job_with_code(
+          job_id,
+          "PREDOCK_YAW_NOT_ALIGNED_AFTER_BRIDGE_SETTLE",
+          "post-bridge yaw alignment did not satisfy final staging pose check; " +
+            predock_check.detail);
+        return;
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lock(docking_job_mutex_);
+      if (docking_job_.id == job_id && docking_job_.state == "running") {
+        docking_job_.post_predock_settle_complete = true;
+        docking_job_.dock_staging_handoff_ready = predock_yaw_aligned;
+      }
+    }
+
     std::string pause_detail;
     if (!set_global_correction_paused_for_docking(job_id, true, "docking_fine_entry", pause_detail)) {
       finish_docking_job_with_code(job_id, "DOCK_FAILED_PREDOCK_SETTLE", pause_detail);
@@ -10247,6 +11195,7 @@ private:
         docking_job_.retry_count < docking_job_.max_retries;
     }
     if (!fine_entry_ok && fine_docking_retry_on_yaw_reject_ &&
+      predock_yaw_align_fallback_allowed() &&
       fine_entry_failure_code == "FINE_DOCKING_REJECTED_YAW_TOO_LARGE" && retry_allowed)
     {
       set_docking_job_phase(job_id, "RESTAGE_RETRY");
@@ -10256,7 +11205,7 @@ private:
           ++docking_job_.retry_count;
         }
       }
-      set_docking_job_phase(job_id, "PREDOCK_YAW_ALIGN");
+      set_docking_job_phase(job_id, "PREDOCK_YAW_ALIGN_RECOVERY");
       auto retry_yaw = run_predock_yaw_align(job_id, fine_entry_check.expected_base_yaw, fine_entry_check);
       record_predock_yaw_align_result(job_id, retry_yaw);
       predock_yaw_aligned = retry_yaw.succeeded;
@@ -10641,7 +11590,8 @@ private:
     const auto charging_contact_snapshot = bms_charging_contact_snapshot();
     const bool charging_contact = charging_contact_snapshot.contact;
     const auto dock_check = pre_navigation_dock_check_snapshot();
-    const bool docked_state = runtime.docking_state == "docked" ||
+    const bool docked_state = dock_check.final_is_docked_or_charging ||
+      runtime.docking_state == "docked" ||
       docking_status_is_success(runtime.docking_status) ||
       dock_check.dock_latch_indicates_docked;
     if (!docked_state && !charging_contact) {
@@ -10776,6 +11726,20 @@ private:
              << "\"charging_contact\":" << (charging_contact.contact ? "true" : "false") << ","
              << "\"charging_contact_reason\":" << json_string(charging_contact.reason) << ","
              << "\"inferred_docked\":" << (inferred_docked ? "true" : "false") << ","
+             << "\"dock_occupancy_state\":" << json_string(dock_check.dock_occupancy_state) << ","
+             << "\"dock_occupancy_evidence\":"
+             << json_string_array_fragment(dock_check.dock_occupancy_evidence) << ","
+             << "\"dock_occupancy_reason\":" << json_string(dock_check.dock_occupancy_reason) << ","
+             << "\"charging_session_latched\":"
+             << (dock_check.charging_session_latched ? "true" : "false") << ","
+             << "\"charging_session_age_sec\":"
+             << json_nullable_number(
+               dock_check.charging_session_age_sec >= 0.0,
+               dock_check.charging_session_age_sec) << ","
+             << "\"charging_session_last_confirmed_at\":"
+             << json_string(dock_check.charging_session_last_confirmed_at) << ","
+             << "\"full_charge_idle_on_dock\":"
+             << (dock_check.full_charge_idle_on_dock ? "true" : "false") << ","
              << "\"can_undock\":" << (dock_check.final_is_docked_or_charging ? "true" : "false") << ","
              << "\"can_auto_undock\":" << (dock_check.can_auto_undock ? "true" : "false") << ","
              << "\"auto_undock_reason\":" << json_string(dock_check.auto_undock_reason) << ","
@@ -11088,6 +12052,12 @@ private:
     check.dock_contact_latch_reason = check.dock_latch.reason;
     check.dock_contact_latch_age_sec = check.dock_latch.age_sec;
     check.dock_contact_latch_stale = check.dock_latch.stale;
+    check.dock_contact_latch_source_strength = dock_latch_source_strength(check.dock_latch.source);
+    check.charging_session_latched =
+      check.dock_latch_indicates_docked && check.dock_latch.source_charging_session;
+    check.charging_session_age_sec = check.charging_session_latched ? check.dock_latch.age_sec : -1.0;
+    check.charging_session_last_confirmed_at =
+      check.charging_session_latched ? check.dock_latch.last_confirmed_at : "";
     check.live_bms_charging_contact_stable = check.bms.have_state && check.bms.fresh && check.bms.contact_stable;
     const bool live_bms_no_contact_stable =
       check.bms.have_state &&
@@ -11128,6 +12098,12 @@ private:
       check.dock_contact_latch_reason = check.dock_latch.reason;
       check.dock_contact_latch_age_sec = check.dock_latch.age_sec;
       check.dock_contact_latch_stale = check.dock_latch.stale;
+      check.dock_contact_latch_source_strength = dock_latch_source_strength(check.dock_latch.source);
+      check.charging_session_latched =
+        check.dock_latch_indicates_docked && check.dock_latch.source_charging_session;
+      check.charging_session_age_sec = check.charging_session_latched ? check.dock_latch.age_sec : -1.0;
+      check.charging_session_last_confirmed_at =
+        check.charging_session_latched ? check.dock_latch.last_confirmed_at : "";
     }
     const bool latch_source_valid_for_auto_undock =
       latch_source_is_docking_evidence(check.dock_latch.source) ||
@@ -11190,13 +12166,105 @@ private:
     if (check.dock_contact_latch_auto_cleared) {
       check.docked_warnings.push_back(check.dock_contact_latch_clear_reason);
     }
+    const bool bms_fresh_no_contact =
+      check.bms.have_state && check.bms.fresh && !check.bms.contact;
+    const bool bms_current_idle =
+      !check.bms.have_state ||
+      !std::isfinite(check.bms.current) ||
+      std::abs(check.bms.current) <= teleop_charging_current_min_a_;
+    const bool bms_soc_full =
+      check.bms.have_soc && std::isfinite(check.bms.soc) &&
+      check.bms.soc >= bms_full_soc_threshold_pct_;
+    const bool bms_status_idle_or_full =
+      check.bms.power_supply_status == sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_UNKNOWN ||
+      check.bms.power_supply_status == sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_FULL ||
+      check.bms.power_supply_status == sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_NOT_CHARGING;
+    const bool strong_session_latch =
+      check.dock_latch_indicates_docked &&
+      !check.dock_contact_latch_stale &&
+      !check.dock_contact_latch_contradicted_by_live_state &&
+      (latch_source_is_charging_session(check.dock_latch.source) ||
+      latch_source_is_docking_evidence(check.dock_latch.source) ||
+      latch_source_is_manual_evidence(check.dock_latch.source));
+    check.full_charge_idle_on_dock =
+      strong_session_latch &&
+      bms_fresh_no_contact &&
+      bms_current_idle &&
+      (bms_soc_full || bms_status_idle_or_full || !check.bms.present);
+    if (check.full_charge_idle_on_dock) {
+      check.docked_evidence.push_back(
+        "full_charge_idle_on_dock:latch=" + check.dock_latch.source + ":" + check.dock_latch.reason);
+    }
     check.inferred_docked =
       !check.runtime_state_docked && (check.strong_live_docked || check.latch_valid_for_auto_undock);
-    check.final_is_docked_or_charging = check.strong_live_docked || check.latch_valid_for_auto_undock;
-    check.final_auto_undock_required =
-      check.final_is_docked_or_charging ||
-      check.runtime_state_undocking ||
-      check.docking_status_indicates_undocking;
+
+    if (check.runtime_state_undocking || check.docking_status_indicates_undocking) {
+      check.dock_occupancy_state = "UNCERTAIN_ON_DOCK";
+      check.dock_occupancy_reason = "undocking_already_active";
+      check.dock_occupancy_evidence.push_back("undocking_active");
+    } else if (
+      check.runtime_state_charging ||
+      check.docking_status_indicates_charging ||
+      check.live_bms_charging_contact_stable)
+    {
+      check.dock_occupancy_state = "DOCKED_CHARGING";
+      check.dock_occupancy_reason = "live_charging_evidence";
+      if (check.runtime_state_charging) {
+        check.dock_occupancy_evidence.push_back("runtime_state:charging");
+      }
+      if (check.docking_status_indicates_charging) {
+        check.dock_occupancy_evidence.push_back("docking_status:charging");
+      }
+      if (check.live_bms_charging_contact_stable) {
+        check.dock_occupancy_evidence.push_back("bms:" + check.bms.reason);
+      }
+    } else if (check.runtime_state_docked || check.docking_status_indicates_docked) {
+      check.dock_occupancy_state = "CONFIRMED_DOCKED";
+      check.dock_occupancy_reason = "live_docked_evidence";
+      if (check.runtime_state_docked) {
+        check.dock_occupancy_evidence.push_back("runtime_state:docked");
+      }
+      if (check.docking_status_indicates_docked) {
+        check.dock_occupancy_evidence.push_back("docking_status:docked");
+      }
+    } else if (check.full_charge_idle_on_dock) {
+      check.dock_occupancy_state = "DOCKED_CHARGE_IDLE";
+      check.dock_occupancy_reason = "charging_session_or_docking_latch_with_bms_idle";
+      check.dock_occupancy_evidence.push_back(
+        "latch:" + check.dock_latch.source + ":" + check.dock_latch.reason);
+      if (bms_soc_full) {
+        check.dock_occupancy_evidence.push_back("bms_soc_full");
+      }
+      if (bms_current_idle) {
+        check.dock_occupancy_evidence.push_back("bms_current_idle");
+      }
+      if (!check.bms.present) {
+        check.dock_occupancy_evidence.push_back("bms_present_false");
+      }
+    } else if (strong_session_latch) {
+      check.dock_occupancy_state = "UNCERTAIN_ON_DOCK";
+      check.dock_occupancy_reason = "recent_strong_dock_or_charging_session_latch";
+      check.dock_occupancy_evidence.push_back(
+        "latch:" + check.dock_latch.source + ":" + check.dock_latch.reason);
+    } else if (check.live_docking_state_undocked && !check.dock_latch_indicates_docked) {
+      check.dock_occupancy_state = "CONFIRMED_UNDOCKED";
+      check.dock_occupancy_reason = "live_docking_state_undocked_without_dock_latch";
+      check.dock_occupancy_evidence.push_back("docking_status:undocked");
+    } else if (check.dock_contact_latch_stale && check.dock_latch.source_bms) {
+      check.dock_occupancy_state = "UNKNOWN";
+      check.dock_occupancy_reason = "stale_bms_latch_ignored";
+      check.dock_occupancy_evidence.push_back("stale_bms_latch");
+    } else {
+      check.dock_occupancy_state = "UNKNOWN";
+      check.dock_occupancy_reason = "no_strong_dock_evidence";
+    }
+
+    check.final_is_docked_or_charging =
+      check.dock_occupancy_state == "CONFIRMED_DOCKED" ||
+      check.dock_occupancy_state == "DOCKED_CHARGING" ||
+      check.dock_occupancy_state == "DOCKED_CHARGE_IDLE" ||
+      check.dock_occupancy_state == "UNCERTAIN_ON_DOCK";
+    check.final_auto_undock_required = check.final_is_docked_or_charging;
     check.docking_active_not_docked_block =
       check.runtime.docking_active &&
       !check.final_is_docked_or_charging &&
@@ -11216,7 +12284,10 @@ private:
       check.docked_state_class = "UNKNOWN";
     }
 
-    if (check.runtime_state_undocking || check.docking_status_indicates_undocking) {
+    if (check.final_auto_undock_required) {
+      check.auto_undock_reason =
+        "dock_occupancy_state:" + check.dock_occupancy_state + ":" + check.dock_occupancy_reason;
+    } else if (check.runtime_state_undocking || check.docking_status_indicates_undocking) {
       check.auto_undock_reason = "undocking_already_active";
     } else if (check.runtime_state_docked) {
       check.auto_undock_reason = "runtime_docking_state_docked";
@@ -11236,6 +12307,8 @@ private:
       check.auto_undock_reason = "stale_bms_latch_ignored";
     } else if (check.docking_active_not_docked_block) {
       check.auto_undock_reason = "docking_active_not_docked:" + check.runtime.docking_state;
+    } else if (check.dock_occupancy_state == "CONFIRMED_UNDOCKED") {
+      check.auto_undock_reason = "confirmed_undocked";
     } else {
       check.auto_undock_reason = "not_docked";
     }
@@ -11287,6 +12360,10 @@ private:
          << "\"note\":" << json_string(latch.note) << ","
          << "\"age_sec\":" << json_nullable_number(latch.age_sec >= 0.0, latch.age_sec) << ","
          << "\"source_bms\":" << (latch.source_bms ? "true" : "false") << ","
+         << "\"source_charging_session\":"
+         << (latch.source_charging_session ? "true" : "false") << ","
+         << "\"source_strength\":"
+         << json_string(dock_latch_source_strength(latch.source)) << ","
          << "\"stale\":" << (latch.stale ? "true" : "false") << ","
          << "\"contradicted_by_live_state\":"
          << (latch.contradicted_by_live_state ? "true" : "false") << ","
@@ -11334,6 +12411,21 @@ private:
          << (check.dock_contact_latch_auto_cleared ? "true" : "false") << ","
          << "\"dock_contact_latch_clear_reason\":"
          << json_string(check.dock_contact_latch_clear_reason) << ","
+         << "\"dock_contact_latch_source_strength\":"
+         << json_string(check.dock_contact_latch_source_strength) << ","
+         << "\"charging_session_latched\":"
+         << (check.charging_session_latched ? "true" : "false") << ","
+         << "\"charging_session_age_sec\":"
+         << json_nullable_number(check.charging_session_age_sec >= 0.0, check.charging_session_age_sec) << ","
+         << "\"charging_session_last_confirmed_at\":"
+         << json_string(check.charging_session_last_confirmed_at) << ","
+         << "\"bms_live_contact\":" << (check.bms.contact ? "true" : "false") << ","
+         << "\"bms_live_contact_reason\":" << json_string(check.bms.reason) << ","
+         << "\"bms_percentage\":" << json_nullable_number(check.bms.have_soc, check.bms.soc) << ","
+         << "\"bms_current\":" << json_nullable_number(check.bms.have_state, check.bms.current) << ","
+         << "\"bms_present\":" << (check.bms.present ? "true" : "false") << ","
+         << "\"full_charge_idle_on_dock\":"
+         << (check.full_charge_idle_on_dock ? "true" : "false") << ","
          << "\"docking\":{"
          << "\"state\":" << json_string(check.runtime.docking_state) << ","
          << "\"active\":" << (check.runtime.docking_active ? "true" : "false") << ","
@@ -11372,6 +12464,10 @@ private:
          << "\"docked_state_class\":" << json_string(check.docked_state_class) << ","
          << "\"docked_evidence\":" << json_string_array_fragment(check.docked_evidence) << ","
          << "\"docked_warnings\":" << json_string_array_fragment(check.docked_warnings) << ","
+         << "\"dock_occupancy_state\":" << json_string(check.dock_occupancy_state) << ","
+         << "\"dock_occupancy_evidence\":"
+         << json_string_array_fragment(check.dock_occupancy_evidence) << ","
+         << "\"dock_occupancy_reason\":" << json_string(check.dock_occupancy_reason) << ","
          << "\"final_is_docked_or_charging\":"
          << (check.final_is_docked_or_charging ? "true" : "false") << ","
          << "\"final_auto_undock_required\":"
@@ -11753,6 +12849,7 @@ private:
   std::string navigation_resume_command_;
   std::string navigation_resume_log_file_;
   std::string runtime_map_context_file_;
+  double navigation_resume_starting_context_ttl_sec_{300.0};
   std::string amcl_runtime_status_file_;
   double amcl_runtime_status_ttl_sec_{5.0};
   std::string last_navigation_map_file_;
@@ -11808,8 +12905,9 @@ private:
   std::string docking_default_sensor_frame_{"gs2_link"};
   int docking_max_retries_{2};
   bool predock_yaw_align_enabled_{true};
+  bool predock_yaw_align_fallback_enabled_{true};
   std::string predock_yaw_align_cmd_topic_{"/cmd_vel_docking"};
-  double predock_yaw_align_tolerance_rad_{0.035};
+  double predock_yaw_align_tolerance_rad_{0.105};
   double predock_yaw_align_trigger_rad_{0.08};
   double predock_yaw_align_hard_fail_rad_{0.80};
   double predock_yaw_align_timeout_sec_{10.0};
@@ -11826,9 +12924,14 @@ private:
   bool fine_docking_entry_require_gs2_fresh_{true};
   bool fine_docking_entry_require_predock_yaw_aligned_{true};
   double fine_docking_entry_max_distance_m_{0.35};
-  double fine_docking_entry_max_yaw_rad_{0.12};
+  double fine_docking_entry_max_yaw_rad_{0.105};
   double fine_docking_entry_max_lateral_m_{0.12};
   bool fine_docking_retry_on_yaw_reject_{true};
+  bool docking_fine_wait_for_bridge_smoothing_enabled_{true};
+  int docking_fine_bridge_smoothing_wait_timeout_ms_{60000};
+  int docking_fine_bridge_smoothing_sample_period_ms_{100};
+  int docking_fine_bridge_smoothing_stable_samples_{3};
+  bool docking_fine_bridge_smoothing_zero_cmd_during_wait_{true};
   bool docking_pause_global_correction_during_fine_{true};
   std::string localization_bridge_correction_pause_service_{
     "/robot_localization_bridge/set_correction_paused"};
@@ -11909,6 +13012,20 @@ private:
   double navigation_goal_result_timeout_sec_{600.0};
   double navigation_goal_position_success_tolerance_m_{0.20};
   std::string navigation_default_goal_completion_policy_{"pose_required"};
+  bool nav2_native_goal_completion_enabled_{true};
+  bool nav2_rotation_shim_enabled_{true};
+  bool api_final_yaw_align_fallback_enabled_{true};
+  bool post_nav2_final_verify_enabled_{false};
+  bool post_nav2_final_verify_wait_bridge_smoothing_{false};
+  int post_nav2_final_verify_bridge_wait_timeout_ms_{2000};
+  int post_nav2_final_verify_bridge_wait_sample_period_ms_{100};
+  int post_nav2_final_verify_max_retry_count_{0};
+  double post_nav2_final_verify_acceptance_slack_m_{0.0};
+  double post_nav2_final_verify_xy_retry_min_error_m_{0.20};
+  double post_nav2_final_verify_xy_retry_max_error_m_{0.60};
+  bool post_nav2_final_verify_yaw_retry_if_failed_{false};
+  bool post_nav2_final_verify_retry_uses_same_nav2_goal_{false};
+  bool post_nav2_final_verify_api_velocity_correction_enabled_{false};
   int navigation_max_reposition_after_yaw_retry_{1};
   double navigation_reposition_after_yaw_drift_timeout_sec_{30.0};
   bool navigation_final_yaw_align_enable_{true};
@@ -11924,7 +13041,7 @@ private:
   std::string navigation_final_yaw_align_cmd_topic_{"/cmd_vel_collision_checked"};
   bool navigation_final_yaw_align_bypass_collision_monitor_{true};
   int navigation_final_yaw_align_zero_cmd_count_{3};
-  double navigation_lifecycle_check_timeout_sec_{0.35};
+  double navigation_lifecycle_check_timeout_sec_{1.5};
 
   std::atomic<bool> running_{false};
   std::atomic<int> active_http_connections_{0};

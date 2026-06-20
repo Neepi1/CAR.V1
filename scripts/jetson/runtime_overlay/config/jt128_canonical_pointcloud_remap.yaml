@@ -4,13 +4,8 @@ pointcloud_axis_remap:
     output_topic: /lidar_points
     output_frame_id: lidar_link
     # /lidar_points is the full-density high-priority canonical trunk.
-    # The localization scan branch is derived here at reduced density so the
-    # Nav2/localizer chain does not subscribe to the full-size trunk directly.
-    # The file-level default is a safe trunk baseline. Production navigation
-    # selects NJRH_LOCAL_PERCEPTION_INPUT_PROFILE=local_branch, and run_driver.sh
-    # injects runtime overrides for /_internal/lidar_points_local so local
-    # obstacle filtering does not subscribe to the full-density trunk directly.
-    # Set the profile to trunk for one-command rollback/diagnosis.
+    # Production obstacle marking/clearing is derived from /scan, not from
+    # derived local PointCloud2 branches.
     nav_output_topic: /lidar_points_nav
     nav_output_stride: 4
     nav_output_publish_every_n: 2

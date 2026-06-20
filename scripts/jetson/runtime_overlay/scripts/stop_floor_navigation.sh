@@ -70,6 +70,7 @@ patterns=(
   "collision_monitor"
   "lifecycle_manager_costmap_filters"
   "lifecycle_manager_navigation"
+  "lifecycle_bringup"
   "lifecycle_manager_localization"
   "global_costmap"
   "local_costmap"
@@ -90,6 +91,10 @@ patterns=(
   "global_localization_node --ros-args"
   "robot_localization_bridge/localization_bridge_node"
   "localization_bridge_node --ros-args"
+  "ros2 run nav2_amcl amcl"
+  "nav2_amcl/amcl"
+  "amcl_scan_admission_node"
+  "amcl_scan_admission_relay.py"
   "map_to_odom_tf_bridge"
   "robot_local_perception/local_perception_node"
   "local_perception_node --ros-args"
@@ -132,9 +137,22 @@ kill_navigation_patterns() {
   done
 }
 
+stop_amcl_bounded() {
+  local timeout_sec="${NJRH_NAV_STOP_AMCL_TIMEOUT_SEC:-4s}"
+  local kill_after="${NJRH_NAV_STOP_AMCL_KILL_AFTER_SEC:-1s}"
+  echo "[runtime-overlay] stopping AMCL shadow localization timeout=${timeout_sec}" >&2
+  if timeout --kill-after="${kill_after}" "${timeout_sec}" \
+    bash "${SCRIPT_DIR}/run_amcl_shadow_localization.sh" --stop
+  then
+    echo "[runtime-overlay] AMCL shadow localization stopped" >&2
+  else
+    local status=$?
+    echo "[runtime-overlay] AMCL stop did not complete within ${timeout_sec} status=${status}; continuing after Nav2 process cleanup" >&2
+  fi
+}
+
 echo "[runtime-overlay] stop floor navigation requested" >&2
 publish_zero
-bash "${SCRIPT_DIR}/run_amcl_shadow_localization.sh" --stop >/dev/null 2>&1 || true
 if [[ "${NJRH_NAV_STOP_LIFECYCLE_SHUTDOWN:-false}" == "true" ]]; then
   lifecycle_shutdown_nav2
 fi
@@ -150,6 +168,7 @@ publish_zero
 kill_navigation_patterns KILL
 wait_until_clear "${NJRH_NAV_STOP_KILL_WAIT_SEC:-1}" || true
 publish_zero
+stop_amcl_bounded
 clear_runtime_map_context
 
 lingering="$(matching_navigation_processes)"

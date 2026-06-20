@@ -5,7 +5,7 @@ from pathlib import Path
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import ComposableNodeContainer, Node
 from launch_ros.descriptions import ComposableNode
 
@@ -35,6 +35,7 @@ def generate_launch_description():
     flatscan_topic = LaunchConfiguration("flatscan_topic")
     use_sim_time = LaunchConfiguration("use_sim_time")
     start_map_server = LaunchConfiguration("start_map_server")
+    map_lifecycle_manager_enabled = LaunchConfiguration("map_lifecycle_manager_enabled")
     map_frame = LaunchConfiguration("map_frame")
 
     map_server = Node(
@@ -51,7 +52,12 @@ def generate_launch_description():
     )
 
     lifecycle_manager = Node(
-        condition=IfCondition(start_map_server),
+        condition=IfCondition(PythonExpression([
+            "'", start_map_server,
+            "'.lower() in ['true', '1', 'yes', 'on'] and '",
+            map_lifecycle_manager_enabled,
+            "'.lower() in ['true', '1', 'yes', 'on']",
+        ])),
         package="nav2_lifecycle_manager",
         executable="lifecycle_manager",
         name="lifecycle_manager_map",
@@ -100,6 +106,7 @@ def generate_launch_description():
         DeclareLaunchArgument("flatscan_topic", default_value="/flatscan"),
         DeclareLaunchArgument("use_sim_time", default_value="false"),
         DeclareLaunchArgument("start_map_server", default_value="true"),
+        DeclareLaunchArgument("map_lifecycle_manager_enabled", default_value="true"),
         DeclareLaunchArgument("map_frame", default_value="map"),
         map_server,
         lifecycle_manager,

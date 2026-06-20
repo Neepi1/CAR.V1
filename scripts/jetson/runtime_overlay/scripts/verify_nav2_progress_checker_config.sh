@@ -101,9 +101,9 @@ check_static_config() {
     && pass "static movement_time_allowance=${timeout}" \
     || fail "static movement_time_allowance=${timeout:-missing}, expected unchanged 12.0"
 
-  [[ "${rotate}" == "false" ]] \
-    && pass "static FollowPath.rotate_to_goal_heading=false" \
-    || fail "static FollowPath.rotate_to_goal_heading=${rotate:-missing}, expected false"
+  [[ "${rotate}" == "true" ]] \
+    && pass "static FollowPath.rotate_to_goal_heading=true" \
+    || fail "static FollowPath.rotate_to_goal_heading=${rotate:-missing}, expected true"
 
   if [[ -n "${threshold}" ]]; then
     pass "static FollowPath.angular_dist_threshold=${threshold}"
@@ -152,7 +152,7 @@ check_runtime_config() {
   fi
 
   rotate="$(param_value /controller_server FollowPath.rotate_to_goal_heading || true)"
-  [[ "${rotate}" == "False" || "${rotate}" == "false" ]] \
+  [[ "${rotate}" == "True" || "${rotate}" == "true" ]] \
     && pass "runtime FollowPath.rotate_to_goal_heading=${rotate}" \
     || warn "runtime FollowPath.rotate_to_goal_heading unavailable or unexpected: ${rotate}"
 

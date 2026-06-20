@@ -12,9 +12,14 @@ The fix is explicit and non-position-based:
   recovery and sends no velocity.
 - `POST /api/v1/docking/clear_docked_latch` clears the latch and sends no
   velocity.
-- Successful docking or live charging contact sets the latch.
+- Successful docking or live charging contact sets the latch. New live charging
+  evidence is recorded as `source=charging_session`; legacy `source=bms` remains
+  weak TTL evidence for compatibility.
 - Odometry-confirmed undock or explicit clear clears the latch.
-- BMS contact false alone never clears the latch.
+- BMS contact false alone never clears a `source=charging_session` or
+  `source=docking_job` latch. Those strong sources clear only after controlled
+  undock success with retreat-distance confirmation or explicit maintenance
+  clear. Stale `source=bms` evidence still follows the D2 TTL rules.
 
 `pre_navigation_dock_check` now exposes `docked_state_class`,
 `docked_evidence`, and `docked_warnings`. `DOCKED_CONFIRMED` comes from live
@@ -25,6 +30,15 @@ Nav2 in both cases.
 `robot_safety` reads the same latch at low frequency and blocks normal
 `/cmd_vel_collision_checked` while preserving `/cmd_vel_docking` for controlled
 undock. Position proximity is not used as confirmed dock evidence.
+
+Phase D2.3 adds `dock_occupancy_state` on top of the raw latch. Full-charge
+charger idle is represented as `DOCKED_CHARGE_IDLE` when a strong charging
+session or docking-job latch exists and live BMS has become inconclusive
+(`status=0`, `present=false`, `current=0`, or full/idle). `UNCERTAIN_ON_DOCK`
+is used when recent strong dock/session evidence exists but BMS and
+`/docking/status` are inconclusive. Both states require auto-undock or block
+direct Nav2 goal submission. SOC=100 alone does not create a charging-session
+latch and does not prove physical dock occupancy.
 
 Maintenance commands:
 

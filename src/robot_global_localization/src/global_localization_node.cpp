@@ -43,6 +43,7 @@ public:
     declare_parameter<double>("service_call_timeout_sec", 10.0);
     declare_parameter<double>("result_wait_timeout_sec", 20.0);
     declare_parameter<double>("bridge_accept_timeout_sec", 8.0);
+    declare_parameter<double>("transient_stale_bridge_accept_timeout_sec", 5.0);
     declare_parameter<double>("map_to_odom_wait_timeout_sec", 8.0);
     declare_parameter<double>("map_to_odom_max_age_ms", 1000.0);
     declare_parameter<bool>("require_grid_search_trigger", true);
@@ -60,6 +61,8 @@ public:
     service_call_timeout_sec_ = get_parameter("service_call_timeout_sec").as_double();
     result_wait_timeout_sec_ = get_parameter("result_wait_timeout_sec").as_double();
     bridge_accept_timeout_sec_ = get_parameter("bridge_accept_timeout_sec").as_double();
+    transient_stale_bridge_accept_timeout_sec_ =
+      get_parameter("transient_stale_bridge_accept_timeout_sec").as_double();
     map_to_odom_wait_timeout_sec_ = get_parameter("map_to_odom_wait_timeout_sec").as_double();
     map_to_odom_max_age_ms_ = get_parameter("map_to_odom_max_age_ms").as_double();
     require_grid_search_trigger_ = get_parameter("require_grid_search_trigger").as_bool();
@@ -127,6 +130,7 @@ private:
     std::uint64_t rejected_result_count{0U};
     bool has_map_to_odom{false};
     double map_to_odom_age_ms{-1.0};
+    double map_odom_publish_gap_ms{-1.0};
     std::string owner;
     std::string gate_mode;
     std::string last_accept_reason;
@@ -144,6 +148,8 @@ private:
       positive_or_default(result_wait_timeout_sec_, std::max(service_timeout_sec_, 20.0));
     const double bridge_accept_timeout_sec =
       positive_or_default(bridge_accept_timeout_sec_, 8.0);
+    const double transient_stale_bridge_accept_timeout_sec =
+      positive_or_default(transient_stale_bridge_accept_timeout_sec_, 5.0);
     const double map_to_odom_wait_timeout_sec =
       positive_or_default(map_to_odom_wait_timeout_sec_, 8.0);
 
@@ -215,7 +221,11 @@ private:
 
     std::string bridge_detail;
     if (require_bridge_acceptance_ && !wait_for_bridge_acceptance(
-        initial_bridge, trigger_started_sec, bridge_accept_timeout_sec, bridge_detail))
+        initial_bridge,
+        trigger_started_sec,
+        bridge_accept_timeout_sec,
+        transient_stale_bridge_accept_timeout_sec,
+        bridge_detail))
     {
       response->accepted = false;
       response->message = bridge_detail + "; " + force_accept_detail + "; " + direct_service_detail;
@@ -313,6 +323,7 @@ private:
     snapshot.rejected_result_count = json_uint_value(msg->data, "rejected_result_count", 0U);
     snapshot.has_map_to_odom = json_bool_value(msg->data, "has_map_to_odom", false);
     snapshot.map_to_odom_age_ms = json_double_value(msg->data, "map_to_odom_age_ms", -1.0);
+    snapshot.map_odom_publish_gap_ms = json_double_value(msg->data, "map_odom_publish_gap_ms", -1.0);
     snapshot.owner = json_string_value(msg->data, "map_to_odom_publisher_owner");
     snapshot.gate_mode = json_string_value(msg->data, "gate_mode");
     snapshot.last_accept_reason = json_string_value(msg->data, "last_accept_reason");
@@ -536,14 +547,35 @@ private:
     const BridgeStatusSnapshot & initial,
     const double trigger_started_sec,
     const double timeout_sec,
+    const double transient_stale_timeout_sec,
     std::string & detail)
   {
-    const auto deadline = steady_deadline(timeout_sec);
+    auto active_deadline = steady_deadline(timeout_sec);
+    bool saw_transient_stale_reject = false;
+    bool saw_nonfresh_bridge_accept = false;
+    std::uint64_t last_transient_stale_reject_count = initial.rejected_result_count;
     BridgeStatusSnapshot latest;
-    while (std::chrono::steady_clock::now() <= deadline) {
+    while (
+      std::chrono::steady_clock::now() <= active_deadline)
+    {
       latest = bridge_status_snapshot();
       if (latest.available && latest.received_sec >= trigger_started_sec) {
         if (latest.rejected_result_count > initial.rejected_result_count) {
+          if (bridge_reject_is_transient_triggered_stale(latest.last_reject_reason)) {
+            if (latest.rejected_result_count > last_transient_stale_reject_count) {
+              last_transient_stale_reject_count = latest.rejected_result_count;
+              saw_transient_stale_reject = true;
+              const auto shortened_deadline = steady_deadline(transient_stale_timeout_sec);
+              if (shortened_deadline < active_deadline) {
+                active_deadline = shortened_deadline;
+              }
+              detail = "bridge waiting for fresh triggered localization_result after transient stale reject: " +
+                       latest.last_reject_reason;
+              RCLCPP_WARN(get_logger(), "%s", detail.c_str());
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+          }
           detail = "failure_code=BRIDGE_REJECTED_RESULT last_reject_reason=" +
                    latest.last_reject_reason;
           return false;
@@ -552,15 +584,28 @@ private:
           latest.accepted_result_count > initial.accepted_result_count &&
           latest.has_map_to_odom)
         {
-          detail = "bridge accepted result gate_mode=" + latest.gate_mode +
-                   " accept_reason=" + latest.last_accept_reason +
-                   " has_map_to_odom=true";
-          return true;
+          if (map_to_odom_ready(latest))
+          {
+            detail = "bridge accepted result gate_mode=" + latest.gate_mode +
+                     " accept_reason=" + latest.last_accept_reason +
+                     " has_map_to_odom=true age_ms=" +
+                     std::to_string(latest.map_to_odom_age_ms) +
+                     " publish_gap_ms=" + std::to_string(latest.map_odom_publish_gap_ms);
+            return true;
+          }
+          saw_nonfresh_bridge_accept = true;
+          detail = "bridge accepted count advanced but map->odom is not fresh yet owner=" +
+                   latest.owner + " age_ms=" + std::to_string(latest.map_to_odom_age_ms) +
+                   " publish_gap_ms=" + std::to_string(latest.map_odom_publish_gap_ms);
         }
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
-    detail = "failure_code=BRIDGE_ACCEPT_TIMEOUT bridge did not accept localization_result";
+    detail = saw_transient_stale_reject ?
+      "failure_code=BRIDGE_ACCEPT_TIMEOUT bridge did not accept a fresh triggered localization_result after transient stale rejects" :
+      (saw_nonfresh_bridge_accept ?
+      "failure_code=BRIDGE_ACCEPT_TIMEOUT bridge accepted a result but map->odom did not become fresh" :
+      "failure_code=BRIDGE_ACCEPT_TIMEOUT bridge did not accept localization_result");
     if (latest.available) {
       detail += " last_reject_reason=" + latest.last_reject_reason;
       if (latest.last_reject_reason.find("tf_history_missing") != std::string::npos) {
@@ -568,6 +613,12 @@ private:
       }
     }
     return false;
+  }
+
+  bool bridge_reject_is_transient_triggered_stale(const std::string & reason) const
+  {
+    return reason.find("isaac_triggered_pose_stale_ms") != std::string::npos &&
+           reason.find("gate_mode=triggered") != std::string::npos;
   }
 
   bool map_to_odom_tf_available()
@@ -580,6 +631,24 @@ private:
     } catch (const std::exception &) {
       return false;
     }
+  }
+
+  bool map_to_odom_bridge_publish_healthy(const BridgeStatusSnapshot & latest) const
+  {
+    if (latest.map_to_odom_age_ms >= 0.0 && latest.map_to_odom_age_ms <= map_to_odom_max_age_ms_) {
+      return true;
+    }
+    return latest.map_odom_publish_gap_ms >= 0.0 &&
+           latest.map_odom_publish_gap_ms <= map_to_odom_max_age_ms_;
+  }
+
+  bool map_to_odom_ready(const BridgeStatusSnapshot & latest)
+  {
+    return latest.available &&
+           latest.has_map_to_odom &&
+           latest.owner == "robot_localization_bridge" &&
+           map_to_odom_bridge_publish_healthy(latest) &&
+           map_to_odom_tf_available();
   }
 
   bool wait_for_map_to_odom(const double timeout_sec, std::string & detail)
@@ -596,16 +665,11 @@ private:
         detail = "failure_code=MAP_TO_ODOM_WRONG_OWNER owner=" + latest.owner;
         return false;
       }
-      if (
-        latest.available &&
-        latest.has_map_to_odom &&
-        latest.owner == "robot_localization_bridge" &&
-        latest.map_to_odom_age_ms >= 0.0 &&
-        latest.map_to_odom_age_ms <= map_to_odom_max_age_ms_ &&
-        map_to_odom_tf_available())
+      if (map_to_odom_ready(latest))
       {
         detail = "map->odom ready owner=robot_localization_bridge age_ms=" +
-                 std::to_string(latest.map_to_odom_age_ms);
+                 std::to_string(latest.map_to_odom_age_ms) +
+                 " publish_gap_ms=" + std::to_string(latest.map_odom_publish_gap_ms);
         return true;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -614,7 +678,8 @@ private:
     if (latest.available) {
       detail += " has_map_to_odom=" + std::string(latest.has_map_to_odom ? "true" : "false") +
                 " owner=" + latest.owner +
-                " age_ms=" + std::to_string(latest.map_to_odom_age_ms);
+                " age_ms=" + std::to_string(latest.map_to_odom_age_ms) +
+                " publish_gap_ms=" + std::to_string(latest.map_odom_publish_gap_ms);
     }
     return false;
   }
@@ -648,6 +713,7 @@ private:
   double service_call_timeout_sec_{10.0};
   double result_wait_timeout_sec_{20.0};
   double bridge_accept_timeout_sec_{8.0};
+  double transient_stale_bridge_accept_timeout_sec_{5.0};
   double map_to_odom_wait_timeout_sec_{8.0};
   double map_to_odom_max_age_ms_{1000.0};
   bool require_grid_search_trigger_{true};

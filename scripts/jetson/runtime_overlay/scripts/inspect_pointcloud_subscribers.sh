@@ -7,10 +7,9 @@ source "${SCRIPT_DIR}/common_env.sh"
 TOPICS=(
   /lidar_points
   /lidar_points_nav
-  /_internal/lidar_points_local
   /points_nav
-  /perception/obstacle_points
-  /perception/clearing_points
+  /scan
+  /flatscan
 )
 
 status=0

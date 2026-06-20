@@ -15,7 +15,8 @@ void write_runtime_map_context_file(
   const std::string & state,
   bool confirmed,
   const std::string & message,
-  double updated_at_sec);
+  double updated_at_sec,
+  const std::string & startup_stage = "");
 
 std::optional<RuntimeMapContext> read_runtime_map_context_file(const std::filesystem::path & path);
 

@@ -26,21 +26,28 @@ def assert_nav2_local_costmap_frame_contract(nav2_yaml: str, local_costmap: str)
     assert "global_frame: odom" in local_costmap
     assert "global_frame: base_link" not in local_costmap
     assert "robot_base_frame: base_link" in local_costmap
+    assert 'plugins: ["obstacle_layer", "local_inflation_layer"]' in local_costmap
+    assert 'plugin: "nav2_costmap_2d::ObstacleLayer"' in local_costmap
+    assert "voxel_layer:" not in local_costmap
+    assert "nav2_costmap_2d::VoxelLayer" not in local_costmap
+    assert "combination_method: 0" in local_costmap
+    assert "footprint_clearing_enabled: true" in local_costmap
     assert 'plugin: "nav2_controller::PoseProgressChecker"' in nav2_yaml
     assert 'plugin: "nav2_controller::SimpleProgressChecker"' not in nav2_yaml
     assert "required_movement_radius: 0.10" in nav2_yaml
     assert "required_movement_angle: 0.10" in nav2_yaml
     assert "movement_time_allowance: 12.0" in nav2_yaml
     assert (
-        "        obstacle_points:\n"
-        "          topic: /perception/obstacle_points\n"
-        "          sensor_frame: base_link\n"
+        "        scan:\n"
+        "          topic: /scan\n"
+        "          sensor_frame: lidar_level_link\n"
+        "          data_type: LaserScan\n"
     ) in local_costmap
-    assert (
-        "        clearing_points:\n"
-        "          topic: /perception/clearing_points\n"
-        "          sensor_frame: base_link\n"
-    ) in local_costmap
+    assert "          marking: true\n" in local_costmap
+    assert "          clearing: true\n" in local_costmap
+    assert "          inf_is_valid: true\n" in local_costmap
+    assert "/perception/obstacle_points" not in local_costmap
+    assert "/perception/clearing_points" not in local_costmap
 
 
 def test_reports_exist():
@@ -51,6 +58,53 @@ def test_reports_exist():
         "occupancy_builder_design.md",
     ):
         assert (ROOT / "reports" / name).exists(), name
+
+
+def test_navigation_failure_observer_uses_ros2_rosout_log_type():
+    script = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "observe_navigation_failure_minimal.sh"
+    ).read_text(encoding="utf-8")
+    assert "from rcl_interfaces.msg import Log" in script
+    assert "from rosgraph_msgs.msg import Log" not in script
+    assert "from nav2_msgs.msg import SpeedLimit" in script
+    assert "from nav_msgs.msg import OccupancyGrid, Path as NavPath" in script
+    assert '"/speed_limit"' in script
+    assert '"/transformed_global_plan"' in script
+    assert '"/local_costmap/costmap"' in script
+    assert "cmd_frames.jsonl" in script
+    assert "subscribes_tf\": False" in script
+    assert "publishes_topics\": False" in script
+    assert "stores_full_costmap\": False" in script
+
+
+def test_local_costmap_scan_clearing_observer_is_read_only():
+    script = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "observe_local_costmap_scan_clearing.sh"
+    ).read_text(encoding="utf-8")
+    assert 'SCAN_TOPIC="${SCAN_TOPIC:-/scan}"' in script
+    assert 'COSTMAP_TOPIC="${COSTMAP_TOPIC:-/local_costmap/costmap}"' in script
+    assert "tf2_ros.TransformListener" in script
+    assert "supported_by_current_scan_endpoint" in script
+    assert "behind_current_scan_endpoint_blocked" in script
+    assert "inside_current_clear_ray_but_still_occupied" in script
+    assert '"calls_services": False' in script
+    assert '"sets_params": False' in script
+    assert '"publishes_control": False' in script
+    assert '"clears_costmap": False' in script
+    assert "clear_entirely_local_costmap" not in script
+    assert "ros2 service call" not in script
+
+
+def test_production_local_obstacle_scan_slice_is_not_too_low():
+    overlay_config = ROOT / "scripts" / "jetson" / "runtime_overlay" / "config"
+    for path in (
+        overlay_config / "pointcloud_accel_axis.yaml",
+        overlay_config / "hesai_accel_driver.yaml",
+    ):
+        text = path.read_text(encoding="utf-8")
+        assert "scan_worker_min_height: -0.50" in text, path
+        assert "scan_worker_max_height: 0.35" in text, path
+        assert "scan_worker_min_height: -0.75" not in text, path
 
 
 def test_nav_defaults_are_fixed():
@@ -73,6 +127,11 @@ def test_nav_defaults_are_fixed():
     assert "vx_min: 0.0" in nav2
     assert "vy_max: 0.0" in nav2
     assert "wz_max: 0.70" in nav2
+    for cfg in (nav2, overlay_nav2):
+        assert '- "VelocityDeadbandCritic"' in cfg
+        assert "VelocityDeadbandCritic:" in cfg
+        assert "deadband_velocities: [0.025, 0.0, 0.025]" in cfg
+        assert "cost_weight: 35.0" in cfg
     assert "desired_linear_vel: 0.80" in nav2
     assert "max_velocity: [1.20, 0.0, 1.00]" in nav2
     assert "nav2_rotation_shim_controller::RotationShimController" in nav2
@@ -85,13 +144,23 @@ def test_nav_defaults_are_fixed():
     assert "required_movement_angle: 0.10" in nav2
     assert "movement_time_allowance: 12.0" in nav2
     assert "movement_time_allowance: 20.0" not in nav2
-    assert "rotate_to_goal_heading: false" in nav2
-    assert "rotate_to_goal_heading: true" not in nav2
+    assert "rotate_to_goal_heading: true" in nav2
+    assert "rotate_to_goal_heading: false" not in nav2
     assert "use_rotate_to_heading: false" in nav2
-    assert "/perception/obstacle_points" in nav2
-    assert "/perception/clearing_points" in nav2
-    assert "origin_z: -0.20" in nav2
-    assert "z_voxels: 16" in nav2
+    assert "observation_sources: scan" in nav2
+    assert "observation_sources: scan" in overlay_nav2
+    assert "data_type: LaserScan" in nav2
+    assert "data_type: LaserScan" in overlay_nav2
+    assert "inf_is_valid: true" in nav2
+    assert "inf_is_valid: true" in overlay_nav2
+    assert "/perception/obstacle_points" not in nav2
+    assert "/perception/clearing_points" not in nav2
+    assert "/perception/obstacle_points" not in overlay_nav2
+    assert "/perception/clearing_points" not in overlay_nav2
+    assert 'plugins: ["obstacle_layer", "local_inflation_layer"]' in nav2
+    assert 'plugin: "nav2_costmap_2d::ObstacleLayer"' in nav2
+    assert "voxel_layer:" not in nav2_local_costmap
+    assert "nav2_costmap_2d::VoxelLayer" not in nav2_local_costmap
     assert "min_obstacle_height: -0.20" in nav2
     assert "max_obstacle_height: 1.40" in nav2
     assert "global_frame: odom" in nav2_local_costmap
@@ -100,11 +169,11 @@ def test_nav_defaults_are_fixed():
     assert "global_frame: base_link" not in overlay_local_costmap
     assert "robot_base_frame: base_link" in nav2_local_costmap
     assert "robot_base_frame: base_link" in overlay_local_costmap
-    assert "sensor_frame: base_link" in nav2
-    assert "sensor_frame: base_link" in overlay_nav2
+    assert "sensor_frame: lidar_level_link" in nav2
+    assert "sensor_frame: lidar_level_link" in overlay_nav2
     assert "clearing: true" in nav2
-    assert "clearing: false" in nav2_local_costmap
-    assert "clearing: false" in overlay_local_costmap
+    assert "clearing: false" not in nav2_local_costmap
+    assert "clearing: false" not in overlay_local_costmap
     assert "observation_persistence: 0.0" in nav2
     assert "controller_frequency: 12.0" in nav2
     assert "bt_loop_duration: 50" in nav2
@@ -132,8 +201,41 @@ def test_nav_defaults_are_fixed():
         "default_nav_to_pose_bt_xml: "
         "/workspaces/njrh-v3/workspace1/install/robot_nav_config/share/robot_nav_config/behavior_trees/navigate_to_pose.xml"
     ) in overlay_nav2
+    assert (
+        "default_nav_through_poses_bt_xml: "
+        "/workspaces/njrh-v3/workspace1/install/robot_nav_config/share/robot_nav_config/behavior_trees/navigate_through_poses.xml"
+    ) in nav2
+    assert (
+        "default_nav_through_poses_bt_xml: "
+        "/workspaces/njrh-v3/workspace1/install/robot_nav_config/share/robot_nav_config/behavior_trees/navigate_through_poses.xml"
+    ) in overlay_nav2
     assert "navigate_to_pose_w_replanning_and_recovery.xml" not in nav2
     assert "navigate_to_pose_w_replanning_and_recovery.xml" not in overlay_nav2
+    assert "navigate_through_poses_w_replanning_and_recovery.xml" not in nav2
+    assert "navigate_through_poses_w_replanning_and_recovery.xml" not in overlay_nav2
+    for bt_plugin in (
+        "nav2_compute_path_to_pose_action_bt_node",
+        "nav2_compute_path_through_poses_action_bt_node",
+        "nav2_follow_path_action_bt_node",
+        "nav2_pipeline_sequence_bt_node",
+        "nav2_navigate_to_pose_action_bt_node",
+        "nav2_navigate_through_poses_action_bt_node",
+    ):
+        assert bt_plugin in nav2
+        assert bt_plugin in overlay_nav2
+    for unused_bt_plugin in (
+        "nav2_spin_action_bt_node",
+        "nav2_wait_action_bt_node",
+        "nav2_back_up_action_bt_node",
+        "nav2_clear_costmap_service_bt_node",
+        "nav2_goal_updated_condition_bt_node",
+        "nav2_rate_controller_bt_node",
+        "nav2_recovery_node_bt_node",
+        "nav2_round_robin_node_bt_node",
+        "nav2_remove_passed_goals_action_bt_node",
+    ):
+        assert unused_bt_plugin not in nav2
+        assert unused_bt_plugin not in overlay_nav2
     assert "batch_size: 1200" in nav2
     assert "width: 10" in nav2
     assert "height: 10" in nav2
@@ -152,22 +254,26 @@ def test_nav_defaults_are_fixed():
     assert "collision_monitor" in nav2
     assert "keepout_filter_mask_server" in nav2
     assert "keepout_costmap_filter_info_server" in nav2
-    assert "speed_filter_mask_server" in nav2
-    assert "speed_costmap_filter_info_server" in nav2
-    assert 'filters: ["keepout_filter", "speed_filter"]' in nav2
+    costmap_filter_nodes = nav2[
+        nav2.index("lifecycle_manager_costmap_filters:") : nav2.index("planner_server:")
+    ]
+    assert "speed_filter_mask_server" not in costmap_filter_nodes
+    assert "speed_costmap_filter_info_server" not in costmap_filter_nodes
+    assert 'filters: ["keepout_filter"]' in nav2
     assert 'plugin: "nav2_costmap_2d::KeepoutFilter"' in nav2
     assert "filter_info_topic: /costmap_filter_info/keepout" in nav2
     assert 'plugin: "nav2_costmap_2d::SpeedFilter"' in nav2
     assert "filter_info_topic: /costmap_filter_info/speed" in nav2
-    assert "yaw_goal_tolerance: 0.15" in nav2
-    assert "yaw_goal_tolerance: 0.15" in overlay_nav2
-    assert "yaw_goal_tolerance: 0.05" not in nav2
-    assert "yaw_goal_tolerance: 0.05" not in overlay_nav2
+    assert "yaw_goal_tolerance: 0.0873" in nav2
+    assert "yaw_goal_tolerance: 0.0873" in overlay_nav2
+    assert "yaw_goal_tolerance: 0.15" not in nav2
+    assert "yaw_goal_tolerance: 0.15" not in overlay_nav2
     assert 'plugin: "nav2_controller::PoseProgressChecker"' in overlay_nav2
     assert 'plugin: "nav2_controller::SimpleProgressChecker"' not in overlay_nav2
     assert "required_movement_angle: 0.10" in overlay_nav2
-    assert "rotate_to_goal_heading: false" in overlay_nav2
-    assert "rotate_to_goal_heading: true" not in overlay_nav2
+    assert "rotate_to_goal_heading: true" in overlay_nav2
+    assert "rotate_to_goal_heading: false" not in overlay_nav2
+    assert "stateful: false" in overlay_nav2
 
     local_perception = (
         ROOT / "src" / "robot_local_perception" / "config" / "local_perception.yaml"
@@ -175,24 +281,19 @@ def test_nav_defaults_are_fixed():
     overlay_local_perception = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "local_perception.yaml"
     ).read_text(encoding="utf-8")
-    assert "input_topic: /lidar_points\n" in local_perception
-    assert "input_topic: /_internal/lidar_points_local" not in local_perception
-    assert "input_topic: /jt128/vendor/points_raw" not in local_perception
-    assert "input_reliable: false" in local_perception
-    assert "input_qos_depth: 1" in local_perception
-    assert "input_transform_use_latest: true" in local_perception
-    assert "clearing.publish_every_n: 4" in local_perception
-    assert "status_topic: /perception/local_perception_status" in local_perception
-    assert "status_publish_period_sec: 2.0" in local_perception
-    assert "input_reliable: false" in overlay_local_perception
-    assert "input_qos_depth: 1" in overlay_local_perception
-    assert "input_topic: /lidar_points\n" in overlay_local_perception
-    assert "input_topic: /_internal/lidar_points_local" not in overlay_local_perception
-    assert "input_topic: /jt128/vendor/points_raw" not in overlay_local_perception
-    assert "input_transform_use_latest: true" in overlay_local_perception
-    assert "clearing.publish_every_n: 4" in overlay_local_perception
-    assert "status_topic: /perception/local_perception_status" in overlay_local_perception
-    assert "status_publish_period_sec: 2.0" in overlay_local_perception
+    for cfg in (local_perception, overlay_local_perception):
+        assert "enabled: false" in cfg
+        assert 'input_topic: ""' in cfg
+        assert 'output_topic: ""' in cfg
+        assert 'clearing_output_topic: ""' in cfg
+        assert "clearing.enabled: false" in cfg
+        assert 'status_topic: ""' in cfg
+        assert "/lidar_points\n" not in cfg
+        assert "/_internal/lidar_points_local" not in cfg
+        assert "/jt128/vendor/points_raw" not in cfg
+        assert "/perception/obstacle_points" not in cfg
+        assert "/perception/clearing_points" not in cfg
+        assert "/perception/local_perception_status" not in cfg
 
 
 def test_nav2_local_costmap_frame_contract():
@@ -218,7 +319,7 @@ def test_verify_nav2_local_costmap_frame_script_contract():
     assert "param_value /local_costmap/local_costmap robot_base_frame" in script
     assert "ros2 run tf2_ros tf2_echo odom base_link" in script
     assert "ros2 topic echo /local_state/odometry --once" in script
-    assert "ros2 topic info -v /perception/obstacle_points" in script
+    assert "ros2 topic info -v /scan" in script
     assert "Node name: local_costmap" in script
     assert "Node name: collision_monitor" in script
     assert "ros2 lifecycle get /controller_server" in script
@@ -295,20 +396,29 @@ def test_phase_n2_goal_completion_semantics_contracts():
     assert 'navigation_default_goal_completion_policy", "pose_required"' in api_cpp
     assert 'navigation_default_goal_completion_policy: "pose_required"' in config
     assert 'navigation_default_goal_completion_policy: "pose_required"' in overlay_config
-    assert "navigation_max_reposition_after_yaw_retry: 1" in config
-    assert "navigation_max_reposition_after_yaw_retry: 1" in overlay_config
+    assert "navigation_max_reposition_after_yaw_retry: 0" in config
+    assert "navigation_max_reposition_after_yaw_retry: 0" in overlay_config
     assert "navigation_reposition_after_yaw_drift_timeout_sec: 30.0" in config
     assert "navigation_reposition_after_yaw_drift_timeout_sec: 30.0" in overlay_config
+    assert "nav2_native_goal_completion_enabled: true" in config
+    assert "nav2_native_goal_completion_enabled: true" in overlay_config
+    assert "nav2_rotation_shim_enabled: true" in config
+    assert "nav2_rotation_shim_enabled: true" in overlay_config
+    assert "api_final_yaw_align_fallback_enabled: false" in config
+    assert "api_final_yaw_align_fallback_enabled: false" in overlay_config
 
     assert "goal_completion_policy=dock_staging is reserved for /api/v1/docking/start" in api_cpp
-    assert "goal_completion_policy=position_only; final yaw alignment not required" in api_cpp
+    assert "under position_only policy" in api_cpp
     assert "manual localization correction accepted; post-settle not requested" in api_cpp
     assert 'json_bool_value(body, "wait_for_settle", false)' in api_cpp
     assert "post_relocalization_settle_requested" in api_cpp
     assert "post_relocalization_settle_ok" in api_cpp
     assert "run_reposition_after_yaw_drift" in api_cpp
     assert "REPOSITION_AFTER_YAW_DRIFT" in api_cpp
-    assert "failed_final_pose_verify" in api_cpp
+    assert "Nav2 native goal completion failed with result code" in api_cpp
+    assert '"nav2_failed"' in api_cpp
+    assert "Nav2 is the single completion owner" in api_cpp
+    assert "navigation goal reached by Nav2 native completion" in api_cpp
     assert "position_reached_yaw_warning" not in api_cpp
 
     assert "ordinary_final_yaw_align_active_" in api_cpp
@@ -321,11 +431,19 @@ def test_phase_n2_goal_completion_semantics_contracts():
     assert 'navigation_final_yaw_align_cmd_topic: "/cmd_vel_docking"' not in config
     assert 'predock_yaw_align_cmd_topic: "/cmd_vel_docking"' in config
     assert 'predock_yaw_align_cmd_topic: "/cmd_vel_docking"' in overlay_config
+    assert "predock_yaw_align_enabled: true" in config
+    assert "predock_yaw_align_enabled: true" in overlay_config
+    assert "predock_yaw_align_fallback_enabled: true" in config
+    assert "predock_yaw_align_fallback_enabled: true" in overlay_config
 
     for token in (
         "goal_completion_policy",
         "dock_staging_handoff_ready",
         "post_predock_settle_complete",
+        "predock_pose_verified",
+        "predock_yaw_verified_by_nav2",
+        "reverse_yaw_offset_applied",
+        "contact_frame_available",
         "ordinary_final_yaw_align_active",
         "predock_yaw_align_active",
         "cmd_owner_conflict_detected",
@@ -347,6 +465,187 @@ def test_phase_n2_goal_completion_semantics_contracts():
     assert "observe_navigation_final_yaw_align.sh" in verify_script
     assert "ros2 topic pub" not in observe_script
     assert "/api/v1/navigation/state" in observe_script
+
+
+def test_phase_n3_nav2_native_goal_completion_contracts():
+    nav2 = (ROOT / "src" / "robot_nav_config" / "config" / "nav2.yaml").read_text(encoding="utf-8")
+    overlay_nav2 = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "nav2.yaml"
+    ).read_text(encoding="utf-8")
+    api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    config = (ROOT / "src" / "robot_api_server" / "config" / "robot_api_server.yaml").read_text(
+        encoding="utf-8"
+    )
+    overlay_config = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "robot_api_server.yaml"
+    ).read_text(encoding="utf-8")
+    verify_script = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "verify_nav2_native_goal_completion.sh"
+    ).read_text(encoding="utf-8")
+    observe_script = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "observe_nav2_native_pose_required_goal.sh"
+    ).read_text(encoding="utf-8")
+    audit_reports = list((ROOT / "reports").glob("nav2_rotation_shim_compat_audit_*.md"))
+    audit_text = "\n".join(p.read_text(encoding="utf-8") for p in audit_reports)
+
+    for params in (nav2, overlay_nav2):
+        assert 'plugin: "nav2_rotation_shim_controller::RotationShimController"' in params
+        assert 'primary_controller: "nav2_mppi_controller::MPPIController"' in params
+        assert "rotate_to_goal_heading: true" in params
+        assert "rotate_to_goal_heading: false" not in params
+        assert 'plugin: "nav2_controller::SimpleGoalChecker"' in params
+        assert "stateful: false" in params
+        assert "xy_goal_tolerance: 0.20" in params
+        assert "yaw_goal_tolerance: 0.0873" in params
+        assert 'plugin: "nav2_smac_planner/SmacPlanner2D"' in params
+        assert 'plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"' in params
+        assert "transform_tolerance: 0.10" in params
+        assert "global_frame: odom" in params
+        assert "/scan" in params
+        assert "/perception/obstacle_points" not in params
+
+    for params in (config, overlay_config):
+        assert 'navigation_default_goal_completion_policy: "pose_required"' in params
+        assert "nav2_native_goal_completion_enabled: true" in params
+        assert "nav2_rotation_shim_enabled: true" in params
+        assert "api_final_yaw_align_fallback_enabled: false" in params
+        assert "navigation_final_yaw_align_enable: false" in params
+        assert "predock_yaw_align_enabled: true" in params
+        assert "predock_yaw_align_fallback_enabled: true" in params
+        assert 'predock_yaw_align_cmd_topic: "/cmd_vel_docking"' in params
+        assert "predock_yaw_align_tolerance_rad: 0.105" in params
+        assert "fine_docking_entry_max_yaw_rad: 0.105" in params
+        assert 'navigation_final_yaw_align_cmd_topic: "/cmd_vel_docking"' not in params
+
+    assert "native_nav2_goal_completion" in api_cpp
+    assert "api_final_yaw_align_enabled" in api_cpp
+    assert "nav2_rotation_shim_enabled" in api_cpp
+    assert "Nav2 native goal completion failed with result code" in api_cpp
+    assert '"nav2_failed"' in api_cpp
+    assert "Nav2 is the single completion owner" in api_cpp
+    assert "navigation goal reached by Nav2 native completion" in api_cpp
+    run_goal_block = api_cpp[
+        api_cpp.index("void run_navigation_goal_job("):api_cpp.index("HttpResponse handle_navigation_state()")
+    ]
+    assert "api_final_yaw_align_enabled" not in run_goal_block
+    assert "run_final_yaw_align(job_id, target, pose_check)" not in run_goal_block
+    assert "goal_completion_policy=dock_staging is reserved for /api/v1/docking/start" in api_cpp
+    assert "PREDOCK_YAW_ALIGN_RECOVERY" in api_cpp
+    assert "PREDOCK_NATIVE_GOAL_VERIFY_FAILED" in api_cpp
+    assert "PREDOCK_YAW_NOT_ALIGNED_AFTER_NAV2" in api_cpp
+    assert 'predock_yaw_align_cmd_topic_ != "/cmd_vel_docking"' in api_cpp
+    assert "PREDOCK_YAW_ALIGN_OWNER_CONFLICT" in api_cpp
+    assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel_safe"' not in api_cpp
+    assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel"' not in api_cpp
+
+    assert "requires_nav2_rotation_shim_backport_or_upgrade`: false" in audit_text
+    assert "RotationShimController is supported" in audit_text
+    assert "rotate_to_goal_heading=true" in verify_script
+    assert "api_final_yaw_align_fallback_enabled: false" in verify_script
+    assert "/api/v1/navigation/state" in observe_script
+    assert "Read-only observer" in observe_script
+    assert "api_final_yaw_align_used" in observe_script
+    assert "final_yaw_handled_by_nav2" in observe_script
+    assert "cmd_owner_conflict" in observe_script
+
+
+def test_phase_n4_post_nav2_final_verify_recovery_contracts():
+    overlay = ROOT / "scripts" / "jetson" / "runtime_overlay"
+    scripts_dir = overlay / "scripts"
+    config_dir = overlay / "config"
+    api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    api_cfg = (ROOT / "src" / "robot_api_server" / "config" / "robot_api_server.yaml").read_text(
+        encoding="utf-8"
+    )
+    overlay_api_cfg = (config_dir / "robot_api_server.yaml").read_text(encoding="utf-8")
+    nav2_cfg = (config_dir / "nav2.yaml").read_text(encoding="utf-8")
+    bridge_cfg = (config_dir / "localization_bridge.yaml").read_text(encoding="utf-8")
+    verify_path = scripts_dir / "verify_post_nav2_final_verify_recovery.sh"
+    observe_path = scripts_dir / "observe_post_nav2_final_verify_recovery.sh"
+    verify = verify_path.read_text(encoding="utf-8")
+    observe = observe_path.read_text(encoding="utf-8")
+
+    for token in (
+        "post_nav2_final_verify_enabled",
+        "final_pose_auditing",
+        "Nav2 is the single completion owner",
+        "navigation goal reached by Nav2 native completion",
+        "final_verify_failure_is_terminal",
+        "final_verify_retry_count",
+        "final_verify_retry_reason",
+        "final_verify_retry_goal_sent",
+    ):
+        assert token in api_cpp
+
+    for params in (api_cfg, overlay_api_cfg):
+        assert "post_nav2_final_verify_enabled: false" in params
+        assert "post_nav2_final_verify_wait_bridge_smoothing: false" in params
+        assert "post_nav2_final_verify_bridge_wait_timeout_ms: 2000" in params
+        assert "post_nav2_final_verify_bridge_wait_sample_period_ms: 100" in params
+        assert "post_nav2_final_verify_max_retry_count: 0" in params
+        assert "post_nav2_final_verify_acceptance_slack_m: 0.0" in params
+        assert "post_nav2_final_verify_xy_retry_min_error_m: 0.20" in params
+        assert "post_nav2_final_verify_xy_retry_max_error_m: 0.60" in params
+        assert "post_nav2_final_verify_yaw_retry_if_failed: false" in params
+        assert "post_nav2_final_verify_retry_uses_same_nav2_goal: false" in params
+        assert "post_nav2_final_verify_api_velocity_correction_enabled: false" in params
+        assert "api_final_yaw_align_fallback_enabled: false" in params
+        assert "navigation_final_yaw_align_enable: false" in params
+
+    run_goal_block = api_cpp[
+        api_cpp.index("void run_navigation_goal_job(") : api_cpp.index("HttpResponse handle_navigation_state()")
+    ]
+    assert "run_post_nav2_final_verify_retry(job_id, target, retry_reason, retry_phase)" not in run_goal_block
+    assert "post_nav2_final_verify_retry_allowed(" not in run_goal_block
+    assert "post_nav2_final_verify_acceptance_slack_allowed(" not in run_goal_block
+    assert "run_final_yaw_align(job_id, target, pose_check)" not in run_goal_block
+    assert "run_reposition_after_yaw_drift(job_id, target)" not in run_goal_block
+    assert "api_final_yaw_align_enabled" not in run_goal_block
+    assert '"failed_final_pose_verify"' not in run_goal_block
+    assert "final_pose_auditing" in run_goal_block
+    assert "Nav2 is the single completion owner" in run_goal_block
+    assert "navigation goal reached by Nav2 native completion" in run_goal_block
+    assert "/cmd_vel_docking" not in run_goal_block
+    assert "post_nav2_final_verify_api_velocity_correction_enabled_" not in run_goal_block
+    assert "publish_predock_yaw_align_command" not in run_goal_block
+    assert 'navigation_goal_job_.state = canceled ? "canceled" : (succeeded ? "succeeded" : "failed")' in api_cpp
+
+    assert 'primary_controller: "nav2_mppi_controller::MPPIController"' in nav2_cfg
+    assert 'plugin: "nav2_smac_planner/SmacPlanner2D"' in nav2_cfg
+    assert "transform_tolerance: 0.10" in nav2_cfg
+    assert "max_odom_tf_age_ms: 100.0" in bridge_cfg
+    for forbidden in ("PointCloud2", "FAST-LIO", "ranger_base_node", "ekf_node"):
+        assert forbidden not in run_goal_block
+    assert "pkill -9" not in api_cpp + verify + observe
+    assert "killall -9" not in api_cpp + verify + observe
+
+    assert verify_path.exists()
+    assert observe_path.exists()
+    assert "does not send Nav2 goals" in verify
+    assert "single completion owner" in verify
+    assert "--mock-final-distance" in verify
+    assert "--expect-task-complete" in verify
+    assert "--expect-final-fail" in verify
+    assert "Read-only observer" in observe
+    assert "does not send navigation goals" in observe
+    assert "final_yaw_align_attempted" in observe
+    assert "final_verify_retry_count" in observe
+
+    bash = shutil.which("bash")
+    if bash:
+        bash_probe = subprocess.run(
+            [bash, "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if bash_probe.returncode == 0:
+            subprocess.run([bash, "-n", str(verify_path)], check=True)
+            subprocess.run([bash, "-n", str(observe_path)], check=True)
 
 
 def test_nav2_rotation_progress_scripts_contract():
@@ -387,7 +686,7 @@ def test_nav2_rotation_progress_scripts_contract():
     assert "/cmd_vel" in diagnose
     assert "/wheel/odom" in diagnose
     assert "/local_state/odometry" in diagnose
-    assert "ros2 topic hz /perception/obstacle_points" in diagnose
+    assert "ros2 topic hz /scan" in diagnose
     assert "ros2 topic hz /local_costmap/costmap" in diagnose
     assert "timeout --signal=INT" not in diagnose
     assert "CASE_A_CONTROLLER_ZERO_LINEAR" in diagnose
@@ -430,7 +729,7 @@ def test_runtime_health_guard_replaces_hot_readiness_probes():
     assert 'super().__init__("runtime_health_guard")' in guard
     assert '"/local_state/odometry"' in guard
     assert '"/fastlio/base_odometry"' in guard
-    assert '"/perception/obstacle_points"' in guard
+    assert '"/scan"' in guard
     assert "NJRH_RUNTIME_HEALTH_OBSERVE_HEAVY_TOPICS" in guard
     assert "if self.observe_heavy_topics:" in guard
     assert 'NJRH_RUNTIME_HEALTH_GRAPH_PERIOD_SEC", 2.0' in guard
@@ -448,13 +747,28 @@ def test_runtime_health_guard_replaces_hot_readiness_probes():
     assert "NJRH_RUNTIME_HEALTH_TF_SEEN_MAX_AGE_SEC" in helpers
     assert 'njrh_exec_affined runtime_health_guard python3 "${guard_script}"' in runner
     assert 'exec njrh_exec_affined runtime_health_guard' not in runner
-    assert "NJRH_RUNTIME_HEALTH_GUARD_AUTOSTART:-false" in common
+    assert "NJRH_RUNTIME_HEALTH_GUARD_AUTOSTART:-true" in common
     assert 'start_common_process "runtime_health_guard"' in common
-    assert common.index('start_canonical_helper \\\n  "robot_local_state_common"') < common.index(
-        "NJRH_RUNTIME_HEALTH_GUARD_AUTOSTART"
+    assert "start_runtime_health_guard_common()" in common
+    assert 'health_file="$(runtime_health_file)"' in common
+    assert 'rm -f "${health_file}"' in common
+    assert "wait_for_runtime_health_local_state_ready()" in common
+    assert 'runtime_health_check "local_state_ready"' in common
+    assert "runtime health confirms local_state_ready before resident navigation autostart" in common
+    assert "continuing because robot_local_state direct readiness already passed" in common
+    health_wait_block = common[
+        common.index("wait_for_runtime_health_local_state_ready()") :
+        common.index("resident_navigation_context_status()")
+    ]
+    assert "return 1" not in health_wait_block
+    assert common.index("NJRH_RUNTIME_HEALTH_GUARD_AUTOSTART") < common.index(
+        'start_canonical_helper \\\n  "robot_local_state_common"'
     )
     assert common.index("NJRH_RUNTIME_HEALTH_GUARD_AUTOSTART") < common.index(
-        'start_overlay_helper "local_perception_common"'
+        "local_perception_common disabled"
+    )
+    assert common.index("wait_for_runtime_health_local_state_ready") < common.index(
+        "resident navigation autostart"
     )
     assert 'source "${SCRIPT_DIR}/runtime_health_helpers.sh"' in canonical
     assert 'source "${SCRIPT_DIR}/runtime_health_helpers.sh"' in nav_helpers
@@ -463,7 +777,7 @@ def test_runtime_health_guard_replaces_hot_readiness_probes():
     assert 'runtime_health_topic_message_ready "${topic}"' in nav_helpers
     assert 'runtime_health_fresh_tf_ready "${target_frame}" "${source_frame}" "${max_age_sec}"' in nav_helpers
     assert "local costmap observation ready from runtime health snapshot" not in nav_helpers
-    assert "wait_for_transformable_obstacle_points" in nav_helpers
+    assert "wait_for_transformable_local_scan" in nav_helpers
     assert 'export NJRH_CPUSET_TF_STATE="${NJRH_CPUSET_TF_STATE:-2}"' in cpu_affinity
     assert 'export NJRH_CPUSET_COLLISION_MONITOR="${NJRH_CPUSET_COLLISION_MONITOR:-${NJRH_CPUSET_BASE_CONTROL}}"' in cpu_affinity
     assert (
@@ -532,6 +846,7 @@ def test_docking_geometry_is_configured():
         assert "park_topic: /ranger_mini3/park" in cfg
         assert "reverse_enable_topic: /ranger_mini3/docking_allow_reverse" in cfg
         assert "use_crab_mode: true" in cfg
+        assert "crab_forced_mode: side_slip" in cfg
         assert "gs2_z_m: 0.290" in cfg
         assert "charge_contact_x_m: 0.398" in cfg
         assert "gs2_to_contact_x_m: 0.038" in cfg
@@ -573,7 +888,7 @@ def test_docking_geometry_is_configured():
         assert "lateral_command_sign: -1.0" in cfg
         assert "kyaw: -0.70" in cfg
         assert "lateral_deadband_m: 0.005" in cfg
-        assert "min_align_speed_mps: 0.035" in cfg
+        assert "min_align_speed_mps: 0.025" in cfg
         assert "min_lateral_speed_mps: 0.025" in cfg
         assert "max_lateral_speed_mps: 0.04" in cfg
         assert "max_forward_while_lateral_mps: 0.000" in cfg
@@ -622,6 +937,7 @@ def test_robot_docking_manager_is_safety_chained_cpp():
     assert 'declare_parameter<std::string>("mode.forced_mode_topic", "/ranger_mini3/forced_mode")' in node
     assert 'declare_parameter<std::string>("mode.reverse_enable_topic", "/ranger_mini3/docking_allow_reverse")' in node
     assert 'declare_parameter<bool>("mode.use_crab_mode", true)' in node
+    assert 'declare_parameter<std::string>("mode.crab_forced_mode", "side_slip")' in node
     assert "create_service<std_srvs::srv::Trigger>" in node
     assert "create_subscription<sensor_msgs::msg::LaserScan>" in node
     assert "create_subscription<sensor_msgs::msg::BatteryState>" in node
@@ -689,6 +1005,8 @@ def test_robot_docking_manager_is_safety_chained_cpp():
     assert "/cmd_vel_docking" in readme
     assert "/cmd_vel_collision_checked" in readme
     assert "controller.kyaw=-0.70" in readme
+    assert "/ranger_mini3/forced_mode=side_slip" in readme
+    assert "`linear.y` can correct lateral offset" in readme
     assert "yaw tolerance is `2deg`" in readme
     assert "/docking/undock" in readme
     assert "/local_state/odometry" in readme
@@ -904,10 +1222,12 @@ def test_navigation_goal_pre_undock_gate_observability_contract():
     assert "map_catalog_->find_map_by_id(map_id)" in precheck_block
     assert 'query_number_value(request, "x")' in precheck_block
     assert 'query_number_value(request, "theta")' in precheck_block
-    assert "navigation_lifecycle_snapshot()" in precheck_block
+    assert "navigation_goal_admission_snapshot()" in precheck_block
     assert "start_pre_navigation_undock" not in precheck_block
     assert "async_send_goal" not in precheck_block
     assert "call_undock_service_with_charging_retry" not in precheck_block
+    assert "navigation_lifecycle_snapshot()" not in goal_block
+    assert "bridge_safe_for_goal_start(\"navigation goal\"" in goal_block
 
     assert "pre_navigation_dock_check" in script
     assert "/api/v1/navigation/pre_goal_check" in script
@@ -1164,7 +1484,8 @@ def test_phase_d2_bms_dock_contact_latch_expiry_contract():
     ]
     assert "check.strong_live_docked" in gate_block
     assert "check.latch_valid_for_auto_undock" in gate_block
-    assert "check.final_is_docked_or_charging = check.strong_live_docked || check.latch_valid_for_auto_undock" in gate_block
+    assert 'check.dock_occupancy_state == "DOCKED_CHARGE_IDLE"' in gate_block
+    assert "check.final_auto_undock_required = check.final_is_docked_or_charging" in gate_block
     assert "stale_bms_latch_cleared_live_undocked_no_contact" in gate_block
     assert "check.dock_contact_latch_contradicted_by_live_state" in gate_block
     assert "check.live_bms_charging_contact_stable" in gate_block
@@ -1195,6 +1516,129 @@ def test_phase_d2_bms_dock_contact_latch_expiry_contract():
     assert "live undocked/no_contact" in verify_script
     assert "topic_once /docking/status" in verify_script
     assert "topic_once /battery_state" in verify_script
+
+
+def test_phase_d23_full_charge_charging_session_dock_gate_contract():
+    api_cpp_path = ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp"
+    api_cpp = api_cpp_path.read_text(encoding="utf-8")
+    docking_cpp = (
+        ROOT / "src" / "robot_docking_manager" / "src" / "docking_manager_node.cpp"
+    ).read_text(encoding="utf-8")
+    verify_script_path = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "verify_full_charge_dock_session_gate.sh"
+    )
+    verify_script = verify_script_path.read_text(encoding="utf-8")
+    nav2_cfg = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "nav2.yaml").read_text(
+        encoding="utf-8"
+    )
+    bridge_cfg = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "localization_bridge.yaml"
+    ).read_text(encoding="utf-8")
+
+    gate_block = api_cpp[
+        api_cpp.index("PreNavigationDockCheck pre_navigation_dock_check_snapshot") : api_cpp.index(
+            "std::string bms_charging_contact_snapshot_json"
+        )
+    ]
+    bms_latch_block = api_cpp[
+        api_cpp.index("void maybe_update_bms_dock_contact_latch") : api_cpp.index("void handle_bms_state")
+    ]
+
+    assert "charging_session" in api_cpp
+    assert '"charging_session"' in bms_latch_block
+    assert "bms_charging_observed:" in bms_latch_block
+    assert '"bms"' not in bms_latch_block
+    assert 'update_dock_contact_latch(true, "charging_session", "bms_charging_observed", "")' in docking_cpp
+
+    assert "latch_source_is_charging_session" in api_cpp
+    assert "source_charging_session" in api_cpp
+    assert "dock_latch_source_strength" in api_cpp
+    assert "dock_contact_latch_source_strength" in api_cpp
+    assert "charging_session_latched" in api_cpp
+    assert "charging_session_age_sec" in api_cpp
+    assert "charging_session_last_confirmed_at" in api_cpp
+
+    assert "full_charge_idle_on_dock" in gate_block
+    assert "bms_soc_full" in gate_block
+    assert "bms_current_idle" in gate_block
+    assert "strong_session_latch" in gate_block
+    assert "SOC=100" not in gate_block
+    assert "normalized_soc_percent" in api_cpp
+    assert '"DOCKED_CHARGE_IDLE"' in gate_block
+    assert '"UNCERTAIN_ON_DOCK"' in gate_block
+    assert '"CONFIRMED_UNDOCKED"' in gate_block
+    assert '"CONFIRMED_DOCKED"' in gate_block
+    assert '"DOCKED_CHARGING"' in gate_block
+    assert "dock_occupancy_state:" in api_cpp
+    assert "check.final_auto_undock_required = check.final_is_docked_or_charging" in gate_block
+
+    assert "check.dock_latch.source_bms" in gate_block
+    assert "stale_bms_latch_cleared_live_undocked_no_contact" in gate_block
+    assert "latch_source_is_docking_evidence(check.dock_latch.source)" in gate_block
+    assert "latch_source_is_manual_evidence(check.dock_latch.source)" in gate_block
+    assert "BMS no_contact" not in api_cpp
+
+    for field in [
+        "dock_occupancy_state",
+        "dock_occupancy_evidence",
+        "dock_occupancy_reason",
+        "charging_session_latched",
+        "charging_session_age_sec",
+        "charging_session_last_confirmed_at",
+        "dock_contact_latch_source_strength",
+        "bms_live_contact",
+        "bms_live_contact_reason",
+        "bms_percentage",
+        "bms_current",
+        "bms_present",
+        "full_charge_idle_on_dock",
+        "final_auto_undock_required",
+        "auto_undock_reason",
+    ]:
+        assert field in api_cpp
+
+    assert verify_script_path.exists()
+    for option in [
+        "--dry-run",
+        "--mock-charging-observed",
+        "--mock-full-charge-idle",
+        "--mock-bms-no-contact",
+        "--mock-docking-job-latch",
+        "--expect-auto-undock",
+        "--expect-docked-charge-idle",
+        "--expect-no-latch-clear",
+    ]:
+        assert option in verify_script
+    assert "does not send goals" in verify_script
+    assert "does not publish velocity" in verify_script
+    assert "ros2 action send_goal" not in verify_script
+    assert "ros2 topic pub" not in verify_script
+
+    assert "MPPIController" in nav2_cfg
+    assert "SmacPlanner2D" in nav2_cfg
+    assert "transform_tolerance: 0.10" in nav2_cfg
+    assert "max_odom_tf_age_ms: 100.0" in bridge_cfg
+    assert "PointCloud2" not in api_cpp
+    assert "FAST-LIO" not in api_cpp
+    assert "ranger_base_node" not in gate_block
+    assert "pkill -9" not in api_cpp + verify_script
+    assert "killall -9" not in api_cpp + verify_script
+
+    bash = shutil.which("bash")
+    if bash:
+        bash_probe = subprocess.run(
+            [bash, "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if bash_probe.returncode == 0:
+            subprocess.run([bash, "-n", str(verify_script_path)], check=True)
 
 
 def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
@@ -1291,7 +1735,9 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     assert 'LOCAL_STATE_MODE:-ekf' in overlay_runner
     assert "robot_local_state/local_state_node" in overlay_runner
     assert "ros2 pkg prefix robot_localization" in overlay_runner
-    assert "ros2 run robot_localization ekf_node" in overlay_runner
+    assert 'EKF_NODE_BIN="${ROBOT_LOCALIZATION_PREFIX}/lib/robot_localization/ekf_node"' in overlay_runner
+    assert "ros2 run robot_localization ekf_node" not in overlay_runner
+    assert 'njrh_start_affined_background ekf_pid robot_local_state "${EKF_NODE_BIN}"' in overlay_runner
     assert "-r __node:=robot_local_state" in overlay_runner
     assert "LOCAL_STATE_WHEEL_ODOM_EKF_PARAMS_FILE" in overlay_runner
     assert "-r __node:=wheel_odom_ekf_input" in overlay_runner
@@ -1378,6 +1824,13 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     assert "fastlio_odom_bridge_process_running && local_state_node_process_running" in overlay_tf_helpers
     assert 'canonical_helper_start_ready "${helper_name}"' in overlay_tf_helpers
     assert "helper child process did not become ready" in overlay_tf_helpers
+    assert "canonical_wait_for_pid_exit()" in overlay_tf_helpers
+    assert "terminate_canonical_helper_pid()" in overlay_tf_helpers
+    assert "canonical_descendant_pids()" in overlay_tf_helpers
+    assert "helper became ready during final recheck" in overlay_tf_helpers
+    assert "LOCAL_STATE_READY_RECHECK_TIMEOUT_SEC" in overlay_tf_helpers
+    assert "helper ignored SIGINT; escalating to SIGTERM" in overlay_tf_helpers
+    assert "helper did not exit after SIGTERM; killing helper process tree" in overlay_tf_helpers
     assert "canonical_helper_ready()" in overlay_tf_helpers
     assert "canonical_helper_start_ready()" in overlay_tf_helpers
     assert "forget_canonical_helper_pid()" in overlay_tf_helpers
@@ -1547,7 +2000,7 @@ def test_local_reuse_manifest_exists():
 
 def test_bringup_includes_perception_and_safety():
     launch_file = (ROOT / "src" / "robot_bringup" / "launch" / "mock_navigation.launch.py").read_text(encoding="utf-8")
-    assert 'include("robot_local_perception"' in launch_file
+    assert 'include("robot_local_perception"' not in launch_file
     assert 'include("robot_safety"' in launch_file
     assert (ROOT / "src" / "robot_bringup" / "launch" / "localization_bringup.launch.py").exists()
     assert (ROOT / "src" / "robot_bringup" / "launch" / "navigation_bringup.launch.py").exists()
@@ -1673,8 +2126,23 @@ def test_commercial_runtime_architecture_contract_is_documented():
     commercial_helpers = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "commercial_runtime_helpers.sh"
     ).read_text(encoding="utf-8")
+    map_server_helpers = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "map_server_helpers.sh"
+    ).read_text(encoding="utf-8")
     resident_runtime = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_navigation_runtime_services.sh"
+    ).read_text(encoding="utf-8")
+    overlay_nav2_script = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_nav2_navigation.sh"
+    ).read_text(encoding="utf-8")
+    overlay_common_services = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_common_services.sh"
+    ).read_text(encoding="utf-8")
+    nav2_lifecycle_sequence = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "nav2_lifecycle_sequence.py"
+    ).read_text(encoding="utf-8")
+    trigger_client = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "call_global_localization_trigger.py"
     ).read_text(encoding="utf-8")
     lifecycle_doc = (ROOT / "docs" / "runtime_service_lifecycle.md").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -1697,19 +2165,52 @@ def test_commercial_runtime_architecture_contract_is_documented():
     assert "active [3]" in readiness
     assert "wait_for_global_costmap_static" in readiness
     assert "check_tf \"map\" \"odom\"" in readiness
-    assert "check_topic \"/perception/obstacle_points\"" in readiness
+    assert "check_topic \"/scan\"" in readiness
     assert 'check_lifecycle_active "/collision_monitor" 12' in readiness
     assert 'check_tf "odom" "base_link" 10' in readiness
-    assert 'check_topic "/perception/obstacle_points" 10' in readiness
+    assert 'check_topic "/scan" 10' in readiness
     assert 'wait_for_global_costmap_static 10' in readiness
+    assert "NJRH_GLOBAL_COSTMAP_FULL_MESSAGE_GATE:-false" in map_server_helpers
+    assert 'runtime_readiness_probe lifecycle-active "/global_costmap/global_costmap"' in map_server_helpers
+    assert 'runtime_readiness_probe topic-publisher "/global_costmap/costmap"' in map_server_helpers
+    assert "NJRH_GLOBAL_COSTMAP_PUBLISHER_READY_TIMEOUT_SEC:-15" in map_server_helpers
+    assert "full OccupancyGrid message gate is deferred" in map_server_helpers
     assert "navigation_runtime_ready_for_current_floor()" in commercial_helpers
     assert "write_runtime_map_context()" in commercial_helpers
     assert "os.getpid()" in commercial_helpers
+    assert "NJRH_RUNTIME_STARTUP_STAGE" in commercial_helpers
+    assert "startup_elapsed_sec" in commercial_helpers
     assert 'tmp_path = f"{path}.tmp"' not in commercial_helpers
+    assert "nav2_lifecycle_manager_reported_active()" in commercial_helpers
+    assert "nav2_point_navigation_core_reported_active()" in commercial_helpers
+    assert "nav2_critical_processes_running()" in commercial_helpers
+    assert '"${NJRH_RUNTIME_LOG_DIR:-}/resident_navigation_runtime.log"' in commercial_helpers
+    assert '"${NJRH_RUNTIME_LOG_DIR:-}/nav2_navigation.log"' in commercial_helpers
+    assert '"lifecycle_manager_navigation" in line' in commercial_helpers
+    assert '"Managed nodes are active" in line' in commercial_helpers
+    assert '"point-navigation core nodes are active" in line' in commercial_helpers
+    assert "STARTUP_STAGE stage=nav2_layer_started" in commercial_helpers
+    assert "start_index = index" in commercial_helpers
+    assert "__node:=controller_server" in commercial_helpers
+    assert "__node:=bt_navigator" in commercial_helpers
+    nav2_critical_block = commercial_helpers[
+        commercial_helpers.index("nav2_critical_processes_running()") :
+        commercial_helpers.index(
+            "map_server_asset_matches_current_floor()",
+            commercial_helpers.index("nav2_critical_processes_running()"),
+        )
+    ]
+    assert "__node:=planner_server" in nav2_critical_block
+    assert "__node:=velocity_smoother" in nav2_critical_block
+    assert "__node:=collision_monitor" in nav2_critical_block
+    assert "__node:=behavior_server" not in nav2_critical_block
+    assert "Nav2 lifecycle manager reported managed nodes active and critical processes are running" in commercial_helpers
+    assert "Nav2 repo lifecycle sequence reported point-navigation core nodes active" in commercial_helpers
+    assert "nav2_lifecycle_node_active()" in commercial_helpers
     assert 'runtime_readiness_probe lifecycle-active "${node_name}" "${timeout_sec}"' in commercial_helpers
+    assert "ros2 lifecycle get" not in commercial_helpers
     assert "from lifecycle_msgs.srv import GetState" not in commercial_helpers
     assert 'service_name = f"{node_name}/get_state"' not in commercial_helpers
-    assert "ros2 lifecycle get" not in commercial_helpers
     assert "runtime_map_context_matches_current_floor()" in commercial_helpers
     assert "navigation_map_source_diagnostics()" in commercial_helpers
     assert "map_server asset is not directly confirmable" in commercial_helpers
@@ -1727,6 +2228,201 @@ def test_commercial_runtime_architecture_contract_is_documented():
     assert "resolve_floor_assets" in resident_runtime
     assert "run_occupancy_grid_localization.sh" in resident_runtime
     assert "run_nav2_navigation.sh" in resident_runtime
+    assert "ensure_common_local_state_ready_for_navigation_start()" in resident_runtime
+    assert 'runtime_health_check "local_state_ready"' in resident_runtime
+    assert "common local_state ready from runtime health snapshot before navigation startup" in resident_runtime
+    assert "LOCAL_STATE_ENDPOINT_NOT_READY" in resident_runtime
+    assert "LOCAL_STATE_ODOM_NOT_FRESH" in resident_runtime
+    assert "ODOM_BASE_TF_NOT_FRESH" in resident_runtime
+    assert 'log_startup_stage "common_local_state_ready"' in resident_runtime
+    resident_main_startup_flow = resident_runtime[
+        resident_runtime.index('write_runtime_map_context "starting" "false" "resident navigation runtime starting"') :
+    ]
+    assert resident_main_startup_flow.index("run_occupancy_grid_localization.sh") < resident_main_startup_flow.index(
+        "ensure_common_local_state_ready_for_navigation_start"
+    )
+    assert "NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION:-false" in resident_runtime
+    assert "NJRH_NAV2_HELD_PRESTART_AFTER_LOCAL_STATE:-true" in resident_runtime
+    assert 'log_startup_stage "nav2_layer_started_after_initial_localization"' in resident_runtime
+    assert "STARTUP_STAGE" in resident_runtime
+    assert "NJRH_RUNTIME_STARTUP_STAGE" in resident_runtime
+    assert "NJRH_RUNTIME_STARTUP_ELAPSED_SEC" in resident_runtime
+    assert 'log_startup_stage "localization_stack_ready"' in resident_runtime
+    assert 'log_startup_stage "initial_global_localization_ready"' in resident_runtime
+    assert "trigger_output_reports_startup_service_race()" in resident_runtime
+    assert "trigger_output_reports_transient_stale_bridge_timeout()" in resident_runtime
+    assert "trigger_output_reports_transient_map_to_odom_timeout()" in resident_runtime
+    assert "trigger_output_reports_transient_localization_result_timeout()" in resident_runtime
+    assert "NJRH_INITIAL_LOCALIZATION_REQUIRE_RESULT_PUBLISHER:-false" in resident_runtime
+    assert "skipping /localization_result publisher pre-gate" in resident_runtime
+    assert "NJRH_INITIAL_LOCALIZATION_FLATSCAN_WAIT_SEC:-5" in resident_runtime
+    assert "NJRH_INITIAL_LOCALIZATION_FLATSCAN_REPAIR_WAIT_SEC:-20" in resident_runtime
+    assert "isaac_triggered_pose_stale_ms" in resident_runtime
+    assert "NJRH_GLOBAL_LOCALIZATION_TRIGGER_ATTEMPT_TIMEOUT:-75" in resident_runtime
+    assert "NJRH_GLOBAL_LOCALIZATION_TRIGGER_CALL_TIMEOUT:-90" in resident_runtime
+    assert "call_global_localization_trigger.py" in resident_runtime
+    assert "if rclpy.ok():" in trigger_client
+    assert "rclpy.shutdown()" in trigger_client
+    assert "ros2 service call \\\n      /global_localization/trigger" not in resident_runtime
+    assert "NJRH_FLOOR_MANAGER_SWITCH_CALL_TIMEOUT:-0.2" in resident_runtime
+    assert "global localization trigger attempt=" in resident_runtime
+    assert "hit startup service race; retrying" in resident_runtime
+    assert "could not reach service; retrying" in resident_runtime
+    assert "saw transient stale Isaac result; retrying for fresh result" in resident_runtime
+    assert "transient stale map->odom during startup; retrying" in resident_runtime
+    assert "transient localization result timeout during startup; retrying" in resident_runtime
+    assert "NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION:-false" in resident_runtime
+    assert "NJRH_NAV2_LIFECYCLE_HOLD" in resident_runtime
+    assert '"nav2_layer_prestarted"' in resident_runtime
+    assert "activate_prestarted_nav2_lifecycle()" in resident_runtime
+    assert "start_prestarted_nav2_lifecycle_background()" in resident_runtime
+    assert "wait_for_prestarted_nav2_lifecycle_background()" in resident_runtime
+    assert "wait_for_prestarted_nav2_launch_hold_ready()" in resident_runtime
+    assert "prestarted Nav2 held launch ready from" in resident_runtime
+    assert "NAV2_HOLD_READY_WRAPPER_PID" in resident_runtime
+    assert "NAV2_HOLD_READY_BASHPID" in resident_runtime
+    assert "NAV2_HOLD_READY_CONTROLLER_PID" in resident_runtime
+    assert "NJRH_NAV2_HOLD_READY_FILE" in resident_runtime
+    assert "NJRH_NAV2_PRESTART_HOLD_READY_TIMEOUT_SEC:-25" in resident_runtime
+    assert "NJRH_NAV2_PRESTART_HOLD_READY_MAX_AGE_SEC:-60" in resident_runtime
+    assert "NJRH_NAV2_LIFECYCLE_BACKGROUND_START:-true" in resident_runtime
+    assert "NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK:-false" in resident_runtime
+    assert "starting prestarted Nav2 lifecycle background after localization stack readiness" in resident_runtime
+    assert "final ready still waits for bridge map->odom and active Nav2" in resident_runtime
+    assert "NJRH_NAV2_LIFECYCLE_CONFIGURE_ALL_FIRST:-false" in resident_runtime
+    assert "NJRH_NAV2_LIFECYCLE_PARALLEL_CORE:-false" in resident_runtime
+    assert "NJRH_NAV2_LIFECYCLE_PARALLEL_BT:-true" in resident_runtime
+    assert "NJRH_NAV2_LIFECYCLE_TRUST_CHANGE_STATE_RESPONSE:-true" in resident_runtime
+    assert "Nav2 lifecycle parallel core activation enabled" in resident_runtime
+    assert "Nav2 lifecycle activation running in background" in resident_runtime
+    assert "nav2_lifecycle_sequence.py" in resident_runtime
+    assert "--trust-change-state-response" in nav2_lifecycle_sequence
+    assert "--configure-all-before-activate" in nav2_lifecycle_sequence
+    assert "lifecycle sequence: configuring all managed nodes before activation" in nav2_lifecycle_sequence
+    assert "NJRH_NAV2_LIFECYCLE_NODE_TIMEOUT_SEC:-60" in resident_runtime
+    assert "lifecycle_manager_navigation external lifecycle sequence: Managed nodes are active" in resident_runtime
+    assert "NJRH_NAV2_LIFECYCLE_PARALLEL_CORE:-true" not in resident_runtime
+    assert 'run_nav2_lifecycle_sequence "${timeout_sec}" "${nodes[@]}"' in resident_runtime
+    assert "write_nav2_hold_ready_status()" in overlay_nav2_script
+    assert "NAV2_HOLD_READY_WRAPPER_PID" in overlay_nav2_script
+    assert "NAV2_HOLD_READY_CONTROLLER_PID" in overlay_nav2_script
+    assert 'rm -f "${NJRH_NAV2_HOLD_READY_FILE}"' in overlay_nav2_script
+    assert "start_navigation_lifecycle_with_repo_sequence()" in overlay_nav2_script
+    assert "NJRH_NAV2_USE_REPO_LIFECYCLE_SEQUENCE:-true" in overlay_nav2_script
+    assert "NJRH_NAV2_BACKGROUND_NONCRITICAL_LIFECYCLE:-true" in overlay_nav2_script
+    assert "lifecycle_manager_navigation external repo lifecycle sequence: point-navigation core nodes are active" in overlay_nav2_script
+    assert overlay_nav2_script.index("bt_navigator") < overlay_nav2_script.index("smoother_server")
+    assert overlay_nav2_script.index("bt_navigator") < overlay_nav2_script.index("behavior_server")
+    assert overlay_nav2_script.index("bt_navigator") < overlay_nav2_script.index("waypoint_follower")
+    assert "Nav2 point-navigation core lifecycle nodes are active" in commercial_helpers
+    critical_lifecycle_block = commercial_helpers[
+        commercial_helpers.index("critical_nav2_lifecycle_nodes()") :
+        commercial_helpers.index("nav2_lifecycle_node_active()", commercial_helpers.index("critical_nav2_lifecycle_nodes()"))
+    ]
+    assert "/behavior_server" not in critical_lifecycle_block
+    critical_process_block = commercial_helpers[
+        commercial_helpers.index("nav2_critical_processes_running()") :
+        commercial_helpers.index("standard_nav_stack_lifecycle_active()", commercial_helpers.index("nav2_critical_processes_running()"))
+    ]
+    assert "__node:=behavior_server" not in critical_process_block
+    resident_prestart_lifecycle_nodes = resident_runtime[
+        resident_runtime.index("activate_prestarted_nav2_lifecycle()") :
+        resident_runtime.index("ensure_navigation_layer_alive || return 1", resident_runtime.index("activate_prestarted_nav2_lifecycle()"))
+    ]
+    assert resident_prestart_lifecycle_nodes.index("planner_server") < resident_prestart_lifecycle_nodes.index(
+        "controller_server"
+    )
+    assert "waypoint_follower" not in resident_prestart_lifecycle_nodes
+    assert "smoother_server" not in resident_prestart_lifecycle_nodes
+    assert "behavior_server" not in resident_prestart_lifecycle_nodes
+    resident_background_lifecycle_nodes = resident_runtime[
+        resident_runtime.index("start_prestarted_nav2_lifecycle_background()") :
+        resident_runtime.index(
+            "ensure_navigation_layer_alive || return 1",
+            resident_runtime.index("start_prestarted_nav2_lifecycle_background()"),
+        )
+    ]
+    assert "waypoint_follower" not in resident_background_lifecycle_nodes
+    assert "smoother_server" not in resident_background_lifecycle_nodes
+    assert "behavior_server" not in resident_background_lifecycle_nodes
+    assert 'log_startup_stage "nav2_lifecycle_activation_started"' in resident_runtime
+    assert "NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION:-false" in resident_runtime
+    assert "prestarting resident AMCL warmup before initial global localization" in resident_runtime
+    assert "deferring resident AMCL warmup until after initial global localization" in resident_runtime
+    assert "NJRH_INITIAL_GLOBAL_LOCALIZATION_BACKGROUND_START:-false" in resident_runtime
+    assert "initial global localization trigger will run after localization stack and floor context are ready" in resident_runtime
+    assert (
+        "NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION="
+        '"${NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION:-false}"'
+    ) in overlay_common_services
+    assert (
+        "NJRH_INITIAL_GLOBAL_LOCALIZATION_BACKGROUND_START="
+        '"${NJRH_INITIAL_GLOBAL_LOCALIZATION_BACKGROUND_START:-false}"'
+    ) in overlay_common_services
+    resident_runtime_main_flow = resident_runtime[resident_runtime.index("if resident_navigation_ready; then") :]
+    assert resident_runtime_main_flow.index("start_amcl_resident_background_if_enabled_for_navigation") < resident_runtime_main_flow.index(
+        "start_initial_global_localization_background"
+    )
+    assert resident_runtime_main_flow.index("start_initial_global_localization_background") < resident_runtime_main_flow.index(
+        "ensure_localization_stack_ready_for_navigation"
+    )
+    assert resident_runtime_main_flow.index("wait_for_initial_global_localization") < resident_runtime_main_flow.index(
+        "start_amcl_readiness_background_if_enabled_for_navigation"
+    )
+    assert "start_amcl_readiness_background_if_enabled_for_navigation()" in resident_runtime
+    assert "wait_for_amcl_readiness_background_if_running()" in resident_runtime
+    assert "complete_amcl_readiness_with_retries_for_navigation()" in resident_runtime
+    assert "AMCL readiness running in background" in resident_runtime
+    assert "NJRH_REQUIRE_AMCL_TRACKING_FOR_NAV_READY:-false" in resident_runtime
+    assert "AMCL tracking readiness continues in background" in resident_runtime
+    assert "AMCL tracking continues in background" in resident_runtime
+    resident_amcl_background_block = resident_runtime[
+        resident_runtime.index("start_amcl_readiness_background_if_enabled_for_navigation()") :
+        resident_runtime.index(
+            "wait_for_amcl_readiness_background_if_running()",
+            resident_runtime.index("start_amcl_readiness_background_if_enabled_for_navigation()"),
+        )
+    ]
+    assert "wait_for_amcl_resident_background_if_running" in resident_amcl_background_block
+    assert "complete_amcl_readiness_with_retries_for_navigation" in resident_amcl_background_block
+    assert "AMCL readiness completed in background" in resident_amcl_background_block
+    assert "AMCL readiness completion attempt=" in resident_runtime
+    assert "AMCL_READINESS_TIMEOUT" in resident_runtime
+    assert "NJRH_NAV2_EXTERNAL_LIFECYCLE_BRINGUP:-true" in resident_runtime
+    assert "NJRH_NAV2_EXTERNAL_LIFECYCLE_READY_TIMEOUT:-210" in resident_runtime
+    assert "complete_amcl_readiness_if_enabled_for_navigation ||" not in resident_runtime
+    assert 'log_startup_stage "nav2_layer_ready"' in resident_runtime
+    assert 'log_startup_stage "amcl_tracking_ready"' in resident_runtime
+    assert "Nav2 activation, and AMCL tracking readiness" in resident_runtime
+    assert "resident Nav2 layer failed startup; localization layer remains running" in resident_runtime
+    assert "stop_navigation_layer_after_failure()" in resident_runtime
+    assert "sweeping standard Nav2 stack after resident Nav2" in resident_runtime
+    assert "stop_existing_standard_nav_stack" in resident_runtime
+    assert 'navigation_pid=""' in resident_runtime
+    nav2_startup_failure_block = resident_runtime[
+        resident_runtime.index('if ! wait_for_nav2_layer_ready; then') :
+        resident_runtime.index('else', resident_runtime.index('if ! wait_for_nav2_layer_ready; then'))
+    ]
+    assert 'stop_navigation_layer_after_failure "startup failure"' in nav2_startup_failure_block
+    assert 'terminate_child "${navigation_pid}" "resident Nav2 layer"\n  navigation_pid=""' not in nav2_startup_failure_block
+    resident_runtime_main = resident_runtime[
+        resident_runtime.index('write_runtime_map_context "starting" "false" "resident navigation runtime starting"') :
+    ]
+    assert resident_runtime_main.index('log_startup_stage "initial_global_localization_ready"') < resident_runtime_main.index(
+        "start_amcl_readiness_background_if_enabled_for_navigation"
+    )
+    assert resident_runtime_main.index('log_startup_stage "initial_global_localization_ready"') < resident_runtime_main.index(
+        'log_startup_stage "nav2_layer_started_after_initial_localization"'
+    )
+    assert resident_runtime_main.index("activate_prestarted_nav2_lifecycle") < resident_runtime_main.index(
+        'log_startup_stage "nav2_layer_ready"'
+    )
+    assert resident_runtime_main.index('log_startup_stage "nav2_layer_ready"') < resident_runtime_main.index(
+        "wait_for_amcl_readiness_background_if_running"
+    )
+    assert resident_runtime_main.index("wait_for_amcl_readiness_background_if_running") < resident_runtime_main.index(
+        'write_runtime_map_context "ready" "true"'
+    )
     assert "resident_navigation_ready" in resident_runtime
     assert "localization stack ready for initial relocalization" in resident_runtime
     assert "initial localization accepted: bridge_status.has_map_to_odom=true and map->odom are ready" in resident_runtime
@@ -1734,6 +2430,30 @@ def test_commercial_runtime_architecture_contract_is_documented():
     assert "navigation_runtime_ready_for_current_floor 3" not in resident_runtime
     assert "wait_for_resident_navigation_runtime_ready" not in resident_runtime
     assert "floor_id is required for resident navigation runtime" in resident_runtime
+
+
+def test_runtime_readiness_probe_has_process_timeout_guard():
+    common_env = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "common_env.sh"
+    ).read_text(encoding="utf-8")
+    probe_cpp = (
+        ROOT / "src" / "robot_bringup" / "src" / "runtime_readiness_probe.cpp"
+    ).read_text(encoding="utf-8")
+    assert "runtime_readiness_probe()" in common_env
+    assert "runtime_readiness_probe_output_reports_success()" in common_env
+    assert "NJRH_RUNTIME_READINESS_PROBE_PROCESS_TIMEOUT_SEC" in common_env
+    assert "NJRH_RUNTIME_READINESS_PROBE_SHUTDOWN_GRACE_SEC" in common_env
+    assert "NJRH_RUNTIME_READINESS_PROBE_KILL_AFTER_SEC" in common_env
+    assert 'timeout --kill-after="${NJRH_RUNTIME_READINESS_PROBE_KILL_AFTER_SEC:-2}"' in common_env
+    assert '"${timeout_sec}" "${probe}" "$@"' in common_env
+    assert "readiness probe reported success but did not exit cleanly" in common_env
+    assert "[runtime-overlay] lifecycle node active:" in common_env
+    assert "[runtime-overlay] TF ready:" in common_env
+    assert '"${probe}" "$@"' not in common_env.replace('"${timeout_sec}" "${probe}" "$@"', "")
+    assert "std::_Exit(code)" in probe_cpp
+    assert "exit_probe(ok ? 0 : 1)" in probe_cpp
+    assert "Fast DDS" in probe_cpp
+    assert "rclcpp::shutdown()" not in probe_cpp
 
 
 def test_runtime_overlay_lidar_view_defaults_to_base_link():
@@ -1806,6 +2526,7 @@ def test_project_runtime_helpers_are_wired():
     overlay_local_perception = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_local_perception.sh").read_text(encoding="utf-8")
     overlay_robot_safety = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_robot_safety.sh").read_text(encoding="utf-8")
     overlay_common_services = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_common_services.sh").read_text(encoding="utf-8")
+    resident_runtime = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_navigation_runtime_services.sh").read_text(encoding="utf-8")
     overlay_nav_runtime_helpers = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "nav_runtime_helpers.sh").read_text(encoding="utf-8")
     overlay_stop_navigation = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "stop_floor_navigation.sh").read_text(encoding="utf-8")
     overlay_canonical_helpers = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "canonical_tf_helpers.sh").read_text(encoding="utf-8")
@@ -1821,8 +2542,88 @@ def test_project_runtime_helpers_are_wired():
     autostart_installer = (ROOT / "scripts" / "jetson" / "install_njrh_autostart.sh").read_text(encoding="utf-8")
     autostart_doc = (ROOT / "docs" / "autostart_systemd.md").read_text(encoding="utf-8")
     powershell_helper = (ROOT / "scripts" / "jetson" / "Invoke-NJRHJetson.ps1").read_text(encoding="utf-8")
+    for token in (
+        "run_navigation_runtime_services.sh",
+        "nav2_lifecycle_sequence.py",
+        "call_global_localization_trigger.py",
+        "run_nav2_navigation.sh",
+        "run_occupancy_grid_localization.sh",
+        "standard_navigation.launch.py",
+        "occupancy_grid_localizer_container",
+        "robot_localization_bridge/localization_bridge_node",
+        "amcl --ros-args",
+        "amcl_scan_admission",
+        "__node:=controller_server",
+        "__node:=planner_server",
+        "__node:=bt_navigator",
+    ):
+        assert token in autostart_runner
+    assert (
+        "NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION="
+        "${NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION:-false}"
+    ) in autostart_runner
+    assert "kill_by_pattern()" not in autostart_runner
+    assert "kill -9" not in autostart_runner
+    assert "stop_exact_process_set" in autostart_runner
+    assert "killing exact stale" in autostart_runner
+    assert "stale ros2 diagnostics cli" in autostart_runner
+    assert "ros2_cli_pattern" in autostart_runner
+    assert 'ros2_cli_pattern="/' in autostart_runner
+    assert "service call /amcl/(change_state|get_state)" in autostart_runner
+    assert "NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION=false" in autostart_installer
+    assert (
+        "NJRH_INITIAL_GLOBAL_LOCALIZATION_BACKGROUND_START="
+        "${NJRH_INITIAL_GLOBAL_LOCALIZATION_BACKGROUND_START:-false}"
+    ) in autostart_runner
+    assert (
+        "NJRH_NAV2_LIFECYCLE_PARALLEL_CORE="
+        "${NJRH_NAV2_LIFECYCLE_PARALLEL_CORE:-false}"
+    ) in autostart_runner
+    assert (
+        "NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK="
+        "${NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK:-false}"
+    ) in autostart_runner
+    assert "NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK=false" in autostart_installer
+    assert "NJRH_PREPARE_RUNTIME_PERMISSIONS_MODE:-once" in autostart_runner
+    assert "runtime permission preparation already complete marker=" in autostart_runner
+    assert "NJRH_PREPARE_RUNTIME_PERMISSIONS_MODE=once" in autostart_installer
+    assert (
+        "NJRH_COMMON_LOCAL_STATE_START_READY_MODE="
+        "${NJRH_COMMON_LOCAL_STATE_START_READY_MODE:-endpoint}"
+    ) in autostart_runner
+    assert (
+        "NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE="
+        "${NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE:-true}"
+    ) in autostart_runner
+    assert "NJRH_COMMON_LOCAL_STATE_START_READY_MODE=endpoint" in autostart_installer
+    assert "NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE=true" in autostart_installer
+    assert "NJRH_LOCAL_STATE_START_READY_MODE=\"${NJRH_COMMON_LOCAL_STATE_START_READY_MODE:-endpoint}\"" in overlay_common_services
+    assert "wait_for_runtime_health_local_state_endpoint_ready" in overlay_common_services
+    assert "NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE:-true" in overlay_common_services
+    assert "common local_state ready from runtime health snapshot before navigation startup" in resident_runtime
+    assert "wait_for_fresh_tf_transform \"odom\" \"base_link\"" in resident_runtime
+    assert (
+        "NJRH_NAV2_LIFECYCLE_PARALLEL_BT="
+        "${NJRH_NAV2_LIFECYCLE_PARALLEL_BT:-true}"
+    ) in autostart_runner
+    assert (
+        "NJRH_NAV2_LIFECYCLE_CONFIGURE_ALL_FIRST="
+        "${NJRH_NAV2_LIFECYCLE_CONFIGURE_ALL_FIRST:-false}"
+    ) in autostart_runner
+    assert (
+        "NJRH_GLOBAL_COSTMAP_PUBLISHER_READY_TIMEOUT_SEC="
+        "${NJRH_GLOBAL_COSTMAP_PUBLISHER_READY_TIMEOUT_SEC:-15}"
+    ) in autostart_runner
+    assert "/tmp/njrh_runtime_map_context.json" in autostart_runner
+    assert "/tmp/njrh_amcl_runtime_status.env" in autostart_runner
+    assert "/tmp/njrh_nav2_launch_hold_ready.env" in autostart_runner
     assert "mode_topic" in local_perception
-    assert "input_topic: /lidar_points\n" in local_perception
+    assert "enabled: false" in local_perception
+    assert 'input_topic: ""' in local_perception
+    assert 'output_topic: ""' in local_perception
+    assert 'clearing_output_topic: ""' in local_perception
+    assert 'status_topic: ""' in local_perception
+    assert "input_topic: /lidar_points\n" not in local_perception
     assert "input_topic: /_internal/lidar_points_local" not in local_perception
     assert "input_topic: /jt128/vendor/points_raw" not in local_perception
     assert "input_reliable: false" in local_perception
@@ -1830,13 +2631,14 @@ def test_project_runtime_helpers_are_wired():
     assert "input_frame_id_override: lidar_link" in local_perception
     assert "input_transform_use_latest: true" in local_perception
     assert "input_rotation_matrix:" in local_perception
-    assert "output_topic: /perception/obstacle_points" in local_perception
-    assert "clearing_output_topic: /perception/clearing_points" in local_perception
+    assert "/perception/obstacle_points" not in local_perception
+    assert "/perception/clearing_points" not in local_perception
+    assert "/perception/local_perception_status" not in local_perception
     assert "processing_rate_hz: 15.0" in local_perception
     assert "process_on_callback: false" in local_perception
     assert "point_sample_stride: 1" in local_perception
-    assert "restamp_to_now: false" in local_perception
-    assert "restamp_to_latest_tf: false" in local_perception
+    assert "restamp_to_now: true" in local_perception
+    assert "restamp_to_latest_tf: true" in local_perception
     assert "require_output_stamp_tf: false" in local_perception
     assert "output_stamp_tf_target_frame: odom" in local_perception
     assert "max_output_tf_stamp_age_sec: 0.25" in local_perception
@@ -1844,13 +2646,12 @@ def test_project_runtime_helpers_are_wired():
     assert "output_stamp_forward_sec: 0.0" in local_perception
     assert "require_startup_tf_ready: true" in local_perception
     assert "startup_tf_warmup_sec: 1.0" in local_perception
-    assert "clearing.enabled: true" in local_perception
+    assert "clearing.enabled: false" in local_perception
     assert "clearing.virtual_rays.enabled: true" in local_perception
     assert "clearing.virtual_rays.angular_resolution_deg: 1.0" in local_perception
     assert "clearing.virtual_rays.range: 8.00" in local_perception
     assert "clearing.virtual_rays.range_steps: [0.50, 1.00, 2.00, 3.50, 5.50, 8.00]" in local_perception
     assert "clearing.max_points: 15000" in local_perception
-    assert "status_topic: /perception/local_perception_status" in local_perception
     assert "status_publish_period_sec: 2.0" in local_perception
     assert "-0.10, 0.05, 0.20, 0.40, 0.60, 0.85, 1.10, 1.30" in local_perception
     assert "profiles.NORMAL.range_filter.max: 5.50" in local_perception
@@ -1863,7 +2664,7 @@ def test_project_runtime_helpers_are_wired():
     assert "status_topic: /safety/status" in robot_safety
     assert "motion_allowed_topic: /safety/motion_allowed" in robot_safety
     assert "cmd_vel_out_topic: /cmd_vel_safe" in robot_safety
-    assert "run_local_perception.sh" in overlay_nav
+    assert "local_perception helper disabled" in overlay_nav
     assert "run_floor_manager.sh" in overlay_nav
     assert "run_robot_safety.sh" in overlay_nav
     assert "run_ranger_mini3_mode_controller.sh" in overlay_nav
@@ -1901,31 +2702,20 @@ def test_project_runtime_helpers_are_wired():
     assert 'env LOCAL_STATE_MODE="${mode}" bash "${SCRIPT_DIR}/run_local_state.sh"' not in overlay_nav
     assert "/local_state/odometry or odom->base_link is not ready from resident common services" not in overlay_nav
     assert "blocking readiness probes are disabled" in overlay_nav
-    assert "install/robot_local_perception/lib/robot_local_perception/local_perception_node" in overlay_local_perception
-    assert "Python fallback has been removed" in overlay_local_perception
+    assert "robot_local_perception PointCloud2 obstacle pipeline has been removed" in overlay_local_perception
+    assert "Nav2 local marking+clearing now uses /scan through nav2_costmap_2d::ObstacleLayer" in overlay_local_perception
+    assert "install/robot_local_perception/lib/robot_local_perception/local_perception_node" not in overlay_local_perception
     assert 'wait_for_topic_message "/local_state/odometry"' not in overlay_local_perception
     assert 'wait_for_tf_transform "base_link" "lidar_link"' not in overlay_local_perception
     assert 'wait_for_fresh_tf_transform \\' not in overlay_local_perception
     assert "local perception TF prerequisites ready" not in overlay_local_perception
-    assert "starting local perception without startup topic/TF probes" in overlay_local_perception
+    assert "starting local perception without startup topic/TF probes" not in overlay_local_perception
     assert "src/robot_local_perception/scripts/local_perception_node.py" not in overlay_nav_helpers
     assert "python3 .*local_perception_node.py" not in overlay_nav_helpers
     assert "robot_local_perception/local_perception_node" in overlay_nav_helpers
-    assert "local_perception_runtime_config_ready()" in overlay_nav_helpers
-    assert 'ros2 param get /robot_local_perception restamp_to_now' in overlay_nav_helpers
-    assert 'ros2 param get /robot_local_perception restamp_to_latest_tf' in overlay_nav_helpers
-    assert 'ros2 param get /robot_local_perception require_output_stamp_tf' in overlay_nav_helpers
-    assert 'ros2 param get /robot_local_perception input_reliable' in overlay_nav_helpers
-    assert 'ros2 param get /robot_local_perception input_qos_depth' in overlay_nav_helpers
-    assert 'ros2 param get /robot_local_perception input_transform_use_latest' in overlay_nav_helpers
-    assert '[[ "${restamp_to_now}" == *"False"* ]]' in overlay_nav_helpers
-    assert '[[ "${restamp_to_latest_tf}" == *"False"* ]]' in overlay_nav_helpers
-    assert '[[ "${require_output_stamp_tf}" == *"False"* ]]' in overlay_nav_helpers
-    assert '[[ "${input_reliable}" == *"False"* ]]' in overlay_nav_helpers
-    assert '[[ "${input_qos_depth}" == *"1"* ]]' in overlay_nav_helpers
-    assert 'ros2 param get /robot_local_perception max_output_tf_stamp_age_sec' in overlay_nav_helpers
-    assert 'ros2 param get /robot_local_perception output_stamp_tf_backoff_sec' in overlay_nav_helpers
-    assert 'ros2 param get /robot_local_perception output_stamp_forward_sec' in overlay_nav_helpers
+    assert "local_perception_runtime_config_ready()" not in overlay_nav_helpers
+    assert 'ros2 param get /robot_local_perception' not in overlay_nav_helpers
+    assert "disabled: production local obstacle marking+clearing uses /scan" in overlay_nav_helpers
     assert "robot_floor_manager/floor_manager_node" in overlay_nav_helpers
     assert "install/robot_safety/lib/robot_safety/robot_safety_node" in overlay_robot_safety
     assert "Python fallback has been removed" in overlay_robot_safety
@@ -1953,20 +2743,72 @@ def test_project_runtime_helpers_are_wired():
     assert "--keepout-yaml" in overlay_nav
     assert "--stable-wait-sec" in overlay_nav
     assert '[[ "${NAV2_KEEP_OUT_MASK_YAML}" == "${runtime_dir}/"* ]]' in overlay_nav
+    assert "costmap_filter_mask_is_neutral()" in overlay_nav
+    assert "disable_neutral_costmap_filters_if_needed()" in overlay_nav
+    assert "NJRH_NAV2_DISABLE_NEUTRAL_COSTMAP_FILTERS:-true" in overlay_nav
+    assert "nav2.neutral_keepout_disabled.yaml" in overlay_nav
+    assert 'disabled_filter_manager = False' in overlay_nav
+    assert 'removed_global_keepout_filter_list = False' in overlay_nav
+    assert 'disabled_keepout_plugin = False' in overlay_nav
+    assert "lifecycle_manager_costmap_filters autostart" in overlay_nav
+    assert 'global_costmap filters: ["keepout_filter"]' in overlay_nav
+    assert "global costmap keepout filter removed and filter lifecycle autostart disabled" in overlay_nav
+    assert "NJR H_NAV2_COSTMAP_FILTER_SERVERS_ENABLED" not in overlay_nav
+    assert "NJR H_NAV2_COSTMAP_FILTER_SERVERS_ENABLED" not in standard_navigation_launch
+    assert "NJRH_NAV2_COSTMAP_FILTER_SERVERS_ENABLED=false" in overlay_nav
+    assert "neutral keepout filter mask detected" in overlay_nav
+    assert 'export NAV2_PARAMS_FILE="${runtime_params}"' in overlay_nav
     assert 'keepout_mask_yaml:="${NAV2_KEEP_OUT_MASK_YAML}"' in overlay_nav
     assert 'speed_mask_yaml:="${NAV2_SPEED_MASK_YAML}"' in overlay_nav
+    assert "nav2_speed_filter_enabled()" in overlay_nav
+    assert "Nav2 speed filter enabled=" in overlay_nav
     assert "costmap_filter_info_server" in standard_navigation_launch
     assert "cpu_affinity_prefix" in standard_navigation_launch
     assert "TimerAction" in standard_navigation_launch
     assert 'DeclareLaunchArgument(\n                "nav_lifecycle_start_delay"' in standard_navigation_launch
-    assert 'NJRH_NAV_LIFECYCLE_START_DELAY_SEC", "18.0"' in standard_navigation_launch
-    assert "filter_lifecycle_nodes = [" in standard_navigation_launch
+    assert 'DeclareLaunchArgument(\n                "navigation_lifecycle_autostart"' in standard_navigation_launch
+    assert 'NJRH_NAVIGATION_LIFECYCLE_AUTOSTART", "true"' in standard_navigation_launch
+    assert 'NJRH_NAV_LIFECYCLE_START_DELAY_SEC", "2.0"' in standard_navigation_launch
+    assert 'export NJRH_NAV_LIFECYCLE_START_DELAY_SEC="${NJRH_NAV_LIFECYCLE_START_DELAY_SEC:-2.0}"' in overlay_nav
+    assert 'NJRH_COSTMAP_FILTER_MASK_STABLE_WAIT_SEC:-0.5' in overlay_nav
+    assert 'NJRH_NAV2_LAUNCH_SETTLE_SEC:-1' in overlay_nav
+    assert 'enable_costmap_filter_servers = os.environ.get(' in standard_navigation_launch
+    assert '"NJRH_NAV2_COSTMAP_FILTER_SERVERS_ENABLED", "true"' in standard_navigation_launch
+    assert "costmap_filter_nodes = []" in standard_navigation_launch
+    assert "if enable_costmap_filter_servers:" in standard_navigation_launch
+    assert "filter_lifecycle_manager_nodes = []" in standard_navigation_launch
+    assert "if filter_lifecycle_nodes:" in standard_navigation_launch
+    assert "*costmap_filter_nodes" in standard_navigation_launch
+    assert "*filter_lifecycle_manager_nodes" in standard_navigation_launch
+    assert "filter_lifecycle_nodes = []" in standard_navigation_launch
     assert "navigation_lifecycle_nodes = [" in standard_navigation_launch
     assert 'name="lifecycle_manager_costmap_filters"' in standard_navigation_launch
     assert 'name="lifecycle_manager_navigation"' in standard_navigation_launch
     assert '{"node_names": filter_lifecycle_nodes}' in standard_navigation_launch
     assert '{"node_names": navigation_lifecycle_nodes}' in standard_navigation_launch
+    assert '{"autostart": navigation_lifecycle_autostart}' in standard_navigation_launch
     assert '{"bond_timeout": 0.0}' in standard_navigation_launch
+    assert 'navigation_lifecycle_autostart:="${navigation_lifecycle_autostart}"' in overlay_nav
+    assert "NJRH_NAV2_EXTERNAL_LIFECYCLE_BRINGUP:-true" in overlay_nav
+    assert "NJRH_NAV2_LIFECYCLE_HOLD:-false" in overlay_nav
+    assert "resident runtime is holding lifecycle activation" in overlay_nav
+    assert "Nav2 launch process is running with lifecycle activation held" in overlay_nav
+    assert "/opt/ros/humble/lib/nav2_util/lifecycle_bringup" in overlay_nav
+    assert "nav_lifecycle_bringup_pid" in overlay_nav
+    overlay_nav_lifecycle_nodes = overlay_nav[
+        overlay_nav.index("start_navigation_lifecycle_with_nav2_util()") :
+        overlay_nav.index(
+            'echo "[runtime-overlay] starting Nav2 core lifecycle',
+            overlay_nav.index("start_navigation_lifecycle_with_nav2_util()"),
+        )
+    ]
+    assert overlay_nav_lifecycle_nodes.index("planner_server") < overlay_nav_lifecycle_nodes.index(
+        "controller_server"
+    )
+    assert 'kill -TERM "${nav_lifecycle_bringup_pid}"' in overlay_nav
+    assert "NJRH_NAV2_LIFECYCLE_BRINGUP_TIMEOUT_SEC:-180" in overlay_nav
+    assert "Nav2 core lifecycle autostart disabled; lifecycle_bringup will manage core nodes" in overlay_nav
+    assert "lifecycle_manager_navigation external lifecycle_bringup: Managed nodes are active" in overlay_nav
     assert 'with_cpu_affinity("controller_server", node_kwargs)' in standard_navigation_launch
     assert 'with_cpu_affinity("velocity_smoother", node_kwargs)' in standard_navigation_launch
     assert 'with_cpu_affinity("collision_monitor", node_kwargs)' in standard_navigation_launch
@@ -1976,6 +2818,8 @@ def test_project_runtime_helpers_are_wired():
     assert nav2_yaml.index("- collision_monitor") < nav2_yaml.index("- bt_navigator")
     assert "keepout_filter_mask_server" in standard_navigation_launch
     assert "speed_filter_mask_server" in standard_navigation_launch
+    assert 'enable_speed_filter = os.environ.get("NJRH_ENABLE_SPEED_FILTER", "false")' in standard_navigation_launch
+    assert "speed_filter_nodes = []" in standard_navigation_launch
     assert '"/costmap_filter_info/keepout"' in standard_navigation_launch
     assert '"/costmap_filter_info/speed"' in standard_navigation_launch
     assert '"/keepout_filter_mask"' in standard_navigation_launch
@@ -1993,7 +2837,8 @@ def test_project_runtime_helpers_are_wired():
     assert "robot_map_toolkit/scripts/map_toolkit_cli.py" in overlay_promote_floor
     assert "local_costmap_debug.launch.py" in overlay_local_costmap_debug
     assert 'source "${SCRIPT_DIR}/cpu_affinity.sh"' in overlay_local_costmap_debug
-    assert "run_local_perception.sh" in overlay_local_costmap_debug
+    assert "run_local_perception.sh" not in overlay_local_costmap_debug
+    assert "local_perception debug helper disabled" in overlay_local_costmap_debug
     assert "run_robot_description.sh" in overlay_local_costmap_debug
     assert "run_local_state.sh" in overlay_local_costmap_debug
     assert "run_robot_safety.sh" not in overlay_local_costmap_debug
@@ -2009,11 +2854,16 @@ def test_project_runtime_helpers_are_wired():
     assert "NJRH_FORCE_RESTART_NAV_HELPERS:-false" in overlay_nav_runtime_helpers
     assert "reusing existing ${helper_name}" in overlay_nav_runtime_helpers
     assert "stop_existing_standard_nav_stack()" in overlay_nav_runtime_helpers
+    assert "NJRH_STANDARD_NAV_STACK_STOP_INT_WAIT_SEC:-0.5" in overlay_nav_runtime_helpers
+    assert "NJRH_OVERLAY_HELPER_START_SETTLE_SEC:-0.2" in overlay_nav_runtime_helpers
+    assert "NJRH_OVERLAY_HELPER_STOP_INT_WAIT_SEC:-0.5" in overlay_nav_runtime_helpers
     assert '"laser_scan_to_flatscan"' not in overlay_stop_navigation
     assert '"laser_scan_to_flatscan"' not in overlay_nav_runtime_helpers
 
     assert "__node:=lifecycle_manager_costmap_filters" in overlay_nav_runtime_helpers
     assert "__node:=lifecycle_manager_navigation" in overlay_nav_runtime_helpers
+    assert "/opt/ros/humble/lib/nav2_util/lifecycle_bringup" in overlay_nav_runtime_helpers
+    assert '"lifecycle_bringup"' in overlay_stop_navigation
     assert "__node:=collision_monitor" in overlay_nav_runtime_helpers
     assert "NJRH_FORCE_RESTART_CANONICAL_TF:-false" in overlay_canonical_helpers
     assert "reusing existing ${helper_name}" in overlay_canonical_helpers
@@ -2046,9 +2896,12 @@ def test_project_runtime_helpers_are_wired():
     assert "FAST-LIO failed to publish fresh ${FASTLIO_ODOM_TOPIC}" in overlay_common_services
     assert "FAST-LIO2 common autostart disabled; mapping starts FAST-LIO2 only while mapping is active" in overlay_common_services
     assert "startup readiness probes are disabled" in overlay_common_services
-    assert 'env LOCAL_STATE_MODE="${NAV_LOCAL_STATE_MODE}" bash "${SCRIPT_DIR}/run_local_state.sh"' in overlay_common_services
+    assert 'env NJRH_LOCAL_STATE_START_READY_MODE="${NJRH_COMMON_LOCAL_STATE_START_READY_MODE:-endpoint}"' in overlay_common_services
+    assert 'LOCAL_STATE_MODE="${NAV_LOCAL_STATE_MODE}"' in overlay_common_services
+    assert 'bash "${SCRIPT_DIR}/run_local_state.sh"' in overlay_common_services
     assert 'kill_canonical_pattern "robot_localization/ekf_node"' in overlay_common_services
-    assert "run_local_perception.sh" in overlay_common_services
+    assert "run_local_perception.sh" not in overlay_common_services
+    assert "local_perception_common disabled" in overlay_common_services
     assert "run_robot_safety.sh" in overlay_common_services
     assert "run_robot_api_server.sh" in overlay_common_services
     assert "run_gs2_driver.sh" in overlay_common_services
@@ -2060,8 +2913,61 @@ def test_project_runtime_helpers_are_wired():
     assert "LAST_NAVIGATION_MAP_FILE" in overlay_common_services
     assert "load_last_navigation_map_selection()" in overlay_common_services
     assert "NJRH_RESIDENT_NAVIGATION_AUTOSTART:-auto" in overlay_common_services
+    assert "resident_navigation_context_status()" in overlay_common_services
+    assert "wait_for_resident_navigation_context_ready()" in overlay_common_services
+    assert "context ready but API goal-start not safe" in overlay_common_services
+    assert "resident_navigation_runtime_process_running()" in overlay_common_services
+    assert "resident_navigation_runtime_pids()" in overlay_common_services
+    assert "stop_stale_resident_navigation_runtime_processes()" in overlay_common_services
+    assert "cleanup_resident_navigation_runtime_layers()" in overlay_common_services
+    assert "prepare_resident_navigation_autostart()" in overlay_common_services
+    assert "clearing stale resident navigation runtime before autostart" in overlay_common_services
+    assert "/run_navigation_runtime_services.sh/ && !/awk/" in overlay_common_services
+    assert "stopping stale resident navigation runtime processes" in overlay_common_services
+    assert "stale resident navigation runtime ignored SIGTERM; killing exact pids" in overlay_common_services
+    assert "kill -KILL ${pids}" in overlay_common_services
+    assert "stop_stale_resident_navigation_runtime_processes" in overlay_common_services[
+        overlay_common_services.index("cleanup_resident_navigation_runtime_layers()") :
+        overlay_common_services.index('bash "${SCRIPT_DIR}/run_amcl_shadow_localization.sh" --stop')
+    ]
+    assert "NJRH_COMMON_AMCL_STOP_TIMEOUT_SEC:-3" in overlay_common_services
+    assert "NJRH_COMMON_AMCL_STOP_KILL_AFTER_SEC:-1" in overlay_common_services
+    assert 'bash "${SCRIPT_DIR}/run_amcl_shadow_localization.sh" --stop' in overlay_common_services
+    assert "stop_existing_standard_nav_stack || true" in overlay_common_services
+    assert "stop_existing_localization_stack || true" in overlay_common_services
+    assert "rm -f /tmp/njrh_runtime_map_context.json /tmp/njrh_amcl_runtime_status.env" in overlay_common_services
+    cleanup_block = overlay_common_services[
+        overlay_common_services.index("cleanup() {") :
+        overlay_common_services.index("on_signal()", overlay_common_services.index("cleanup() {"))
+    ]
+    assert cleanup_block.count("cleanup_resident_navigation_runtime_layers") >= 2
+    assert "NJRH_RESIDENT_NAVIGATION_READY_TIMEOUT_SEC:-120" in overlay_common_services
+    assert "NJRH_RESIDENT_NAVIGATION_READY_HARD_TIMEOUT_SEC:-240" in overlay_common_services
+    assert "exceeded soft SLA" in overlay_common_services
+    assert "hard timeout" in overlay_common_services
+    assert "resident navigation context ready" in overlay_common_services
+    assert "resident navigation context did not become ready" in overlay_common_services
     assert "no valid last navigation map; common services stay alive in NO_MAP mode" in overlay_common_services
     assert "last_navigation_map.json" in overlay_common_services
+    resident_navigation_runtime = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_navigation_runtime_services.sh"
+    ).read_text(encoding="utf-8")
+    nav2_ready_block = resident_navigation_runtime[
+        resident_navigation_runtime.index("log_startup_stage \"nav2_layer_ready\"") :
+        resident_navigation_runtime.index("log_startup_stage \"amcl_tracking_ready\"")
+    ]
+    assert "wait_for_amcl_readiness_background_if_running" in nav2_ready_block
+    assert "AMCL readiness background did not complete cleanly" in nav2_ready_block
+    assert "complete_amcl_readiness_with_retries_for_navigation" in nav2_ready_block
+    assert nav2_ready_block.index("wait_for_amcl_readiness_background_if_running") < nav2_ready_block.index(
+        "complete_amcl_readiness_with_retries_for_navigation"
+    )
+    assert overlay_common_services.index("prepare_resident_navigation_autostart") < overlay_common_services.index(
+        'start_common_process "resident_navigation_runtime"'
+    )
+    assert overlay_common_services.index("wait_for_resident_navigation_context_ready") < overlay_common_services.index(
+        "common services are running; start mapping or resident navigation scripts in reuse mode"
+    )
     overlay_gs2_driver = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_gs2_driver.sh"
     ).read_text(encoding="utf-8")
@@ -2089,8 +2995,32 @@ def test_project_runtime_helpers_are_wired():
     assert "chmod 664" in container_script
     assert 'ROBOT_API_READY_TIMEOUT_SEC="${NJRH_ROBOT_API_READY_TIMEOUT_SEC:-120}"' in container_script
     assert 'ROBOT_API_READY_POLL_SEC="${NJRH_ROBOT_API_READY_POLL_SEC:-1}"' in container_script
+    assert 'ROBOT_NAV_READY_TIMEOUT_SEC="${NJRH_ROBOT_NAV_READY_TIMEOUT_SEC:-120}"' in container_script
+    assert 'ROBOT_NAV_READY_POLL_SEC="${NJRH_ROBOT_NAV_READY_POLL_SEC:-1}"' in container_script
     assert 'deadline=$((SECONDS + ROBOT_API_READY_TIMEOUT_SEC))' in container_script
+    assert "resident_navigation_context_status()" in container_script
+    assert "wait_for_resident_navigation_runtime()" in container_script
+    assert 'state == "ready" and confirmed' in container_script
+    assert 'startup_elapsed_sec=' in container_script
+    assert "stop_detached_runtime_processes()" in container_script
+    assert "run_navigation_runtime_services.sh" in container_script
+    assert "standard_navigation.launch.py" in container_script
+    assert "robot_api_server/robot_api_server_node" in container_script
+    assert "/tmp/njrh_runtime_map_context.json" in container_script
+    assert "pkill -9" not in container_script
     assert "seq 1 30" not in container_script
+    start_common_services_block = container_script[
+        container_script.index("start_common_services()") : container_script.index("stop_detached_runtime_processes()")
+    ]
+    assert "wait_for_robot_api" in start_common_services_block
+    assert "wait_for_resident_navigation_runtime" in start_common_services_block
+    assert start_common_services_block.index("wait_for_robot_api") < start_common_services_block.index(
+        "wait_for_resident_navigation_runtime"
+    )
+    stop_common_services_block = container_script[
+        container_script.index("stop_common_services()") : container_script.index("wait_for_dashboard()")
+    ]
+    assert "stop_detached_runtime_processes" in stop_common_services_block
     start_runtime_case = container_script.split("start-runtime)", 1)[1].split(";;", 1)[0]
     assert "start_container" in start_runtime_case
     assert "start_dashboard" not in start_runtime_case
@@ -2184,7 +3114,6 @@ def test_runtime_overlay_cpu_affinity_policy_is_wired():
         "run_driver.sh",
         "run_local_state.sh",
         "run_localization_bridge.sh",
-        "run_local_perception.sh",
         "run_robot_safety.sh",
         "run_nav2_navigation.sh",
         "run_fastlio_tf.sh",
@@ -2192,6 +3121,10 @@ def test_runtime_overlay_cpu_affinity_policy_is_wired():
     ):
         text = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / runner).read_text(encoding="utf-8")
         assert 'source "${SCRIPT_DIR}/cpu_affinity.sh"' in text
+    retired_local_perception = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_local_perception.sh"
+    ).read_text(encoding="utf-8")
+    assert "robot_local_perception PointCloud2 obstacle pipeline has been removed" in retired_local_perception
 
 
 def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
@@ -2323,6 +3256,9 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     ).read_text(encoding="utf-8")
     occupancy_localization_script = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_occupancy_grid_localization.sh"
+    ).read_text(encoding="utf-8")
+    occupancy_localization_launch = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "launch" / "occupancy_localization.launch.py"
     ).read_text(encoding="utf-8")
     stop_navigation_script = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "stop_floor_navigation.sh"
@@ -2493,6 +3429,7 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "struct StoredPose" in storage_header
     assert "struct MapManifest" in storage_header
     assert "struct RuntimeMapContext" in storage_header
+    assert "std::string startup_stage" in storage_header
     assert "struct MapYamlInfo" in storage_header
     assert "safe_pose_id" in storage_cpp
     assert "safe_asset_id" in storage_cpp
@@ -2577,6 +3514,8 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "write_runtime_map_context_file(" in node_cpp
     assert "read_runtime_map_context_file(" in node_cpp
     assert "njrh.runtime_map_context.v1" not in node_cpp
+    assert "double updated_at_sec{0.0};" in storage_header
+    assert 'context.updated_at_sec = json_number_value(text, "updated_at").value_or(0.0);' in runtime_context_cpp
     assert '#include "robot_api_server/runtime_map_lookup.hpp"' in node_cpp
     assert "safe_map_name" in runtime_map_lookup_header
     assert "runtime_map_asset_paths" in runtime_map_lookup_header
@@ -2904,7 +3843,7 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert 'navigation_final_yaw_align_cmd_topic_ = "/cmd_vel_collision_checked"' in node_cpp
     assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel_safe"' not in node_cpp
     assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel"' not in node_cpp
-    assert "position_reached_verifying" in node_cpp
+    assert "final_pose_auditing" in node_cpp
     assert "position_reached_yaw_aligning" in node_cpp
     assert "final_pose_verifying" in node_cpp
     assert "final_pose_verified" in node_cpp
@@ -2920,12 +3859,15 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "yaw_align_failed" in node_cpp
     assert "REPOSITION_AFTER_YAW_DRIFT" in node_cpp
     assert "run_reposition_after_yaw_drift" in node_cpp
-    assert "navigation position reached but pose_required final yaw failed" in node_cpp
-    assert "goal_completion_policy=position_only; final yaw alignment not required" in node_cpp
+    assert "navigation goal reached by Nav2 native completion" in node_cpp
+    assert "Nav2 is the single completion owner" in node_cpp
+    assert "under position_only policy" in node_cpp
     assert "bool position_reached = pose_check.position_reached;" in node_cpp
     assert "bool position_reached = nav2_succeeded" not in node_cpp
-    assert "navigation reported success but final position is outside tolerance" in node_cpp
-    assert '"failed_position"' in node_cpp
+    run_goal_block = node_cpp[node_cpp.index("void run_navigation_goal_job("):node_cpp.index("HttpResponse handle_navigation_state()")]
+    assert "Nav2 reported success but read-only final pose verification failed" not in run_goal_block
+    assert '"failed_final_pose_verify"' in node_cpp
+    assert '"nav2_failed"' in node_cpp
     assert '"position_not_reached"' not in node_cpp[node_cpp.index("void run_navigation_goal_job("):]
     assert "final_yaw_align_blocked" in node_cpp
     assert "final_yaw_align_attempted" in node_cpp
@@ -3106,13 +4048,16 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "navigation_relocalize_before_goal_always: false" in config
     assert "navigation_relocalize_before_goal_required: false" in config
     assert "navigation_relocalize_wait_sec: 8.0" in config
-    assert "navigation_lifecycle_check_timeout_sec: 0.35" in config
+    assert "navigation_lifecycle_check_timeout_sec: 1.5" in config
     assert "navigation_goal_result_timeout_sec: 600.0" in config
     assert "navigation_goal_position_success_tolerance_m: 0.20" in config
     assert "navigation_default_goal_completion_policy: \"pose_required\"" in config
-    assert "navigation_max_reposition_after_yaw_retry: 1" in config
+    assert "navigation_max_reposition_after_yaw_retry: 0" in config
     assert "navigation_reposition_after_yaw_drift_timeout_sec: 30.0" in config
-    assert "navigation_final_yaw_align_enable: true" in config
+    assert "nav2_native_goal_completion_enabled: true" in config
+    assert "nav2_rotation_shim_enabled: true" in config
+    assert "api_final_yaw_align_fallback_enabled: false" in config
+    assert "navigation_final_yaw_align_enable: false" in config
     assert "navigation_final_yaw_tolerance_rad: 0.05" in config
     assert "navigation_final_yaw_align_trigger_rad: 0.08" in config
     assert "navigation_final_yaw_align_speed_radps: 0.25" in config
@@ -3217,13 +4162,16 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "navigation_relocalize_before_goal_always: false" in overlay_config
     assert "navigation_relocalize_before_goal_required: false" in overlay_config
     assert "navigation_relocalize_wait_sec: 8.0" in overlay_config
-    assert "navigation_lifecycle_check_timeout_sec: 0.35" in overlay_config
+    assert "navigation_lifecycle_check_timeout_sec: 1.5" in overlay_config
     assert "navigation_goal_result_timeout_sec: 600.0" in overlay_config
     assert "navigation_goal_position_success_tolerance_m: 0.20" in overlay_config
     assert "navigation_default_goal_completion_policy: \"pose_required\"" in overlay_config
-    assert "navigation_max_reposition_after_yaw_retry: 1" in overlay_config
+    assert "navigation_max_reposition_after_yaw_retry: 0" in overlay_config
     assert "navigation_reposition_after_yaw_drift_timeout_sec: 30.0" in overlay_config
-    assert "navigation_final_yaw_align_enable: true" in overlay_config
+    assert "nav2_native_goal_completion_enabled: true" in overlay_config
+    assert "nav2_rotation_shim_enabled: true" in overlay_config
+    assert "api_final_yaw_align_fallback_enabled: false" in overlay_config
+    assert "navigation_final_yaw_align_enable: false" in overlay_config
     assert "navigation_final_yaw_tolerance_rad: 0.05" in overlay_config
     assert "navigation_final_yaw_align_trigger_rad: 0.08" in overlay_config
     assert "navigation_final_yaw_align_speed_radps: 0.25" in overlay_config
@@ -3256,6 +4204,8 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "docking_manual_predock_max_distance_m: 1.20" in overlay_config
     assert "docking_manual_predock_max_yaw_error_rad: 0.80" in overlay_config
     assert "runtime_map_context_file: \"/tmp/njrh_runtime_map_context.json\"" in overlay_config
+    assert "navigation_resume_starting_context_ttl_sec: 300.0" in overlay_config
+    assert "navigation_resume_starting_context_ttl_sec: 300.0" in config
     assert "last_navigation_map_file: \"/workspaces/njrh-v3/workspace1/maps_release/last_navigation_map.json\"" in overlay_config
     assert "navigate_to_pose_action: \"/navigate_to_pose\"" in overlay_config
     assert "scan_topic: \"/scan\"" in overlay_config
@@ -3296,8 +4246,13 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "navigation readiness failed: map_server_asset" not in commercial_runtime_helpers
     assert "navigation readiness failed: map_topic" not in commercial_runtime_helpers
     assert "write_runtime_map_context \"ready\" \"true\"" in resident_runtime_script
-    assert "resident navigation runtime ready after trigger wrapper, bridge map->odom, and Nav2 activation" in resident_runtime_script
+    assert "STARTUP_STAGE" in resident_runtime_script
+    assert (
+        "resident navigation runtime ready after trigger wrapper, bridge map->odom, Nav2 activation, "
+        "and AMCL tracking readiness"
+    ) in resident_runtime_script
     assert "resident_navigation_ready()" in resident_runtime_script
+    assert 'NJRH_NAV_REUSE_READY_CONTEXT:-true' in resident_runtime_script
     assert "navigation_runtime_ready_for_current_floor 3" not in resident_runtime_script
     assert "wait_for_resident_navigation_runtime_ready()" not in resident_runtime_script
     assert "ensure_navigation_layer_alive()" in resident_runtime_script
@@ -3307,7 +4262,8 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "wait_for_nav2_layer_ready()" in resident_runtime_script
     assert 'wait_for_ros_service "/global_localization/trigger"' in resident_runtime_script
     assert 'wait_for_ros_service "/trigger_grid_search_localization"' in resident_runtime_script
-    assert 'wait_for_topic_message "/flatscan" "${flatscan_timeout}"' in resident_runtime_script
+    assert 'wait_for_flatscan_publisher_ready "${flatscan_timeout}"' in resident_runtime_script
+    assert 'wait_for_topic_publisher_from_node "/flatscan" "laser_scan_to_flatscan"' in resident_runtime_script
     assert 'NJRH_INITIAL_LOCALIZATION_FLATSCAN_MAX_AGE_SEC' not in resident_runtime_script
     assert "wait_for_bridge_has_map_to_odom()" in resident_runtime_script
     assert "trigger_output_reports_map_to_odom_ready()" in resident_runtime_script
@@ -3318,12 +4274,13 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "BRIDGE_ACCEPT_TIMEOUT" in resident_runtime_script
     assert "BRIDGE_REJECTED_RESULT" in resident_runtime_script
     assert "MAP_TO_ODOM_WRONG_OWNER" in resident_runtime_script
-    assert 'wait_for_fresh_header_topic_message \\' not in resident_runtime_script
+    assert 'wait_for_fresh_header_topic_message \\\n    "/local_state/odometry"' in resident_runtime_script
+    assert 'wait_for_fresh_header_topic_message \\\n    "/lidar_points"' not in resident_runtime_script
     assert 'wait_for_tf_transform "map" "odom"' in resident_runtime_script
     assert 'wait_for_global_costmap_static "${costmap_timeout}"' in resident_runtime_script
     assert "trigger_global_localization_for_navigation()" in resident_runtime_script
     assert "NJRH_GLOBAL_LOCALIZATION_TRIGGER_RECHECK_TIMEOUT:-30" not in resident_runtime_script
-    assert "NJRH_GLOBAL_LOCALIZATION_TRIGGER_CALL_TIMEOUT:-60" in resident_runtime_script
+    assert "NJRH_GLOBAL_LOCALIZATION_TRIGGER_CALL_TIMEOUT:-90" in resident_runtime_script
     assert "resident_navigation_start:${NJRH_BUILDING_ID}/${NJRH_FLOOR_ID}" in resident_runtime_script
     assert "resident localization layer already owns map/localizer loading" in resident_runtime_script
     assert (
@@ -3331,13 +4288,20 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
         "resume_navigation: false}\""
     ) in resident_runtime_script
     assert "resume_navigation: true}" not in resident_runtime_script
-    resident_runtime_startup = resident_runtime_script.split('write_runtime_map_context "starting"', 1)[1]
+    resident_runtime_startup = resident_runtime_script.split('if resident_navigation_ready; then', 1)[1]
     assert "ensure_localization_stack_ready_for_navigation ||" in resident_runtime_startup
     assert 'ensure_map_server_active "${NAV2_MAP_YAML:-}" "${map_server_timeout}"' in resident_runtime_script
     assert "MAP_SERVER_NOT_ACTIVE" in resident_runtime_script
     assert "initial global localization did not pass trigger wrapper, bridge, and map->odom gates" in resident_runtime_script
+    assert "start_initial_global_localization_background()" in resident_runtime_script
+    assert "wait_for_initial_global_localization()" in resident_runtime_script
+    assert "NJRH_INITIAL_GLOBAL_LOCALIZATION_BACKGROUND_START:-false" in resident_runtime_script
+    assert "initial global localization trigger will run after localization stack and floor context are ready" in resident_runtime_script
+    assert resident_runtime_startup.index("start_initial_global_localization_background") < resident_runtime_startup.index(
+        "ensure_localization_stack_ready_for_navigation"
+    )
     assert resident_runtime_startup.index("/floor_manager/switch_floor") < resident_runtime_startup.index(
-        "trigger_global_localization_for_navigation"
+        "wait_for_initial_global_localization"
     )
     assert "existing resident navigation context matches selected floor" in resident_runtime_script
     assert 'NJRH_NAV2_REUSE_READY_STACK:-false' in overlay_nav2_script
@@ -3348,6 +4312,19 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "starting Nav2 without blocking map/topic/TF readiness probes" in overlay_nav2_script
     assert "blocking readiness probes are disabled" in overlay_nav2_script
     assert 'MAP_SERVER_READY_TIMEOUT="${NJRH_LOCALIZATION_MAP_SERVER_READY_TIMEOUT:-75}"' in occupancy_localization_script
+    assert 'LOCALIZATION_MAP_EXTERNAL_LIFECYCLE_BRINGUP="${NJRH_LOCALIZATION_MAP_EXTERNAL_LIFECYCLE_BRINGUP:-true}"' in occupancy_localization_script
+    assert 'map_lifecycle_manager_enabled:=false' in occupancy_localization_script
+    map_lifecycle_block = occupancy_localization_script[
+        occupancy_localization_script.index("start_map_server_lifecycle_with_nav2_util()") :
+        occupancy_localization_script.index("repair_jt128_navigation_points()")
+    ]
+    assert "nav2_lifecycle_sequence.py" in map_lifecycle_block
+    assert "/opt/ros/humble/lib/nav2_util/lifecycle_bringup map_server" not in map_lifecycle_block
+    assert "localization map_server repo lifecycle sequence: map_server active" in occupancy_localization_script
+    assert "map_lifecycle_bringup_pid" in occupancy_localization_script
+    assert 'export NJRH_LOCALIZATION_MAP_EXTERNAL_LIFECYCLE_BRINGUP="${NJRH_LOCALIZATION_MAP_EXTERNAL_LIFECYCLE_BRINGUP:-true}"' in resident_runtime_script
+    assert "map_lifecycle_manager_enabled" in occupancy_localization_launch
+    assert "PythonExpression" in occupancy_localization_launch
     assert 'ensure_map_server_active "${NAV2_MAP_YAML}" "${MAP_SERVER_READY_TIMEOUT}"' not in occupancy_localization_script
     assert "localization pointcloud startup probe disabled" in occupancy_localization_script
     assert "standard_nav_stack_ready()" in overlay_nav2_script
@@ -3357,11 +4334,22 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "NJRH_NAV_STOP_INT_WAIT_SEC:-1" in stop_navigation_script
     assert "NJRH_NAV_STOP_TERM_WAIT_SEC:-1" in stop_navigation_script
     assert "NJRH_NAV_STOP_KILL_WAIT_SEC:-1" in stop_navigation_script
+    assert "NJRH_NAV_STOP_AMCL_TIMEOUT_SEC" in stop_navigation_script
+    assert "NJRH_NAV_STOP_AMCL_KILL_AFTER_SEC" in stop_navigation_script
+    assert "stop_amcl_bounded()" in stop_navigation_script
+    assert "timeout --kill-after" in stop_navigation_script
     assert "run_navigation_runtime_services.sh" in stop_navigation_script
     assert "run_local_perception.sh" in stop_navigation_script
     assert "robot_local_perception/local_perception_node" in stop_navigation_script
+    assert "nav2_amcl/amcl" in stop_navigation_script
+    assert "amcl_scan_admission_node" in stop_navigation_script
+    assert "amcl_scan_admission_relay.py" in stop_navigation_script
     assert "clear_runtime_map_context()" in stop_navigation_script
     assert "rm -f \"${context_file}\"" in stop_navigation_script
+    assert "run_amcl_shadow_localization.sh\" --stop >/dev/null" not in stop_navigation_script
+    assert stop_navigation_script.index("kill_navigation_patterns KILL") < stop_navigation_script.index(
+        "publish_zero\nstop_amcl_bounded\nclear_runtime_map_context"
+    )
     assert "The app should not join ROS 2 DDS directly" in app_doc
     assert "bms.soc" in app_doc
     assert "Ranger `/battery_state`" in app_doc
@@ -3430,9 +4418,9 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "/trigger_grid_search_localization" in resident_runtime_script
     assert "trigger_global_localization_and_wait_for_result" not in resident_runtime_script
     assert "pre-armed localization_result subscribers" not in resident_runtime_script
-    assert 'local call_timeout="${NJRH_GLOBAL_LOCALIZATION_TRIGGER_CALL_TIMEOUT:-60}"' in resident_runtime_script
-    assert 'local bridge_timeout="${NJRH_INITIAL_LOCALIZATION_BRIDGE_ACCEPT_WAIT_SEC:-25}"' in resident_runtime_script
-    assert 'local tf_timeout="${NJRH_INITIAL_LOCALIZATION_MAP_ODOM_WAIT_SEC:-20}"' in resident_runtime_script
+    assert 'local call_timeout="${NJRH_GLOBAL_LOCALIZATION_TRIGGER_CALL_TIMEOUT:-90}"' in resident_runtime_script
+    assert 'local bridge_timeout="${NJRH_INITIAL_LOCALIZATION_BRIDGE_ACCEPT_WAIT_SEC:-8}"' in resident_runtime_script
+    assert 'local tf_timeout="${NJRH_INITIAL_LOCALIZATION_MAP_ODOM_WAIT_SEC:-8}"' in resident_runtime_script
     assert "global localization wrapper accepted" in resident_runtime_script
     assert "trigger_output_reports_map_to_odom_ready" in resident_runtime_script
     assert "wrapper already verified bridge map->odom readiness" in resident_runtime_script
@@ -3440,7 +4428,8 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "map->odom TF was not published after bridge acceptance" in resident_runtime_script
     assert 'NJRH_GLOBAL_LOCALIZATION_TRIGGER_FALLBACK_TF_TIMEOUT:-20' not in resident_runtime_script
     assert "requesting global localization through wrapper and waiting for bridge/map->odom" in resident_runtime_script
-    assert "starting resident Nav2 layer" in resident_runtime_script
+    assert "start_resident_navigation_layer" in resident_runtime_script
+    assert '"nav2_layer_prestarted"' in resident_runtime_script
     assert "runtime_ready=0" in resident_runtime_script
     assert "write_runtime_map_context \"failed\" \"false\"" in resident_runtime_script
     assert "resident navigation runtime failed; check" in resident_runtime_script
@@ -3450,6 +4439,9 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "async_send_request" in global_localization_node
     assert "wait_for_bridge_acceptance" in global_localization_node
     assert "wait_for_map_to_odom" in global_localization_node
+    assert "map_odom_publish_gap_ms" in global_localization_node
+    assert "map_to_odom_bridge_publish_healthy" in global_localization_node
+    assert "map_to_odom_ready(latest)" in global_localization_node
     assert "failure_code=BRIDGE_ACCEPT_TIMEOUT" in global_localization_node
     assert "failure_code=MAP_TO_ODOM_TIMEOUT" in global_localization_node
     assert "done.wait" not in global_localization_node
@@ -3461,7 +4453,9 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "<depend>std_srvs</depend>" in global_localization_package
     assert "<exec_depend>rclpy</exec_depend>" not in global_localization_package
     assert not (ROOT / "src" / "robot_global_localization" / "scripts" / "global_localization_node.py").exists()
-    assert 'wait_for_topic_message "/flatscan" "${flatscan_timeout}"' in resident_runtime_script
+    assert 'wait_for_flatscan_publisher_ready "${flatscan_timeout}"' in resident_runtime_script
+    assert 'wait_for_topic_publisher_from_node "/flatscan" "laser_scan_to_flatscan"' in resident_runtime_script
+    assert 'wait_for_topic_message "/flatscan"' not in resident_runtime_script
     assert "create_subscription(" not in resident_runtime_script
     assert '"/localization_result"' in resident_runtime_script
     assert 'wait_for_tf_transform "map" "odom"' in resident_runtime_script
@@ -3482,17 +4476,9 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT" in runtime_probe_cpp
     assert "timed out waiting for topic message: " in runtime_probe_cpp
     assert "helper_ready()" in nav_runtime_helpers
-    assert "local_perception_runtime_config_ready()" in nav_runtime_helpers
-    assert 'ros2 param get /robot_local_perception restamp_to_now' in nav_runtime_helpers
-    assert 'ros2 param get /robot_local_perception restamp_to_latest_tf' in nav_runtime_helpers
-    assert 'ros2 param get /robot_local_perception require_output_stamp_tf' in nav_runtime_helpers
-    assert 'ros2 param get /robot_local_perception input_reliable' in nav_runtime_helpers
-    assert 'ros2 param get /robot_local_perception input_qos_depth' in nav_runtime_helpers
-    assert 'ros2 param get /robot_local_perception input_transform_use_latest' in nav_runtime_helpers
-    assert 'ros2 param get /robot_local_perception max_output_tf_stamp_age_sec' in nav_runtime_helpers
-    assert 'ros2 param get /robot_local_perception output_stamp_tf_backoff_sec' in nav_runtime_helpers
-    assert 'ros2 param get /robot_local_perception output_stamp_forward_sec' in nav_runtime_helpers
-    assert 'wait_for_topic_message "/perception/obstacle_points"' in nav_runtime_helpers
+    assert "local_perception_runtime_config_ready()" not in nav_runtime_helpers
+    assert 'ros2 param get /robot_local_perception' not in nav_runtime_helpers
+    assert 'wait_for_topic_message "/scan"' in nav_runtime_helpers
     assert "wait_for_local_costmap_observation_ready()" in nav_runtime_helpers
     assert 'wait_for_topic_message "/local_costmap/costmap"' in nav_runtime_helpers
     assert 'wait_for_fresh_tf_transform "odom" "base_link"' in nav_runtime_helpers
@@ -3502,10 +4488,11 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "tf2_msgs::msg::TFMessage" in runtime_probe_cpp
     assert 'create_subscription<tf2_msgs::msg::TFMessage>' in runtime_probe_cpp
     assert "source=/tf" in runtime_probe_cpp
-    assert "wait_for_transformable_obstacle_points" in nav_runtime_helpers
+    assert "wait_for_transformable_local_scan" in nav_runtime_helpers
+    assert "transformable-scan" in nav_runtime_helpers
     assert "NJRH_LOCAL_COSTMAP_TF_BUFFER_WARMUP_SEC" in runtime_probe_cpp
     assert "tf_buffer_warmup" in runtime_probe_cpp
-    assert "local_costmap_observation_tf_not_transformable" in nav_runtime_helpers
+    assert "local_costmap_scan_tf_not_transformable" in nav_runtime_helpers
     assert 'wait_for_topic_message "/safety/status"' not in nav_runtime_helpers
     assert 'wait_for_ros_service "/floor_manager/switch_floor"' not in nav_runtime_helpers
     assert "existing ${helper_name} process is stale" not in nav_runtime_helpers
@@ -3525,6 +4512,8 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "requested map is already published on /map; continuing without waiting for /map_server discovery" in map_server_helpers
     assert "/map_server node discovery unavailable, but requested map is being published; continuing" in map_server_helpers
     assert "timeout 3 ros2 lifecycle get /map_server" in map_server_helpers
+    assert "localization_map_external_lifecycle_bringup_enabled()" in map_server_helpers
+    assert "external lifecycle_bringup is managing /map_server" in map_server_helpers
     assert "lifecycle state unavailable, but requested map is selected; continuing" in map_server_helpers
     assert 'wait_for_ros_service "/global_localization/trigger" "${NJRH_GLOBAL_LOCALIZATION_SERVICE_WAIT_SEC:-75}"' not in resident_runtime_script
     assert 'wait_for_ros_service "/trigger_grid_search_localization" "${NJRH_ISAAC_TRIGGER_SERVICE_WAIT_SEC:-75}"' not in resident_runtime_script
@@ -3537,6 +4526,17 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert 'context && !context->confirmed && context->state == "failed"' in node_cpp
     assert "navigation runtime failed before ready" in node_cpp
     assert "runtime_context_matches_resume_request" in node_cpp
+    assert "runtime_context_same_resume_request" in node_cpp
+    assert "runtime_context_starting_is_fresh" in node_cpp
+    assert "navigation_resume_starting_context_ttl_sec" in node_cpp
+    assert "runtime map context is not ready: state=" in node_cpp
+    assert "startup_stage=" in node_cpp
+    assert '\\"runtime_map_context\\":' in node_cpp
+    assert '\\"startup_stage\\":' in runtime_context_cpp
+    assert 'json_string_value(text, "startup_stage")' in runtime_context_cpp
+    assert "navigation_runtime_starting_reused" in node_cpp
+    assert "resident navigation runtime already starting for selected floor" in node_cpp
+    assert '\\"external_runtime\\":' in node_cpp
     assert "navigation_runtime_reused" in node_cpp
     assert "reused" in node_cpp
     assert node_cpp.index("existing_resume_process_running") < node_cpp.index("terminate_navigation_resume_process_locked();")
@@ -3549,19 +4549,19 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "if (!pre_nav_resume && !load_filter_masks" in floor_manager_code
     assert "if (!pre_nav_resume && clear_costmaps_after_switch_)" in floor_manager_code
     assert resident_runtime_script.index("run_occupancy_grid_localization.sh") < resident_runtime_script.index(
-        'sleep "${NJRH_NAV_LOCALIZATION_START_SETTLE_SEC:-3}"'
+        'sleep "${NJRH_NAV_LOCALIZATION_START_SETTLE_SEC:-0.1}"'
     )
-    assert resident_runtime_script.index('sleep "${NJRH_NAV_LOCALIZATION_START_SETTLE_SEC:-3}"') < resident_runtime_script.index(
-        "/floor_manager/switch_floor"
-    )
+    assert resident_runtime_script.index(
+        'sleep "${NJRH_NAV_LOCALIZATION_START_SETTLE_SEC:-0.1}"'
+    ) < resident_runtime_script.index("/floor_manager/switch_floor")
     assert resident_runtime_startup.index("/floor_manager/switch_floor") < resident_runtime_startup.index(
-        "trigger_global_localization_for_navigation"
+        "wait_for_initial_global_localization"
     )
-    assert resident_runtime_startup.index("trigger_global_localization_for_navigation") < resident_runtime_startup.index(
-        "starting resident Nav2 layer"
+    assert resident_runtime_startup.index("wait_for_initial_global_localization") < resident_runtime_startup.index(
+        'log_startup_stage "nav2_layer_started_after_initial_localization"'
     )
-    assert resident_runtime_script.index("starting resident Nav2 layer") < resident_runtime_script.index(
-        'sleep "${NJRH_NAV_RUNTIME_READY_MARK_DELAY_SEC:-1}"'
+    assert resident_runtime_startup.index("wait_for_initial_global_localization") < resident_runtime_startup.index(
+        'sleep "${NJRH_NAV_RUNTIME_READY_MARK_DELAY_SEC:-0.0}"'
     )
     assert "dashboard_server" not in node_cpp
     assert "patch_dashboard_runtime" not in node_cpp
@@ -3699,6 +4699,13 @@ def test_ranger_mini3_mode_controller_is_cpp_and_rejects_lateral_reverse():
     assert "waiting_actual_motion_mode" in node_cpp
     assert "odom guards must use actual motion_mode" in node_cpp
     assert "forced_policy_ = \"crab\"" in node_cpp
+    assert "forced_policy_ = \"side_slip\"" in node_cpp
+    assert "forcedLateralAllowed()" in node_cpp
+    assert "forced lateral mode active under official_passthrough" in node_cpp
+    assert "MotionMode::kSideSlip" in node_cpp
+    assert "RangerMotionMode::SIDE_SLIP" in node_cpp
+    assert 'mode == "motion_mode_side_slip" || mode == "3"' in node_cpp
+    assert "!forcedLateralAllowed()" in node_cpp
     assert "msg.linear.y = command.lateral_mps" in node_cpp
     assert "spin_on_high_curvature_while_moving_ || low_speed_spin_allowed" in node_cpp
     assert "auto_spin_max_linear_mps_" in node_cpp
@@ -3777,87 +4784,44 @@ def test_local_perception_node_ports_validated_base_link_filter_contract():
     overlay_cfg = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "local_perception.yaml"
     ).read_text(encoding="utf-8")
+    run_local = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_local_perception.sh"
+    ).read_text(encoding="utf-8")
     assert "find_package(nav_msgs REQUIRED)" in cmake
     assert "nav_msgs" in cmake
     assert "<depend>nav_msgs</depend>" in package_xml
-    assert "pcl_conversions" in node_script
-    assert '#include "nav_msgs/msg/odometry.hpp"' in node_script
-    assert "TransformListener" in node_script
-    assert "lookupTransform(" in node_script
-    assert 'declare_parameter<std::string>("output_frame_id", "base_link")' in node_script
-    assert 'declare_parameter<std::string>("input_topic", "/lidar_points")' in node_script
-    assert 'declare_parameter<std::string>("clearing_output_topic", "/perception/clearing_points")' in node_script
-    assert "clearing.virtual_rays.enabled" in node_script
-    assert "buildVirtualClearingPoints" in node_script
-    assert "updateClearingBin" in node_script
-    assert "FusedTransform3x4" in node_script
-    assert "makeFusedTransform" in node_script
-    assert "transformInputPoint(fused_transform" in node_script
-    assert "std::unordered_map<std::uint64_t, std::uint16_t> counts" in node_script
-    assert "packedVoxelKey" in node_script
-    assert "makePointCloud2FromPoints(filtered_points" in node_script
-    assert "std::optional<PendingClearingJob> pending_clearing_job_" in node_script
-    assert "clearingWorkerLoop" in node_script
-    assert "enqueueClearingJob" in node_script
-    assert "pending_clearing_job_ = std::move(job)" in node_script
-    assert 'declare_parameter<std::string>("status_topic", "/perception/local_perception_status")' in node_script
-    assert 'declare_parameter<double>("status_publish_period_sec", 2.0)' in node_script
-    assert "publishStatus" in node_script
-    assert "input_callback_hz" in node_script
-    assert "input_cloud_accept_hz" in node_script
-    assert "input_interarrival_ms_avg" in node_script
-    assert "input_subscription_qos_reliable" in node_script
-    assert "processed_cloud_hz" in node_script
-    assert "published_obstacle_hz" in node_script
-    assert "pcl::toROSMsg" not in node_script
-    assert "std::map<std::tuple" not in node_script
-    assert "outputStampForCostmap" in node_script
-    assert 'declare_parameter<std::string>("output_stamp_tf_target_frame", "odom")' in node_script
-    assert 'declare_parameter<std::string>("output_stamp_odom_topic", "/local_state/odometry")' in node_script
-    assert 'declare_parameter<bool>("restamp_to_latest_tf", false)' in node_script
-    assert 'declare_parameter<bool>("require_output_stamp_tf", false)' in node_script
-    assert 'declare_parameter<double>("max_output_tf_stamp_age_sec", 0.45)' in node_script
-    assert 'declare_parameter<double>("output_stamp_tf_backoff_sec", 0.0)' in node_script
-    assert 'declare_parameter<double>("output_stamp_forward_sec", 0.0)' in node_script
-    assert 'declare_parameter<bool>("require_startup_tf_ready", true)' in node_script
-    assert 'declare_parameter<double>("startup_tf_warmup_sec", 1.0)' in node_script
-    assert "startupTfGateReady" in node_script
-    assert "Skipping local perception cloud while TF listener warms" in node_script
-    assert "local perception startup TF gate passed" in node_script
-    assert "create_subscription<nav_msgs::msg::Odometry>" in node_script
-    assert "odomStampCallback" in node_script
-    assert "latest_odom_stamp_" in node_script
-    assert "costmapOutputStamp()" in node_script
-    assert "shiftedStamp(nowMsg(), output_stamp_forward_sec_)" in node_script
-    assert "Gate output on a fresh odom<-base_link TF" in node_script
-    assert "Skipping local perception cloud because latest" in node_script
-    assert "local costmap stamping requires latest %s <- %s TF" in node_script
-    assert "return std::nullopt" in node_script
-    assert "lookupTransform(\n        output_stamp_tf_target_frame_, output_frame_id_, tf2::TimePointZero" in node_script
-    assert "rclcpp::QoS(rclcpp::KeepLast(1)).best_effort()" in node_script
-    assert "best_effort" in node_script
-    assert "applyVoxelOutlierFilter" in node_script
-    assert "\"ELEVATOR_WAIT\"" in node_script
-    assert "\"DOORWAY\"" in node_script
-    assert "output_stamp_odom_topic: /local_state/odometry" in local_cfg
-    assert "output_stamp_odom_topic: /local_state/odometry" in overlay_cfg
+    assert 'declare_parameter<bool>("enabled", false)' in node_script
+    assert 'declare_parameter<std::string>("input_topic", "")' in node_script
+    assert 'declare_parameter<std::string>("output_topic", "")' in node_script
+    assert 'declare_parameter<std::string>("clearing_output_topic", "")' in node_script
+    assert 'declare_parameter<std::string>("status_topic", "")' in node_script
+    assert "robot_local_perception is retired and disabled by default" in node_script
+    assert "requires explicit input_topic, output_topic, and clearing_output_topic" in node_script
+    assert 'enabled: false' in local_cfg
+    assert 'enabled: false' in overlay_cfg
+    assert 'input_topic: ""' in local_cfg
+    assert 'input_topic: ""' in overlay_cfg
+    assert 'output_topic: ""' in local_cfg
+    assert 'output_topic: ""' in overlay_cfg
+    assert 'clearing_output_topic: ""' in local_cfg
+    assert 'clearing_output_topic: ""' in overlay_cfg
+    assert "clearing.enabled: false" in local_cfg
+    assert "clearing.enabled: false" in overlay_cfg
+    assert 'status_topic: ""' in local_cfg
+    assert 'status_topic: ""' in overlay_cfg
+    assert "/perception/obstacle_points" not in local_cfg
+    assert "/perception/obstacle_points" not in overlay_cfg
+    assert "/perception/clearing_points" not in local_cfg
+    assert "/perception/clearing_points" not in overlay_cfg
+    assert "/perception/local_perception_status" not in local_cfg
+    assert "/perception/local_perception_status" not in overlay_cfg
     assert "max_output_tf_stamp_age_sec: 0.25" in local_cfg
     assert "max_output_tf_stamp_age_sec: 0.25" in overlay_cfg
-    assert "require_startup_tf_ready: true" in local_cfg
-    assert "require_startup_tf_ready: true" in overlay_cfg
-    assert "startup_tf_warmup_sec: 1.0" in local_cfg
-    assert "startup_tf_warmup_sec: 1.0" in overlay_cfg
-    assert "output_stamp_tf_backoff_sec: 0.0" in local_cfg
-    assert "output_stamp_tf_backoff_sec: 0.0" in overlay_cfg
-    assert "output_stamp_forward_sec: 0.0" in local_cfg
-    assert "output_stamp_forward_sec: 0.0" in overlay_cfg
-    assert "status_topic: /perception/local_perception_status" in local_cfg
-    assert "status_topic: /perception/local_perception_status" in overlay_cfg
-    assert "status_publish_period_sec: 2.0" in local_cfg
-    assert "status_publish_period_sec: 2.0" in overlay_cfg
-    assert "preserve the original pointcloud acquisition stamp" in readme
-    assert "/perception/local_perception_status" in readme
-    assert "cold TF listener" in readme
+    assert "retired from the production navigation runtime" in readme
+    assert "Nav2 `local_costmap` uses `nav2_costmap_2d::ObstacleLayer`" in readme
+    assert "no production local PointCloud2 obstacle publisher" in readme
+    assert "no production local PointCloud2 clearing publisher" in readme
+    assert "robot_local_perception PointCloud2 obstacle pipeline has been removed" in run_local
 
 
 def test_robot_safety_node_exports_stateful_final_cmd_vel_contract():
@@ -4138,9 +5102,8 @@ def test_runtime_overlay_live_2d_mapping_uses_slam_toolbox():
     assert "odom.header.frame_id = output_odom_frame_" in fastlio_odom_bridge_cpp
     assert "tf.header = odom.header" in fastlio_odom_bridge_cpp
     assert "nav_msgs/msg/odometry.hpp" not in scan_republisher_cpp
-    assert "find_package(nav_msgs REQUIRED)" not in hesai_cmake
-    assert "rclcpp nav_msgs sensor_msgs" not in hesai_cmake
-    assert "<depend>nav_msgs</depend>" not in hesai_package
+    assert "find_package(nav_msgs REQUIRED)" in hesai_cmake
+    assert "<depend>nav_msgs</depend>" in hesai_package
     assert "preprocessor_params" in slam_launch
     assert "nav_points_topic" in slam_launch
     assert '"output_frame_id": "lidar_level_link"' in slam_launch
@@ -4463,14 +5426,14 @@ def test_jt128_driver_normalizes_vendor_raw_to_canonical_topics():
     pointcloud_remap_cfg = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "jt128_canonical_pointcloud_remap.yaml"
     ).read_text(encoding="utf-8")
-    pointcloud_local_branch_cfg = (
+    pointcloud_local_branch_cfg_path = (
         ROOT
         / "scripts"
         / "jetson"
         / "runtime_overlay"
         / "config"
         / "jt128_canonical_pointcloud_remap_local_branch.yaml"
-    ).read_text(encoding="utf-8")
+    )
     local_profile_env = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "local_perception_input_profile.env"
     ).read_text(encoding="utf-8")
@@ -4619,7 +5582,8 @@ def test_jt128_driver_normalizes_vendor_raw_to_canonical_topics():
     assert 'rclcpp_components_register_nodes(local_perception_component "LocalPerceptionNode")' in local_perception_cmake
     assert "ComposableNodeContainer" in pointcloud_pipeline_launch
     assert 'plugin="PointCloudAxisRemapNode"' in pointcloud_pipeline_launch
-    assert 'plugin="LocalPerceptionNode"' in pointcloud_pipeline_launch
+    assert 'plugin="LocalPerceptionNode"' not in pointcloud_pipeline_launch
+    assert "robot_local_perception" not in pointcloud_pipeline_launch
     assert '"use_intra_process_comms": True' in pointcloud_pipeline_launch
     assert "nav_output_topic: /lidar_points_nav" in pointcloud_remap_cfg
     assert "nav_output_stride: 4" in pointcloud_remap_cfg
@@ -4631,23 +5595,23 @@ def test_jt128_driver_normalizes_vendor_raw_to_canonical_topics():
     assert "output_reliable: false" in pointcloud_remap_cfg
     assert "status_topic: /lidar/axis_remap_status" in pointcloud_remap_cfg
     assert "status_publish_period_sec: 1.0" in pointcloud_remap_cfg
-    assert "local_output_topic: /_internal/lidar_points_local" in pointcloud_local_branch_cfg
-    assert "local_output_stride: 2" in pointcloud_local_branch_cfg
-    assert "local_output_publish_every_n: 1" in pointcloud_local_branch_cfg
-    assert "local_output_qos_depth: 1" in pointcloud_local_branch_cfg
-    assert "output_reliable: false" in pointcloud_local_branch_cfg
-    assert "Branch publishers are fixed best-effort/depth 1" in pointcloud_local_branch_cfg
-    assert "export NJRH_LOCAL_PERCEPTION_INPUT_PROFILE=local_branch" in local_profile_env
-    assert "local_branch)" in local_profile_helper
-    assert "trunk)" in local_profile_helper
-    assert 'RESOLVED_LOCAL_PERCEPTION_INPUT_TOPIC="${ROBOT_LOCAL_PERCEPTION_INPUT_TOPIC}"' in local_profile_helper
-    assert 'RESOLVED_AXIS_LOCAL_OUTPUT_TOPIC="${NJRH_POINTCLOUD_AXIS_LOCAL_OUTPUT_TOPIC}"' in local_profile_helper
+    assert not pointcloud_local_branch_cfg_path.exists()
+    assert "export NJRH_LOCAL_PERCEPTION_INPUT_PROFILE=disabled" in local_profile_env
+    assert "Production local obstacle handling has moved to Nav2's standard" in local_profile_env
+    assert "/scan" in local_profile_env
+    assert "path. Keep the old PointCloud2 local-perception branch disabled" in local_profile_env
+    assert "local_branch|trunk)" in local_profile_helper
+    assert "forcing disabled because Nav2 uses /scan" in local_profile_helper
+    assert "disabled)" in local_profile_helper
+    assert 'RESOLVED_LOCAL_PERCEPTION_INPUT_TOPIC="${profile_input_topic}"' in local_profile_helper
+    assert 'RESOLVED_AXIS_LOCAL_OUTPUT_TOPIC="${profile_axis_local_output_topic}"' in local_profile_helper
+    assert 'RESOLVED_LOCAL_PERCEPTION_INPUT_TOPIC="${ROBOT_LOCAL_PERCEPTION_INPUT_TOPIC}"' not in local_profile_helper
+    assert 'RESOLVED_AXIS_LOCAL_OUTPUT_TOPIC="${NJRH_POINTCLOUD_AXIS_LOCAL_OUTPUT_TOPIC}"' not in local_profile_helper
     assert 'RESOLVED_AXIS_LOCAL_OUTPUT_STRIDE="${NJRH_POINTCLOUD_AXIS_LOCAL_OUTPUT_STRIDE}"' in local_profile_helper
     assert 'RESOLVED_AXIS_LOCAL_OUTPUT_PUBLISH_EVERY_N="${NJRH_POINTCLOUD_AXIS_LOCAL_OUTPUT_PUBLISH_EVERY_N}"' in local_profile_helper
     assert "selected local perception profile=" in local_profile_helper
-    assert 'INPUT_TOPIC="${RESOLVED_LOCAL_PERCEPTION_INPUT_TOPIC}"' in run_local_perception
-    assert "njrh_print_local_perception_profile" in run_local_perception
-    assert '-p "input_topic:=${INPUT_TOPIC}"' in run_local_perception
+    assert "robot_local_perception PointCloud2 obstacle pipeline has been removed" in run_local_perception
+    assert '-p "input_topic:=${INPUT_TOPIC}"' not in run_local_perception
     assert 'declare_parameter<std::string>("status_topic", "/lidar/axis_remap_status")' in pointcloud_remap_cpp
     assert 'declare_parameter<int>("nav_output_publish_every_n", 1)' in pointcloud_remap_cpp
     assert 'declare_parameter<int>("local_output_publish_every_n", 1)' in pointcloud_remap_cpp
@@ -4691,29 +5655,27 @@ def test_jt128_driver_normalizes_vendor_raw_to_canonical_topics():
     assert "MIN_LIDAR_HZ" in verify_pointcloud_rates
     assert "for topic in ${OPTIONAL_TOPICS}" in verify_pointcloud_rates
     assert "/lidar/axis_remap_status" in verify_pointcloud_matrix
-    assert "/perception/local_perception_status" in verify_pointcloud_matrix
+    assert "/perception/local_perception_status" not in verify_pointcloud_matrix
     assert "/lidar/nav_cloud_preprocessor_status" in verify_pointcloud_matrix
     assert "CASE_A_MAIN_TRUNK_LOW" in verify_pointcloud_matrix
-    assert "CASE_B_LOCAL_DDS_DELIVERY_LOW" in verify_pointcloud_matrix
-    assert "CASE_C_LOCAL_PROCESS_OR_PUBLISH_GATING" in verify_pointcloud_matrix
+    assert "CASE_B_LOCAL_DDS_DELIVERY_LOW" not in verify_pointcloud_matrix
+    assert "CASE_C_LOCAL_PROCESS_OR_PUBLISH_GATING" not in verify_pointcloud_matrix
     assert "CASE_D_FANOUT_PRESSURE" in verify_pointcloud_matrix
     assert "CASE_E_TOO_MANY_FULL_DENSITY_SUBSCRIBERS" in verify_pointcloud_matrix
-    assert "CASE_F_LOCAL_BRANCH_EFFECTIVE" in verify_pointcloud_matrix
+    assert "CASE_F_LOCAL_BRANCH_EFFECTIVE" not in verify_pointcloud_matrix
     assert "CASE_G_DDS_TRANSPORT_SUSPECT" in verify_pointcloud_matrix
-    assert "CASE_H_LOCAL_BRANCH_ENABLED_BUT_WEAK" in verify_pointcloud_matrix
-    assert "CASE_I_LOCAL_BRANCH_DRAGS_TRUNK" in verify_pointcloud_matrix
+    assert "CASE_H_LOCAL_BRANCH_ENABLED_BUT_WEAK" not in verify_pointcloud_matrix
+    assert "CASE_I_LOCAL_BRANCH_DRAGS_TRUNK" not in verify_pointcloud_matrix
     assert "NJRH_VERIFY_MATRIX_LIDAR_POINTS_CLI_HZ" in verify_pointcloud_matrix
     assert "topic_graph_counts" in verify_pointcloud_matrix
     assert "graph_subscription_count" in verify_pointcloud_matrix
     assert "FASTDDS_BUILTIN_TRANSPORTS" in verify_pointcloud_matrix
     assert "NJRH_FASTDDS_PROFILE_ENABLED" in verify_pointcloud_matrix
-    assert "current local perception profile=" in verify_pointcloud_matrix
-    assert "resolved axis local_output_stride=" in verify_pointcloud_matrix
-    assert "resolved axis local_output_publish_every_n=" in verify_pointcloud_matrix
-    assert "local_branch_enabled" in verify_pointcloud_matrix
-    assert "local_branch_publish_hz" in verify_pointcloud_matrix
-    assert "local_branch_subscription_count" in verify_pointcloud_matrix
-    assert "obstacle CLI hint: ros2 topic hz /perception/obstacle_points" in verify_pointcloud_matrix
+    assert "retired local PointCloud2 obstacle branch is not sampled" in verify_pointcloud_matrix
+    assert "local_branch_enabled" not in verify_pointcloud_matrix
+    assert "local_branch_publish_hz" not in verify_pointcloud_matrix
+    assert "local_branch_subscription_count" not in verify_pointcloud_matrix
+    assert "obstacle CLI hint: ros2 topic hz /perception/obstacle_points" not in verify_pointcloud_matrix
     assert "FAST-LIO2 navigation residue" in verify_pointcloud_matrix
     assert "does not start/stop Nav2" in verify_pointcloud_matrix
     assert "/lidar/axis_remap_status" in verify_lidar_trunk_jitter
@@ -4725,22 +5687,22 @@ def test_jt128_driver_normalizes_vendor_raw_to_canonical_topics():
     assert "last_branch_publish_duration_ms" in verify_lidar_trunk_jitter
     assert "last_total_publish_outputs_duration_ms" in verify_lidar_trunk_jitter
     assert "nav_output_publish_every_n" in verify_lidar_trunk_jitter
-    assert "input_callback_hz" in verify_lidar_trunk_jitter
-    assert "published_obstacle_hz" in verify_lidar_trunk_jitter
+    assert "scan_publish_hz" in verify_lidar_trunk_jitter
+    assert "published_obstacle_hz" not in verify_lidar_trunk_jitter
     assert "This default run does not subscribe to full-density /lidar_points" in diagnose_lidar_jitter
     assert "--include-cli-hz" in diagnose_lidar_jitter
     assert "CASE_A_AXIS_PUBLISH_LOW" in diagnose_lidar_jitter
     assert "CASE_B_CLI_DELIVERY_LOW_ONLY" in diagnose_lidar_jitter
-    assert "CASE_C_PROFILE_REGRESSION" in diagnose_lidar_jitter
+    assert "CASE_C_RETIRED_LOCAL_POINTCLOUD_BRANCH_ENABLED" in diagnose_lidar_jitter
     assert "CASE_D_STALE_PROCESS_OR_OLD_BINARY" in diagnose_lidar_jitter
     assert "CASE_E_TOO_MANY_TRUNK_SUBSCRIBERS" in diagnose_lidar_jitter
-    assert "CASE_F_LOCAL_BRANCH_OK_BUT_TRUNK_CLI_LOW" in diagnose_lidar_jitter
-    assert "CASE_G_AXIS_LOW_WITH_PURE_TRUNK_NEEDED" in diagnose_lidar_jitter
+    assert "CASE_F_LOCAL_BRANCH_OK_BUT_TRUNK_CLI_LOW" not in diagnose_lidar_jitter
+    assert "CASE_G_AXIS_LOW_WITH_PURE_TRUNK_NEEDED" not in diagnose_lidar_jitter
     assert "ros2 topic hz /lidar_points" in diagnose_lidar_jitter
     assert "INCLUDE_CLI_HZ" in diagnose_lidar_jitter
     assert "trunk_publish_gap_over_100ms_count" in diagnose_lidar_jitter
     assert "raw_interarrival_ms_avg" in diagnose_lidar_jitter
-    assert "local_branch production default" in diagnose_lidar_jitter
+    assert "Retired robot_local_perception PointCloud2 obstacle topics are not sampled" in diagnose_lidar_jitter
     assert "does not subscribe to full-density" in diagnose_lidar_jitter
     assert "run_lidar_trunk_pure_ab.sh [--duration-sec SECONDS]" in pure_trunk_ab
     assert "--execute" in pure_trunk_ab
@@ -4766,12 +5728,13 @@ def test_jt128_driver_normalizes_vendor_raw_to_canonical_topics():
     assert "require_value local_output_topic '\"\"'" in topology_contract
     assert "require_int_ge nav_output_stride 2" in topology_contract
     assert "require_int_ge nav_output_publish_every_n 2" in topology_contract
-    assert "/_internal/lidar_points_local" in topology_contract
-    assert "local_branch profile derives /_internal/lidar_points_local" in topology_contract
-    assert "trunk profile disables local internal branch" in topology_contract
+    assert "baseline config keeps retired local PointCloud2 branch disabled" in topology_contract
+    assert "local_branch profile derives /_internal/lidar_points_local" not in topology_contract
+    assert "trunk profile disables local internal branch" not in topology_contract
     assert "/lidar_points graph publisher count is 1" in topology_contract
-    assert "/_internal/lidar_points_local graph publisher/subscriber count is 1/1" in topology_contract
-    assert "jt128_canonical_pointcloud_remap(_local_branch)?[.]yaml" in topology_contract
+    assert "/scan graph has Nav2/collision subscribers" in topology_contract
+    assert "/_internal/lidar_points_local graph publisher/subscriber count is 1/1" not in topology_contract
+    assert "jt128_canonical_pointcloud_remap(_local_branch)?[.]yaml" not in topology_contract
     assert "output_reliable" in topology_contract
     assert "Observing ROS graph only" in inspect_pointcloud_subscribers
     assert "ros2 topic info -v" in inspect_pointcloud_subscribers
@@ -4779,43 +5742,44 @@ def test_jt128_driver_normalizes_vendor_raw_to_canonical_topics():
     assert "ros2 topic hz" not in inspect_pointcloud_subscribers
     assert "/lidar_points publisher count must be exactly 1" in inspect_pointcloud_subscribers
     assert "/lidar_points has ${subscription_count} subscribers" in inspect_pointcloud_subscribers
-    assert "/_internal/lidar_points_local" in inspect_pointcloud_subscribers
+    assert "/_internal/lidar_points_local" not in inspect_pointcloud_subscribers
     assert "FAST-LIO appears attached to /lidar_points" in inspect_pointcloud_subscribers
     assert "--transport UDPv4|DEFAULT|LARGE_DATA" in dds_transport_ab
     assert "Runtime restart not requested; no production process was stopped." in dds_transport_ab
     assert "FASTDDS_BUILTIN_TRANSPORTS must be set before every ROS participant starts" in dds_transport_ab
     assert "NJRH_VERIFY_MATRIX_LIDAR_POINTS_CLI_HZ" in dds_transport_ab
-    assert "--profile local_branch|trunk" in set_local_profile
-    assert "--restart not requested; no process was restarted." in set_local_profile
-    assert "NJRH_FORCE_RESTART_DRIVER=true" in set_local_profile
-    assert "run_local_perception_local_profile.log" in set_local_profile
-    assert "inspect_pointcloud_subscribers.sh" in set_local_profile
-    assert "verify_pointcloud_delivery_matrix.sh" in set_local_profile
-    assert "ros2 topic hz /perception/obstacle_points" in set_local_profile
+    assert "PointCloud2 obstacle profiles have been removed" in set_local_profile
+    assert "--profile local_branch|trunk" not in set_local_profile
+    assert "NJRH_FORCE_RESTART_DRIVER=true" not in set_local_profile
+    assert "ros2 topic hz /perception/obstacle_points" not in set_local_profile
     assert "pointcloud_axis_remap" in inspect_cpu_affinity
     assert "pid=%s tid=%s cpu=%s pcpu=%s" in inspect_cpu_affinity
-    assert "robot_local_perception" in inspect_cpu_affinity
+    assert 'print_threads_for_pattern "robot_local_perception"' not in inspect_cpu_affinity
+    assert "/perception/local_perception_status" not in inspect_cpu_affinity
     assert "nav_cloud_preprocessor" in inspect_cpu_affinity
     assert "pointcloud_to_laserscan" in inspect_cpu_affinity
     assert "scan_republisher" in inspect_cpu_affinity
     assert "global_localization/localizer" in inspect_cpu_affinity
     assert "NJRH_CPUSET_" in inspect_cpu_affinity
-    assert "WARN local_branch is enabled but local input <10Hz" in inspect_cpu_affinity
+    assert "WARN local_branch is enabled but local input <10Hz" not in inspect_cpu_affinity
     assert "thermal and clock snapshot" in inspect_cpu_affinity
     assert "tegrastats" in inspect_cpu_affinity
     assert "nvpmodel" in inspect_cpu_affinity
     assert "jetson_clocks" in inspect_cpu_affinity
     assert "record_pointcloud_nav_acceptance.sh [--duration-sec SECONDS]" in nav_acceptance
     assert "/lidar/axis_remap_status" in nav_acceptance
-    assert "/perception/local_perception_status" in nav_acceptance
-    assert "/lidar/nav_cloud_preprocessor_status" in nav_acceptance
+    assert "/perception/local_perception_status" not in nav_acceptance
+    assert "/perception/obstacle_points" not in nav_acceptance
+    assert "/perception/clearing_points" not in nav_acceptance
+    assert "/lidar/pointcloud_accel_status" in nav_acceptance
+    assert "/scan" in nav_acceptance
     assert "/safety/status" in nav_acceptance
     assert "/local_state/odometry" in nav_acceptance
-    assert "/localization_result" in nav_acceptance
-    assert "NJRH_RECORD_HEAVY_POINTCLOUDS=true" in nav_acceptance
+    assert "/localization/bridge_status" in nav_acceptance
+    assert "NJRH_RECORD_HEAVY_POINTCLOUDS=true" not in nav_acceptance
     assert "axis lidar_points_publish_hz" in nav_acceptance
-    assert "axis local_branch_publish_hz" in nav_acceptance
-    assert "CASE_I_LOCAL_BRANCH_DRAGS_TRUNK seen" in nav_acceptance
+    assert "accel scan_publish_hz" in nav_acceptance
+    assert "CASE_I_LOCAL_BRANCH_DRAGS_TRUNK seen" not in nav_acceptance
     assert "FAST-LIO2 navigation residue seen" in nav_acceptance
     assert "timeout 8 ros2 lifecycle get /bt_navigator" in nav_acceptance
     assert "input_topic: /lidar_points" in pointcloud_downsample_cfg
@@ -4984,7 +5948,7 @@ def test_localization_bridge_latches_one_shot_localizer_pose():
     assert "trigger_localization_and_wait_for_result(" in api_code
     assert "&relocalization_sequence" in api_code
     assert "post_undock_relocalization_succeeded" in api_code
-    assert "undocked before navigation but post-undock relocalization did not complete" in api_code
+    assert "undocked before navigation; post-undock navigation readiness failed, Nav2 goal not sent" in api_code
     for cfg in (api_cfg, overlay_api_cfg):
         assert 'localization_bridge_force_accept_service: "/robot_localization_bridge/force_accept_next_localization"' in cfg
 
@@ -5087,9 +6051,7 @@ def test_phase111_pointcloud_triage_contracts():
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "patches" / "jt128_nav_tools_pointcloud_qos.patch"
     ).read_text(encoding="utf-8")
     local_cfg = (config_dir / "local_perception.yaml").read_text(encoding="utf-8")
-    local_branch_cfg = (config_dir / "jt128_canonical_pointcloud_remap_local_branch.yaml").read_text(
-        encoding="utf-8"
-    )
+    local_branch_cfg_path = config_dir / "jt128_canonical_pointcloud_remap_local_branch.yaml"
     local_profile = (config_dir / "local_perception_input_profile.env").read_text(encoding="utf-8")
     common_env = (scripts_dir / "common_env.sh").read_text(encoding="utf-8")
     nav2 = (config_dir / "nav2.yaml").read_text(encoding="utf-8")
@@ -5132,15 +6094,17 @@ def test_phase111_pointcloud_triage_contracts():
     assert "source_frame" in nav_patch
     assert "publisher_subscription_count" in nav_patch
 
-    assert "input_topic: /lidar_points\n" in local_cfg
+    assert "enabled: false" in local_cfg
+    assert 'input_topic: ""' in local_cfg
+    assert 'output_topic: ""' in local_cfg
+    assert 'clearing_output_topic: ""' in local_cfg
+    assert 'status_topic: ""' in local_cfg
+    assert "/perception/obstacle_points" not in local_cfg
+    assert "/perception/clearing_points" not in local_cfg
     assert "input_topic: /_internal/lidar_points_local" not in local_cfg
-    assert "export NJRH_LOCAL_PERCEPTION_INPUT_PROFILE=local_branch" in local_profile
-    assert "local_output_topic: /_internal/lidar_points_local" in local_branch_cfg
-    assert "local_output_stride: 2" in local_branch_cfg
-    assert "local_output_stride: 1" not in local_branch_cfg
+    assert "export NJRH_LOCAL_PERCEPTION_INPUT_PROFILE=disabled" in local_profile
+    assert not local_branch_cfg_path.exists()
     assert "input_reliable: false" in local_cfg
-    assert "input_reliable: false" in local_branch_cfg
-    assert "output_reliable: false" in local_branch_cfg
     assert 'export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"' in common_env
     assert 'export FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}"' in common_env
     assert "rmw_cyclonedds_cpp" not in common_env
@@ -5301,19 +6265,25 @@ def test_phase113_pointcloud_accel_profile_contracts():
         encoding="utf-8"
     )
 
-    assert 'export NJRH_POINTCLOUD_ACCEL_PROFILE="${NJRH_POINTCLOUD_ACCEL_PROFILE:-legacy}"' in profile_env
+    assert 'export NJRH_POINTCLOUD_ACCEL_PROFILE="${NJRH_POINTCLOUD_ACCEL_PROFILE:-ipc_worker}"' in profile_env
     assert 'export NJRH_POINTCLOUD_INGRESS_PROFILE="${NJRH_POINTCLOUD_INGRESS_PROFILE:-separate_process}"' in ingress_env
     assert "separate_process" in accel_profile
     assert "driver_integrated" in accel_profile
     assert "nitros" in accel_profile
     assert "ipc_worker" in accel_profile
-    assert "--profile legacy|ipc_worker|nitros" in set_profile
+    assert "--profile ipc_worker|nitros" in set_profile
+    assert "legacy profile was removed" in set_profile
     assert "--ingress-profile separate_process|driver_integrated" in set_profile
     assert "NJRH_POINTCLOUD_ACCEL_RESTART=true" in set_profile
     assert "NITROS profile was not written" in set_profile
     assert "pkill -9" not in set_profile
     assert "killall" not in set_profile
+    assert "DEFAULT_HESAI_CONFIG_FILE" in run_driver
+    assert "REPO_HESAI_CONFIG_FILE" in run_driver
+    assert 'src/third_party/hesai_lidar_ros2_overlay/config/config.yaml' in run_driver
+    assert "hesai_driver_config_path: /workspaces/njrh-v3/workspace1/src/third_party/hesai_lidar_ros2_overlay/config/config.yaml" in hesai_accel_cfg
     assert "legacy)" in run_pipeline
+    assert "FAIL legacy profile removed" in run_pipeline
     assert "ipc_worker)" in run_pipeline
     assert "nitros)" in run_pipeline
     assert "NITROS profile not started" in run_pipeline
@@ -5321,23 +6291,13 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "driver_integrated ingress selected" in run_pipeline
     assert "standalone hesai_ros_driver_node or pointcloud_accel_axis_node" in run_pipeline
     assert 'NJRH_FORCE_RESTART_DRIVER="${NJRH_FORCE_RESTART_DRIVER:-false}"' in run_pipeline
-    assert "run_local_perception.sh" in run_pipeline
-    assert "NJRH_POINTCLOUD_ACCEL_PROFILE=legacy" in run_pipeline
-    assert "jt128_localization_sensing.launch.py" in run_pipeline
-    assert "legacy_scan_pid" in run_pipeline
-    assert "legacy_scan_chain_running()" in run_pipeline
-    assert "legacy_scan_chain_partial_running()" in run_pipeline
-    assert "legacy scan chain already running; reusing" in run_pipeline
-    assert "preprocessor_params:=" in run_pipeline
-    assert "scan_params:=" in run_pipeline
-    assert "flatscan_params:=" in run_pipeline
-    assert "points_topic:=" in run_pipeline
-    assert "nav_points_topic:=" in run_pipeline
-    assert "scan_topic:=" in run_pipeline
-    assert "flatscan_topic:=" in run_pipeline
+    assert "run_local_perception.sh" not in run_pipeline
+    assert "NJRH_POINTCLOUD_ACCEL_PROFILE=legacy" not in run_pipeline
+    assert "jt128_localization_sensing.launch.py" not in run_pipeline
+    assert "legacy scan chain already running; reusing" not in run_pipeline
     assert "pkill -TERM -f" in run_pipeline
     assert "laser_scan_to_flatscan" in run_pipeline
-    assert "pointcloud_accel_axis_node workers publish /perception/* and /scan" in run_pipeline
+    assert "pointcloud_accel_axis_node scan worker publishes /scan" in run_pipeline
     assert "pkill -9" not in run_pipeline
     assert "killall" not in run_pipeline
     for protected_process in (
@@ -5361,7 +6321,7 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "isaac_ros_managed_nitros" in nitros_check
     assert "isaac_ros_nitros_point_cloud_type" in nitros_check
     assert "NitrosPointCloud" in nitros_check
-    assert "use NJRH_POINTCLOUD_ACCEL_PROFILE=ipc_worker or legacy" in nitros_check
+    assert "use NJRH_POINTCLOUD_ACCEL_PROFILE=ipc_worker or legacy" not in nitros_check
 
     assert "pointcloud_accel_axis_node src/pointcloud_accel_axis_node.cpp" in hesai_cmake
     assert "pointcloud_accel_core src/pointcloud_accel_core.cpp" in hesai_cmake
@@ -5409,7 +6369,14 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert 'Node("pointcloud_accel_axis_node", options)' in accel_axis
     assert 'declare_parameter<bool>("input_reliable", false)' in accel_axis
     assert 'declare_parameter<bool>("output_reliable", false)' in accel_axis
-    assert 'declare_parameter<bool>("local_worker_enabled", true)' in accel_axis
+    assert 'declare_parameter<bool>("local_worker_enabled", false)' in accel_axis
+    assert "PointCloud2 local obstacle worker is disabled" in accel_axis
+    assert 'declare_parameter<bool>("local_worker_restamp_to_now", true)' in accel_axis
+    assert 'declare_parameter<std::string>("local_worker_stamp_source", "")' in accel_axis
+    assert 'declare_parameter<std::string>("local_worker_stamp_odom_topic", "/local_state/odometry")' in accel_axis
+    assert 'declare_parameter<double>("local_worker_stamp_max_odom_age_sec", 0.25)' in accel_axis
+    assert "create_subscription<nav_msgs::msg::Odometry>" in accel_axis
+    assert "resolve_local_worker_output_stamp" in accel_axis
     assert 'declare_parameter<bool>("scan_worker_enabled", true)' in accel_axis
     assert 'declare_parameter<std::string>("flatscan_output_topic", "/flatscan")' in accel_axis
     assert "local_worker_enabled=" in accel_axis
@@ -5455,7 +6422,12 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "output_qos_depth: 1" in accel_cfg
     assert "output_reliable: false" in accel_cfg
     assert "flatscan_output_topic: /flatscan" in accel_cfg
-    assert "local_worker_enabled: true" in accel_cfg
+    assert "local_worker_enabled: false" in accel_cfg
+    assert "worker_local_enabled: false" in accel_cfg
+    assert 'local_output_topic: ""' in accel_cfg
+    assert "local_compact_enabled: false" in accel_cfg
+    assert 'nav_output_topic: ""' in accel_cfg
+    assert "nav_compact_enabled: false" in accel_cfg
     assert "scan_worker_enabled: true" in accel_cfg
     assert "local_compact_fields: xyzi" in accel_cfg
     assert "local_compact_stride: 4" in accel_cfg
@@ -5463,8 +6435,10 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "nav_compact_fields: xyzi" in accel_cfg
     assert "nav_compact_stride: 4" in accel_cfg
     assert "nav_compact_max_rate_hz: 10.0" in accel_cfg
-    assert "obstacle_output_topic: /perception/obstacle_points" in accel_cfg
-    assert "clearing_output_topic: /perception/clearing_points" in accel_cfg
+    assert "local_worker_restamp_to_now: true" in accel_cfg
+    assert "local_worker_stamp_source: local_odom" in accel_cfg
+    assert "local_worker_stamp_odom_topic: /local_state/odometry" in accel_cfg
+    assert "local_worker_stamp_max_odom_age_sec: 0.25" in accel_cfg
     assert "scan_output_topic: /scan" in accel_cfg
     assert "/points_nav" not in accel_cfg
     assert "driver_integrated_available: true" in hesai_accel_cfg
@@ -5473,6 +6447,16 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "publish_vendor_raw_debug: false" in hesai_accel_cfg
     assert "publish_vendor_imu_raw_debug: true" in hesai_accel_cfg
     assert "lidar_points_full_density_full_fields: true" in hesai_accel_cfg
+    assert "local_worker_enabled: false" in hesai_accel_cfg
+    assert "worker_local_enabled: false" in hesai_accel_cfg
+    assert 'local_output_topic: ""' in hesai_accel_cfg
+    assert "local_compact_enabled: false" in hesai_accel_cfg
+    assert 'nav_output_topic: ""' in hesai_accel_cfg
+    assert "nav_compact_enabled: false" in hesai_accel_cfg
+    assert "local_worker_restamp_to_now: true" in hesai_accel_cfg
+    assert "local_worker_stamp_source: local_odom" in hesai_accel_cfg
+    assert "local_worker_stamp_odom_topic: /local_state/odometry" in hesai_accel_cfg
+    assert "local_worker_stamp_max_odom_age_sec: 0.25" in hesai_accel_cfg
 
     assert 'source "${SCRIPT_DIR}/pointcloud_accel_profile.sh"' in run_driver
     assert "njrh_load_pointcloud_accel_profile" in run_driver
@@ -5496,16 +6480,29 @@ def test_phase113_pointcloud_accel_profile_contracts():
 
     assert "pointcloud_accel_pipeline_aux_running" in common_services
     assert "run_pointcloud_accel_pipeline.sh" in common_services
-    assert "local_perception is owned by pointcloud accel profile" in common_services
-    assert "local_perception is owned by pointcloud accel profile" in nav2_navigation
-    assert "local_perception is owned by pointcloud accel profile" in local_costmap_debug
+    assert "local_perception_common disabled" in common_services
+    assert "local_perception helper disabled" in nav2_navigation
+    assert "local_perception debug helper disabled" in local_costmap_debug
     assert "occupancy_localization.launch.py" in occupancy
     assert "occupancy_localization_stack.launch.py" in occupancy
     assert "ensure_pointcloud_accel_pipeline_for_localization" in occupancy
     assert "pointcloud accel pipeline already running" in occupancy
+    assert "flatscan_publisher_ready_for_localization()" in occupancy
+    assert "NJRH_LOCALIZATION_FLATSCAN_READY_TIMEOUT_SEC:-75" in occupancy
+    assert 'wait_for_topic_publisher_from_node "${LOCALIZER_FLATSCAN_TOPIC}" "laser_scan_to_flatscan"' in occupancy
+    assert "nav2_lifecycle_sequence.py" in occupancy
+    assert "localization map_server repo lifecycle sequence" in occupancy
+    map_lifecycle_block = occupancy[
+        occupancy.index("start_map_server_lifecycle_with_nav2_util()") :
+        occupancy.index("repair_jt128_navigation_points()")
+    ]
+    assert "/opt/ros/humble/lib/nav2_util/lifecycle_bringup map_server" not in map_lifecycle_block
+    assert "pipeline is running but ${LOCALIZER_FLATSCAN_TOPIC} publisher is missing; restarting" in occupancy
     assert "pointcloud_accel_pipeline_localization" in occupancy
     assert "laser_scan_to_flatscan" in occupancy
     assert "pointcloud accel profile=${NJRH_POINTCLOUD_ACCEL_PROFILE}" in occupancy
+    occupancy_cleanup = occupancy[occupancy.index("patterns=(") : occupancy.index("for pattern in \"${patterns[@]}\"")]
+    assert '"laser_scan_to_flatscan"' not in occupancy_cleanup
 
     assert "NJR H_CPUSET_POINTCLOUD_ACCEL" not in cpu_affinity
     assert "NJRH_CPUSET_POINTCLOUD_ACCEL_CONTAINER" in cpu_affinity
@@ -5513,8 +6510,11 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "NJRH_CPUSET_POINTCLOUD_ACCEL_SCAN_WORKER" in cpu_affinity
     assert "NJRH_CPUSET_NITROS_POINTCLOUD_CONTAINER" in cpu_affinity
 
-    assert "/perception/obstacle_points" in nav2
-    assert "/perception/clearing_points" in nav2
+    assert "/perception/obstacle_points" not in nav2
+    assert "/perception/clearing_points" not in nav2
+    assert "observation_sources: scan" in nav2
+    assert "data_type: LaserScan" in nav2
+    assert "inf_is_valid: true" in nav2
     assert 'plugin: "nav2_smac_planner/SmacPlanner2D"' in nav2
     assert 'primary_controller: "nav2_mppi_controller::MPPIController"' in nav2
     assert 'plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"' in nav2
@@ -5536,7 +6536,7 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "resolved_profile" in verify_profile
     assert "/lidar_points publisher count" in verify_profile
     assert "axis publish hz" in verify_profile
-    assert "obstacle_hz" in verify_profile
+    assert "retired local PointCloud2 obstacle output topics are not configured" in verify_profile
     assert "scan_hz" in verify_profile
     assert "flatscan_hz" in verify_profile
     assert "FAST-LIO2 residual" in verify_profile
@@ -5545,21 +6545,18 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "DDS transport env" in verify_profile
     assert "/lidar_points publisher_nodes" in verify_profile
     assert "actual trunk owner" in verify_profile
-    assert "actual obstacle owner" in verify_profile
-    assert "actual clearing owner" in verify_profile
+    assert "actual obstacle owner" not in verify_profile
+    assert "actual clearing owner" not in verify_profile
     assert "actual points_nav owner" in verify_profile
     assert "actual scan owner" in verify_profile
     assert "actual flatscan owner" in verify_profile
-    assert "legacy trunk owner is pointcloud_axis_remap" in verify_profile
     assert "trunk owner is pointcloud_accel_axis_node" in verify_profile
-    assert "obstacle owner is accel core process" in verify_profile
-    assert "clearing owner is accel core process" in verify_profile
-    assert "legacy points_nav owner is nav_cloud_preprocessor" in verify_profile
-    assert "legacy missing /scan publisher from scan_republisher" in verify_profile
-    assert "legacy missing /flatscan publisher from laser_scan_to_flatscan" in verify_profile
+    assert "must not publish /perception/obstacle_points" not in verify_profile
+    assert "must not publish /perception/clearing_points" not in verify_profile
+    assert "local PointCloud2 worker disabled by config" in verify_profile
     assert "still using legacy pointcloud_axis_remap as trunk owner" in verify_profile
     assert "scan owner is accel core process" in verify_profile
-    assert "local_worker_enabled must be true" in verify_profile
+    assert "local_worker_enabled must be false" in verify_profile
     assert "scan_worker_enabled must be true" in verify_profile
     assert "internal_zero_copy_profile must be true" in verify_profile
     assert "latest_internal_buffer_points must be present and nonzero" in verify_profile
@@ -5570,13 +6567,13 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "production_hop_points_nav=false" in verify_profile
     assert "/points_nav still has a production publisher" in verify_profile
     assert "PROFILE_OWNER_CONTRACT_OK" in verify_profile
-    assert "LEGACY_SCAN_CHAIN_OK" in verify_profile
     assert "IPC_WORKER_OWNER_OK" in verify_profile
     assert "TRUNK_FULL_DENSITY_OK" in verify_profile
     assert "NAV2_COMPAT_TOPICS_OK" in verify_profile
     assert "INGRESS_PROFILE" in verify_profile
 
-    assert "--profile legacy|ipc_worker|nitros" in ab_runner
+    assert "--profile ipc_worker|nitros" in ab_runner
+    assert "legacy profile was removed" in ab_runner
     assert "--ingress-profile separate_process|driver_integrated" in ab_runner
     assert "--duration-sec" in ab_runner
     assert "--apply" in ab_runner
@@ -5592,8 +6589,9 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "status_vendor_raw_ros_hop_required" in ab_runner
     assert "binary actually running" in ab_runner
     assert "trunk owner" in ab_runner
-    assert "obstacle owner" in ab_runner
-    assert "clearing owner" in ab_runner
+    assert "obstacle owner" not in ab_runner
+    assert "clearing owner" not in ab_runner
+    assert "retired local PointCloud2 obstacle publishers are not part of production" in ab_runner
     assert "points_nav owner" in ab_runner
     assert "scan owner" in ab_runner
     assert "flatscan owner" in ab_runner
@@ -5605,7 +6603,7 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "/points_nav subscribers" in ab_runner
     assert "/scan subscribers" in ab_runner
     assert "/flatscan subscribers" in ab_runner
-    assert "legacy scan chain recovered" in ab_runner
+    assert "legacy scan chain recovered" not in ab_runner
     assert "ipc_worker no production /points_nav hop" in ab_runner
     assert "PASS/WARN/FAIL" in ab_runner
     assert "restoring prior profile" in ab_runner
@@ -5616,10 +6614,10 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "cpu6" in ab_runner
     assert "cpu7" in ab_runner
 
-    assert 'export NJRH_LOCAL_PERCEPTION_INPUT_PROFILE=local_branch' in (
+    assert 'export NJRH_LOCAL_PERCEPTION_INPUT_PROFILE=disabled' in (
         config_dir / "local_perception_input_profile.env"
     ).read_text(encoding="utf-8")
-    assert "INPUT_TOPIC=\"${RESOLVED_LOCAL_PERCEPTION_INPUT_TOPIC}\"" in (
+    assert "robot_local_perception PointCloud2 obstacle pipeline has been removed" in (
         scripts_dir / "run_local_perception.sh"
     ).read_text(encoding="utf-8")
 
@@ -5712,6 +6710,14 @@ def test_phase_d1_pointcloud_driver_integrated_ingress_contracts():
     assert "accel_core_process_decoded_view_count" in accel_core
     assert 'declare_parameter<bool>("clearing_worker_virtual_rays_enabled", true)' in accel_core
     assert 'declare_parameter<double>("clearing_worker_virtual_ray_angle_resolution_deg", 1.0)' in accel_core
+    assert 'declare_parameter<double>("clearing_worker_virtual_ray_min_angle_deg", -110.0)' in accel_core
+    assert 'declare_parameter<double>("clearing_worker_virtual_ray_max_angle_deg", 110.0)' in accel_core
+    assert 'declare_parameter<bool>("clearing_worker_virtual_rays_allow_self_mask_endpoints", true)' in accel_core
+    assert 'declare_parameter<std::string>("local_worker_stamp_source", "")' in accel_core
+    assert "local_worker_stamp_source_ == \"local_odom\"" in accel_core
+    assert "LocalWorkerHeaderStampSource::LocalOdom" in accel_core
+    assert "current_local_worker_header_stamp_source_label()" in accel_core
+    assert "!clearing_worker_virtual_rays_allow_self_mask_endpoints_ && in_self_mask(endpoint)" in accel_core
     assert "struct ClearingRayBin" in accel_core
     assert "build_virtual_clearing_points()" in accel_core
     assert "update_clearing_virtual_ray_bin(point)" in accel_core
@@ -5720,10 +6726,20 @@ def test_phase_d1_pointcloud_driver_integrated_ingress_contracts():
         assert "NJRH_POINTCLOUD_INGRESS_PROFILE" in script
 
     assert "driver_integrated" in accel_profile
-    assert "forcing pointcloud ingress separate_process for legacy" in accel_profile
+    assert "NJR H_POINTCLOUD_ACCEL_PROFILE" not in accel_profile
+    assert "NJR H_POINTCLOUD_INGRESS_PROFILE" not in accel_profile
+    assert "NJR H" not in accel_profile
+    assert "NJR H" not in run_pipeline
+    assert "NJR H" not in verify_profile
+    assert "NJR H" not in ab_runner
+    assert "NJR H" not in set_profile
+    assert "NJRH_POINTCLOUD_ACCEL_PROFILE=legacy has been removed from production" in accel_profile
     assert "NJRH_POINTCLOUD_INGRESS_PROFILE=driver_integrated" in run_pipeline
     assert "driver_integrated ingress selected" in run_pipeline
     assert "HESAI_ACCEL_DRIVER_CPP_BIN" in run_driver
+    assert "DEFAULT_HESAI_CONFIG_FILE" in run_driver
+    assert "REPO_HESAI_CONFIG_FILE" in run_driver
+    assert 'src/third_party/hesai_lidar_ros2_overlay/config/config.yaml' in run_driver
     assert run_driver.index('if [[ "${NJRH_POINTCLOUD_INGRESS_PROFILE}" == "driver_integrated" ]]') < run_driver.index('[[ -f "${POINTCLOUD_REMAP_CONFIG}" ]]')
     assert "hesai_accel_driver_node" in run_driver
     assert "hesai_ros_driver_node" in run_driver
@@ -5742,17 +6758,28 @@ def test_phase_d1_pointcloud_driver_integrated_ingress_contracts():
     assert "local_compact_stride: 4" in accel_cfg
     assert "nav_compact_stride: 4" in accel_cfg
     assert "lidar_points_full_density_full_fields: true" in hesai_accel_cfg
+    assert "hesai_driver_config_path: /workspaces/njrh-v3/workspace1/src/third_party/hesai_lidar_ros2_overlay/config/config.yaml" in hesai_accel_cfg
     assert "publish_vendor_raw_debug: false" in hesai_accel_cfg
     assert "publish_vendor_imu_raw_debug: true" in hesai_accel_cfg
     assert "vendor_raw_ros_hop_required: false" in hesai_accel_cfg
     for cfg in (accel_cfg, hesai_accel_cfg):
+        assert "local_worker_stamp_source: local_odom" in cfg
+        assert "local_worker_stamp_odom_topic: /local_state/odometry" in cfg
+        assert "local_worker_stamp_max_odom_age_sec: 0.25" in cfg
         assert "clearing_worker_virtual_rays_enabled: true" in cfg
         assert "clearing_worker_virtual_ray_angle_resolution_deg: 1.0" in cfg
+        assert "clearing_worker_virtual_ray_min_angle_deg: -110.0" in cfg
+        assert "clearing_worker_virtual_ray_max_angle_deg: 110.0" in cfg
+        assert "clearing_worker_virtual_rays_allow_self_mask_endpoints: true" in cfg
         assert "clearing_worker_virtual_ray_range: 8.00" in cfg
-        assert "clearing_worker_virtual_ray_range_steps: [0.50, 1.00, 2.00, 3.50, 5.50, 8.00]" in cfg
+        assert "clearing_worker_max_points: 30000" in cfg
+        assert (
+            "clearing_worker_virtual_ray_range_steps: "
+            "[0.10, 0.15, 0.20, 0.35, 0.50, 0.75, 1.00, 1.50, 2.50, 4.00, 6.00, 8.00]"
+        ) in cfg
         assert (
             "clearing_worker_virtual_ray_endpoint_z_values: "
-            "[-0.10, 0.05, 0.20, 0.40, 0.60, 0.85, 1.10, 1.30]"
+            "[-0.10, 0.05, 0.20, 0.40, 0.60, 0.80, 1.00, 1.20, 1.40]"
         ) in cfg
 
     status_topics = {
@@ -5768,10 +6795,11 @@ def test_phase_d1_pointcloud_driver_integrated_ingress_contracts():
         "/lidar_points_nav",
         "/points_nav",
         "/perception/obstacle_points",
-        "/perception/clearing_points",
-        "/scan",
-        "/flatscan",
-    }
+            "/perception/clearing_points",
+            "/scan",
+            "/scan-based",
+            "/flatscan",
+        }
     topic_prefixes = ("/jt128/", "/lidar", "/_internal/", "/points", "/perception/", "/scan", "/flatscan")
     for text in (accel_cfg, hesai_accel_cfg, accel_core, hesai_overlay_source_driver, verify_profile, ab_runner):
         for topic in re.findall(r"/[A-Za-z0-9_][A-Za-z0-9_./-]*", text):
@@ -5796,7 +6824,7 @@ def test_phase_d1_pointcloud_driver_integrated_ingress_contracts():
     assert 'export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"' in common_env
     assert 'export FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}"' in common_env
     assert "rmw_cyclonedds_cpp" not in common_env
-    assert 'export NJRH_POINTCLOUD_ACCEL_PROFILE="${NJRH_POINTCLOUD_ACCEL_PROFILE:-legacy}"' in (
+    assert 'export NJRH_POINTCLOUD_ACCEL_PROFILE="${NJRH_POINTCLOUD_ACCEL_PROFILE:-ipc_worker}"' in (
         config_dir / "pointcloud_accel_profile.env"
     ).read_text(encoding="utf-8")
     assert "global_frame: odom" in local_costmap_config_block(nav2)
@@ -5817,7 +6845,7 @@ def test_phase115_flatscan_lifecycle_hardening_contracts():
     nav2 = (overlay / "config" / "nav2.yaml").read_text(encoding="utf-8")
 
     combined = run_pipeline + verify_profile + nav_runtime + ab_runner
-    for topic in ("/lidar_points", "/scan", "/flatscan", "/perception/obstacle_points", "/perception/clearing_points"):
+    for topic in ("/lidar_points", "/scan", "/flatscan"):
         assert topic in combined
     assert "/flatscan_debug" not in combined
     assert "/flatscan_status" not in combined
@@ -5840,12 +6868,14 @@ def test_phase115_flatscan_lifecycle_hardening_contracts():
     assert "FLATSCAN_HELPER_RESTART_COUNT" in run_pipeline
     assert "CASE_FLATSCAN_HELPER_DEAD" in run_pipeline
     assert "standalone /scan exists but /flatscan publisher is missing while laser_scan_to_flatscan pid=" in run_pipeline
-    assert "legacy_scan_pid=$!" in run_pipeline
-    assert 'flatscan_helper_mode="legacy_launch"' in run_pipeline
+    assert "legacy_scan_pid=$!" not in run_pipeline
+    assert "jt128_localization_sensing.launch.py" not in run_pipeline
+    assert 'flatscan_helper_mode="legacy_launch"' not in run_pipeline
     assert 'flatscan_helper_mode="standalone"' in run_pipeline
     assert "start_flatscan_helper" in run_pipeline[run_pipeline.index("ipc_worker)") :]
     legacy_block = run_pipeline[run_pipeline.index("legacy)") : run_pipeline.index("ipc_worker)")]
-    assert "jt128_localization_sensing.launch.py" in legacy_block
+    assert "FAIL legacy profile removed" in legacy_block
+    assert "jt128_localization_sensing.launch.py" not in legacy_block
     assert "start_flatscan_helper" not in legacy_block
     assert run_pipeline.rstrip().endswith("supervise_flatscan_helper")
     assert "pkill -9" not in run_pipeline
@@ -5867,9 +6897,17 @@ def test_phase115_flatscan_lifecycle_hardening_contracts():
     assert "LOCALIZATION_RESULT_PUBLISHER_MISSING" in nav_runtime
     assert "scan_flatscan_admission_diagnostics" in nav_runtime
     assert "recover_flatscan_helper_for_navigation" in nav_runtime
+    assert "start_flatscan_helper_for_navigation_repair" in nav_runtime
+    assert "wait_for_flatscan_publisher_ready" in nav_runtime
+    assert 'wait_for_topic_publisher_from_node "/flatscan" "laser_scan_to_flatscan"' in nav_runtime
+    assert 'wait_for_topic_message "/flatscan"' not in nav_runtime
     assert "current_pointcloud_accel_profile" in nav_runtime
+    assert "without restarting pointcloud accel profile" in nav_runtime
+    assert "stopping stale laser_scan_to_flatscan process without touching pointcloud driver" in nav_runtime
+    assert "NJRH_FLATSCAN_REPAIR_RESTART_POINTCLOUD:-false" in nav_runtime
     assert "set_pointcloud_accel_profile.sh\" --profile \"${profile}\" --restart" in nav_runtime
-    assert "/flatscan repair succeeded after pointcloud accel restart" in nav_runtime
+    assert "/flatscan repair fallback: restarting pointcloud accel profile=${profile}" in nav_runtime
+    assert "/flatscan repair succeeded" in nav_runtime
     assert "laser_scan_to_flatscan_process" in nav_runtime
     assert "pointcloud_accel_profile" in nav_runtime
     assert "suggested_fix" in nav_runtime
@@ -5922,7 +6960,7 @@ def test_phase_a2_amcl_replaces_isaac_continuous_localization_contracts():
     assert "scan_worker_rate_hz: 15.0" in accel_cfg
     assert "scan_worker_rate_hz: 15.0" in hesai_accel_cfg
     assert "output_topic: /lidar_points" in accel_cfg
-    assert "obstacle_output_topic: /perception/obstacle_points" in accel_cfg
+    assert "local_worker_enabled: false" in accel_cfg
     assert "input_reliable: false" in accel_cfg
     assert "output_reliable: false" in accel_cfg
     assert "rmw_cyclonedds_cpp" not in common_env
@@ -6001,6 +7039,8 @@ def test_phase_a2_amcl_replaces_isaac_continuous_localization_contracts():
     assert "service_call_timeout_sec: 10.0" in global_cfg
     assert "result_wait_timeout_sec: 20.0" in global_cfg
     assert "bridge_accept_timeout_sec: 8.0" in global_cfg
+    assert "transient_stale_bridge_accept_timeout_sec: 3.0" in global_cfg
+    assert "active_deadline = shortened_deadline" in global_cpp
     assert "map_to_odom_wait_timeout_sec: 8.0" in global_cfg
     assert "bridge_status_topic: /localization/bridge_status" in global_cfg
     assert "bridge_force_accept_service: /robot_localization_bridge/force_accept_next_localization" in global_cfg
@@ -6010,6 +7050,8 @@ def test_phase_a2_amcl_replaces_isaac_continuous_localization_contracts():
     assert "tf2_ros" in global_cmake
     assert "<depend>tf2_ros</depend>" in global_pkg
     assert "wait_for_bridge_acceptance" in global_cpp
+    assert "bridge_reject_is_transient_triggered_stale" in global_cpp
+    assert "isaac_triggered_pose_stale_ms" in global_cpp
     assert "wait_for_map_to_odom" in global_cpp
     assert "failure_code=ISAAC_SERVICE_TIMEOUT" in global_cpp
     assert "failure_code=LOCALIZATION_RESULT_TIMEOUT" in global_cpp
@@ -6022,10 +7064,15 @@ def test_phase_a2_amcl_replaces_isaac_continuous_localization_contracts():
     assert "wait_for_bridge_has_map_to_odom" in nav_runtime
     assert "start_amcl_resident_if_enabled_for_navigation" in nav_runtime
     assert "complete_amcl_readiness_if_enabled_for_navigation" in nav_runtime
-    assert "wait_for_fresh_header_topic_message" not in nav_runtime
-    assert "NJRH_GLOBAL_LOCALIZATION_TRIGGER_CALL_TIMEOUT:-60" in nav_runtime
+    assert "amcl_resident_runtime_status_ready_for_seed()" in nav_runtime
+    assert "AMCL resident already warm from status file" in nav_runtime
+    assert 'wait_for_fresh_header_topic_message \\\n    "/local_state/odometry"' in nav_runtime
+    assert 'wait_for_fresh_header_topic_message \\\n    "/lidar_points"' not in nav_runtime
+    assert "NJRH_GLOBAL_LOCALIZATION_TRIGGER_CALL_TIMEOUT:-90" in nav_runtime
     assert "GLOBAL_LOCALIZATION_TRIGGER_TIMEOUT" in nav_runtime
     assert "LOCALIZATION_RESULT_TIMEOUT" in nav_runtime
+    assert "trigger_output_reports_transient_amcl_pose_stale_reject" in nav_runtime
+    assert "AMCL_POSE_STALE" in nav_runtime
     assert "MAP_TO_ODOM_TIMEOUT" in nav_runtime
     assert "NJRH_RUNTIME_LAST_TRIGGERED_RELOCALIZATION_OK" in nav_runtime
     assert "NJRH_RUNTIME_MAP_TO_ODOM_AGE_MS" in nav_runtime
@@ -6079,13 +7126,28 @@ def test_phase_a1_amcl_shadow_localization_contracts():
     assert "NJRH_AMCL_LOCALIZATION_MODE:-gated" in amcl_mode
     assert "NJRH_AMCL_TF_WARMUP_SEC" in amcl_mode
     assert "NJRH_AMCL_LIFECYCLE_TRANSITION_TIMEOUT_SEC" in amcl_mode
+    assert "NJRH_AMCL_LIFECYCLE_TRANSITION_TIMEOUT_SEC:-8" in amcl_mode
+    assert "NJRH_AMCL_LIFECYCLE_POST_TRANSITION_STATE_WAIT_SEC:-2" in amcl_mode
+    assert "NJRH_AMCL_PARAM_READY_TIMEOUT_SEC:-5" in amcl_mode
     assert "NJRH_AMCL_SEED_RETRY_COUNT" in amcl_mode
     assert "NJRH_AMCL_SCAN_ADMISSION_ENABLED" in amcl_mode
     assert "NJRH_AMCL_SCAN_OUTPUT_TOPIC" in amcl_mode
-    assert "NJRH_AMCL_SCAN_MAX_AGE_MS:-250.0" in amcl_mode
+    assert "NJRH_AMCL_SCAN_MAX_AGE_MS:-1000.0" in amcl_mode
     assert "NJRH_AMCL_SCAN_WAIT_FOR_TF_TIMEOUT_MS:-20.0" in amcl_mode
+    assert "NJRH_AMCL_STATIC_STANDBY_SKIP_SCAN_FRESH_WAIT:-true" in amcl_runner
+    assert "NJRH_AMCL_STATIC_STANDBY_SKIP_SCAN_ADMISSION_READY_WAIT:-true" in amcl_runner
+    assert "AMCL static standby fast seed" in amcl_runner
+    assert "status readiness remains asynchronous" in amcl_runner
+    readiness_start = amcl_runner.index("complete_amcl_readiness_sequence()")
+    readiness_end = amcl_runner.index("start_amcl_node()", readiness_start)
+    readiness_sequence = amcl_runner[readiness_start:readiness_end]
+    assert readiness_sequence.index("AMCL static standby fast seed") < readiness_sequence.index(
+        "wait_for_scan_admission_status_ready"
+    )
     assert "disabled|shadow|gated" in amcl_runner
-    assert "ros2 run nav2_amcl amcl" in amcl_runner
+    assert "AMCL_BIN=" in amcl_runner
+    assert '"${AMCL_BIN}" --ros-args' in amcl_runner
+    assert "ros2 run nav2_amcl amcl --ros-args" not in amcl_runner
     assert "complete_amcl_readiness_sequence" in amcl_runner
     assert "wait_for_amcl_tf_warmup" in amcl_runner
     assert 'source "${SCRIPT_DIR}/map_server_helpers.sh"' in amcl_runner
@@ -6095,6 +7157,8 @@ def test_phase_a1_amcl_shadow_localization_contracts():
     assert "lifecycle_msgs/srv/ChangeState" in amcl_runner
     assert '"/${AMCL_NODE_NAME}/get_state"' in amcl_runner
     assert "lifecycle_msgs/srv/GetState" in amcl_runner
+    assert "amcl_lifecycle_transition_state_reached" in amcl_runner
+    assert "response was not reliable, but state reached target" in amcl_runner
     assert '[[ "${state}" != active* && "${state}" != inactive* ]]' in amcl_runner
     assert 'ros2 lifecycle set "/${AMCL_NODE_NAME}" configure' not in amcl_runner
     assert 'ros2 lifecycle set "/${AMCL_NODE_NAME}" activate' not in amcl_runner
@@ -6118,6 +7182,11 @@ def test_phase_a1_amcl_shadow_localization_contracts():
     assert "Please set the initial pose" in amcl_verify
     assert "Message Filter dropping message" in amcl_verify
     assert "run_amcl_shadow_localization.sh" in stop_nav
+    assert "NJRH_NAV_STOP_AMCL_TIMEOUT_SEC" in stop_nav
+    assert "stop_amcl_bounded()" in stop_nav
+    assert "nav2_amcl/amcl" in stop_nav
+    assert "amcl_scan_admission_node" in stop_nav
+    assert "run_amcl_shadow_localization.sh\" --stop >/dev/null" not in stop_nav
     assert "killall -9" not in amcl_runner
     assert "killall -9" not in amcl_verify
     assert "pkill -9" not in amcl_runner
@@ -6234,7 +7303,7 @@ def test_phase_a13_amcl_scan_admission_cpu_affinity_contracts():
     assert "njrh_cpuset_for amcl" in amcl_runner
     assert 'export NJRH_CPUSET_AMCL="${amcl_cpuset}"' in amcl_runner
     assert 'taskset -c "${amcl_cpuset}" true' in amcl_runner
-    assert 'nohup taskset -c "${amcl_cpuset}" ros2 run nav2_amcl amcl' in amcl_runner
+    assert 'nohup taskset -c "${amcl_cpuset}" "${AMCL_BIN}" --ros-args' in amcl_runner
     assert "njrh_apply_affinity_to_pids amcl" in amcl_runner
     assert "njrh_cpuset_for amcl_scan_admission" in amcl_runner
     assert 'export NJRH_CPUSET_AMCL_SCAN_ADMISSION="${relay_cpuset}"' in amcl_runner
@@ -6347,8 +7416,23 @@ def test_phase_a14_cpp_amcl_scan_admission_contracts():
     assert 'export NJRH_AMCL_SCAN_ADMISSION_IMPL="${NJRH_AMCL_SCAN_ADMISSION_IMPL:-cpp}"' in profile
     assert 'SCAN_RELAY_IMPL="${NJRH_AMCL_SCAN_ADMISSION_IMPL:-cpp}"' in runner
     assert "SCAN_RELAY_CPP_BIN" in runner
-    assert "ros2 run robot_localization_bridge amcl_scan_admission_node" in runner
+    assert 'relay_cmd=("${SCAN_RELAY_CPP_BIN}" --ros-args' in runner
+    assert "ros2 run robot_localization_bridge amcl_scan_admission_node --ros-args" not in runner
     assert "python3 \"${SCAN_RELAY_SCRIPT}\"" in runner
+    assert "wait_for_fresh_amcl_scan_input()" in runner
+    assert "runtime_readiness_probe \\" in runner
+    assert "fresh-header-topic" in runner
+    readiness_block = runner[
+        runner.index("complete_amcl_readiness_sequence()") :
+        runner.index("start_amcl_node()", runner.index("complete_amcl_readiness_sequence()"))
+    ]
+    assert readiness_block.index("wait_for_amcl_tf_warmup true") < readiness_block.index(
+        "wait_for_fresh_amcl_scan_input"
+    )
+    assert readiness_block.index("wait_for_fresh_amcl_scan_input") < readiness_block.index(
+        "start_scan_admission_relay"
+    )
+    assert "/scan did not become fresh before AMCL scan admission" in runner
     assert "explicitly set NJRH_AMCL_SCAN_ADMISSION_IMPL=python" in runner
     assert "implementation=${SCAN_RELAY_IMPL}" in runner
     assert "max_scan_age_ms=${scan_max_age_ms}" in runner
@@ -6356,12 +7440,22 @@ def test_phase_a14_cpp_amcl_scan_admission_contracts():
     assert "nohup taskset -c \"${relay_cpuset}\" \"${relay_cmd[@]}\"" in runner
     assert "killall -9" not in runner
     assert "pkill -9" not in runner
+    assert "amcl_heartbeat_process_pids()" in runner
+    assert "amcl_nonstop_runner_process_pids()" in runner
+    assert "stop_amcl_runner_processes()" in runner
+    assert "stop_amcl_heartbeat_processes()" in runner
+    assert "stopping remaining AMCL runner processes" in runner
+    assert "AMCL runner processes ignored SIGTERM; killing exact pids" in runner
+    assert "stop_amcl_runner_processes" in runner[runner.index("stop_amcl()") :]
+    assert "stop_amcl_heartbeat_processes" in runner[runner.index("stop_amcl()") :]
+    assert "/run_amcl_shadow_localization.sh/ && /--heartbeat/" in runner
+    assert "/run_amcl_shadow_localization.sh/ && !/--stop/" in runner
 
     assert "declare_parameter<std::string>(\"input_topic\", \"/scan\")" in cpp
     assert "declare_parameter<std::string>(\"output_topic\", \"/scan_amcl\")" in cpp
     assert "declare_parameter<std::string>(\"target_frame\", \"odom\")" in cpp
     assert "declare_parameter<double>(\"max_rate_hz\", 5.0)" in cpp
-    assert "declare_parameter<double>(\"max_scan_age_ms\", 250.0)" in cpp
+    assert "declare_parameter<double>(\"max_scan_age_ms\", 1000.0)" in cpp
     assert "declare_parameter<double>(\"tf_wait_timeout_ms\", 20.0)" in cpp
     assert "declare_parameter<bool>(\"require_tf_available\", true)" in cpp
     assert "declare_parameter<bool>(\"preserve_stamp\", true)" in cpp
@@ -6447,6 +7541,9 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(encoding="utf-8")
     runtime_path = scripts_dir / "run_navigation_runtime_services.sh"
     runtime = runtime_path.read_text(encoding="utf-8")
+    lifecycle_sequence = (scripts_dir / "nav2_lifecycle_sequence.py").read_text(encoding="utf-8")
+    common_runner = (scripts_dir / "run_common_services.sh").read_text(encoding="utf-8")
+    canonical_helpers = (scripts_dir / "canonical_tf_helpers.sh").read_text(encoding="utf-8")
     amcl_runner_path = scripts_dir / "run_amcl_shadow_localization.sh"
     amcl_runner = amcl_runner_path.read_text(encoding="utf-8")
     verify_path = scripts_dir / "verify_amcl_runtime_readiness.sh"
@@ -6468,11 +7565,27 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "disabled|shadow|gated" in amcl_runner
     assert "--start-resident" in amcl_runner
     assert "--complete-readiness" in amcl_runner
+    assert "--heartbeat" in amcl_runner
     assert "wait_for_amcl_tf_warmup false" in amcl_runner
     assert "wait_for_amcl_tf_warmup true" in amcl_runner
     assert "start_scan_admission_relay || return 2" in amcl_runner
     assert "wait_for_scan_admission_status_ready || return 3" in amcl_runner
+    assert "NJRH_AMCL_SCAN_ADMISSION_READY_MIN_HZ:-0.5" in amcl_runner
+    assert "blocking_errors = (" in amcl_runner
+    assert '"AMCL_SCAN_TF_UNAVAILABLE"' in amcl_runner
+    assert '"AMCL_SCAN_FRAME_MISMATCH"' in amcl_runner
+    assert '"AMCL_SCAN_FUTURE_STAMP"' in amcl_runner
+    assert '"AMCL_SCAN_WARMUP"' in amcl_runner
+    assert "published_count = int(data.get(\"published_count\", 0) or 0)" in amcl_runner
+    assert "hz >= min_ready_hz and published_count > 0" in amcl_runner
+    assert "str(data.get(\"last_error\", \"none\")) in (\"\", \"none\")" not in amcl_runner
     assert "seed_amcl_initial_pose || return 4" in amcl_runner
+    seed_fn = amcl_runner[
+        amcl_runner.index("seed_amcl_initial_pose()") :
+        amcl_runner.index("start_scan_admission_relay()", amcl_runner.index("seed_amcl_initial_pose()"))
+    ]
+    assert "client = node.create_client(Trigger, service)" in seed_fn
+    assert "ros2 service call" not in seed_fn
     assert 'status_log_period_sec:=${NJRH_AMCL_SCAN_ADMISSION_STATUS_LOG_PERIOD_SEC:-1.0}' in amcl_runner
     assert "request_amcl_nomotion_update" in amcl_runner
     assert "request_amcl_nomotion_update_and_wait_for_pose" in amcl_runner
@@ -6484,6 +7597,8 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "AMCL_READY mode=${MODE}" in amcl_runner
     assert "wait_for_amcl_tf_broadcast_false" in amcl_runner
     assert "NJRH_AMCL_PARAM_READY_TIMEOUT_SEC" in amcl_runner
+    assert "amcl_cmdline_tf_broadcast_false" in amcl_runner
+    assert "process launch argument is tf_broadcast:=false; continuing" in amcl_runner
     assert "did not become readable as false" in amcl_runner
     assert "NJRH_AMCL_RUNTIME_STATUS_FILE" in amcl_runner
     assert "/tmp/njrh_amcl_runtime_status.env" in amcl_runner
@@ -6494,13 +7609,42 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "AMCL_EXIT_SEED_FAILED=24" in amcl_runner
     assert "AMCL_EXIT_POSE_MISSING=25" in amcl_runner
     assert "write_amcl_runtime_status" in amcl_runner
+    assert "source_status_file_if_valid" in amcl_runner
+    assert "status_file_value()" in amcl_runner
+    assert 'existing_seed_succeeded="$(status_file_value "${STATUS_FILE}" AMCL_SEED_SUCCEEDED)' in amcl_runner
+    assert 'existing_static_standby="$(status_file_value "${STATUS_FILE}" AMCL_STATIC_STANDBY_ACCEPTED)' in amcl_runner
+    assert 'AMCL_SEED_SUCCEEDED=true' in amcl_runner
+    assert 'AMCL_STATIC_STANDBY_ACCEPTED=true' in amcl_runner
+    assert 'bash -n "${file}"' in amcl_runner
+    assert 'mv -f "${tmp_file}" "${STATUS_FILE}"' in amcl_runner
+    assert "heartbeat_amcl_runtime_status" in amcl_runner
+    assert "load_existing_amcl_runtime_status" in amcl_runner
+    assert 'existing_ready="$(status_file_value "${STATUS_FILE}" AMCL_READY)' in amcl_runner
+    assert 'existing_tracking_ready="$(status_file_value "${STATUS_FILE}" AMCL_TRACKING_READY)' in amcl_runner
+    assert 'AMCL_STATIC_STANDBY_ACCEPTED=true' in amcl_runner
+    assert "amcl_resident_processes_alive" in amcl_runner
+    assert "NJRH_AMCL_RUNTIME_STATUS_HEARTBEAT_SEC:-2.0" in amcl_runner
+    assert "AMCL status heartbeat started" in amcl_runner
+    assert 'if [[ "${MODE}" != "disabled" && "${start_result}" == "ready" && "${amcl_seeded}" != "true" ]]' in amcl_runner
+    assert 'effective_start_result="waiting_seed"' in amcl_runner
+    assert "AMCL seed has not completed" in amcl_runner
+    assert 'write_amcl_runtime_status waiting_seed false false "resident AMCL is alive; waiting for initial pose seed"' in amcl_runner
+    assert 'write_amcl_runtime_status ready true false ""' in amcl_runner
     assert "AMCL_STATE" in amcl_runner
     assert "AMCL_STATUS_STAMP_SEC" in amcl_runner
     assert "AMCL_STATUS_STALE" in amcl_runner
+    assert '|| "${AMCL_STATIC_STANDBY_ACCEPTED}" == "true"' in amcl_runner
     assert "AMCL_PROCESS_READY" in amcl_runner
     assert "AMCL_SEED_RESPONSE_OK" in amcl_runner
     assert "AMCL_NOMOTION_PROBE_USED" in amcl_runner
     assert "AMCL_NOMOTION_POSE_RECEIVED" in amcl_runner
+    assert "AMCL_STATIC_STANDBY_ACCEPTED" in amcl_runner
+    assert "NJRH_AMCL_STATIC_STANDBY_WITHOUT_POSE_OK:-true" in amcl_runner
+    assert "NJRH_AMCL_STATIC_STANDBY_SKIP_POSE_WAIT:-true" in amcl_runner
+    assert "AMCL static standby accepted immediately after seed" in amcl_runner
+    assert "AMCL static standby accepted after seed without a fresh/no-motion pose" in amcl_runner
+    assert "NJRH_AMCL_STATUS_GRAPH_PROBE_ENABLED:-false" in amcl_runner
+    assert 'if [[ "${graph_probe_enabled}" == "true" ]]; then' in amcl_runner
     assert "AMCL_STATIC_STANDBY" in amcl_runner
     assert "AMCL_CORRECTION_READY" in amcl_runner
     assert "AMCL_DEGRADED" in amcl_runner
@@ -6515,21 +7659,175 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert 'AMCL lifecycle is active but not ready; continuing triggered localization baseline"\n    return 0' not in amcl_runner
 
     assert "start_amcl_resident_if_enabled_for_navigation" in runtime
+    assert "start_amcl_resident_background_if_enabled_for_navigation" in runtime
+    assert "start_amcl_readiness_background_if_enabled_for_navigation" in runtime
+    assert "wait_for_amcl_readiness_background_if_running" in runtime
+    assert "start_prestarted_nav2_lifecycle_background()" in runtime
+    assert "wait_for_prestarted_nav2_lifecycle_background()" in runtime
+    assert "wait_for_prestarted_nav2_launch_hold_ready()" in runtime
+    assert "prestarted Nav2 held launch ready from" in runtime
+    assert "NAV2_HOLD_READY_WRAPPER_PID" in runtime
+    assert "NAV2_HOLD_READY_BASHPID" in runtime
+    assert "NAV2_HOLD_READY_CONTROLLER_PID" in runtime
+    assert "NJRH_NAV2_HOLD_READY_FILE" in runtime
+    assert "NJRH_NAV2_PRESTART_HOLD_READY_TIMEOUT_SEC:-25" in runtime
+    assert "NJRH_NAV2_PRESTART_HOLD_READY_MAX_AGE_SEC:-60" in runtime
+    assert "NJRH_NAV2_LIFECYCLE_BACKGROUND_START:-true" in runtime
+    assert "NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK:-false" in runtime
+    assert "starting prestarted Nav2 lifecycle background after localization stack readiness" in runtime
+    assert "NJRH_NAV2_LIFECYCLE_CONFIGURE_ALL_FIRST:-false" in runtime
+    assert "NJRH_NAV2_LIFECYCLE_PARALLEL_CORE:-false" in runtime
+    assert "NJRH_NAV2_LIFECYCLE_PARALLEL_BT:-true" in runtime
+    assert "NJRH_NAV2_LIFECYCLE_TRUST_CHANGE_STATE_RESPONSE:-true" in runtime
+    assert "NJRH_INITIAL_LOCALIZATION_REQUIRE_RESULT_PUBLISHER:-false" in runtime
+    assert "skipping /localization_result publisher pre-gate" in runtime
+    assert "NJRH_INITIAL_LOCALIZATION_FLATSCAN_WAIT_SEC:-5" in runtime
+    assert "NJRH_INITIAL_LOCALIZATION_FLATSCAN_REPAIR_WAIT_SEC:-20" in runtime
+    assert 'bash -n "${NJRH_AMCL_RUNTIME_STATUS_FILE}"' in runtime
+    assert "failed to source AMCL runtime status file" in runtime
+    assert "run_nav2_lifecycle_sequence()" in runtime
+    assert "run_nav2_lifecycle_sequence_until_active()" in runtime
+    assert 'runtime_readiness_probe lifecycle-active "${node_name}"' in runtime
+    assert "lifecycle nodes active; stopping lifecycle helper pid=" in runtime
+    assert 'if wait "${nav2_lifecycle_bringup_pid}"; then' in runtime
+    assert "prestarted Nav2 lifecycle helper exited rc=" in runtime
+    assert "prestarted Nav2 lifecycle nodes active before background helper exit" in runtime
+    assert "NJRH_NAV2_LIFECYCLE_BACKGROUND_ACTIVE_WAIT_SEC" in runtime
+    assert "NJRH_NAV2_LIFECYCLE_BACKGROUND_JOIN_TIMEOUT_SEC" not in runtime
+    assert "Nav2 lifecycle parallel core activation enabled" in runtime
+    assert "Nav2 lifecycle activation running in background" in runtime
+    assert "--trust-change-state-response" in lifecycle_sequence
+    assert "--configure-all-before-activate" in lifecycle_sequence
+    assert "lifecycle sequence: configuring all managed nodes before activation" in lifecycle_sequence
+    resident_lifecycle_block = runtime[
+        runtime.index("activate_prestarted_nav2_lifecycle()") :
+        runtime.index("ensure_navigation_layer_alive || return 1", runtime.index("activate_prestarted_nav2_lifecycle()"))
+    ]
+    assert "waypoint_follower" not in resident_lifecycle_block
+    assert "smoother_server" not in resident_lifecycle_block
+    assert "behavior_server" not in resident_lifecycle_block
+    assert resident_lifecycle_block.index("planner_server") < resident_lifecycle_block.index("controller_server")
+    assert "start_amcl_status_heartbeat_if_enabled_for_navigation" in runtime
+    assert "amcl_status_heartbeat_pid" in runtime
+    assert "AMCL runtime status heartbeat" in runtime
+    assert "cleanup_stale_amcl_runtime_status_owner" in common_runner
+    assert "cleanup_stale_amcl_runtime_status_owner" in runtime
+    assert "resident_navigation_layer_pids()" in common_runner
+    assert "nav2_lifecycle_sequence.py" in common_runner
+    assert "call_global_localization_trigger.py" in common_runner
+    assert "resident_navigation_layers_running()" in common_runner
+    assert "resolve_resident_navigation_autostart_selection()" in common_runner
+    assert "start_resident_navigation_autostart_if_selected()" in common_runner
+    assert "wait_for_resident_navigation_autostart_if_started()" in common_runner
+    assert "NJRH_RESIDENT_NAVIGATION_EARLY_AUTOSTART:-true" in common_runner
+    assert "no stale resident navigation layers found; skipping Nav2/localization/AMCL cleanup sweep" in common_runner
+    assert "njrh_load_pointcloud_ingress_profile" in common_runner
+    assert "hesai_accel_driver_node" in common_runner
+    assert "NJRH_COMMON_PROCESS_START_SETTLE_SEC:-0.2" in common_runner
+    assert "ensure_flatscan_ready_before_navigation_autostart()" in common_runner
+    assert "NJRH_COMMON_FLATSCAN_READY_TIMEOUT_SEC:-45" in common_runner
+    assert "NJRH_COMMON_FLATSCAN_REPAIR_TIMEOUT_SEC:-60" in common_runner
+    assert "common_require_flatscan_before_resident_autostart()" in common_runner
+    assert "NJRH_COMMON_REQUIRE_FLATSCAN_BEFORE_RESIDENT_AUTOSTART:-false" in common_runner
+    assert "skipping common /flatscan precheck before resident navigation autostart" in common_runner
+    assert 'wait_for_topic_publisher_from_node "/flatscan" "laser_scan_to_flatscan"' in common_runner
+    assert 'wait_for_topic_message "/flatscan"' not in common_runner
+    assert "NJRH_POINTCLOUD_ACCEL_STOP_KILL_WAIT_SEC:-0.2" in common_runner
+    assert "stale pointcloud accel process ignored SIGTERM; killing exact pids" in common_runner
+    assert "/flatscan missing before resident navigation; restarting pointcloud accel" in common_runner
+    common_main_flow = common_runner[common_runner.index("require_can_interface_up") :]
+    assert common_main_flow.index('start_canonical_helper "ranger_chassis_common"') < common_main_flow.index(
+        'start_common_process "pointcloud_accel_pipeline"'
+    )
+    assert common_main_flow.index('start_canonical_helper "robot_description_static_tf_common"') < common_main_flow.index(
+        'start_common_process "pointcloud_accel_pipeline"'
+    )
+    assert common_main_flow.index("NJRH_RUNTIME_HEALTH_GUARD_AUTOSTART") < common_main_flow.index(
+        'start_canonical_helper \\\n  "robot_local_state_common"'
+    )
+    assert common_main_flow.index("NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE") < common_main_flow.index(
+        'start_canonical_helper \\\n  "robot_local_state_common"'
+    )
+    assert common_main_flow.index("NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE") < common_main_flow.index(
+        "start_resident_navigation_autostart_if_selected"
+    )
+    assert common_main_flow.index('start_canonical_helper \\\n  "robot_local_state_common"') < common_main_flow.index(
+        "wait_for_runtime_health_local_state_ready"
+    )
+    assert "wait_for_fresh_header_topic_message" in runtime
+    assert 'wait_for_fresh_tf_transform "odom" "base_link"' in runtime
+    autostart_block = common_runner[
+        common_runner.index("start_resident_navigation_autostart_if_selected()") :
+        common_runner.index("wait_for_resident_navigation_autostart_if_started()")
+    ]
+    assert autostart_block.index("prepare_resident_navigation_autostart") < autostart_block.index(
+        "common_require_flatscan_before_resident_autostart"
+    )
+    assert autostart_block.index("common_require_flatscan_before_resident_autostart") < autostart_block.index(
+        'start_common_process "resident_navigation_runtime"'
+    )
+    assert "LOCAL_STATE_START_READY_TIMEOUT_SEC:-12" in canonical_helpers
+    assert "LOCAL_STATE_READY_RECHECK_TIMEOUT_SEC:-12" in canonical_helpers
+    assert "NJRH_RESIDENT_NAVIGATION_STOP_INT_WAIT_SEC:-0.5" in common_runner
+    assert "NJRH_RESIDENT_NAVIGATION_STOP_TERM_WAIT_SEC:-0.5" in common_runner
+    assert "NJRH_RESIDENT_NAVIGATION_STOP_KILL_WAIT_SEC:-0.2" in common_runner
+    assert "stale_amcl_seed_helper_pids()" in common_runner
+    assert 'grep -F "/robot_localization_bridge/seed_amcl_initial_pose"' in common_runner
+    assert "stopping stale AMCL seed helper before common startup" in common_runner
+    assert "NJRH_AMCL_SEED_HELPER_STOP_TERM_WAIT_SEC" in common_runner
+    assert "killing stale AMCL seed helper before common startup" in common_runner
+    assert "kill -KILL ${pids}" in common_runner
+    assert "/run_amcl_shadow_localization.sh/ && /--heartbeat/" in common_runner
+    assert "/run_amcl_shadow_localization.sh/ && /--heartbeat/" in runtime
+    assert "stopping stale AMCL runtime status heartbeat before common startup" in common_runner
+    assert "stopping stale AMCL runtime status heartbeat before resident navigation startup" in runtime
     assert "complete_amcl_readiness_if_enabled_for_navigation" in runtime
+    assert "complete_amcl_readiness_with_retries_for_navigation" in runtime
     assert "run_amcl_localization_step" in runtime
+    assert 'if ! run_amcl_localization_step "${mode}" "start-resident" --start-resident; then' in runtime
+    assert 'if ! run_amcl_localization_step "${mode}" "complete-readiness" --complete-readiness; then' in runtime
+    background_block = runtime[
+        runtime.index("start_amcl_readiness_background_if_enabled_for_navigation()") :
+        runtime.index(
+            "wait_for_amcl_readiness_background_if_running()",
+            runtime.index("start_amcl_readiness_background_if_enabled_for_navigation()"),
+        )
+    ]
+    assert "wait_for_amcl_resident_background_if_running" in background_block
+    assert "complete_amcl_readiness_with_retries_for_navigation" in background_block
+    assert "AMCL readiness completed in background" in background_block
     assert "set +e" in runtime
     assert "rc=$?" in runtime
     assert "AMCL_DEGRADED phase=${phase}" in runtime
     assert "AMCL_GATED_NOT_READY" in runtime
     assert "AMCL_SCAN_ADMISSION_FAILED" in runtime
     assert "AMCL_POSE_MISSING" in runtime
-    main_flow = runtime.split('if resident_navigation_ready; then', 1)[1]
-    assert main_flow.index("start_amcl_resident_if_enabled_for_navigation") < main_flow.index(
-        "trigger_global_localization_for_navigation"
+    main_flow = runtime[
+        runtime.index('write_runtime_map_context "starting" "false" "resident navigation runtime starting"') :
+    ]
+    assert main_flow.index("wait_for_initial_global_localization") < main_flow.index(
+        "start_amcl_readiness_background_if_enabled_for_navigation"
     )
-    assert main_flow.index("trigger_global_localization_for_navigation") < main_flow.index(
-        "complete_amcl_readiness_if_enabled_for_navigation"
+    assert main_flow.index("ensure_localization_stack_ready_for_navigation") < main_flow.index(
+        "wait_for_initial_global_localization"
     )
+    assert main_flow.index("wait_for_initial_global_localization") < main_flow.index(
+        'log_startup_stage "nav2_layer_started_after_initial_localization"'
+    )
+    assert main_flow.index('log_startup_stage "nav2_layer_ready"') < main_flow.index(
+        "wait_for_amcl_readiness_background_if_running"
+    )
+    assert 'log_startup_stage "amcl_tracking_ready"' in main_flow
+    assert main_flow.index('log_startup_stage "amcl_tracking_ready"') < main_flow.index(
+        "start_amcl_status_heartbeat_if_enabled_for_navigation"
+    )
+    assert main_flow.index("start_amcl_status_heartbeat_if_enabled_for_navigation") < main_flow.index(
+        'write_runtime_map_context "ready" "true"'
+    )
+    assert main_flow.index("wait_for_amcl_readiness_background_if_running") < main_flow.index(
+        'write_runtime_map_context "ready" "true"'
+    )
+    assert "complete_amcl_readiness_if_enabled_for_navigation ||" not in main_flow
     assert "--start-resident" in runtime
     assert "--complete-readiness" in runtime
     assert "--mode \"${mode}\" --restart" not in runtime
@@ -6552,9 +7850,14 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "amcl_static_standby" in bridge_cpp
     assert "amcl_tracking_ready" in bridge_cpp
     assert "amcl_correction_ready" in bridge_cpp
+    assert "amcl_correction_pending" in bridge_cpp
     assert "amcl_pose_age_ms" in bridge_cpp
     assert "amcl_pose_fresh" in bridge_cpp
     assert "amcl_not_moving_no_update_ok" in bridge_cpp
+    assert "amcl_runtime_static_standby" in bridge_cpp
+    assert "amcl_runtime_status.static_standby" in bridge_cpp
+    assert "amcl_runtime_status.not_moving_no_update_ok" in bridge_cpp
+    assert "amcl_runtime_status.tracking_ready && !amcl_runtime_status.correction_ready" in bridge_cpp
     assert "localization_degraded" in bridge_cpp
     assert "amcl_runtime_status_file" in bridge_cpp
     assert "read_amcl_runtime_status_file" in bridge_cpp
@@ -6579,6 +7882,7 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "amcl_nomotion_pose_received" in api_cpp
     assert "amcl_static_standby" in api_cpp
     assert "amcl_correction_ready" in api_cpp
+    assert "amcl_correction_pending" in api_cpp
     assert "localization_degraded" in api_cpp
     assert "localization_degraded_reason" in api_cpp
     assert "using_triggered_baseline_only" in api_cpp
@@ -6740,13 +8044,14 @@ def test_phase_a22_amcl_readiness_stale_status_and_nomotion_race_contracts():
     assert "amcl_static_standby" in bridge_cpp
     assert "amcl_tracking_ready" in bridge_cpp
     assert "amcl_correction_ready" in bridge_cpp
-    assert 'amcl_gate_mode_ == "gated" && amcl_correction_ready' in bridge_cpp
+    assert "amcl_upstream_ready &&\n      amcl_tracking_ready" in bridge_cpp
     assert "amcl_gated_ready = amcl_shadow_ready && amcl_gate_mode_ == \"gated\"" not in bridge_cpp
-    assert "AMCL_STATIC_STANDBY_NO_CORRECTION" in bridge_cpp
-    assert "AMCL_CORRECTION_NOT_READY" in bridge_cpp
+    assert "AMCL_TRACKING_NOT_READY" in bridge_cpp
+    assert "(amcl_gate_mode_ == \"gated\" && !amcl_correction_ready)" not in bridge_cpp
 
     assert "amcl_runtime_status_ttl_sec" in api_cpp
     assert "bridge_status.amcl_correction_ready" in api_cpp
+    assert "bridge_status.amcl_correction_pending" in api_cpp
     assert "amcl_status_file_stale" in api_cpp
     assert "amcl_seed_response_ok" in api_cpp
     assert "amcl_nomotion_pose_received" in api_cpp
@@ -6916,15 +8221,20 @@ def test_phase_d3_docking_framework_state_machine_contracts():
         "RESOLVE_DOCK_PROFILE",
         "BEFORE_PREDOCK_RELOCALIZE",
         "BEFORE_PREDOCK_SETTLE",
-        "NAV_TO_STAGING",
-        "STAGING_NAV_SUCCEEDED",
+        "NAV_TO_STAGING_NATIVE_NAV2",
+        "STAGING_NAV2_GOAL_SUCCEEDED",
         "PREDOCK_POSE_VERIFY",
-        "PREDOCK_YAW_ALIGN",
-        "PREDOCK_YAW_ALIGN_SETTLE",
+        "PREDOCK_NATIVE_GOAL_VERIFY_FAILED",
+        "PREDOCK_YAW_ALIGN_RECOVERY",
+        "PREDOCK_YAW_ALIGN_RECOVERY_SETTLE",
         "AFTER_PREDOCK_RELOCALIZE",
         "AFTER_PREDOCK_SETTLE",
         "GS2_DOCK_DETECT",
-        "FINE_DOCKING_ENTRY_CHECK",
+            "FINE_DOCKING_BRIDGE_SETTLE",
+            "PREDOCK_POSE_VERIFY_AFTER_BRIDGE_SETTLE",
+            "PREDOCK_YAW_ALIGN_AFTER_BRIDGE_SETTLE",
+            "PREDOCK_YAW_ALIGN_AFTER_BRIDGE_SETTLE_VERIFY",
+            "FINE_DOCKING_ENTRY_CHECK",
         "FINE_ALIGN",
         "RESTAGE_RETRY",
     ):
@@ -6947,18 +8257,30 @@ def test_phase_d3_docking_framework_state_machine_contracts():
     assert "mode_controller_status_topic_" in api_cpp
     assert "docking_gs2_scan_topic_" in api_cpp
     assert "set_global_correction_paused_for_docking(job_id, true, \"docking_fine_entry\"" in api_cpp
+    assert "correction_pause_reason" in api_cpp
+    assert "bridge_status_has_docking_fine_pause" in api_cpp
+    assert "release_stale_docking_fine_pause_if_needed" in api_cpp
+    assert '"pre_navigation_undock_start"' in api_cpp
+    assert '"post_undock_relocalization_before_trigger"' in api_cpp
+    assert "POST_UNDOCK_STALE_DOCKING_FINE_PAUSE" in api_cpp
+    assert "docking_job_finished_" in api_cpp
     assert "std_srvs::srv::SetBool" in api_cpp
 
     for code in (
         "DOCK_FAILED_PREDOCK_NAV",
         "DOCK_FAILED_PREDOCK_RELOCALIZATION",
         "DOCK_FAILED_PREDOCK_SETTLE",
-        "PREDOCK_YAW_NOT_ALIGNED",
+        "PREDOCK_NATIVE_GOAL_VERIFY_FAILED",
+            "PREDOCK_YAW_NOT_ALIGNED_AFTER_NAV2",
+            "PREDOCK_POSE_DRIFTED_AFTER_BRIDGE_SETTLE",
+            "PREDOCK_YAW_NOT_ALIGNED_AFTER_BRIDGE_SETTLE",
+            "PREDOCK_YAW_NOT_ALIGNED",
         "PREDOCK_YAW_HARD_FAIL",
         "PREDOCK_YAW_ALIGN_TIMEOUT",
         "PREDOCK_YAW_ALIGN_MODE_SWITCHING_TIMEOUT",
         "PREDOCK_YAW_ALIGN_NO_YAW_MOTION",
         "GS2_DOCK_DETECT_TIMEOUT",
+        "DOCK_FAILED_FINE_LOCALIZATION_TRANSITION_TIMEOUT",
         "FINE_DOCKING_ENTRY_CONDITION_FAILED",
         "FINE_DOCKING_REJECTED_YAW_TOO_LARGE",
         "FINE_DOCKING_REJECTED_LATERAL_TOO_LARGE",
@@ -6975,7 +8297,13 @@ def test_phase_d3_docking_framework_state_machine_contracts():
         "sensor_frame",
         "max_retries",
         "retry_count",
+        "predock_yaw_verified_by_nav2",
+        "reverse_yaw_offset_applied",
+        "contact_frame_available",
         "predock_yaw_aligned",
+        "fine_bridge_settle_started",
+        "fine_bridge_settle_complete",
+        "fine_bridge_settle_failure_code",
         "fine_entry_checked",
         "global_correction_paused",
         "pause_reason",
@@ -6991,11 +8319,14 @@ def test_phase_d3_docking_framework_state_machine_contracts():
 
     for key in (
         "docking_framework_state_machine_enabled: true",
-        "predock_yaw_align_enabled: true",
+            "predock_yaw_align_enabled: true",
+            "predock_yaw_align_fallback_enabled: true",
         'predock_yaw_align_cmd_topic: "/cmd_vel_docking"',
         "predock_yaw_align_require_actual_spin: true",
         "fine_docking_entry_require_gs2_fresh: true",
         "fine_docking_entry_require_predock_yaw_aligned: true",
+        "docking_fine_wait_for_bridge_smoothing_enabled: true",
+        "docking_fine_bridge_smoothing_wait_timeout_ms: 60000",
         "docking_pause_global_correction_during_fine: true",
         'localization_bridge_correction_pause_service: "/robot_localization_bridge/set_correction_paused"',
         'mode_controller_status_topic: "/ranger_mini3_mode_controller/status"',
@@ -7039,6 +8370,172 @@ def test_phase_d3_docking_framework_state_machine_contracts():
         )
         if bash_probe.returncode == 0:
             for path in (verify_path, observe_path, ab_path):
+                subprocess.run([bash, "-n", str(path)], check=True)
+
+
+def test_phase_v1_navigation_docking_validation_contracts():
+    overlay = ROOT / "scripts" / "jetson" / "runtime_overlay"
+    scripts_dir = overlay / "scripts"
+    config_dir = overlay / "config"
+
+    script_paths = {
+        "pose": scripts_dir / "observe_pose_required_navigation.sh",
+        "manual_relocalization": scripts_dir / "verify_manual_relocalization_api.sh",
+        "predock_trace": scripts_dir / "observe_predock_yaw_alignment_trace.sh",
+        "predock_probe": scripts_dir / "run_predock_yaw_alignment_probe.sh",
+        "fine_gate": scripts_dir / "verify_fine_docking_entry_gate.sh",
+        "v1_runner": scripts_dir / "run_v1_navigation_docking_validation.sh",
+    }
+    scripts = {}
+    for name, path in script_paths.items():
+        assert path.exists(), name
+        scripts[name] = path.read_text(encoding="utf-8")
+
+    combined_scripts = "\n".join(scripts.values())
+    for forbidden in (
+        "PointCloud2",
+        "/lidar_points",
+        "/perception/obstacle_points",
+        "ros2 action send_goal",
+        "pkill -9",
+        "killall -9",
+    ):
+        assert forbidden not in combined_scripts
+
+    assert "Default mode is observe-only" in scripts["pose"]
+    assert "never sends navigation goals" in scripts["pose"]
+    assert "velocity commands, relocalization triggers" in scripts["pose"]
+    assert "/api/v1/navigation/state" in scripts["pose"]
+    assert "/cmd_vel_collision_checked" in scripts["pose"]
+    assert "/cmd_vel_safe" in scripts["pose"]
+    assert "/follow_path/_action/status" in scripts["pose"]
+    assert "task_complete" in scripts["pose"]
+    assert "goal_completion_policy" in scripts["pose"]
+    assert "/api/v1/localization/trigger" not in scripts["pose"]
+
+    assert "WAIT_FOR_SETTLE=false" in scripts["manual_relocalization"]
+    assert "POST /api/v1/localization/trigger" in scripts["manual_relocalization"]
+    assert '{"wait_for_settle": wait_for_settle}' in scripts["manual_relocalization"]
+    assert "post_relocalization_settle_requested" in scripts["manual_relocalization"]
+    assert "default post_relocalization_settle_requested=false" in scripts["manual_relocalization"]
+    assert "/cmd_vel" not in scripts["manual_relocalization"]
+
+    assert "Default mode is read-only" in scripts["predock_trace"]
+    assert "does not send docking requests" in scripts["predock_trace"]
+    assert "/api/v1/docking/state" in scripts["predock_trace"]
+    assert "/cmd_vel_docking" in scripts["predock_trace"]
+    assert "/cmd_vel_safe" in scripts["predock_trace"]
+    assert "/ranger_mini3_mode_controller/status" in scripts["predock_trace"]
+    assert "predock_yaw_aligned" in scripts["predock_trace"]
+    assert "/api/v1/localization/trigger" not in scripts["predock_trace"]
+
+    assert "APPLY_SMALL_YAW_TEST=false" in scripts["predock_probe"]
+    assert "Default mode is observe-only" in scripts["predock_probe"]
+    assert "publishes a bounded angular command only to" in scripts["predock_probe"]
+    assert 'create_publisher(Twist, "/cmd_vel_docking", 10)' in scripts["predock_probe"]
+    assert "active navigation goal is present" in scripts["predock_probe"]
+    assert "active docking or undocking is present" in scripts["predock_probe"]
+    assert "command_published: `false`" in scripts["predock_probe"]
+    assert "POST /api/v1/localization/trigger" not in scripts["predock_probe"]
+
+    assert "Static/read-only contract verifier" in scripts["fine_gate"]
+    assert "calls_docking_start" in scripts["fine_gate"]
+    assert "sends_velocity" in scripts["fine_gate"]
+    assert "false" in scripts["fine_gate"]
+    assert "fine_docking_entry_require_predock_yaw_aligned_ && !predock_yaw_aligned" in scripts["fine_gate"]
+    assert "global_correction_pause_applied" in scripts["fine_gate"]
+    assert "post_predock_settle_complete" in scripts["fine_gate"]
+    assert "FINE_DOCKING_BRIDGE_SETTLE" in scripts["fine_gate"]
+    assert "DOCK_FAILED_FINE_LOCALIZATION_TRANSITION_TIMEOUT" in scripts["fine_gate"]
+
+    assert "OBSERVE_ONLY=true" in scripts["v1_runner"]
+    assert "INCLUDE_MANUAL_RELOCALIZATION=false" in scripts["v1_runner"]
+    assert "INCLUDE_PREDOCK_YAW_PROBE=false" in scripts["v1_runner"]
+    assert "APPLY_SMALL_YAW_TEST=false" in scripts["v1_runner"]
+    assert "verify_goal_completion_semantics.sh" in scripts["v1_runner"]
+    assert "verify_docking_framework_state_machine.sh" in scripts["v1_runner"]
+    assert "verify_fine_docking_entry_gate.sh" in scripts["v1_runner"]
+    assert "observe_pose_required_navigation.sh" in scripts["v1_runner"]
+    assert "observe_predock_yaw_alignment_trace.sh" in scripts["v1_runner"]
+    assert "verify_manual_relocalization_api.sh" in scripts["v1_runner"]
+    assert "run_predock_yaw_alignment_probe.sh" in scripts["v1_runner"]
+    assert "allowed_to_run_full_docking_test" in scripts["v1_runner"]
+    assert "runtime_report_dirs=" in scripts["v1_runner"]
+    assert "PREDOCK_YAW_ALIGN_OWNER_CONFLICT" in scripts["v1_runner"]
+    assert "grep -R \"PREDOCK_YAW_ALIGN_OWNER_CONFLICT\" \"${OUTPUT_DIR}\"" not in scripts["v1_runner"]
+
+    api_cfg = (config_dir / "robot_api_server.yaml").read_text(encoding="utf-8")
+    amcl_cfg = (config_dir / "amcl_shadow.yaml").read_text(encoding="utf-8")
+    nav2_cfg = (config_dir / "nav2.yaml").read_text(encoding="utf-8")
+    bridge_cfg = (config_dir / "localization_bridge.yaml").read_text(encoding="utf-8")
+    api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    bridge_cpp = (
+        ROOT / "src" / "robot_localization_bridge" / "src" / "localization_bridge_node.cpp"
+    ).read_text(encoding="utf-8")
+
+    assert 'navigation_default_goal_completion_policy: "pose_required"' in api_cfg
+    assert 'predock_yaw_align_cmd_topic: "/cmd_vel_docking"' in api_cfg
+    assert "fine_docking_entry_require_predock_yaw_aligned: true" in api_cfg
+    assert "docking_fine_wait_for_bridge_smoothing_enabled: true" in api_cfg
+    assert "docking_fine_bridge_smoothing_wait_timeout_ms: 60000" in api_cfg
+    assert "docking_pause_global_correction_during_fine: true" in api_cfg
+    assert "tf_broadcast: false" in amcl_cfg
+    assert "global_frame: odom" in local_costmap_config_block(nav2_cfg)
+    assert "max_odom_tf_age_ms: 100.0" in bridge_cfg
+    assert bridge_cpp.count("tf_broadcaster_->sendTransform(tf)") == 1
+    assert "map_to_odom_ = candidate.transform" not in bridge_cpp
+
+    assert 'navigation_default_goal_completion_policy", "pose_required"' in api_cpp
+    assert "goal_completion_policy=dock_staging is reserved for /api/v1/docking/start" in api_cpp
+    assert 'json_bool_value(body, "wait_for_settle", false)' in api_cpp
+    assert "post_relocalization_settle_requested" in api_cpp
+    assert "PREDOCK_YAW_ALIGN_OWNER_CONFLICT" in api_cpp
+    assert "fine_docking_entry_require_predock_yaw_aligned_ && !predock_yaw_aligned" in api_cpp
+    assert "wait_for_bridge_smoothing_before_fine_docking" in api_cpp
+    assert "FINE_DOCKING_BRIDGE_SETTLE" in api_cpp
+    assert "DOCK_FAILED_FINE_LOCALIZATION_TRANSITION_TIMEOUT" in api_cpp
+
+    audit_reports = sorted((ROOT / "reports").glob("v1_runtime_config_audit_*.md"))
+    assert audit_reports
+    audit = audit_reports[-1].read_text(encoding="utf-8")
+    for token in (
+        "Phase V1 Runtime Config Audit",
+        "navigation_default_goal_completion_policy",
+        "/api/v1/localization/trigger",
+        "PREDOCK_YAW_ALIGN",
+        "PASS",
+    ):
+        assert token in audit
+
+    phase_doc = ROOT / "docs" / "phase_v1_navigation_docking_validation.md"
+    assert phase_doc.exists()
+    phase_doc_text = phase_doc.read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    for token in (
+        "Phase V1",
+        "observe_pose_required_navigation.sh",
+        "verify_manual_relocalization_api.sh",
+        "observe_predock_yaw_alignment_trace.sh",
+        "run_predock_yaw_alignment_probe.sh",
+        "verify_fine_docking_entry_gate.sh",
+        "run_v1_navigation_docking_validation.sh",
+        "bridge `map->odom` smoothing completion",
+    ):
+        assert token in phase_doc_text
+        assert token in readme
+
+    bash = shutil.which("bash")
+    if bash:
+        bash_probe = subprocess.run(
+            [bash, "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if bash_probe.returncode == 0:
+            for path in script_paths.values():
                 subprocess.run([bash, "-n", str(path)], check=True)
 
 
@@ -7237,10 +8734,15 @@ def test_phase_u1_post_undock_settle_before_pending_nav_goal_contracts():
     assert '"post_undock"' in complete_block
     assert '"nav2_goal"' in complete_block
     assert "post_undock_failure_code_from_settle_failure" in complete_block
+    assert "record_post_undock_navigation_readiness_failure_locked" in complete_block
+    assert "undock succeeded; post-undock navigation readiness failed, pending Nav2 goal held" in complete_block
+    assert 'finish_docking_job_locked(\n        false,\n        "failed"' not in complete_block
     assert "post_undock_relocalization_succeeded" in wait_block
+    assert "post-undock navigation readiness failed, Nav2 goal not sent" in wait_block
     assert "pending_goal_released_after_post_undock_settle = true" in wait_block
     assert "undock_before_navigation_if_needed" in goal_handler
     assert goal_handler.find("undock_before_navigation_if_needed") < goal_handler.find("async_send_goal(goal)")
+    assert "navigation requires post-undock localization readiness before goal start" in goal_handler
 
     for field in [
         "post_undock_relocalization_started",
@@ -7248,6 +8750,9 @@ def test_phase_u1_post_undock_settle_before_pending_nav_goal_contracts():
         "post_undock_settle_started",
         "post_undock_settle_complete",
         "post_undock_settle_failure_reason",
+        "post_undock_navigation_readiness_failed",
+        "post_undock_navigation_readiness_failure_code",
+        "post_undock_navigation_readiness_detail",
         "pending_goal_held_for_post_undock_settle",
         "pending_goal_released_after_post_undock_settle",
         "using_triggered_baseline_only",
@@ -7329,6 +8834,10 @@ def test_phase_r0_r2_runtime_force_accept_reduction_and_bridge_smoothing_contrac
     )
     nav2_cfg = (overlay / "config" / "nav2.yaml").read_text(encoding="utf-8")
     amcl_cfg = (overlay / "config" / "amcl_shadow.yaml").read_text(encoding="utf-8")
+    phase_r3_doc = (ROOT / "docs" / "phase_r3_explicit_relocalization_fast_smoothing.md").read_text(
+        encoding="utf-8"
+    )
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
     audit_reports = sorted(
         (ROOT / "reports").glob("runtime_force_accept_and_bridge_smoothing_audit_*.md")
@@ -7377,12 +8886,20 @@ def test_phase_r0_r2_runtime_force_accept_reduction_and_bridge_smoothing_contrac
         "safe_for_goal_start",
         "bridge_localization_degraded_blocks_goal_start",
         "AMCL_STATIC_STANDBY_NO_CORRECTION",
+        "AMCL correction pending before",
+        "AMCL correction not ready before",
+        "amcl_static_pending_is_standby",
         "amcl_not_moving_no_update_ok",
+        "bridge.amcl_correction_pending",
+        "bridge.amcl_correction_ready",
+        "goal_start_detail",
+        "localization_transition_active",
         "LOCALIZATION_DEGRADED",
         "LOCALIZATION_TRANSITION_ACTIVE",
     ):
         assert token in api_cpp
-    assert "bridge_localization_degraded_blocks_goal_start(bridge_status)" in api_cpp
+    assert "bridge_status_safe_for_goal_start(bridge_status, \"status\"" in api_cpp
+    assert "bridge_status_safe_for_goal_start(bridge_status, \"navigation state\"" in api_cpp
 
     assert "current_transform" in bridge_cpp
     assert "target_transform" in bridge_cpp
@@ -7391,6 +8908,10 @@ def test_phase_r0_r2_runtime_force_accept_reduction_and_bridge_smoothing_contrac
     assert "safe_for_goal_start" in bridge_cpp
     assert "correction_active" in bridge_cpp
     assert "smoothing_enabled" in bridge_cpp
+    assert "explicit_relocalization_fast_smoothing_enabled_" in bridge_cpp
+    assert "explicit_relocalization_uses_fast_smoothing" in bridge_cpp
+    assert "explicit_relocalization_fast_max_duration_sec_" in bridge_cpp
+    assert "smoothing_policy" in bridge_cpp
     assert "online_correction_requires_recovery" in bridge_cpp
     assert "large_correction_rejected_count" in bridge_cpp
     apply_start = bridge_cpp.index("void apply_candidate(")
@@ -7412,6 +8933,10 @@ def test_phase_r0_r2_runtime_force_accept_reduction_and_bridge_smoothing_contrac
         assert "map_odom_smoothing_publish_rate_hz: 50.0" in cfg
         assert "map_odom_smoothing_translation_rate_mps: 0.20" in cfg
         assert "map_odom_smoothing_yaw_rate_radps: 0.25" in cfg
+        assert "explicit_relocalization_fast_smoothing_enabled: true" in cfg
+        assert "explicit_relocalization_fast_correction_translation_m: 1.0" in cfg
+        assert "explicit_relocalization_fast_correction_yaw_rad: 0.35" in cfg
+        assert "explicit_relocalization_fast_max_duration_sec: 3.0" in cfg
         assert "map_odom_large_correction_requires_recovery: true" in cfg
         assert "map_odom_online_hard_reject_translation_m: 0.80" in cfg
         assert "max_odom_tf_age_ms: 100.0" in cfg
@@ -7421,6 +8946,9 @@ def test_phase_r0_r2_runtime_force_accept_reduction_and_bridge_smoothing_contrac
     assert "transform_tolerance: 0.15" in local_costmap_config_block(nav2_cfg)
     assert "MPPIController" in nav2_cfg
     assert "SmacPlanner2D" in nav2_cfg
+    assert "Phase R3 Explicit Relocalization Fast Smoothing" in phase_r3_doc
+    assert "explicit_relocalization_fast" in phase_r3_doc
+    assert "Phase R3 keeps that smoothing model" in readme
 
     script_names = (
         "verify_runtime_force_accept_reduction.sh",
@@ -7480,7 +9008,8 @@ def test_phase24a_local_costmap_timestamp_audit_contracts():
     assert "/lidar_points" not in script_text
     assert ".yaml" not in script_text
     assert "ros2 topic echo /lidar/pointcloud_accel_status" in script_text
-    assert "ros2 topic echo /perception/local_perception_status" in script_text
+    assert "ros2 topic echo /perception/local_perception_status" not in script_text
+    assert "header_once /scan" in script_text
     assert "ros2 topic echo \"${topic}\" --once --field header" in script_text
     assert "ros2 param get" in script_text
     assert 'export AMENT_TRACE_SETUP_FILES="${AMENT_TRACE_SETUP_FILES:-}"' in script_text
@@ -7503,47 +9032,31 @@ def test_phase24a_local_costmap_timestamp_audit_contracts():
         "latest_internal_buffer_stamp_age_ms",
         "latest_internal_buffer_update_age_ms",
         "latest_internal_buffer_seq",
-        "local_worker_start_source_age_ms",
-        "local_worker_end_source_age_ms",
-        "obstacle_output_header_age_ms",
-        "obstacle_output_source_age_ms",
-        "obstacle_output_publish_delay_ms",
-        "obstacle_output_frame_id",
-        "obstacle_output_header_stamp_source=source_stamp",
-        "clearing_output_header_age_ms",
-        "clearing_output_source_age_ms",
-        "clearing_output_publish_delay_ms",
-        "clearing_output_frame_id",
-        "clearing_output_header_stamp_source=source_stamp",
-        "scan_output_header_age_ms",
-        "scan_output_source_age_ms",
-        "scan_output_frame_id",
-        "tf_drop_suspect_obstacle_header_age_over_100ms_count",
-        "tf_drop_suspect_obstacle_header_age_over_200ms_count",
-    ):
-        assert field in accel_axis
+            "publish_time",
+            "source_stamp",
+            "scan_output_header_age_ms",
+            "scan_output_source_age_ms",
+            "scan_output_frame_id",
+        ):
+            assert field in accel_axis
 
-    for field in (
-        "input_header_age_ms",
-        "input_receive_age_ms",
-        "obstacle_output_header_age_ms",
-        "obstacle_output_source_age_ms",
-        "obstacle_output_frame_id",
-        "clearing_output_header_age_ms",
-        "clearing_output_source_age_ms",
-        "clearing_output_frame_id",
-    ):
-        assert field in local_perception
+    assert 'declare_parameter<bool>("enabled", false)' in local_perception
+    assert "robot_local_perception is retired and disabled by default" in local_perception
 
     assert "global_frame: odom" in nav2
     assert "global_frame: base_link" not in nav2
-    assert "sensor_frame: base_link" in nav2
+    assert "sensor_frame: lidar_level_link" in nav2
+    assert "sensor_frame: base_link" not in nav2
     assert "tf_filter_tolerance" not in nav2
     assert "observation_persistence: 0.0" in nav2
-    assert "obstacle_output_stamp_policy" not in accel_cfg
-    assert "obstacle_output_stamp_policy" not in local_perception_cfg
-    assert "restamp_to_now: false" in local_perception_cfg
-    assert "restamp_to_latest_tf: false" in local_perception_cfg
+    assert "local_worker_enabled: false" in accel_cfg
+    assert "worker_local_enabled: false" in accel_cfg
+    assert 'local_output_topic: ""' in accel_cfg
+    assert 'nav_output_topic: ""' in accel_cfg
+    assert "enabled: false" in local_perception_cfg
+    assert 'input_topic: ""' in local_perception_cfg
+    assert 'output_topic: ""' in local_perception_cfg
+    assert 'clearing_output_topic: ""' in local_perception_cfg
     assert "input_reliable: false" in accel_cfg
     assert "output_reliable: false" in accel_cfg
     assert "input_reliable: false" in local_perception_cfg

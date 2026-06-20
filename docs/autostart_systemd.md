@@ -9,6 +9,11 @@ The service does not start the Web dashboard. It starts:
 
 The systemd runner intentionally calls `njrh_container.sh start` instead of `start-runtime`. `start-runtime` is a manual convenience command that starts common services in the background; using it from systemd and then foregrounding `run_common_services.sh` would create duplicate common-service nodes.
 
+On `systemctl stop` or `systemctl restart`, the runner stops both common-service
+processes and resident navigation/localization children from the previous run.
+This is a service-bound cleanup path, not a runtime watchdog: normal navigation
+does not self-restart Nav2, AMCL, Isaac localization, or `robot_localization_bridge`.
+
 Install and enable:
 
 ```bash

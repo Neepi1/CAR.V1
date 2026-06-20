@@ -153,9 +153,9 @@ cat <<'EOF'
 [lidar-trunk-jitter]   ros2 topic hz /lidar_points
 [lidar-trunk-jitter] This creates a full-density subscriber and can add pressure. Prefer /lidar/axis_remap_status for final publish-side judgment.
 [lidar-trunk-jitter] Obstacle follow-up:
-[lidar-trunk-jitter]   ros2 topic echo /perception/local_perception_status --field data
-[lidar-trunk-jitter]   ros2 topic hz /perception/obstacle_points
-[lidar-trunk-jitter] Watch input_callback_hz, processed_cloud_hz, published_obstacle_hz, no_new_count, and input_interarrival_ms_max.
+[lidar-trunk-jitter]   ros2 topic echo /lidar/pointcloud_accel_status --field data
+[lidar-trunk-jitter]   ros2 topic hz /scan
+[lidar-trunk-jitter] Watch scan_publish_hz, scan_output_header_age_ms, and scan_output_source_age_ms.
 EOF
 
 if [[ "${status}" -eq 0 ]]; then

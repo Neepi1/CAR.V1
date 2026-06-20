@@ -13,21 +13,17 @@ RESOLVED_INGRESS_PROFILE="${NJRH_POINTCLOUD_INGRESS_PROFILE}"
 
 AXIS_STATUS_TOPIC="${NJRH_POINTCLOUD_ACCEL_AXIS_STATUS_TOPIC:-/lidar/axis_remap_status}"
 ACCEL_STATUS_TOPIC="${NJRH_POINTCLOUD_ACCEL_STATUS_TOPIC:-/lidar/pointcloud_accel_status}"
-LOCAL_STATUS_TOPIC="${NJRH_POINTCLOUD_ACCEL_LOCAL_STATUS_TOPIC:-/perception/local_perception_status}"
 ACCEL_CONFIG="${NJRH_POINTCLOUD_ACCEL_AXIS_CONFIG:-${NJRH_OVERLAY_ROOT}/config/pointcloud_accel_axis.yaml}"
 MIN_TRUNK_HZ="${NJRH_POINTCLOUD_ACCEL_MIN_TRUNK_HZ:-18.0}"
-MIN_OBSTACLE_HZ="${NJRH_POINTCLOUD_ACCEL_MIN_OBSTACLE_HZ:-10.0}"
 MIN_SCAN_HZ="${NJRH_POINTCLOUD_ACCEL_MIN_SCAN_HZ:-8.0}"
 MIN_FLATSCAN_HZ="${NJRH_FLATSCAN_MIN_HZ:-5.0}"
 FLATSCAN_STATUS_FILE="${NJRH_FLATSCAN_HELPER_STATUS_FILE:-${NJRH_RUNTIME_LOG_DIR}/flatscan_helper_status.env}"
-ALLOW_LOCAL_PERCEPTION_FALLBACK="${NJRH_POINTCLOUD_ACCEL_ALLOW_LOCAL_PERCEPTION_FALLBACK:-false}"
 ALLOW_LEGACY_SCAN_FALLBACK="${NJRH_POINTCLOUD_ACCEL_ALLOW_LEGACY_SCAN_FALLBACK:-false}"
 TMP_DIR="$(mktemp -d /tmp/njrh_pointcloud_accel_verify_XXXX)"
 trap 'rm -rf "${TMP_DIR}"' EXIT
 
 status=0
 profile_owner_contract_ok=true
-legacy_scan_chain_ok=true
 ipc_worker_owner_ok=true
 trunk_full_density_ok=true
 nav2_compat_topics_ok=true
@@ -118,11 +114,6 @@ mark_profile_fail() {
   profile_owner_contract_ok=false
 }
 
-mark_legacy_scan_fail() {
-  legacy_scan_chain_ok=false
-  nav2_compat_topics_ok=false
-}
-
 mark_ipc_fail() {
   ipc_worker_owner_ok=false
 }
@@ -138,11 +129,8 @@ mark_nav2_fail() {
 for spec in \
   "/lidar_points:lidar" \
   "/jt128/vendor/points_raw:vendor_raw" \
-  "/perception/obstacle_points:obstacle" \
-  "/perception/clearing_points:clearing" \
   "/points_nav:points_nav" \
   "/lidar_points_nav:lidar_points_nav" \
-  "/_internal/lidar_points_local:internal_local" \
   "/scan:scan" \
   "/flatscan:flatscan"; do
   topic="${spec%%:*}"
@@ -176,14 +164,9 @@ lidar_publishers="$(topic_count lidar "Publisher count")"
 lidar_subscribers="$(topic_count lidar "Subscription count")"
 vendor_raw_publishers="$(topic_count vendor_raw "Publisher count")"
 vendor_raw_subscribers="$(topic_count vendor_raw "Subscription count")"
-obstacle_publishers="$(topic_count obstacle "Publisher count")"
-obstacle_subscribers="$(topic_count obstacle "Subscription count")"
-clearing_publishers="$(topic_count clearing "Publisher count")"
-clearing_subscribers="$(topic_count clearing "Subscription count")"
 points_nav_publishers="$(topic_count points_nav "Publisher count")"
 points_nav_subscribers="$(topic_count points_nav "Subscription count")"
 lidar_points_nav_publishers="$(topic_count lidar_points_nav "Publisher count")"
-internal_local_publishers="$(topic_count internal_local "Publisher count")"
 scan_publishers="$(topic_count scan "Publisher count")"
 scan_subscribers="$(topic_count scan "Subscription count")"
 flatscan_publishers="$(topic_count flatscan "Publisher count")"
@@ -191,16 +174,12 @@ flatscan_subscribers="$(topic_count flatscan "Subscription count")"
 
 lidar_publisher_nodes="$(publisher_nodes lidar || true)"
 vendor_raw_publisher_nodes="$(publisher_nodes vendor_raw || true)"
-obstacle_publisher_nodes="$(publisher_nodes obstacle || true)"
-clearing_publisher_nodes="$(publisher_nodes clearing || true)"
 points_nav_publisher_nodes="$(publisher_nodes points_nav || true)"
 scan_publisher_nodes="$(publisher_nodes scan || true)"
 flatscan_publisher_nodes="$(publisher_nodes flatscan || true)"
 
 lidar_owner="$(nodes_csv <<<"${lidar_publisher_nodes}")"
 vendor_raw_owner="$(nodes_csv <<<"${vendor_raw_publisher_nodes}")"
-obstacle_owner="$(nodes_csv <<<"${obstacle_publisher_nodes}")"
-clearing_owner="$(nodes_csv <<<"${clearing_publisher_nodes}")"
 points_nav_owner="$(nodes_csv <<<"${points_nav_publisher_nodes}")"
 scan_owner="$(nodes_csv <<<"${scan_publisher_nodes}")"
 flatscan_owner="$(nodes_csv <<<"${flatscan_publisher_nodes}")"
@@ -209,14 +188,9 @@ echo "[pointcloud-accel-verify] /lidar_points publisher count=${lidar_publishers
 echo "[pointcloud-accel-verify] /lidar_points publisher_nodes=${lidar_owner}"
 echo "[pointcloud-accel-verify] actual trunk owner=${lidar_owner:-missing}"
 echo "[pointcloud-accel-verify] /jt128/vendor/points_raw publishers=${vendor_raw_publishers} subscribers=${vendor_raw_subscribers} publisher_nodes=${vendor_raw_owner}"
-echo "[pointcloud-accel-verify] /perception/obstacle_points publishers=${obstacle_publishers} subscribers=${obstacle_subscribers} publisher_nodes=${obstacle_owner}"
-echo "[pointcloud-accel-verify] actual obstacle owner=${obstacle_owner:-missing}"
-echo "[pointcloud-accel-verify] /perception/clearing_points publishers=${clearing_publishers} subscribers=${clearing_subscribers} publisher_nodes=${clearing_owner}"
-echo "[pointcloud-accel-verify] actual clearing owner=${clearing_owner:-missing}"
 echo "[pointcloud-accel-verify] /points_nav publishers=${points_nav_publishers} subscribers=${points_nav_subscribers} publisher_nodes=${points_nav_owner}"
 echo "[pointcloud-accel-verify] actual points_nav owner=${points_nav_owner:-missing}"
 echo "[pointcloud-accel-verify] /lidar_points_nav publishers=${lidar_points_nav_publishers}"
-echo "[pointcloud-accel-verify] /_internal/lidar_points_local publishers=${internal_local_publishers}"
 echo "[pointcloud-accel-verify] /scan publishers=${scan_publishers} subscribers=${scan_subscribers} publisher_nodes=${scan_owner}"
 echo "[pointcloud-accel-verify] actual scan owner=${scan_owner:-missing}"
 echo "[pointcloud-accel-verify] /flatscan publishers=${flatscan_publishers} subscribers=${flatscan_subscribers} publisher_nodes=${flatscan_owner}"
@@ -236,19 +210,6 @@ else
 fi
 
 case "${RESOLVED_PROFILE}" in
-  legacy)
-    if node_list_has "${lidar_publisher_nodes}" '(^|[[:space:]])pointcloud_axis_remap(_node)?($|[[:space:]])'; then
-      echo "[pointcloud-accel-verify] PASS legacy trunk owner is pointcloud_axis_remap"
-    else
-      fail "legacy /lidar_points publisher must be pointcloud_axis_remap_node or pointcloud_axis_remap"
-      mark_profile_fail
-      mark_trunk_fail
-    fi
-    if node_list_has "${lidar_publisher_nodes}" '(^|[[:space:]])pointcloud_accel_axis_node($|[[:space:]])'; then
-      fail "legacy must not use pointcloud_accel_axis_node as trunk owner"
-      mark_profile_fail
-    fi
-    ;;
   ipc_worker|nitros)
     if node_list_has "${lidar_publisher_nodes}" '(^|[[:space:]])pointcloud_axis_remap(_node)?($|[[:space:]])'; then
       fail "${RESOLVED_PROFILE} is still using legacy pointcloud_axis_remap as trunk owner"
@@ -273,6 +234,10 @@ case "${RESOLVED_PROFILE}" in
       mark_trunk_fail
     fi
     ;;
+  *)
+    fail "unsupported pointcloud accel profile ${RESOLVED_PROFILE}; legacy local PointCloud2 obstacle profiles are removed"
+    mark_profile_fail
+    ;;
 esac
 
 if [[ "${RESOLVED_PROFILE}" == "nitros" ]] && ! bash "${SCRIPT_DIR}/check_isaac_ros_nitros_env.sh" >/dev/null 2>&1; then
@@ -283,15 +248,11 @@ fi
 
 axis_status="$(status_once "${AXIS_STATUS_TOPIC}")"
 accel_status="$(status_once "${ACCEL_STATUS_TOPIC}")"
-local_status="$(status_once "${LOCAL_STATUS_TOPIC}")"
 if [[ -n "${axis_status}" ]]; then
   echo "[pointcloud-accel-verify] axis_status=${axis_status}"
 fi
 if [[ -n "${accel_status}" ]]; then
   echo "[pointcloud-accel-verify] accel_status=${accel_status}"
-fi
-if [[ -n "${local_status}" && "${RESOLVED_PROFILE}" == "legacy" ]]; then
-  echo "[pointcloud-accel-verify] local_status=${local_status}"
 fi
 
 local_worker_enabled="$(field_value "${accel_status}" local_worker_enabled)"
@@ -331,73 +292,56 @@ echo "[pointcloud-accel-verify] scan_worker_intermediate_pointcloud_build_count=
 echo "[pointcloud-accel-verify] local_worker_lock_wait_ms_max=${local_worker_lock_wait_ms_max:-missing}"
 echo "[pointcloud-accel-verify] scan_worker_lock_wait_ms_max=${scan_worker_lock_wait_ms_max:-missing}"
 
-if [[ "${RESOLVED_PROFILE}" == "legacy" ]]; then
-  legacy_input_topic="$(field_value "${local_status}" input_topic)"
-  if [[ -z "${axis_status}" ]]; then
-    fail "${AXIS_STATUS_TOPIC} is required for legacy"
-    mark_profile_fail
-  fi
-  if [[ -z "${local_status}" ]]; then
-    fail "${LOCAL_STATUS_TOPIC} is required for legacy"
-    mark_profile_fail
-  elif [[ "${legacy_input_topic}" == "/_internal/lidar_points_local" ]]; then
-    echo "[pointcloud-accel-verify] PASS legacy robot_local_perception input_topic=/_internal/lidar_points_local"
-  else
-    fail "legacy robot_local_perception input_topic is ${legacy_input_topic:-missing}, expected /_internal/lidar_points_local"
-    mark_profile_fail
-  fi
-else
-  if [[ -z "${accel_status}" ]]; then
-    fail "${ACCEL_STATUS_TOPIC} is required for ${RESOLVED_PROFILE}"
-    mark_profile_fail
-    mark_ipc_fail
-  fi
-  if [[ "${local_worker_enabled:-false}" != "true" ]]; then
-    fail "local_worker_enabled must be true for ${RESOLVED_PROFILE}"
-    mark_profile_fail
-    mark_ipc_fail
-  fi
-  if [[ "${scan_worker_enabled:-false}" != "true" ]]; then
-    fail "scan_worker_enabled must be true for ${RESOLVED_PROFILE}"
+if [[ -z "${accel_status}" ]]; then
+  fail "${ACCEL_STATUS_TOPIC} is required for ${RESOLVED_PROFILE}"
+  mark_profile_fail
+  mark_ipc_fail
+fi
+if [[ "${local_worker_enabled:-true}" != "false" ]]; then
+  fail "local_worker_enabled must be false for ${RESOLVED_PROFILE}; local costmap uses /scan"
+  mark_profile_fail
+  mark_ipc_fail
+fi
+if [[ "${scan_worker_enabled:-false}" != "true" ]]; then
+  fail "scan_worker_enabled must be true for ${RESOLVED_PROFILE}"
+  mark_profile_fail
+  mark_ipc_fail
+fi
+if [[ "${RESOLVED_INGRESS_PROFILE}" == "separate_process" && "${status_vendor_raw_ros_hop_required:-missing}" == "false" ]]; then
+  fail "separate_process status must not claim vendor_raw_ros_hop_required=false"
+  mark_profile_fail
+fi
+if [[ "${RESOLVED_INGRESS_PROFILE}" == "driver_integrated" ]]; then
+  if [[ "${status_vendor_raw_ros_hop_required:-missing}" != "false" ]]; then
+    fail "driver_integrated selected but status does not report vendor_raw_ros_hop_required=false"
     mark_profile_fail
     mark_ipc_fail
   fi
-  if [[ "${RESOLVED_INGRESS_PROFILE}" == "separate_process" && "${status_vendor_raw_ros_hop_required:-missing}" == "false" ]]; then
-    fail "separate_process status must not claim vendor_raw_ros_hop_required=false"
-    mark_profile_fail
-  fi
-  if [[ "${RESOLVED_INGRESS_PROFILE}" == "driver_integrated" ]]; then
-    if [[ "${status_vendor_raw_ros_hop_required:-missing}" != "false" ]]; then
-      fail "driver_integrated selected but status does not report vendor_raw_ros_hop_required=false"
-      mark_profile_fail
-      mark_ipc_fail
-    fi
-    if [[ "${status_driver_integrated_process:-missing}" != "true" ]]; then
-      fail "driver_integrated selected but accel status is not from integrated process"
-      mark_profile_fail
-      mark_ipc_fail
-    fi
-  fi
-  if [[ "${internal_zero_copy_profile:-false}" != "true" ]]; then
-    fail "internal_zero_copy_profile must be true for ${RESOLVED_PROFILE}"
+  if [[ "${status_driver_integrated_process:-missing}" != "true" ]]; then
+    fail "driver_integrated selected but accel status is not from integrated process"
     mark_profile_fail
     mark_ipc_fail
   fi
-  if [[ -z "${latest_internal_buffer_points}" ]] || ! float_ge "${latest_internal_buffer_points}" 1.0; then
-    fail "latest_internal_buffer_points must be present and nonzero for ${RESOLVED_PROFILE}"
-    mark_profile_fail
-    mark_ipc_fail
-  fi
-  if [[ "${local_worker_full_cloud_copy_count:-missing}" != "0" || "${scan_worker_full_cloud_copy_count:-missing}" != "0" ]]; then
-    fail "worker full PointCloud2 copy counters must stay zero"
-    mark_profile_fail
-    mark_ipc_fail
-  fi
-  if [[ "${local_worker_intermediate_pointcloud_build_count:-missing}" != "0" || "${scan_worker_intermediate_pointcloud_build_count:-missing}" != "0" ]]; then
-    fail "worker intermediate PointCloud2 build counters must stay zero"
-    mark_profile_fail
-    mark_ipc_fail
-  fi
+fi
+if [[ "${internal_zero_copy_profile:-false}" != "true" ]]; then
+  fail "internal_zero_copy_profile must be true for ${RESOLVED_PROFILE}"
+  mark_profile_fail
+  mark_ipc_fail
+fi
+if [[ -z "${latest_internal_buffer_points}" ]] || ! float_ge "${latest_internal_buffer_points}" 1.0; then
+  fail "latest_internal_buffer_points must be present and nonzero for ${RESOLVED_PROFILE}"
+  mark_profile_fail
+  mark_ipc_fail
+fi
+if [[ "${local_worker_full_cloud_copy_count:-missing}" != "0" || "${scan_worker_full_cloud_copy_count:-missing}" != "0" ]]; then
+  fail "worker full PointCloud2 copy counters must stay zero"
+  mark_profile_fail
+  mark_ipc_fail
+fi
+if [[ "${local_worker_intermediate_pointcloud_build_count:-missing}" != "0" || "${scan_worker_intermediate_pointcloud_build_count:-missing}" != "0" ]]; then
+  fail "worker intermediate PointCloud2 build counters must stay zero"
+  mark_profile_fail
+  mark_ipc_fail
 fi
 
 axis_hz="$(field_value "${axis_status}" fast_path_lidar_points_publish_hz)"
@@ -411,13 +355,7 @@ elif ! float_ge "${axis_hz}" "${MIN_TRUNK_HZ}"; then
 fi
 
 obstacle_hz="$(field_value "${accel_status}" local_worker_obstacle_publish_hz)"
-if [[ -z "${obstacle_hz}" ]]; then
-  obstacle_hz="$(field_value "${local_status}" published_obstacle_hz)"
-fi
 clearing_hz="$(field_value "${accel_status}" local_worker_clearing_publish_hz)"
-if [[ -z "${clearing_hz}" ]]; then
-  clearing_hz="$(field_value "${local_status}" published_clearing_hz)"
-fi
 scan_hz="$(field_value "${accel_status}" scan_worker_scan_publish_hz)"
 if [[ -z "${scan_hz}" ]]; then
   scan_hz="$(light_hz /scan)"
@@ -449,22 +387,16 @@ else
   mark_nav2_fail
 fi
 
-if [[ "${RESOLVED_PROFILE}" != "legacy" ]]; then
-  if [[ -z "${obstacle_hz}" ]] || ! float_ge "${obstacle_hz}" "${MIN_OBSTACLE_HZ}"; then
-    if [[ -n "${obstacle_hz}" ]] && float_ge "${obstacle_hz}" 9.0; then
-      warn "obstacle is 9-10Hz but stable"
-    else
-      fail "obstacle < ${MIN_OBSTACLE_HZ}Hz"
-      mark_nav2_fail
-    fi
-  fi
-  if [[ -z "${scan_hz}" ]] || ! float_ge "${scan_hz}" "${MIN_SCAN_HZ}"; then
-    if [[ -n "${scan_hz}" ]] && float_ge "${scan_hz}" 7.0; then
-      warn "scan is 7-8Hz"
-    else
-      fail "scan < ${MIN_SCAN_HZ}Hz"
-      mark_nav2_fail
-    fi
+if [[ "${obstacle_publishers:-0}" != "0" || "${clearing_publishers:-0}" != "0" ]]; then
+  fail "local pointcloud obstacle/clearing publishers must be 0 when local_worker_enabled=false"
+  mark_nav2_fail
+fi
+if [[ -z "${scan_hz}" ]] || ! float_ge "${scan_hz}" "${MIN_SCAN_HZ}"; then
+  if [[ -n "${scan_hz}" ]] && float_ge "${scan_hz}" 7.0; then
+    warn "scan is 7-8Hz"
+  else
+    fail "scan < ${MIN_SCAN_HZ}Hz"
+    mark_nav2_fail
   fi
 fi
 
@@ -473,96 +405,50 @@ if [[ "${RESOLVED_INGRESS_PROFILE}" == "driver_integrated" ]]; then
   expected_accel_owner='(^|[[:space:]])hesai_accel_driver_node($|[[:space:]])|(^|[[:space:]])jt128_accel_driver_node($|[[:space:]])'
 fi
 
-if [[ "${RESOLVED_PROFILE}" == "legacy" ]]; then
-  if node_list_has "${obstacle_publisher_nodes}" '(^|[[:space:]])robot_local_perception($|[[:space:]])'; then
-    echo "[pointcloud-accel-verify] PASS legacy obstacle owner is robot_local_perception"
+if grep -Eq '^[[:space:]]*(local_worker_enabled|worker_local_enabled):[[:space:]]*true[[:space:]]*$' "${ACCEL_CONFIG}"; then
+  fail "local PointCloud2 worker must be disabled in ${ACCEL_CONFIG}"
+  mark_profile_fail
+  mark_ipc_fail
+else
+  echo "[pointcloud-accel-verify] PASS local PointCloud2 worker disabled by config"
+fi
+if grep -Eq '^[[:space:]]*(obstacle_output_topic|clearing_output_topic):[[:space:]]*/' "${ACCEL_CONFIG}"; then
+  fail "retired local PointCloud2 obstacle output topic is configured in ${ACCEL_CONFIG}"
+  mark_profile_fail
+  mark_ipc_fail
+else
+  echo "[pointcloud-accel-verify] PASS retired local PointCloud2 obstacle output topics are not configured"
+fi
+if node_list_has "${scan_publisher_nodes}" "${expected_accel_owner}"; then
+  echo "[pointcloud-accel-verify] PASS ${RESOLVED_PROFILE}/${RESOLVED_INGRESS_PROFILE} scan owner is accel core process"
+else
+  fail "${RESOLVED_PROFILE}/${RESOLVED_INGRESS_PROFILE} scan owner must be the selected accel core process or an explicit accel scan worker"
+  mark_profile_fail
+  mark_ipc_fail
+fi
+if [[ "${points_nav_publishers}" != "0" ]] || node_list_has "${points_nav_publisher_nodes}" '(^|[[:space:]])nav_cloud_preprocessor($|[[:space:]])'; then
+  if [[ "${ALLOW_LEGACY_SCAN_FALLBACK}" == "true" ]]; then
+    warn "/points_nav legacy scan fallback observed in ${RESOLVED_PROFILE}"
   else
-    fail "legacy obstacle owner must be robot_local_perception"
+    fail "/points_nav still has a production publisher in ${RESOLVED_PROFILE}; it must not be the production scan hop"
     mark_profile_fail
-  fi
-  if node_list_has "${clearing_publisher_nodes}" '(^|[[:space:]])robot_local_perception($|[[:space:]])'; then
-    echo "[pointcloud-accel-verify] PASS legacy clearing owner is robot_local_perception"
-  else
-    fail "legacy clearing owner must be robot_local_perception"
-    mark_profile_fail
-  fi
-  if [[ "${points_nav_publishers}" != "0" ]] && node_list_has "${points_nav_publisher_nodes}" '(^|[[:space:]])nav_cloud_preprocessor($|[[:space:]])'; then
-    echo "[pointcloud-accel-verify] PASS legacy points_nav owner is nav_cloud_preprocessor"
-  else
-    fail "legacy missing /points_nav publisher from nav_cloud_preprocessor"
-    mark_legacy_scan_fail
-  fi
-  if [[ "${scan_publishers}" != "0" ]] && node_list_has "${scan_publisher_nodes}" '(^|[[:space:]])scan_republisher($|[[:space:]])'; then
-    echo "[pointcloud-accel-verify] PASS legacy scan owner is scan_republisher"
-  else
-    fail "legacy missing /scan publisher from scan_republisher"
-    mark_legacy_scan_fail
-  fi
-  if [[ "${flatscan_publishers}" != "0" ]] && node_list_has "${flatscan_publisher_nodes}" '(^|[[:space:]])laser_scan_to_flatscan($|[[:space:]])'; then
-    flatscan_owner_ok=true
-    echo "[pointcloud-accel-verify] PASS legacy flatscan owner is laser_scan_to_flatscan"
-  else
-    fail "legacy missing /flatscan publisher from laser_scan_to_flatscan"
-    mark_legacy_scan_fail
+    mark_ipc_fail
   fi
 else
-  if node_list_has "${obstacle_publisher_nodes}" '(^|[[:space:]])robot_local_perception($|[[:space:]])'; then
-    if [[ "${ALLOW_LOCAL_PERCEPTION_FALLBACK}" == "true" ]]; then
-      warn "${RESOLVED_PROFILE} obstacle owner includes standalone robot_local_perception fallback"
-    else
-      fail "${RESOLVED_PROFILE} obstacle owner is still standalone robot_local_perception"
-      mark_profile_fail
-      mark_ipc_fail
-    fi
-  fi
-  if node_list_has "${obstacle_publisher_nodes}" "${expected_accel_owner}"; then
-    echo "[pointcloud-accel-verify] PASS ${RESOLVED_PROFILE}/${RESOLVED_INGRESS_PROFILE} obstacle owner is accel core process"
-  else
-    fail "${RESOLVED_PROFILE}/${RESOLVED_INGRESS_PROFILE} obstacle owner must be the selected accel core process unless an explicit fallback is documented"
-    mark_profile_fail
-    mark_ipc_fail
-  fi
-  if node_list_has "${clearing_publisher_nodes}" "${expected_accel_owner}"; then
-    echo "[pointcloud-accel-verify] PASS ${RESOLVED_PROFILE}/${RESOLVED_INGRESS_PROFILE} clearing owner is accel core process"
-  else
-    fail "${RESOLVED_PROFILE}/${RESOLVED_INGRESS_PROFILE} clearing owner must be the selected accel core process unless an explicit fallback is documented"
-    mark_profile_fail
-    mark_ipc_fail
-  fi
-  if node_list_has "${scan_publisher_nodes}" "${expected_accel_owner}"; then
-    echo "[pointcloud-accel-verify] PASS ${RESOLVED_PROFILE}/${RESOLVED_INGRESS_PROFILE} scan owner is accel core process"
-  else
-    fail "${RESOLVED_PROFILE}/${RESOLVED_INGRESS_PROFILE} scan owner must be the selected accel core process or an explicit accel scan worker"
-    mark_profile_fail
-    mark_ipc_fail
-  fi
-  if [[ "${points_nav_publishers}" != "0" ]] || node_list_has "${points_nav_publisher_nodes}" '(^|[[:space:]])nav_cloud_preprocessor($|[[:space:]])'; then
-    if [[ "${ALLOW_LEGACY_SCAN_FALLBACK}" == "true" ]]; then
-      warn "/points_nav legacy scan fallback observed in ${RESOLVED_PROFILE}"
-    else
-      fail "/points_nav still has a production publisher in ${RESOLVED_PROFILE}; it must not be the production scan hop"
-      mark_profile_fail
-      mark_ipc_fail
-    fi
-  else
-    echo "[pointcloud-accel-verify] PASS /points_nav is not a production hop for ${RESOLVED_PROFILE}"
-  fi
-  if [[ "${internal_local_publishers}" != "0" ]]; then
-    echo "[pointcloud-accel-verify] /_internal/lidar_points_local debug_compat_publishers=${internal_local_publishers}"
-  fi
-  if [[ "${flatscan_publishers}" != "0" ]] && node_list_has "${flatscan_publisher_nodes}" '(^|[[:space:]])laser_scan_to_flatscan($|[[:space:]])'; then
-    flatscan_owner_ok=true
-    echo "[pointcloud-accel-verify] PASS ${RESOLVED_PROFILE} flatscan compatibility owner is laser_scan_to_flatscan"
-  elif [[ "${flatscan_publishers}" != "0" ]] && node_list_has "${flatscan_publisher_nodes}" '(^|[[:space:]])pointcloud_accel_axis_node($|[[:space:]])'; then
-    flatscan_owner_ok=true
-    echo "[pointcloud-accel-verify] PASS ${RESOLVED_PROFILE} flatscan owner is pointcloud_accel_axis_node direct publisher"
-  elif [[ "${flatscan_publishers}" == "0" ]]; then
-    fail "${RESOLVED_PROFILE} /flatscan compatibility publisher is missing"
-    mark_nav2_fail
-  else
-    fail "${RESOLVED_PROFILE} /flatscan publisher owner is unexpected: ${flatscan_owner:-missing}"
-    mark_nav2_fail
-  fi
+  echo "[pointcloud-accel-verify] PASS /points_nav is not a production hop for ${RESOLVED_PROFILE}"
+fi
+if [[ "${flatscan_publishers}" != "0" ]] && node_list_has "${flatscan_publisher_nodes}" '(^|[[:space:]])laser_scan_to_flatscan($|[[:space:]])'; then
+  flatscan_owner_ok=true
+  echo "[pointcloud-accel-verify] PASS ${RESOLVED_PROFILE} flatscan compatibility owner is laser_scan_to_flatscan"
+elif [[ "${flatscan_publishers}" != "0" ]] && node_list_has "${flatscan_publisher_nodes}" '(^|[[:space:]])pointcloud_accel_axis_node($|[[:space:]])'; then
+  flatscan_owner_ok=true
+  echo "[pointcloud-accel-verify] PASS ${RESOLVED_PROFILE} flatscan owner is pointcloud_accel_axis_node direct publisher"
+elif [[ "${flatscan_publishers}" == "0" ]]; then
+  fail "${RESOLVED_PROFILE} /flatscan compatibility publisher is missing"
+  mark_nav2_fail
+else
+  fail "${RESOLVED_PROFILE} /flatscan publisher owner is unexpected: ${flatscan_owner:-missing}"
+  mark_nav2_fail
 fi
 
 hesai_driver_running=false
@@ -589,11 +475,9 @@ echo "[pointcloud-accel-verify] hesai_accel_driver_node_running=${hesai_accel_dr
 echo "[pointcloud-accel-verify] pointcloud_accel_axis_node_running=${pointcloud_accel_axis_running}"
 if [[ "${RESOLVED_INGRESS_PROFILE}" == "separate_process" ]]; then
   [[ "${hesai_driver_running}" == "true" ]] || { fail "separate_process requires hesai_ros_driver_node"; mark_profile_fail; }
-  if [[ "${RESOLVED_PROFILE}" != "legacy" ]]; then
-    [[ "${pointcloud_accel_axis_running}" == "true" ]] || { fail "separate_process accel profile requires pointcloud_accel_axis_node"; mark_profile_fail; mark_ipc_fail; }
-    [[ "${vendor_raw_publishers}" == "1" ]] || { fail "separate_process requires /jt128/vendor/points_raw publisher=1"; mark_profile_fail; }
-    [[ "${vendor_raw_subscribers}" != "0" ]] || { fail "separate_process requires /jt128/vendor/points_raw subscriber from accel node"; mark_profile_fail; }
-  fi
+  [[ "${pointcloud_accel_axis_running}" == "true" ]] || { fail "separate_process accel profile requires pointcloud_accel_axis_node"; mark_profile_fail; mark_ipc_fail; }
+  [[ "${vendor_raw_publishers}" == "1" ]] || { fail "separate_process requires /jt128/vendor/points_raw publisher=1"; mark_profile_fail; }
+  [[ "${vendor_raw_subscribers}" != "0" ]] || { fail "separate_process requires /jt128/vendor/points_raw subscriber from accel node"; mark_profile_fail; }
 else
   [[ "${hesai_accel_driver_running}" == "true" ]] || { fail "driver_integrated requires hesai_accel_driver_node running"; mark_profile_fail; mark_ipc_fail; }
   [[ "${hesai_driver_running}" == "false" ]] || { fail "driver_integrated must not run standalone hesai_ros_driver_node"; mark_profile_fail; mark_ipc_fail; }
@@ -641,26 +525,21 @@ else
   warn "bt_navigator lifecycle unavailable"
 fi
 
-if grep -q "/local_costmap" "${TMP_DIR}/obstacle.info"; then
-  echo "[pointcloud-accel-verify] PASS local_costmap subscribes /perception/obstacle_points"
+if grep -q "/local_costmap" "${TMP_DIR}/scan.info"; then
+  echo "[pointcloud-accel-verify] PASS local_costmap subscribes /scan"
 else
-  fail "local_costmap subscriber not observed on /perception/obstacle_points"
+  fail "local_costmap subscriber not observed on /scan"
   mark_nav2_fail
 fi
-if grep -q "collision_monitor" "${TMP_DIR}/obstacle.info"; then
-  echo "[pointcloud-accel-verify] PASS collision_monitor subscribes /perception/obstacle_points"
+if grep -q "collision_monitor" "${TMP_DIR}/scan.info"; then
+  echo "[pointcloud-accel-verify] PASS collision_monitor subscribes /scan"
 else
-  fail "collision_monitor subscriber not observed on /perception/obstacle_points"
+  fail "collision_monitor subscriber not observed on /scan"
   mark_nav2_fail
 fi
 
-if [[ "${RESOLVED_PROFILE}" == "legacy" ]]; then
-  echo "[pointcloud-accel-verify] production_hop_internal_local_branch=true"
-  echo "[pointcloud-accel-verify] production_hop_points_nav=true"
-else
-  echo "[pointcloud-accel-verify] production_hop_internal_local_branch=false"
-  echo "[pointcloud-accel-verify] production_hop_points_nav=false"
-fi
+echo "[pointcloud-accel-verify] production_hop_internal_local_branch=false"
+echo "[pointcloud-accel-verify] production_hop_points_nav=false"
 
 echo "[pointcloud-accel-verify] PointCloud2 QoS snapshot:"
 grep -E "Reliability|Depth|Publisher count|Subscription count" "${TMP_DIR}/lidar.info" || true
@@ -674,7 +553,6 @@ top -b -n1 | awk '/^%Cpu/ || /^Cpu/ {print}' || true
 
 echo "[pointcloud-accel-verify] PROFILE_OWNER_CONTRACT_OK=${profile_owner_contract_ok}"
 echo "[pointcloud-accel-verify] INGRESS_PROFILE=${RESOLVED_INGRESS_PROFILE}"
-echo "[pointcloud-accel-verify] LEGACY_SCAN_CHAIN_OK=${legacy_scan_chain_ok}"
 echo "[pointcloud-accel-verify] IPC_WORKER_OWNER_OK=${ipc_worker_owner_ok}"
 echo "[pointcloud-accel-verify] TRUNK_FULL_DENSITY_OK=${trunk_full_density_ok}"
 echo "[pointcloud-accel-verify] NAV2_COMPAT_TOPICS_OK=${nav2_compat_topics_ok}"

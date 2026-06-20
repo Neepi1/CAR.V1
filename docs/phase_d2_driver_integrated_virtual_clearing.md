@@ -23,7 +23,11 @@ No architecture contract changes are made:
 - `map->odom` stays owned by `robot_localization_bridge`.
 - `odom->base_link` stays owned by `robot_local_state`.
 - FAST-LIO2 remains mapping-only in standard navigation.
-- DDS/QoS, PointCloud2 timestamps, TF ownership, Nav2 planner/controller parameters, and MPPI are unchanged.
+- DDS/QoS, TF ownership, Nav2 planner/controller parameters, and MPPI are unchanged.
+- Only the derived local-costmap clouds (`/perception/obstacle_points` and
+  `/perception/clearing_points`) use the TF-aligned local odom stamp described
+  below. The `/lidar_points` trunk, `/scan`, raw JT128 timestamps, and mapping
+  chain are unchanged.
 
 ## Root Cause
 
@@ -39,6 +43,13 @@ That means the local worker could mark obstacles, but it did not consistently
 publish near and multi-height clearing rays to remove stale VoxelLayer cells
 around the robot.
 
+A later field check found the virtual clearing cloud was being published and
+received, but local VoxelLayer cells near `base_link` still stayed high/lethal
+after the current `/perception/obstacle_points` cloud had no near returns. The
+local VoxelLayer now uses `combination_method: 0` so clearing-only rays can
+lower stale costs in the master grid instead of preserving old lethal cells
+through MAX combination.
+
 ## Implementation
 
 `PointCloudAccelCore` now builds bounded virtual clearing rays in the local
@@ -47,23 +58,43 @@ worker when `clearing_worker_virtual_rays_enabled=true`.
 Runtime defaults:
 
 ```yaml
+local_worker_stamp_source: local_odom
+local_worker_stamp_odom_topic: /local_state/odometry
+local_worker_stamp_max_odom_age_sec: 0.25
 clearing_worker_virtual_rays_enabled: true
 clearing_worker_virtual_ray_angle_resolution_deg: 1.0
+clearing_worker_virtual_ray_min_angle_deg: -110.0
+clearing_worker_virtual_ray_max_angle_deg: 110.0
+clearing_worker_virtual_rays_allow_self_mask_endpoints: true
 clearing_worker_virtual_ray_range: 8.00
-clearing_worker_virtual_ray_range_steps: [0.50, 1.00, 2.00, 3.50, 5.50, 8.00]
-clearing_worker_virtual_ray_endpoint_z_values: [-0.10, 0.05, 0.20, 0.40, 0.60, 0.85, 1.10, 1.30]
-clearing_worker_max_points: 15000
+clearing_worker_virtual_ray_range_steps: [0.10, 0.15, 0.20, 0.35, 0.50, 0.75, 1.00, 1.50, 2.50, 4.00, 6.00, 8.00]
+clearing_worker_virtual_ray_endpoint_z_values: [-0.10, 0.05, 0.20, 0.40, 0.60, 0.80, 1.00, 1.20, 1.40]
+clearing_worker_max_points: 30000
+```
+
+Nav2 local VoxelLayer:
+
+```yaml
+combination_method: 0
 ```
 
 For each angular bin, the worker records the farthest valid clearing return. It
 then emits virtual endpoints up to that return range, or to the configured
-virtual range when no return exists in that bin. Endpoints inside the configured
-self mask are skipped.
+virtual range when no return exists in that bin.
+
+Obstacle marking still excludes the configured self mask. Virtual clearing
+uses the same angular observation window as obstacle marking, but its endpoints
+are allowed inside that self-mask region by default so near-body stale
+VoxelLayer cells are actively cleared instead of accumulating around the robot
+footprint.
 
 The generated cloud keeps:
 
 - frame: `base_link`
-- stamp: source pointcloud stamp
+- stamp: latest fresh `/local_state/odometry.header.stamp` in the Jetson
+  runtime profile; if that stamp is missing or older than 250 ms, the worker
+  falls back to the source pointcloud stamp and increments
+  `local_worker_stamp_fallback_count` in `/lidar/pointcloud_accel_status`
 - topic: `/perception/clearing_points`
 
 ## Validation

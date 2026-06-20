@@ -43,13 +43,15 @@ void write_runtime_map_context_file(
   const std::string & state,
   const bool confirmed,
   const std::string & message,
-  const double updated_at_sec)
+  const double updated_at_sec,
+  const std::string & startup_stage)
 {
   std::ostringstream body;
   body << std::fixed << std::setprecision(6)
        << "{"
        << "\"schema\":\"njrh.runtime_map_context.v1\","
        << "\"state\":" << json_string(state) << ","
+       << "\"startup_stage\":" << json_string(startup_stage) << ","
        << "\"confirmed\":" << (confirmed ? "true" : "false") << ","
        << "\"message\":" << json_string(message) << ","
        << "\"map_id\":" << json_string(manifest.map_id) << ","
@@ -78,11 +80,13 @@ std::optional<RuntimeMapContext> read_runtime_map_context_file(const fs::path & 
   RuntimeMapContext context;
   context.confirmed = json_bool_value(text, "confirmed", false);
   context.state = json_string_value(text, "state").value_or("");
+  context.startup_stage = json_string_value(text, "startup_stage").value_or("");
   context.message = json_string_value(text, "message").value_or("");
   context.map_id = *map_id;
   context.display_name = json_string_value(text, "display_name").value_or(*map_id);
   context.building_id = *building_id;
   context.floor_id = *floor_id;
+  context.updated_at_sec = json_number_value(text, "updated_at").value_or(0.0);
   return context;
 }
 

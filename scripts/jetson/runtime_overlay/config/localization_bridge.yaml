@@ -16,6 +16,10 @@ robot_localization_bridge:
     map_odom_smoothing_yaw_rate_radps: 0.25
     map_odom_smoothing_snap_translation_epsilon_m: 0.005
     map_odom_smoothing_snap_yaw_epsilon_rad: 0.005
+    explicit_relocalization_fast_smoothing_enabled: true
+    explicit_relocalization_fast_correction_translation_m: 1.0
+    explicit_relocalization_fast_correction_yaw_rad: 0.35
+    explicit_relocalization_fast_max_duration_sec: 3.0
     map_odom_large_correction_translation_m: 0.50
     map_odom_large_correction_yaw_rad: 0.35
     map_odom_large_correction_requires_recovery: true

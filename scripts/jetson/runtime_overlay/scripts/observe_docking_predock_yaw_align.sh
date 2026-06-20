@@ -21,9 +21,10 @@ Usage:
   bash scripts/jetson/runtime_overlay/scripts/observe_docking_predock_yaw_align.sh --duration-sec 180 --label dock_test_1
 
 Read-only observer. Start it, then trigger return-to-dock from the App.
-It does not send goals or velocity. It records API docking state, bridge pause
-status, /cmd_vel_docking, Ranger mode alignment, GS2 scan freshness, safety,
-and filtered rosout lines for the capture window.
+It does not send goals or velocity. It records API docking state, native Nav2
+predock XY+yaw verification, optional explicit /cmd_vel_docking fallback, Ranger
+mode alignment, GS2 scan freshness, safety, and filtered rosout lines for the
+capture window.
 EOF
 }
 
@@ -246,16 +247,33 @@ cmd = text("echo_cmd_vel_docking.log")
 mode = text("echo_mode_controller_status.log")
 actual_spinning_mentions = len(re.findall(r'SPINNING|code: 2|"code":2', mode))
 
-print("# Docking Predock Yaw Align Observation")
+print("# Docking Predock Native Nav2 Observation")
 print()
 print(f"- report_dir: `{out}`")
 print(f"- final_docking_state: `{dock.get('state')}`")
 print(f"- final_phase: `{job.get('phase')}`")
+print(f"- nav_goal_succeeded: `{job.get('nav_goal_succeeded')}`")
+print(f"- predock_pose_verified: `{job.get('predock_pose_verified')}`")
+print(f"- predock_yaw_verified_by_nav2: `{job.get('predock_yaw_verified_by_nav2')}`")
+print(f"- predock_xy_ok: `{job.get('predock_xy_ok')}`")
+print(f"- predock_base_yaw_ok: `{job.get('predock_base_yaw_ok')}`")
+print(f"- predock_contact_yaw_ok: `{job.get('predock_contact_yaw_ok')}`")
+print(f"- expected_base_yaw_at_predock: `{job.get('expected_base_yaw_at_predock')}`")
+print(f"- current_base_yaw_map: `{job.get('current_base_yaw_map')}`")
+print(f"- base_yaw_error: `{job.get('base_yaw_error')}`")
+print(f"- reverse_yaw_offset_applied: `{job.get('reverse_yaw_offset_applied')}`")
+print(f"- contact_frame_available: `{job.get('contact_frame_available')}`")
 print(f"- predock_yaw_align_attempted: `{job.get('predock_yaw_align_attempted')}`")
 print(f"- predock_yaw_align_succeeded: `{job.get('predock_yaw_align_succeeded')}`")
 print(f"- predock_yaw_align_failure_code: `{job.get('predock_yaw_align_failure_code')}`")
 print(f"- fine_entry_ok: `{job.get('fine_entry_ok')}`")
 print(f"- fine_entry_failure_code: `{job.get('fine_entry_failure_code')}`")
+print(f"- fine_bridge_settle_started: `{job.get('fine_bridge_settle_started')}`")
+print(f"- fine_bridge_settle_complete: `{job.get('fine_bridge_settle_complete')}`")
+print(f"- fine_bridge_settle_failure_code: `{job.get('fine_bridge_settle_failure_code')}`")
+print(f"- fine_bridge_settle_duration_sec: `{job.get('fine_bridge_settle_duration_sec')}`")
+print(f"- fine_bridge_settle_remaining_translation_m: `{job.get('fine_bridge_settle_remaining_translation_m')}`")
+print(f"- fine_bridge_settle_remaining_yaw_rad: `{job.get('fine_bridge_settle_remaining_yaw_rad')}`")
 print(f"- global_correction_paused_last: `{job.get('global_correction_paused')}`")
 print(f"- bridge_global_correction_paused_last: `{bridge.get('global_correction_paused')}`")
 print(f"- cmd_vel_docking_messages: `{cmd.count('---')}`")
@@ -270,7 +288,7 @@ print("- `echo_bridge_status.log`")
 print("- `rosout_filtered.log`")
 PY
     {
-      echo "# Docking Predock Yaw Align Observation"
+      echo "# Docking Predock Native Nav2 Observation"
       echo
       echo "- report_dir: \`${OUTPUT_DIR}\`"
       echo "- summary_error: see \`summary.err\`"
