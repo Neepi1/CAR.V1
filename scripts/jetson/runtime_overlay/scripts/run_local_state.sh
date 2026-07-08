@@ -125,8 +125,132 @@ if [[ "${MODE}" == "passthrough" || "${MODE}" == "legacy" ]]; then
   njrh_exec_affined robot_local_state "${NODE_BIN}" --ros-args --params-file "${PARAMS_FILE}"
 fi
 
-EKF_PROFILE="${LOCAL_STATE_EKF_PROFILE:-${NJRH_LOCAL_STATE_EKF_PROFILE:-wheel_imu}}"
+EKF_PROFILE="${LOCAL_STATE_EKF_PROFILE:-${NJRH_LOCAL_STATE_EKF_PROFILE:-wheel_only}}"
+DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf.yaml"
 case "${EKF_PROFILE}" in
+  wheel_pose_imu_vyaw|pose_imu_vyaw)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf_wheel_pose_imu_vyaw.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_imu_pose_soft_yaw_015|pose_soft_yaw_015)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf.yaml"
+    DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf_pose_soft_yaw_015.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_imu_twist_soft_yaw_012|twist_soft_yaw_012)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf.yaml"
+    DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf_twist_soft_yaw_012.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_imu_twist_soft_yaw_010|twist_soft_yaw_010)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf.yaml"
+    DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf_twist_soft_yaw_010.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_imu_twist_soft_yaw_015|twist_soft_yaw_015)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf.yaml"
+    DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf_twist_soft_yaw_015.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_imu_yaw_offset_m061|yaw_offset_m061)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf.yaml"
+    DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf_yaw_offset_m061.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_imu_xy_shear_p062|xy_shear_p062)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf.yaml"
+    DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf_xy_shear_p062.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_imu_xy_lateral_m061|xy_lateral_m061)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf.yaml"
+    DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf_xy_lateral_m061.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_imu_xy_lateral_m040|xy_lateral_m040)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf.yaml"
+    DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf_xy_lateral_m040.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_imu_xy_lateral_m050|xy_lateral_m050)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf.yaml"
+    DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf_xy_lateral_m050.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_imu_xy_lateral_m085|xy_lateral_m085)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf.yaml"
+    DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf_xy_lateral_m085.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_imu_xy_lateral_m120|xy_lateral_m120)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf.yaml"
+    DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf_xy_lateral_m120.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_imu_xy_lateral_soft_yaw_016|xy_lateral_soft_yaw_016)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf.yaml"
+    DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf_xy_lateral_soft_yaw_016.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_imu_xy_lateral_yaw_p979_n1011|xy_lateral_yaw_p979_n1011)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf.yaml"
+    DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf_xy_lateral_yaw_p979_n1011.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_imu_soft_yaw_018|soft_yaw_018)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf.yaml"
+    DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf_soft_yaw_018.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_imu_soft_yaw_016|soft_yaw_016)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf.yaml"
+    DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf_soft_yaw_016.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_imu_soft_yaw_014|soft_yaw_014)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf.yaml"
+    DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf_soft_yaw_014.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_imu_soft_yaw_010|soft_yaw_010)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf.yaml"
+    DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf_soft_yaw_010.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_imu_soft_yaw_015|soft_yaw_015)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf.yaml"
+    DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf_soft_yaw_015.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_imu_soft_yaw|soft_yaw)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf.yaml"
+    DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf_soft_yaw.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_xy_imu_vyaw|xy_imu_vyaw)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf_wheel_xy_imu_vyaw.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_xy_imu_yaw|xy_imu_yaw)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf_wheel_xy_imu_yaw.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_xy_diff_yaw_imu|xy_diff_yaw_imu)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf_wheel_xy_diff_yaw_imu.yaml"
+    EKF_USES_IMU=true
+    ;;
+  twist_imu|wheel_twist_imu)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf_twist_imu.yaml"
+    EKF_USES_IMU=true
+    ;;
+  twist_imu_vyaw_only|wheel_twist_imu_vyaw_only|twist_imu_gyro_only)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf_twist_imu_vyaw_only.yaml"
+    EKF_USES_IMU=true
+    ;;
+  twist_wheel_yaw_imu|wheel_yaw_twist_imu)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf_twist_wheel_yaw_imu.yaml"
+    EKF_USES_IMU=true
+    ;;
   wheel_imu|default)
     DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf.yaml"
     EKF_USES_IMU=true
@@ -136,7 +260,7 @@ case "${EKF_PROFILE}" in
     EKF_USES_IMU=false
     ;;
   *)
-    echo "[runtime-overlay] invalid LOCAL_STATE_EKF_PROFILE=${EKF_PROFILE}; expected wheel_imu or wheel_only" >&2
+    echo "[runtime-overlay] invalid LOCAL_STATE_EKF_PROFILE=${EKF_PROFILE}; expected wheel_imu, wheel_pose_imu_vyaw, wheel_imu_pose_soft_yaw_015, wheel_imu_twist_soft_yaw_012, wheel_imu_twist_soft_yaw_010, wheel_imu_twist_soft_yaw_015, wheel_imu_yaw_offset_m061, wheel_imu_xy_shear_p062, wheel_imu_xy_lateral_m061, wheel_imu_xy_lateral_m040, wheel_imu_xy_lateral_m050, wheel_imu_xy_lateral_m085, wheel_imu_xy_lateral_m120, wheel_imu_xy_lateral_soft_yaw_016, wheel_imu_xy_lateral_yaw_p979_n1011, wheel_imu_soft_yaw_018, wheel_imu_soft_yaw_016, wheel_imu_soft_yaw_015, wheel_imu_soft_yaw_014, wheel_imu_soft_yaw_010, wheel_imu_soft_yaw, wheel_xy_imu_vyaw, wheel_xy_imu_yaw, wheel_xy_diff_yaw_imu, twist_imu, twist_imu_vyaw_only, twist_wheel_yaw_imu, or wheel_only" >&2
     exit 1
     ;;
 esac
@@ -146,12 +270,25 @@ EKF_PARAMS_FILE="${LOCAL_STATE_EKF_PARAMS_FILE:-${DEFAULT_EKF_PARAMS_FILE}}"
   echo "[runtime-overlay] local state EKF params file missing: ${EKF_PARAMS_FILE}" >&2
   exit 1
 }
-WHEEL_ODOM_EKF_PARAMS_FILE="${LOCAL_STATE_WHEEL_ODOM_EKF_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf.yaml}"
+WHEEL_ODOM_EKF_PARAMS_FILE="${LOCAL_STATE_WHEEL_ODOM_EKF_PARAMS_FILE:-${DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE}}"
 [[ -f "${WHEEL_ODOM_EKF_PARAMS_FILE}" ]] || {
   echo "[runtime-overlay] local state wheel odom EKF params file missing: ${WHEEL_ODOM_EKF_PARAMS_FILE}" >&2
   exit 1
 }
-if [[ "${EKF_USES_IMU}" == "true" ]]; then
+LOCAL_STATE_IMU_BIAS_FILTER_ENABLED="${LOCAL_STATE_IMU_BIAS_FILTER_ENABLED:-true}"
+case "${LOCAL_STATE_IMU_BIAS_FILTER_ENABLED}" in
+  true|false)
+    ;;
+  *)
+    echo "[runtime-overlay] invalid LOCAL_STATE_IMU_BIAS_FILTER_ENABLED=${LOCAL_STATE_IMU_BIAS_FILTER_ENABLED}; expected true or false" >&2
+    exit 1
+    ;;
+esac
+if [[ "${EKF_USES_IMU}" == "true" && "${LOCAL_STATE_IMU_BIAS_FILTER_ENABLED}" != "true" ]]; then
+  echo "[runtime-overlay] LOCAL_STATE_EKF_PROFILE=${EKF_PROFILE} uses IMU; LOCAL_STATE_IMU_BIAS_FILTER_ENABLED must stay true" >&2
+  exit 1
+fi
+if [[ "${LOCAL_STATE_IMU_BIAS_FILTER_ENABLED}" == "true" ]]; then
   IMU_BIAS_FILTER_PARAMS_FILE="${LOCAL_STATE_IMU_BIAS_FILTER_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/local_state_imu_bias_filter.yaml}"
   [[ -f "${IMU_BIAS_FILTER_PARAMS_FILE}" ]] || {
     echo "[runtime-overlay] local state IMU bias filter params file missing: ${IMU_BIAS_FILTER_PARAMS_FILE}" >&2
@@ -222,7 +359,7 @@ if ! kill -0 "${wheel_odom_pid}" 2>/dev/null; then
   exit 1
 fi
 
-if [[ "${EKF_USES_IMU}" == "true" ]]; then
+if [[ "${LOCAL_STATE_IMU_BIAS_FILTER_ENABLED}" == "true" ]]; then
   IMU_BIAS_NODE_BIN="${NJRH_PROJECT_ROOT}/install/robot_local_state/lib/robot_local_state/imu_gyro_bias_filter_node"
   [[ -x "${IMU_BIAS_NODE_BIN}" ]] || {
     echo "[runtime-overlay] compiled IMU gyro bias filter missing or not executable: ${IMU_BIAS_NODE_BIN}" >&2
@@ -237,8 +374,37 @@ if [[ "${EKF_USES_IMU}" == "true" ]]; then
     echo "[runtime-overlay] IMU gyro bias filter failed to stay alive" >&2
     exit 1
   fi
+  if [[ "${LOCAL_STATE_IMU_BIAS_FILTER_READY_CHECK:-true}" == "true" ]]; then
+    CORRECTED_IMU_TOPIC="${LOCAL_STATE_CORRECTED_IMU_TOPIC:-/lidar_imu_bias_corrected}"
+    IMU_BIAS_TOPIC="${LOCAL_STATE_IMU_BIAS_TOPIC:-/local_state/imu_bias}"
+    IMU_BIAS_READY_TIMEOUT_SEC="${LOCAL_STATE_IMU_BIAS_FILTER_READY_TIMEOUT_SEC:-8}"
+    runtime_readiness_probe publisher-from-node \
+      "${CORRECTED_IMU_TOPIC}" imu_gyro_bias_filter "${IMU_BIAS_READY_TIMEOUT_SEC}" || {
+        echo "[runtime-overlay] IMU gyro bias filter missing publisher on ${CORRECTED_IMU_TOPIC}" >&2
+        exit 1
+      }
+    runtime_readiness_probe topic "${CORRECTED_IMU_TOPIC}" "${IMU_BIAS_READY_TIMEOUT_SEC}" || {
+      echo "[runtime-overlay] IMU gyro bias filter did not publish samples on ${CORRECTED_IMU_TOPIC}" >&2
+      exit 1
+    }
+    runtime_readiness_probe publisher-from-node \
+      "${IMU_BIAS_TOPIC}" imu_gyro_bias_filter "${IMU_BIAS_READY_TIMEOUT_SEC}" || {
+        echo "[runtime-overlay] IMU gyro bias filter missing publisher on ${IMU_BIAS_TOPIC}" >&2
+        exit 1
+      }
+    runtime_readiness_probe topic "${IMU_BIAS_TOPIC}" "${IMU_BIAS_READY_TIMEOUT_SEC}" || {
+      echo "[runtime-overlay] IMU gyro bias filter did not publish samples on ${IMU_BIAS_TOPIC}" >&2
+      exit 1
+    }
+  fi
 else
-  echo "[runtime-overlay] LOCAL_STATE_EKF_PROFILE=wheel_only; skipping IMU gyro bias filter and EKF imu0 fusion" >&2
+  echo "[runtime-overlay] LOCAL_STATE_IMU_BIAS_FILTER_ENABLED=false; skipping IMU gyro bias filter and EKF imu0 fusion" >&2
+fi
+
+if [[ "${EKF_USES_IMU}" != "true" && "${LOCAL_STATE_IMU_BIAS_FILTER_ENABLED}" == "true" ]]; then
+  echo "[runtime-overlay] LOCAL_STATE_EKF_PROFILE=${EKF_PROFILE}; EKF imu0 fusion disabled while IMU bias filter stays available for safety consumers" >&2
+elif [[ "${EKF_USES_IMU}" != "true" ]]; then
+  echo "[runtime-overlay] LOCAL_STATE_EKF_PROFILE=${EKF_PROFILE}; EKF imu0 fusion disabled and IMU bias filter disabled by override" >&2
 fi
 
 echo "[runtime-overlay] starting robot_local_state EKF profile=${EKF_PROFILE} params=${EKF_PARAMS_FILE}" >&2

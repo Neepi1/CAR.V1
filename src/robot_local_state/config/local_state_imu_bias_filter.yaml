@@ -5,6 +5,10 @@ imu_gyro_bias_filter:
     cmd_vel_topic: /cmd_vel_safe
     output_imu_topic: /lidar_imu_bias_corrected
     bias_topic: /local_state/imu_bias
+    transform_output_to_target_frame: true
+    output_target_frame: base_link
+    transform_lookup_timeout_sec: 0.02
+    drop_output_on_transform_failure: true
     use_odom_stationary: true
     use_cmd_vel_stationary: true
     require_fresh_cmd_vel: false

@@ -46,6 +46,14 @@ resolve_gs2_serial_port() {
 
 GS2_SERIAL_PORT="$(resolve_gs2_serial_port)"
 
+RUNTIME_OVERRIDE_ENV="${NJRH_RUNTIME_OVERRIDE_ENV:-/tmp/njrh_runtime_override.env}"
+if [[ -f "${RUNTIME_OVERRIDE_ENV}" ]]; then
+  # shellcheck source=/dev/null
+  set -a
+  source "${RUNTIME_OVERRIDE_ENV}"
+  set +a
+fi
+
 container_env=(
   "-e" "ROBOT_API_TOKEN=${ROBOT_API_TOKEN:-}"
   "-e" "NJRH_REUSE_COMMON_SERVICES=${NJRH_REUSE_COMMON_SERVICES:-true}"
@@ -56,9 +64,22 @@ container_env=(
   "-e" "NJRH_NAV2_LIFECYCLE_PARALLEL_BT=${NJRH_NAV2_LIFECYCLE_PARALLEL_BT:-true}"
   "-e" "NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK=${NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK:-false}"
   "-e" "NJRH_COMMON_LOCAL_STATE_START_READY_MODE=${NJRH_COMMON_LOCAL_STATE_START_READY_MODE:-endpoint}"
-  "-e" "NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE=${NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE:-true}"
+  "-e" "NJRH_COMMON_LOCAL_STATE_BACKGROUND_START=${NJRH_COMMON_LOCAL_STATE_BACKGROUND_START:-true}"
+  "-e" "NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE=${NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE:-false}"
+  "-e" "LOCAL_STATE_PROCESS_START_TIMEOUT_SEC=${LOCAL_STATE_PROCESS_START_TIMEOUT_SEC:-}"
+  "-e" "LOCAL_STATE_START_READY_TIMEOUT_SEC=${LOCAL_STATE_START_READY_TIMEOUT_SEC:-}"
+  "-e" "LOCAL_STATE_READY_RECHECK_TIMEOUT_SEC=${LOCAL_STATE_READY_RECHECK_TIMEOUT_SEC:-}"
+  "-e" "LOCAL_STATE_IMU_BIAS_FILTER_READY_CHECK=${LOCAL_STATE_IMU_BIAS_FILTER_READY_CHECK:-}"
+  "-e" "LOCAL_STATE_IMU_BIAS_FILTER_READY_TIMEOUT_SEC=${LOCAL_STATE_IMU_BIAS_FILTER_READY_TIMEOUT_SEC:-}"
+  "-e" "LOCAL_STATE_LAUNCH_SETTLE_SEC=${LOCAL_STATE_LAUNCH_SETTLE_SEC:-}"
+  "-e" "NJRH_INITIAL_LOCALIZATION_SERVICE_WAIT_SEC=${NJRH_INITIAL_LOCALIZATION_SERVICE_WAIT_SEC:-}"
   "-e" "NJRH_NAV2_LIFECYCLE_CONFIGURE_ALL_FIRST=${NJRH_NAV2_LIFECYCLE_CONFIGURE_ALL_FIRST:-false}"
   "-e" "NJRH_GLOBAL_COSTMAP_PUBLISHER_READY_TIMEOUT_SEC=${NJRH_GLOBAL_COSTMAP_PUBLISHER_READY_TIMEOUT_SEC:-15}"
+  "-e" "NJRH_NAV_LOCAL_STATE_MODE=${NJRH_NAV_LOCAL_STATE_MODE:-}"
+  "-e" "NJRH_LOCAL_STATE_EKF_PROFILE=${NJRH_LOCAL_STATE_EKF_PROFILE:-}"
+  "-e" "LOCAL_STATE_EKF_PROFILE=${LOCAL_STATE_EKF_PROFILE:-}"
+  "-e" "NJRH_FORCE_RESTART_CANONICAL_TF=${NJRH_FORCE_RESTART_CANONICAL_TF:-}"
+  "-e" "NJRH_FORCE_RESTART_NAV_HELPERS=${NJRH_FORCE_RESTART_NAV_HELPERS:-}"
   "-e" "NJRH_PROJECT_ROOT=${WORKSPACE_CONTAINER}"
   "-e" "NJRH_UPSTREAM_ROOT=${UPSTREAM_WORKSPACE_CONTAINER}"
   "-e" "NJRH_UPSTREAM_HOST_ROOT=${UPSTREAM_WORKSPACE_HOST}"
@@ -138,6 +159,8 @@ stop_container_common_processes() {
           $0 !~ /stop_exact_process_set/ &&
           $0 !~ /common_pattern=/ &&
           $0 !~ /node_pattern=/ &&
+          $0 !~ /docker exec/ &&
+          $0 !~ /njrh_systemd_runtime\.sh/ &&
           $0 !~ /ros2_cli_pattern=/ {print $1}
         '"'"'
     }
@@ -175,7 +198,7 @@ stop_container_common_processes() {
       kill -KILL "${pids[@]}" 2>/dev/null || true
     }
     common_pattern="run_common_services.sh"
-    node_pattern="hesai_ros_driver_node|pointcloud_axis_remap|imu_axis_remap|ranger_base_node|robot_description_static_tf_node|robot_eai_gs2/gs2_driver_node|gs2_driver_node --ros-args|ros2 launch robot_eai_gs2 gs2.launch.py|ekf_node --ros-args.*__node:=robot_local_state|robot_localization/ekf_node|robot_local_perception/local_perception_node|robot_floor_manager/floor_manager_node|robot_safety/robot_safety_node|ranger_mini3_mode_controller/mode_controller_node|run_robot_api_server_supervised.sh|robot_api_server/robot_api_server_node|robot_api_server_node --ros-args|run_navigation_runtime_services.sh|nav2_lifecycle_sequence.py|call_global_localization_trigger.py|run_nav2_navigation.sh|run_occupancy_grid_localization.sh|standard_navigation.launch.py|occupancy_localization_stack.launch.py|occupancy_grid_localizer_container|occupancy_grid_localizer|robot_localization_bridge/localization_bridge_node|localization_bridge_node --ros-args|amcl --ros-args|nav2_amcl|amcl_scan_admission|__node:=map_server|__node:=controller_server|__node:=planner_server|__node:=bt_navigator|__node:=behavior_server|__node:=velocity_smoother|__node:=collision_monitor|__node:=lifecycle_manager_navigation|__node:=lifecycle_manager_costmap_filters"
+    node_pattern="hesai_ros_driver_node|pointcloud_axis_remap|imu_axis_remap|ranger_base_node|robot_description_static_tf_node|robot_eai_gs2/gs2_driver_node|gs2_driver_node --ros-args|ros2 launch robot_eai_gs2 gs2.launch.py|ekf_node --ros-args.*__node:=robot_local_state|robot_localization/ekf_node|robot_local_perception/local_perception_node|robot_floor_manager/floor_manager_node|robot_safety/robot_safety_node|ranger_mini3_mode_controller/mode_controller_node|robot_docking_manager/docking_manager_node|docking_manager_node --ros-args|run_robot_api_server_supervised.sh|robot_api_server/robot_api_server_node|robot_api_server_node --ros-args|run_navigation_runtime_services.sh|nav2_lifecycle_sequence.py|call_global_localization_trigger.py|run_nav2_navigation.sh|run_occupancy_grid_localization.sh|standard_navigation.launch.py|occupancy_localization_stack.launch.py|occupancy_grid_localizer_container|occupancy_grid_localizer|robot_localization_bridge/localization_bridge_node|localization_bridge_node --ros-args|amcl --ros-args|nav2_amcl|amcl_scan_admission|__node:=map_server|__node:=controller_server|__node:=planner_server|__node:=bt_navigator|__node:=behavior_server|__node:=velocity_smoother|__node:=collision_monitor|__node:=lifecycle_manager_navigation|__node:=lifecycle_manager_costmap_filters"
     ros2_cli_pattern="/opt/ros/humble/bin/ros2 (lifecycle get|topic echo|topic hz|topic info|node info|service call /amcl/(change_state|get_state))|ros2 (lifecycle get|topic echo|topic hz|topic info|node info|service call /amcl/(change_state|get_state))"
     stop_exact_process_set "stale ros2 diagnostics cli" "${ros2_cli_pattern}"
     stop_exact_process_set "common services" "${common_pattern}"

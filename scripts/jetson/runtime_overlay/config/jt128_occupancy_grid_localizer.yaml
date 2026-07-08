@@ -10,8 +10,8 @@ occupancy_grid_localizer:
     # The current JT128 2D slice is still relatively sparse near the robot due
     # to vehicle-body occlusion. Use a wider acceptance band than the upstream
     # defaults so Isaac can return a coarse global pose instead of timing out.
-    max_beam_error: 1.20
-    max_output_error: 1.00
+    max_beam_error: 0.35
+    max_output_error: 0.30
     min_output_error: 0.05
 
     num_beams_gpu: 512

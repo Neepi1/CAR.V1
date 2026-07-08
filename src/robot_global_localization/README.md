@@ -13,6 +13,8 @@ The former Python script is kept only as historical reference during migration a
 - `default_floor_id`: mock floor asset binding
 - `grid_search_trigger_service`: Isaac relocalization trigger service, defaults to `/trigger_grid_search_localization`
 - `service_call_timeout_sec`, `result_wait_timeout_sec`, `bridge_accept_timeout_sec`, `map_to_odom_wait_timeout_sec`: staged `/global_localization/trigger` timeouts
+- `localizer_input_freshness_enabled`, `localizer_input_topic`, `localizer_input_wait_timeout_sec`, `localizer_input_max_age_sec`: bounded pre-trigger freshness fence for Isaac's localizer input. The default waits up to 1 second for a fresh `/flatscan` sample and normally passes on the next scan frame.
+- `result_allowed_pretrigger_age_sec`: rejects stale `/localization_result` messages that arrive after a trigger but were stamped before the trigger window.
 - `bridge_status_topic`: defaults to `/localization/bridge_status`
 - `bridge_force_accept_service`: defaults to `/robot_localization_bridge/force_accept_next_localization`
 - `require_grid_search_trigger`: fail `/global_localization/trigger` when Isaac trigger service is unavailable
@@ -34,4 +36,4 @@ Phase L1.1 makes the trigger service a staged success gate. It arms `robot_local
 
 Phase A2 keeps Isaac as triggered global relocalization only. Runtime continuous localization candidates come from AMCL on `/scan`; no runtime path forwards `/flatscan` into Isaac's trigger input for background updates.
 
-Hardware validation still needs a cold navigation start while recording `/global_localization/health`, `/localization/bridge_status`, `/localization_result`, and `/tf` to confirm the wrapper reaches bridge acceptance without false timeouts. Startup readiness should use bridge acceptance plus `map -> odom`; `/localization/health` is not used as a navigation startup probe, and `/localization_result.header.stamp` being 2-3 seconds older than receive time is allowed in triggered mode.
+Hardware validation still needs a cold navigation start while recording `/global_localization/health`, `/localization/bridge_status`, `/localization_result`, and `/tf` to confirm the wrapper reaches bridge acceptance without false timeouts. Startup readiness should use bridge acceptance plus `map -> odom`; `/localization/health` is not used as a navigation startup probe. Before calling Isaac's trigger, the wrapper now requires a fresh localizer input sample so the first trigger is less likely to consume startup-stale scan data. If the bridge reports `isaac_triggered_pose_stale_ms` in triggered mode, the wrapper first waits within the same trigger for a fresh result while bridge force-accept remains armed; only if that short same-trigger window expires does it return `failure_code=FRESH_LOCALIZATION_RETRY_REQUIRED` so the startup script can retry.

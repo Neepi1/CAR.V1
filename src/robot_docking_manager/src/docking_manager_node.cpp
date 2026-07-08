@@ -108,7 +108,8 @@ public:
         last_odom_time_ = now();
       });
 
-    cmd_pub_ = create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, rclcpp::QoS(10));
+    cmd_pub_ = create_publisher<geometry_msgs::msg::Twist>(
+      cmd_vel_topic_, rclcpp::QoS(rclcpp::KeepLast(1)).reliable());
     status_pub_ = create_publisher<std_msgs::msg::String>(status_topic_, rclcpp::QoS(10).transient_local());
     forced_mode_pub_ = create_publisher<std_msgs::msg::String>(
       forced_mode_topic_, rclcpp::QoS(1).transient_local());
@@ -210,6 +211,7 @@ private:
       declare_parameter<std::string>("mode.reverse_enable_topic", "/ranger_mini3/docking_allow_reverse");
     use_crab_mode_ = declare_parameter<bool>("mode.use_crab_mode", true);
     crab_forced_mode_ = declare_parameter<std::string>("mode.crab_forced_mode", "side_slip");
+    yaw_forced_mode_ = declare_parameter<std::string>("mode.yaw_forced_mode", "spinning");
     release_forced_mode_ = declare_parameter<std::string>("mode.release_forced_mode", "auto");
     park_on_docked_ = declare_parameter<bool>("mode.park_on_docked", true);
 
@@ -250,6 +252,11 @@ private:
     detector_lateral_gate_m_ = declare_parameter<double>("detector.lateral_gate_m", 0.20);
     detector_max_range_m_ = declare_parameter<double>("detector.max_range_m", 0.30);
     detector_min_range_m_ = declare_parameter<double>("detector.min_range_m", 0.025);
+    detector_front_cluster_x_window_m_ =
+      declare_parameter<double>("detector.front_cluster_x_window_m", 0.015);
+    detector_min_confidence_ = declare_parameter<double>("detector.min_confidence", 0.10);
+    detector_yaw_fit_min_lateral_span_m_ =
+      declare_parameter<double>("detector.yaw_fit_min_lateral_span_m", 0.055);
     detector_stable_frames_required_ = declare_parameter<int>("detector.stable_frames_required", 3);
     detection_filter_alpha_ = declare_parameter<double>("detector.filter_alpha", 0.25);
     use_yaw_fit_ = declare_parameter<bool>("detector.use_yaw_fit", false);
@@ -269,6 +276,8 @@ private:
     max_forward_while_lateral_mps_ = declare_parameter<double>("controller.max_forward_while_lateral_mps", 0.020);
     lock_lateral_during_final_insert_ =
       declare_parameter<bool>("controller.lock_lateral_during_final_insert", true);
+    yaw_spin_priority_enabled_ =
+      declare_parameter<bool>("controller.yaw_spin_priority_enabled", true);
     max_command_steering_rad_ = declare_parameter<double>("controller.max_command_steering_rad", 0.35);
     ackermann_wheelbase_m_ = declare_parameter<double>("controller.ackermann_wheelbase_m", 0.494);
     contact_crawl_speed_mps_ = declare_parameter<double>("controller.contact_crawl_speed_mps", 0.025);
@@ -455,6 +464,27 @@ private:
       return detection;
     }
 
+    if (detector_front_cluster_x_window_m_ > 0.0) {
+      const auto nearest_x_it = std::min_element(xs.begin(), xs.end());
+      const double front_x_max = *nearest_x_it + detector_front_cluster_x_window_m_;
+      std::vector<double> clustered_xs;
+      std::vector<double> clustered_ys;
+      clustered_xs.reserve(xs.size());
+      clustered_ys.reserve(ys.size());
+      for (size_t i = 0; i < xs.size(); ++i) {
+        if (xs[i] <= front_x_max) {
+          clustered_xs.push_back(xs[i]);
+          clustered_ys.push_back(ys[i]);
+        }
+      }
+      xs = std::move(clustered_xs);
+      ys = std::move(clustered_ys);
+      detection.points = static_cast<int>(xs.size());
+      if (detection.points < detector_min_points_) {
+        return detection;
+      }
+    }
+
     const auto [min_y_it, max_y_it] = std::minmax_element(ys.begin(), ys.end());
     detection.lateral_span = *max_y_it - *min_y_it;
     if (detection.lateral_span < detector_min_span_m_) {
@@ -463,10 +493,11 @@ private:
 
     detection.distance_x = median(xs);
     detection.lateral_y = median(ys);
-    detection.yaw_error = use_yaw_fit_ ? estimate_yaw_error(xs, ys) : 0.0;
+    detection.yaw_error = (use_yaw_fit_ && detection.lateral_span >= detector_yaw_fit_min_lateral_span_m_) ?
+      estimate_yaw_error(xs, ys) : 0.0;
     detection.confidence = std::min(1.0, static_cast<double>(detection.points) / 40.0) *
       std::min(1.0, detection.lateral_span / 0.12);
-    detection.valid = detection.confidence > 0.25;
+    detection.valid = detection.confidence > detector_min_confidence_;
     return detection;
   }
 
@@ -578,22 +609,44 @@ private:
 
     const double lateral_error = apply_deadband(detection.lateral_y, lateral_deadband_m_);
     const double yaw_error = apply_deadband(detection.yaw_error, yaw_deadband_rad_);
+    double desired_contact_vy = 0.0;
+    double pivot_compensation_vy = 0.0;
     if (use_crab_mode_) {
+      if (yaw_spin_priority_enabled_ && !yaw_ok) {
+        publish_forced_mode(yaw_forced_mode_);
+        cmd.linear.x = 0.0;
+        cmd.linear.y = 0.0;
+        cmd.angular.z = clamp(kyaw_ * yaw_error, -max_angular_speed_radps_, max_angular_speed_radps_);
+        publish_cmd(cmd);
+        publish_status(alignment_status(
+          detection, cmd, desired_contact_vy, pivot_compensation_vy, "yaw_spin", yaw_forced_mode_));
+        return;
+      }
+
+      publish_forced_mode(crab_forced_mode_);
       const bool final_insert_locked = lock_lateral_during_final_insert_ && lateral_ok && yaw_ok;
       if (final_insert_locked) {
         cmd.linear.y = 0.0;
         cmd.angular.z = 0.0;
       } else {
-        cmd.linear.y = clamp(
+        desired_contact_vy = clamp(
           lateral_command_sign_ * ky_lateral_ * lateral_error,
           -max_lateral_speed_mps_,
           max_lateral_speed_mps_);
-        if (std::abs(lateral_error) > 0.0 && std::abs(cmd.linear.y) < min_lateral_speed_mps_) {
-          cmd.linear.y = std::copysign(
+        if (std::abs(lateral_error) > 0.0 && std::abs(desired_contact_vy) < min_lateral_speed_mps_) {
+          desired_contact_vy = std::copysign(
             std::min(min_lateral_speed_mps_, max_lateral_speed_mps_),
-            cmd.linear.y);
+            desired_contact_vy);
         }
-        cmd.angular.z = clamp(kyaw_ * yaw_error, -max_angular_speed_radps_, max_angular_speed_radps_);
+        // Once yaw is inside the fine-docking tolerance, keep yaw locked and correct
+        // centerline only. Mixing angular.z with side-slip near the dock makes the
+        // forward contact point sweep an arc and can drive a lateral/yaw limit cycle.
+        cmd.angular.z = 0.0;
+        pivot_compensation_vy = 0.0;
+        cmd.linear.y = clamp(
+          desired_contact_vy + pivot_compensation_vy,
+          -max_lateral_speed_mps_,
+          max_lateral_speed_mps_);
       }
       if (!final_insert_locked && (!lateral_ok || !yaw_ok ||
         std::abs(lateral_error) > lateral_priority_threshold_m_ ||
@@ -606,7 +659,10 @@ private:
     }
     publish_cmd(cmd);
 
-    publish_status(detection_status("aligning", detection));
+    publish_status(alignment_status(
+      detection, cmd, desired_contact_vy, pivot_compensation_vy,
+      use_crab_mode_ ? "side_slip_align" : "ackermann_align",
+      use_crab_mode_ ? crab_forced_mode_ : release_forced_mode_));
   }
 
   void handle_contact_verify()
@@ -1123,9 +1179,13 @@ private:
 
   void publish_forced_mode(const std::string & mode) const
   {
+    if (mode == last_forced_mode_request_) {
+      return;
+    }
     std_msgs::msg::String msg;
     msg.data = mode;
     forced_mode_pub_->publish(msg);
+    last_forced_mode_request_ = mode;
   }
 
   void publish_park(bool park) const
@@ -1160,6 +1220,27 @@ private:
     return out.str();
   }
 
+  std::string alignment_status(
+    const Detection & detection,
+    const geometry_msgs::msg::Twist & cmd,
+    const double desired_contact_vy,
+    const double pivot_compensation_vy,
+    const std::string & phase,
+    const std::string & forced_mode) const
+  {
+    std::ostringstream out;
+    out << detection_status("aligning", detection)
+        << " phase=" << phase
+        << " forced_mode=" << forced_mode
+        << " cmd_vx=" << cmd.linear.x
+        << " cmd_vy=" << cmd.linear.y
+        << " cmd_wz=" << cmd.angular.z
+        << " desired_contact_vy=" << desired_contact_vy
+        << " pivot_comp_vy=" << pivot_compensation_vy
+        << " charge_contact_x=" << charge_contact_x_m_;
+    return out.str();
+  }
+
   void publish_status(const std::string & text) const
   {
     std_msgs::msg::String msg;
@@ -1191,11 +1272,13 @@ private:
   mutable std::string last_dock_contact_latch_source_;
   mutable std::string last_dock_contact_latch_reason_;
   mutable std::string last_dock_contact_latch_dock_id_;
+  mutable std::string last_forced_mode_request_;
   std::string undock_odom_topic_{"/local_state/odometry"};
   std::string forced_mode_topic_;
   std::string park_topic_;
   std::string reverse_enable_topic_;
   std::string crab_forced_mode_{"side_slip"};
+  std::string yaw_forced_mode_{"spinning"};
   std::string release_forced_mode_{"auto"};
   bool use_crab_mode_{true};
   bool park_on_docked_{true};
@@ -1232,6 +1315,9 @@ private:
   double detector_lateral_gate_m_{0.20};
   double detector_max_range_m_{0.30};
   double detector_min_range_m_{0.025};
+  double detector_front_cluster_x_window_m_{0.015};
+  double detector_min_confidence_{0.10};
+  double detector_yaw_fit_min_lateral_span_m_{0.055};
   int detector_stable_frames_required_{3};
   double detection_filter_alpha_{0.25};
   bool use_yaw_fit_{false};
@@ -1249,6 +1335,7 @@ private:
   double yaw_priority_threshold_rad_{deg_to_rad(2.0)};
   double max_forward_while_lateral_mps_{0.020};
   bool lock_lateral_during_final_insert_{true};
+  bool yaw_spin_priority_enabled_{true};
   double max_command_steering_rad_{0.35};
   double ackermann_wheelbase_m_{0.494};
   double contact_crawl_speed_mps_{0.025};

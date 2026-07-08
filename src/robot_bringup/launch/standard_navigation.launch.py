@@ -64,6 +64,14 @@ def generate_launch_description():
         "yes",
         "on",
     )
+    launch_noncritical_navigation_nodes = os.environ.get(
+        "NJRH_NAV2_LAUNCH_NONCRITICAL_NODES", "true"
+    ).lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
     filter_lifecycle_nodes = []
     costmap_filter_nodes = []
@@ -124,12 +132,17 @@ def generate_launch_description():
         "controller_server",
         "velocity_smoother",
         "collision_monitor",
-        "smoother_server",
         "planner_server",
         "behavior_server",
+        "smoother_server",
         "bt_navigator",
-        "waypoint_follower",
     ]
+    if launch_noncritical_navigation_nodes:
+        navigation_lifecycle_nodes.extend(
+            [
+                "waypoint_follower",
+            ]
+        )
 
     remappings = [
         ("/tf", "tf"),
@@ -195,6 +208,17 @@ def generate_launch_description():
                 prefix=cpu_affinity_prefix("nav2_map_server"),
             ),
         ]
+    noncritical_navigation_nodes = []
+    if launch_noncritical_navigation_nodes:
+        noncritical_navigation_nodes = [
+            Node(
+                package="nav2_waypoint_follower",
+                executable="waypoint_follower",
+                name="waypoint_follower",
+                remappings=remappings,
+                **with_cpu_affinity("waypoint_follower", node_kwargs),
+            ),
+        ]
     filter_lifecycle_manager_nodes = []
     if filter_lifecycle_nodes:
         filter_lifecycle_manager_nodes = [
@@ -246,13 +270,6 @@ def generate_launch_description():
                 **with_cpu_affinity("controller_server", node_kwargs),
             ),
             Node(
-                package="nav2_smoother",
-                executable="smoother_server",
-                name="smoother_server",
-                remappings=remappings,
-                **with_cpu_affinity("smoother_server", node_kwargs),
-            ),
-            Node(
                 package="nav2_planner",
                 executable="planner_server",
                 name="planner_server",
@@ -267,18 +284,18 @@ def generate_launch_description():
                 **with_cpu_affinity("behavior_server", node_kwargs),
             ),
             Node(
+                package="nav2_smoother",
+                executable="smoother_server",
+                name="smoother_server",
+                remappings=remappings,
+                **with_cpu_affinity("smoother_server", node_kwargs),
+            ),
+            Node(
                 package="nav2_bt_navigator",
                 executable="bt_navigator",
                 name="bt_navigator",
                 remappings=remappings,
                 **with_cpu_affinity("bt_navigator", node_kwargs),
-            ),
-            Node(
-                package="nav2_waypoint_follower",
-                executable="waypoint_follower",
-                name="waypoint_follower",
-                remappings=remappings,
-                **with_cpu_affinity("waypoint_follower", node_kwargs),
             ),
             Node(
                 package="nav2_velocity_smoother",
@@ -294,6 +311,7 @@ def generate_launch_description():
                 remappings=remappings,
                 **with_cpu_affinity("collision_monitor", node_kwargs),
             ),
+            *noncritical_navigation_nodes,
             *filter_lifecycle_manager_nodes,
             TimerAction(
                 period=nav_lifecycle_start_delay,

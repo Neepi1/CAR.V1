@@ -47,6 +47,11 @@ write_env_file_if_missing() {
     else
       echo 'NJRH_NAV2_LIFECYCLE_PARALLEL_CORE=false' | sudo tee -a "${ENV_FILE}" >/dev/null
     fi
+    if grep -q '^NJRH_NAV2_LIFECYCLE_PARALLEL_BT=' "${ENV_FILE}"; then
+      sudo sed -i 's/^NJRH_NAV2_LIFECYCLE_PARALLEL_BT=.*/NJRH_NAV2_LIFECYCLE_PARALLEL_BT=true/' "${ENV_FILE}"
+    else
+      echo 'NJRH_NAV2_LIFECYCLE_PARALLEL_BT=true' | sudo tee -a "${ENV_FILE}" >/dev/null
+    fi
     if grep -q '^NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK=' "${ENV_FILE}"; then
       sudo sed -i 's/^NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK=.*/NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK=false/' "${ENV_FILE}"
     else
@@ -62,10 +67,15 @@ write_env_file_if_missing() {
     else
       echo 'NJRH_COMMON_LOCAL_STATE_START_READY_MODE=endpoint' | sudo tee -a "${ENV_FILE}" >/dev/null
     fi
-    if grep -q '^NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE=' "${ENV_FILE}"; then
-      sudo sed -i 's/^NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE=.*/NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE=true/' "${ENV_FILE}"
+    if grep -q '^NJRH_COMMON_LOCAL_STATE_BACKGROUND_START=' "${ENV_FILE}"; then
+      sudo sed -i 's/^NJRH_COMMON_LOCAL_STATE_BACKGROUND_START=.*/NJRH_COMMON_LOCAL_STATE_BACKGROUND_START=true/' "${ENV_FILE}"
     else
-      echo 'NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE=true' | sudo tee -a "${ENV_FILE}" >/dev/null
+      echo 'NJRH_COMMON_LOCAL_STATE_BACKGROUND_START=true' | sudo tee -a "${ENV_FILE}" >/dev/null
+    fi
+    if grep -q '^NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE=' "${ENV_FILE}"; then
+      sudo sed -i 's/^NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE=.*/NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE=false/' "${ENV_FILE}"
+    else
+      echo 'NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE=false' | sudo tee -a "${ENV_FILE}" >/dev/null
     fi
     echo "[njrh-autostart] env file already exists: ${ENV_FILE}"
     return 0
@@ -85,7 +95,8 @@ NJRH_NAV2_LIFECYCLE_PARALLEL_BT=true
 NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK=false
 NJRH_PREPARE_RUNTIME_PERMISSIONS_MODE=once
 NJRH_COMMON_LOCAL_STATE_START_READY_MODE=endpoint
-NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE=true
+NJRH_COMMON_LOCAL_STATE_BACKGROUND_START=true
+NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE=false
 RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 FASTDDS_BUILTIN_TRANSPORTS=UDPv4
 ROBOT_API_TOKEN=${ROBOT_API_TOKEN:-}
@@ -96,14 +107,15 @@ EOF
 
 install_unit() {
   require_sudo
-  [[ -x "${RUNNER}" ]] || {
-    echo "[njrh-autostart] missing executable runner: ${RUNNER}" >&2
+  [[ -f "${RUNNER}" ]] || {
+    echo "[njrh-autostart] missing runner: ${RUNNER}" >&2
     exit 1
   }
-  [[ -x "${CAN_RUNNER}" ]] || {
-    echo "[njrh-autostart] missing executable CAN runner: ${CAN_RUNNER}" >&2
+  [[ -f "${CAN_RUNNER}" ]] || {
+    echo "[njrh-autostart] missing CAN runner: ${CAN_RUNNER}" >&2
     exit 1
   }
+  chmod +x "${RUNNER}" "${CAN_RUNNER}" 2>/dev/null || true
   write_env_file_if_missing
   sudo tee "${CAN_UNIT_PATH}" >/dev/null <<EOF
 [Unit]
@@ -119,7 +131,7 @@ EnvironmentFile=-${ENV_FILE}
 Environment=CAN_IFACE=can0
 Environment=CAN_BITRATE=500000
 Environment=CAN_WAIT_TIMEOUT_SEC=120
-ExecStart=${CAN_RUNNER}
+ExecStart=/usr/bin/env bash ${CAN_RUNNER}
 
 [Install]
 WantedBy=multi-user.target
@@ -136,8 +148,8 @@ Type=simple
 User=${SUDO_USER:-${USER}}
 WorkingDirectory=${WORKSPACE_HOST}
 EnvironmentFile=-${ENV_FILE}
-ExecStart=${RUNNER} run
-ExecStop=${RUNNER} stop
+ExecStart=/usr/bin/env bash ${RUNNER} run
+ExecStop=/usr/bin/env bash ${RUNNER} stop
 Restart=always
 RestartSec=10
 TimeoutStartSec=240

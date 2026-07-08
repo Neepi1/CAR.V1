@@ -62,8 +62,8 @@ Use 10m as the default field test distance. A 0.10m S curve is too short to
 measure Ranger odometry accuracy and should only be used as a bench smoke test.
 
 The command path remains:
-  test script -> /cmd_vel_collision_checked -> robot_safety -> /cmd_vel_safe
-              -> ranger_mini3_mode_controller -> /cmd_vel -> ranger_base
+  test script -> /cmd_vel_collision_checked -> robot_safety -> /cmd_vel -> ranger_base
+  /cmd_vel_safe is a robot_safety diagnostic mirror.
 EOF
 }
 

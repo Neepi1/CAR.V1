@@ -49,21 +49,50 @@ canonical_helper_process_pattern() {
   esac
 }
 
-canonical_process_running() {
+canonical_cmdline_matches() {
   local pattern="$1"
-  pgrep -f "${pattern}" >/dev/null 2>&1
+  CANONICAL_CMDLINE_PATTERN="${pattern}" python3 - <<'PY'
+import os
+import re
+import sys
+
+pattern = os.environ.get("CANONICAL_CMDLINE_PATTERN", "")
+if not pattern:
+    sys.exit(1)
+try:
+    regex = re.compile(pattern)
+except re.error:
+    sys.exit(1)
+
+for name in os.listdir("/proc"):
+    if not name.isdigit():
+        continue
+    path = os.path.join("/proc", name, "cmdline")
+    try:
+        with open(path, "rb") as handle:
+            cmdline = handle.read().replace(b"\0", b" ").decode("utf-8", "ignore")
+    except OSError:
+        continue
+    if cmdline and regex.search(cmdline):
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+canonical_process_running() {
+  canonical_cmdline_matches "$1"
 }
 
 local_state_node_process_running() {
-  pgrep -f "robot_local_state/local_state_node|local_state_node --ros-args" >/dev/null 2>&1
+  canonical_cmdline_matches "robot_local_state/local_state_node|local_state_node --ros-args"
 }
 
 fastlio_odom_bridge_process_running() {
-  pgrep -f "robot_fastlio_mapping/fastlio_odom_bridge_node|fastlio_odom_bridge_node --ros-args" >/dev/null 2>&1
+  canonical_cmdline_matches "robot_fastlio_mapping/fastlio_odom_bridge_node|fastlio_odom_bridge_node --ros-args"
 }
 
 ekf_local_state_process_running() {
-  pgrep -f "robot_localization/ekf_node|ekf_node --ros-args.*__node:=robot_local_state" >/dev/null 2>&1
+  canonical_cmdline_matches "robot_localization/ekf_node|ekf_node --ros-args.*__node:=robot_local_state"
 }
 
 local_state_required_processes_running() {
@@ -205,9 +234,33 @@ local_state_runtime_ready() {
     local_state_tf_ready "${timeout_sec}" "${max_age_sec}"
 }
 
+ranger_chassis_runtime_ready() {
+  local timeout_sec="${1:-${RANGER_CHASSIS_READY_TIMEOUT_SEC:-4}}"
+  local odom_max_age_sec="${2:-${RANGER_CHASSIS_ODOM_MAX_AGE_SEC:-1.0}}"
+  local odom_max_future_sec="${3:-${RANGER_CHASSIS_ODOM_MAX_FUTURE_SEC:-0.25}}"
+  wait_for_topic_publisher_from_node "/wheel/odom" "ranger_base_node" "${timeout_sec}" &&
+    wait_for_fresh_header_topic_message "/wheel/odom" "${timeout_sec}" "${odom_max_age_sec}" "${odom_max_future_sec}" &&
+    wait_for_topic_publisher_from_node "/motion_state" "ranger_base_node" "${timeout_sec}" &&
+    wait_for_topic_message "/motion_state" "${timeout_sec}"
+}
+
+ranger_chassis_liveness_ready() {
+  local timeout_sec="${1:-${RANGER_CHASSIS_LIVENESS_TIMEOUT_SEC:-3}}"
+  local odom_max_age_sec="${2:-${RANGER_CHASSIS_ODOM_MAX_AGE_SEC:-1.0}}"
+  local odom_max_future_sec="${3:-${RANGER_CHASSIS_ODOM_MAX_FUTURE_SEC:-0.25}}"
+  local process_pattern
+  process_pattern="$(canonical_helper_process_pattern "ranger_chassis")" || return 1
+  canonical_process_running "${process_pattern}" &&
+    wait_for_topic_publisher_from_node "/wheel/odom" "ranger_base_node" "${timeout_sec}" &&
+    wait_for_fresh_header_topic_message "/wheel/odom" "${timeout_sec}" "${odom_max_age_sec}" "${odom_max_future_sec}"
+}
+
 canonical_helper_ready() {
   local helper_name="$1"
   case "${helper_name}" in
+    ranger_chassis*)
+      ranger_chassis_runtime_ready "${RANGER_CHASSIS_REUSE_READY_TIMEOUT_SEC:-3}"
+      ;;
     local_state*|robot_local_state*)
       local_state_runtime_ready "${LOCAL_STATE_REUSE_READY_TIMEOUT_SEC:-3}"
       ;;
@@ -219,15 +272,28 @@ canonical_helper_ready() {
 
 canonical_helper_start_ready() {
   local helper_name="$1"
+  local ready_start_sec="${SECONDS}"
+  local elapsed_sec
   case "${helper_name}" in
+    ranger_chassis*)
+      ranger_chassis_runtime_ready "${RANGER_CHASSIS_START_READY_TIMEOUT_SEC:-8}" || return 1
+      elapsed_sec=$((SECONDS - ready_start_sec))
+      echo "[runtime-overlay] RANGER_CHASSIS_START_READY_STAGE stage=topics_ready elapsed_sec=${elapsed_sec}" >&2
+      ;;
     local_state*|robot_local_state*)
       wait_for_local_state_required_processes "${LOCAL_STATE_PROCESS_START_TIMEOUT_SEC:-12}" || return 1
+      elapsed_sec=$((SECONDS - ready_start_sec))
+      echo "[runtime-overlay] LOCAL_STATE_START_READY_STAGE stage=processes_ready elapsed_sec=${elapsed_sec}" >&2
       case "${NJRH_LOCAL_STATE_START_READY_MODE:-fresh_tf}" in
         endpoint)
-          local_state_endpoint_ready "${LOCAL_STATE_START_READY_TIMEOUT_SEC:-12}"
+          local_state_endpoint_ready "${LOCAL_STATE_START_READY_TIMEOUT_SEC:-12}" || return 1
+          elapsed_sec=$((SECONDS - ready_start_sec))
+          echo "[runtime-overlay] LOCAL_STATE_START_READY_STAGE stage=endpoint_ready elapsed_sec=${elapsed_sec}" >&2
           ;;
         fresh_tf)
-          local_state_runtime_ready "${LOCAL_STATE_START_READY_TIMEOUT_SEC:-12}"
+          local_state_runtime_ready "${LOCAL_STATE_START_READY_TIMEOUT_SEC:-12}" || return 1
+          elapsed_sec=$((SECONDS - ready_start_sec))
+          echo "[runtime-overlay] LOCAL_STATE_START_READY_STAGE stage=fresh_tf_ready elapsed_sec=${elapsed_sec}" >&2
           ;;
         *)
           echo "[runtime-overlay] unsupported NJRH_LOCAL_STATE_START_READY_MODE=${NJRH_LOCAL_STATE_START_READY_MODE}; expected endpoint|fresh_tf" >&2

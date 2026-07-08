@@ -15,7 +15,7 @@ usage() {
   cat <<'EOF'
 Usage:
   verify_ranger_official_passthrough.sh [--duration-sec N] [--compare-cmd]
-      [--profile official_passthrough|custom] [--set-profile] [--restart] [--watch-once]
+      [--profile official_passthrough] [--set-profile] [--watch-once]
 
 Default is read-only and does not publish motion commands.
 EOF
@@ -40,7 +40,8 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --restart)
-      DO_RESTART=1
+      echo "[verify-ranger-pass] --restart is disabled; restart the full njrh-runtime.service owner" >&2
+      exit 2
       shift
       ;;
     --watch-once)
@@ -61,20 +62,14 @@ done
 
 if [[ -n "${PROFILE}" ]]; then
   case "${PROFILE}" in
-    official_passthrough|custom) ;;
+    official_passthrough) ;;
     *) echo "[verify-ranger-pass] invalid profile: ${PROFILE}" >&2; exit 2 ;;
   esac
 fi
 
 if [[ "${SET_PROFILE}" -eq 1 ]]; then
   [[ -n "${PROFILE}" ]] || { echo "[verify-ranger-pass] --set-profile requires --profile" >&2; exit 2; }
-  args=(--profile "${PROFILE}")
-  [[ "${DO_RESTART}" -eq 1 ]] && args+=(--restart)
-  bash "${SCRIPT_DIR}/set_ranger_mode_controller_profile.sh" "${args[@]}" --print
-elif [[ "${DO_RESTART}" -eq 1 ]]; then
-  args=(--restart --print)
-  [[ -n "${PROFILE}" ]] && args=(--profile "${PROFILE}" "${args[@]}")
-  bash "${SCRIPT_DIR}/set_ranger_mode_controller_profile.sh" "${args[@]}"
+  bash "${SCRIPT_DIR}/set_ranger_mode_controller_profile.sh" --profile "${PROFILE}" --print
 fi
 
 failures=0
@@ -106,14 +101,14 @@ status = json.loads(sys.argv[1])
 expected = sys.argv[2] or "official_passthrough"
 checks = {
     "mode_controller_profile": status.get("mode_controller_profile"),
-    "custom_ackermann_enabled": status.get("custom_ackermann_enabled"),
+    "legacy_custom_ackermann_removed": status.get("legacy_custom_ackermann_removed"),
     "cmd_vel_passthrough": status.get("cmd_vel_passthrough"),
     "desired_motion_mode_source": status.get("desired_motion_mode_source"),
 }
 print("[verify-ranger-pass] status=" + json.dumps(checks, sort_keys=True))
 if expected == "official_passthrough":
     assert status.get("mode_controller_profile") == "official_passthrough"
-    assert status.get("custom_ackermann_enabled") is False
+    assert status.get("legacy_custom_ackermann_removed") is True
     assert status.get("cmd_vel_passthrough") is True
     assert status.get("desired_motion_mode_source") == "predicted_from_cmd_vel_safe"
 PY
@@ -121,12 +116,15 @@ fi
 
 topic_exists /cmd_vel_safe && pass "/cmd_vel_safe exists" || fail "/cmd_vel_safe missing"
 topic_exists /cmd_vel && pass "/cmd_vel exists" || fail "/cmd_vel missing"
-topic_info_contains /cmd_vel "Node name: ranger_mini3_mode_controller" &&
-  pass "/cmd_vel publisher is ranger_mini3_mode_controller" ||
-  fail "/cmd_vel publisher is not ranger_mini3_mode_controller"
+topic_info_contains /cmd_vel "Node name: robot_safety" &&
+  pass "/cmd_vel publisher is robot_safety" ||
+  fail "/cmd_vel publisher is not robot_safety"
 topic_info_contains /cmd_vel_safe "Node name: robot_safety" &&
-  pass "robot_safety publishes /cmd_vel_safe" ||
+  pass "robot_safety publishes /cmd_vel_safe mirror" ||
   fail "robot_safety does not publish /cmd_vel_safe"
+topic_info_contains /ranger_mini3/mode_controller_shadow_cmd_vel "Node name: ranger_mini3_mode_controller" &&
+  pass "mode_controller publishes only shadow cmd_vel" ||
+  warn "mode_controller shadow cmd_vel publisher not visible"
 topic_info_contains /cmd_vel "Node name: ranger_base_node|Node name: ranger_base" &&
   pass "ranger_base_node subscribes /cmd_vel" ||
   warn "ranger_base_node /cmd_vel subscription not visible"
@@ -150,7 +148,7 @@ from rclpy.node import Node
 from std_msgs.msg import String
 
 duration = float(sys.argv[1])
-allowed = {"reverse_not_allowed", "timeout_zero", "park_requested", "startup_zero", "lateral_not_allowed", "custom_profile"}
+allowed = {"reverse_not_allowed", "timeout_zero", "park_requested", "startup_zero", "lateral_not_allowed"}
 
 class Probe(Node):
     def __init__(self):

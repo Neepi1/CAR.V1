@@ -1,11 +1,11 @@
 # ranger_mini3_mode_controller
 
-C++ safety/status layer between `robot_safety` and the AgileX `ranger_base_node`.
+C++ motion-mode observer for the AgileX `ranger_base_node`.
 
 ## Runtime Contract
 
-- Input: `/cmd_vel_safe`
-- Output: `/cmd_vel`
+- Input: `/cmd_vel_safe` diagnostic mirror from `robot_safety`
+- Output: `/ranger_mini3/mode_controller_shadow_cmd_vel`
 - Feedback/status: `/ranger_mini3_mode_controller/status`
 - Desired mode hint: `/ranger_mini3/desired_motion_mode` (`std_msgs/String`, official Ranger
   `motion_mode` enum JSON with legacy string retained)
@@ -13,32 +13,19 @@ C++ safety/status layer between `robot_safety` and the AgileX `ranger_base_node`
 - Forced mode input: `/ranger_mini3/forced_mode`
 - Runtime reverse permission: `/ranger_mini3/docking_allow_reverse` and `/ranger_mini3/teleop_allow_reverse`, plus legacy `/ranger_mini3/allow_reverse`
 
-This node does not write CAN frames directly. `ranger_base_node` remains the only CAN owner.
+This node does not write CAN frames directly and is not in the commercial critical
+speed path. `robot_safety` owns the final `/cmd_vel` publisher, and `ranger_base_node`
+remains the only CAN owner.
 
-## Phase R4 Control Profile
+## Official Passthrough Only
 
-Production default:
-
-```yaml
-mode_controller_profile: official_passthrough
-```
-
-In `official_passthrough`, the node keeps the `robot_safety -> /cmd_vel_safe ->
-ranger_mini3_mode_controller -> /cmd_vel -> ranger_base_node` chain intact but
-does not run repository-owned Ackermann curvature/yaw-rate shaping for normal
-commands. `/cmd_vel` preserves `/cmd_vel_safe` unless a safety rule applies:
-startup zero, command-timeout zero, park zero, reverse-not-allowed protection, or
-lateral-not-allowed protection. The official AgileX `ranger_base_node` and SDK
-therefore interpret the Twist and motion mode once.
-
-Rollback/A-B profile:
-
-```yaml
-mode_controller_profile: custom
-```
-
-`custom` keeps the legacy repository-owned Ackermann shaping path for controlled
-diagnosis only. It is not the production default.
+The legacy repository-owned Ackermann shaping profile has been removed. The node
+now has one production behavior: official passthrough. It shadows the
+`robot_safety` final command mirror
+and publishes only `/ranger_mini3/mode_controller_shadow_cmd_vel` plus motion-mode
+diagnostics. It does not own `/cmd_vel`, so a mode/status failure cannot break the
+commercial command path `robot_safety -> /cmd_vel -> ranger_base_node`. The official
+AgileX `ranger_base_node` and SDK therefore interpret the production Twist once.
 
 ## Ranger Motion Mode Contract
 
@@ -66,12 +53,12 @@ hint.
 
 ## Current Policy
 
-- In `official_passthrough`, preserve normal `linear.x`, `linear.y`, and `angular.z` from `/cmd_vel_safe` only when policy allows it.
-- Clamp reverse commands out during navigation; `linear.x < 0` becomes zero unless a fresh docking or mapping-teleop reverse permission is present.
+- Preserve normal `linear.x`, `linear.y`, and `angular.z` from `/cmd_vel_safe` only when policy allows it.
+- Clamp reverse commands out during navigation; `linear.x < 0` becomes zero unless a fresh docking, mapping-teleop, or bounded ordinary final-verify retry reverse permission is present.
 - Reject lateral output by default when `lateral_policy=reject`, reporting `diff_reason=lateral_not_allowed`.
 - `/ranger_mini3/forced_mode=side_slip` or legacy `crab` is the docking-only lateral exception in official passthrough. While active, `linear.y` is preserved and desired motion mode is `MOTION_MODE_SIDE_SLIP=3`; normal navigation still rejects lateral commands.
 - `/ranger_mini3/forced_mode=park` publishes zero.
-- In `custom`, keep the legacy Ackermann yaw-rate/curvature shaping, low-speed spin hysteresis, and crab/parallel handling for rollback diagnostics.
+- `/ranger_mini3_mode_controller/status` exposes `legacy_custom_ackermann_removed=true`; any stale `mode_controller_profile=custom` override is ignored with a warning.
 - Reverse permission is short-lived (`reverse_enable_timeout_s`, default `0.75 s`) and tracked per source, so an idle App teleop publisher cannot cancel a live docking undock permit.
 
 The current upstream Ranger ROS2 driver exposes `0x00` as front/rear dual Ackermann. A true front-only Ackermann mode is not exposed through the current `/cmd_vel -> ranger_base_node` interface. Crab mode is therefore intentionally not used by MPPI/Nav2; it is a short-range docking override only.

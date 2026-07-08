@@ -8,7 +8,6 @@ TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 REPORT_FILE="${REPORT_DIR}/local_state_input_rates_${TIMESTAMP}.md"
 HZ_TIMEOUT_SEC="${NJRH_LOCAL_STATE_RATE_HZ_TIMEOUT_SEC:-5}"
 UDP_WINDOW_SEC="${NJRH_LOCAL_STATE_RATE_UDP_WINDOW_SEC:-2}"
-EKF_PROFILE="${LOCAL_STATE_EKF_PROFILE:-${NJRH_LOCAL_STATE_EKF_PROFILE:-wheel_imu}}"
 
 if [[ -f "${SCRIPT_DIR}/common_env.sh" ]]; then
   # shellcheck source=/dev/null
@@ -21,6 +20,8 @@ else
     source "${PROJECT_ROOT}/install/setup.bash"
   fi
 fi
+
+EKF_PROFILE="${LOCAL_STATE_EKF_PROFILE:-${NJRH_LOCAL_STATE_EKF_PROFILE:-wheel_only}}"
 
 mkdir -p "${REPORT_DIR}"
 
@@ -70,8 +71,70 @@ udp_rcvbuf_errors() {
 topic_rate() {
   local topic="$1"
   local window="$2"
+  local reliability="${3:-default}"
   local output
-  output="$(timeout "${HZ_TIMEOUT_SEC}" ros2 topic hz "${topic}" --window "${window}" 2>&1 || true)"
+  if [[ "${reliability}" == "best_effort" ]]; then
+    output="$(python3 - "${topic}" "${window}" "${HZ_TIMEOUT_SEC}" <<'PY' 2>&1 || true
+import sys
+import time
+
+import rclpy
+from geometry_msgs.msg import Vector3Stamped
+from nav_msgs.msg import Odometry
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import Imu
+
+topic = sys.argv[1]
+window = max(2, int(float(sys.argv[2])))
+timeout_sec = max(1.0, float(sys.argv[3]))
+message_types = {
+    "/lidar_imu": Imu,
+    "/lidar_imu_bias_corrected": Imu,
+    "/local_state/imu_bias": Vector3Stamped,
+    "/wheel/odom": Odometry,
+    "/wheel/odom_ekf": Odometry,
+    "/local_state/odometry": Odometry,
+}
+message_type = message_types.get(topic)
+if message_type is None:
+    raise SystemExit(f"unsupported best_effort rate topic: {topic}")
+
+rclpy.init()
+node = rclpy.create_node("njrh_topic_rate_best_effort")
+qos = QoSProfile(
+    history=HistoryPolicy.KEEP_LAST,
+    depth=max(10, window),
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+)
+stamps = []
+
+def callback(_msg):
+    now = time.monotonic()
+    stamps.append(now)
+    if len(stamps) > window:
+        del stamps[0]
+
+node.create_subscription(message_type, topic, callback, qos)
+deadline = time.monotonic() + timeout_sec
+try:
+    while rclpy.ok() and time.monotonic() < deadline:
+        rclpy.spin_once(node, timeout_sec=0.05)
+finally:
+    node.destroy_node()
+    if rclpy.ok():
+        rclpy.shutdown()
+
+if len(stamps) < 2:
+    raise SystemExit(1)
+elapsed = stamps[-1] - stamps[0]
+if elapsed <= 0.0:
+    raise SystemExit(1)
+print(f"average rate: {(len(stamps) - 1) / elapsed:.3f}")
+PY
+)"
+  else
+    output="$(timeout "${HZ_TIMEOUT_SEC}" ros2 topic hz "${topic}" --window "${window}" 2>&1 || true)"
+  fi
   printf '%s\n' "${output}" >"/tmp/njrh_local_state_hz_${topic//\//_}.txt"
   printf '%s\n' "${output}" |
     awk '/average rate:/ {rate=$3} END {if (rate != "") print rate}'
@@ -90,7 +153,17 @@ publisher_count() {
 contains_node_name() {
   local text="$1"
   local node="$2"
-  printf '%s\n' "${text}" | grep -Eq "Node name: ${node}([[:space:]]|$)"
+  printf '%s\n' "${text}" | tr -d '\r' | awk -v node="${node}" '
+    /^[[:space:]]*Node name:[[:space:]]*/ {
+      candidate = $0
+      sub(/^[[:space:]]*Node name:[[:space:]]*/, "", candidate)
+      sub(/[[:space:]]*$/, "", candidate)
+      if (candidate == node || candidate == "/" node) {
+        found = 1
+      }
+    }
+    END {exit found ? 0 : 1}
+  '
 }
 
 rate_rows=()
@@ -98,8 +171,9 @@ rate_rows=()
 record_rate() {
   local topic="$1"
   local window="$2"
+  local reliability="${3:-default}"
   local rate
-  rate="$(topic_rate "${topic}" "${window}")"
+  rate="$(topic_rate "${topic}" "${window}" "${reliability}")"
   rate_rows+=("${topic}|${rate:-missing}")
   echo "RATE ${topic} ${rate:-missing}"
 }
@@ -165,12 +239,12 @@ classify_rates() {
 
 udp_before="$(udp_rcvbuf_errors)"
 
-if [[ "${EKF_PROFILE}" == "wheel_only" ]]; then
-  add_pass "LOCAL_STATE_EKF_PROFILE=wheel_only skips IMU rate checks"
-else
+if [[ "${LOCAL_STATE_IMU_BIAS_FILTER_ENABLED:-true}" == "true" ]]; then
   record_rate /lidar_imu 50
-  record_rate /lidar_imu_bias_corrected 30
+  record_rate /lidar_imu_bias_corrected 30 best_effort
   record_rate /local_state/imu_bias 20
+else
+  add_warn "LOCAL_STATE_IMU_BIAS_FILTER_ENABLED=false skips corrected IMU rate checks"
 fi
 record_rate /wheel/odom 20
 record_rate /wheel/odom_ekf 20
@@ -229,6 +303,13 @@ else
 fi
 
 imu_info="$(topic_info_text /lidar_imu_bias_corrected)"
+if [[ "${LOCAL_STATE_IMU_BIAS_FILTER_ENABLED:-true}" == "true" ]]; then
+  if contains_node_name "${imu_info}" "imu_gyro_bias_filter"; then
+    add_pass "/lidar_imu_bias_corrected has imu_gyro_bias_filter publisher"
+  else
+    add_fail "/lidar_imu_bias_corrected is missing imu_gyro_bias_filter publisher"
+  fi
+fi
 if [[ "${EKF_PROFILE}" == "wheel_only" ]]; then
   if contains_node_name "${imu_info}" "robot_local_state"; then
     add_fail "wheel_only profile must not have EKF subscriber on /lidar_imu_bias_corrected"

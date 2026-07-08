@@ -87,7 +87,7 @@ that hides the real slow stage.
 The external lifecycle helper activates `planner_server` first so the selected
 floor global costmap subscribes to `/map` and starts its static-layer resize as
 early as possible. For normal point navigation, `waypoint_follower`,
-`smoother_server`, and `behavior_server` are not part of the resident startup
+`waypoint_follower` is not part of the resident startup
 hard gate. The field BT XMLs execute only `ComputePathToPose` /
 `ComputePathThroughPoses`, `FollowPath`, and `PipelineSequence`, so behavior
 recovery action servers are not required before the App can send a point goal.
@@ -193,8 +193,8 @@ runtime keeps `lifecycle_manager_navigation` present but starts the core nodes
 with the repo-owned `nav2_lifecycle_sequence.py` helper and a bounded outer
 timeout. The production default keeps the point-navigation core lifecycle
 sequence serial (`NJRH_NAV2_LIFECYCLE_PARALLEL_CORE=false`): `planner_server`,
-`controller_server`, `velocity_smoother`, `collision_monitor`, and
-`bt_navigator` transition in a deterministic order. A parallel core sequence is
+`controller_server`, `velocity_smoother`, `collision_monitor`, `behavior_server`,
+`smoother_server`, and `bt_navigator` transition in a deterministic order. A parallel core sequence is
 kept as an explicit A/B switch only because field cold-start testing showed it
 can leave the resident startup stuck in lifecycle activation on the current
 Orin NX image. `NJRH_NAV2_LIFECYCLE_CONFIGURE_ALL_FIRST=true` remains an
@@ -256,10 +256,10 @@ or make App success visible early.
 The serial production path keeps one repo-owned lifecycle helper for the startup
 critical path rather than spawning competing lifecycle clients. Its node order
 brings up the point-navigation core first: planner, controller/local costmap,
-velocity smoother, collision monitor, and `bt_navigator`. The older
+velocity smoother, collision monitor, `behavior_server`, `smoother_server`, and `bt_navigator`. The older
 `nav2_util/lifecycle_bringup` path remains available with
 `NJRH_NAV2_USE_REPO_LIFECYCLE_SEQUENCE=false` for A/B rollback.
-`smoother_server`, `behavior_server`, and `waypoint_follower` remain available
+`waypoint_follower` remains available
 as launched Nav2 processes and are activated by a background repo lifecycle
 helper, but they are not part of the resident startup ready gate for the current
 point-navigation behavior trees.
@@ -333,8 +333,8 @@ Hardware validation:
   before `controller_server`, starts in the background after
   `nav2_layer_prestarted` only after the matching
   `NJRH_NAV2_HOLD_READY_FILE` is written by the current `run_nav2_navigation.sh`
-  wrapper, and does not include `waypoint_follower`, `smoother_server`, or
-  `behavior_server` in the point-navigation startup hard gate.
+  wrapper, and does not include `waypoint_follower` in the point-navigation
+  startup hard gate.
 - Confirm common startup logs `runtime health confirms local_state_ready before
   resident navigation autostart` before `starting resident_navigation_runtime`.
 - Confirm the localization layer logs `localization map_server

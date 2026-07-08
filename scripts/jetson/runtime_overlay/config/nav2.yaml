@@ -29,49 +29,61 @@ planner_server:
     planner_plugins: ["GridBased"]
     GridBased:
       plugin: "nav2_smac_planner/SmacPlanner2D"
-      tolerance: 0.25
+      tolerance: 0.05
       downsample_costmap: false
       allow_unknown: true
 
 controller_server:
   ros__parameters:
     use_sim_time: false
-    controller_frequency: 12.0
+    controller_frequency: 15.0
     odom_topic: /local_state/odometry
     speed_limit_topic: /speed_limit
     min_x_velocity_threshold: 0.01
     min_y_velocity_threshold: 0.0
     min_theta_velocity_threshold: 0.01
-    failure_tolerance: 0.6
+    # Dynamic obstacles in building corridors should make the controller pause
+    # briefly, not abort the business goal on a single blocked MPPI cycle.
+    failure_tolerance: 3.0
     progress_checker_plugin: "progress_checker"
     goal_checker_plugins: ["goal_checker"]
     controller_plugins: ["FollowPath", "FollowPathFallback"]
     progress_checker:
       # PoseProgressChecker counts legitimate in-place yaw progress during
-      # RotationShim startup alignment. The radius and timeout stay unchanged;
-      # this avoids masking stalls by only extending movement_time_allowance.
+      # RotationShim startup alignment. Keep the linear progress radius below
+      # the ordinary point-goal tolerance so terminal creep is not
+      # misclassified as a no-progress failure on Ranger Mini 3.
       plugin: "nav2_controller::PoseProgressChecker"
-      required_movement_radius: 0.10
-      required_movement_angle: 0.10
+      required_movement_radius: 0.03
+      required_movement_angle: 0.05
       movement_time_allowance: 12.0
     goal_checker:
       plugin: "nav2_controller::SimpleGoalChecker"
+      # Re-evaluate XY and yaw together on every tick. A latched XY gate can
+      # falsely accept a goal after a near-goal obstacle or avoidance maneuver
+      # pushes the robot back outside the ordinary point tolerance.
       stateful: false
-      xy_goal_tolerance: 0.20
-      yaw_goal_tolerance: 0.0873
+      xy_goal_tolerance: 0.06
+      yaw_goal_tolerance: 0.05
     FollowPath:
       plugin: "nav2_rotation_shim_controller::RotationShimController"
       primary_controller: "nav2_mppi_controller::MPPIController"
-      angular_dist_threshold: 1.20
+      # Ackermann MPPI cannot spin in place: its hard turning-radius constraint
+      # collapses wz with vx near zero. Let RotationShim own path entry heading
+      # before MPPI starts crawling with physically ineffective tiny commands.
+      angular_dist_threshold: 0.45
+      angular_disengage_threshold: 0.075
       forward_sampling_distance: 0.55
-      rotate_to_heading_angular_vel: 0.85
-      max_angular_accel: 2.4
+      # Ranger Mini 3 can enter chassis SPINNING mode on aggressive pure-yaw
+      # shim commands; keep Nav2-owned heading closure smooth and observable.
+      rotate_to_heading_angular_vel: 0.60
+      max_angular_accel: 1.2
       simulate_ahead_time: 1.0
       # RotationShim owns ordinary pose_required terminal heading and docking
       # predock staging heading before the Nav2 action succeeds.
       rotate_to_goal_heading: true
-      time_steps: 44
-      model_dt: 0.0833333333
+      time_steps: 48
+      model_dt: 0.0666666667
       batch_size: 1200
       iteration_count: 1
       prune_distance: 4.5
@@ -85,11 +97,18 @@ controller_server:
       regenerate_noises: false
       retry_attempt_limit: 3
       reset_period: 1.0
-      vx_std: 0.45
+      # Match the Ranger Mini 3's observed smooth chassis response. MPPI may
+      # still request 1.2 m/s cruise, but samples and acceleration limits should
+      # not assume snap acceleration that the physical base will not track.
+      vx_std: 0.30
       vy_std: 0.0
-      wz_std: 0.45
+      wz_std: 0.32
       vx_max: 1.20
-      vx_min: 0.0
+      # Allow only a low-speed terminal reverse correction. PreferForwardCritic
+      # keeps long-range path following forward-biased, while this gives MPPI a
+      # way to recover the measured near-goal forward overshoot instead of
+      # stalling outside the 6 cm goal checker tolerance.
+      vx_min: -0.08
       vy_max: 0.0
       wz_max: 0.70
       critics:
@@ -99,18 +118,19 @@ controller_server:
         - "PathAlignCritic"
         - "PathFollowCritic"
         - "PathAngleCritic"
+        - "PreferForwardCritic"
         - "VelocityDeadbandCritic"
         - "TwirlingCritic"
       GoalCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 4.0
-        threshold_to_consider: 0.8
+        cost_weight: 16.0
+        threshold_to_consider: 1.5
       GoalAngleCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 4.0
-        threshold_to_consider: 0.8
+        cost_weight: 6.0
+        threshold_to_consider: 1.5
       ObstaclesCritic:
         enabled: true
         cost_power: 1
@@ -126,18 +146,21 @@ controller_server:
       PathAlignCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 1.8
+        cost_weight: 2.4
         max_path_occupancy_ratio: 0.05
         trajectory_point_step: 4
-        threshold_to_consider: 0.8
-        offset_from_furthest: 10
+        threshold_to_consider: 1.5
+        offset_from_furthest: 12
         use_path_orientations: false
       PathFollowCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 4.0
-        offset_from_furthest: 8
-        threshold_to_consider: 0.8
+        # Keep long-range goals from falling into the low-speed terminal
+        # correction local optimum after vx_min is opened for final overshoot
+        # recovery.
+        cost_weight: 7.0
+        offset_from_furthest: 10
+        threshold_to_consider: 1.2
       PathAngleCritic:
         enabled: true
         cost_power: 1
@@ -148,12 +171,20 @@ controller_server:
         mode: 0
       TwirlingCritic:
         enabled: true
-        twirling_cost_power: 1
-        twirling_cost_weight: 1.0
+        cost_power: 1
+        cost_weight: 1.0
+      PreferForwardCritic:
+        enabled: true
+        cost_power: 1
+        # Strongly bias long-range samples forward; this critic drops out near
+        # the goal so the bounded -0.08 m/s terminal reverse correction remains
+        # available.
+        cost_weight: 20.0
+        threshold_to_consider: 0.50
       VelocityDeadbandCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 35.0
+        cost_weight: 90.0
         deadband_velocities: [0.025, 0.0, 0.025]
     FollowPathFallback:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
@@ -199,8 +230,11 @@ bt_navigator:
     robot_base_frame: base_link
     odom_topic: /local_state/odometry
     bt_loop_duration: 50
-    default_server_timeout: 1000
-    wait_for_service_timeout: 2000
+    # Nav2 BT action/service acknowledgement can exceed 1s on Jetson while
+    # AMCL, costmaps, and Fast DDS discovery are active. Keep HTTP goal submit
+    # asynchronous, but give BT-internal servers enough time to acknowledge.
+    default_server_timeout: 5000
+    wait_for_service_timeout: 8000
     transform_tolerance: 0.10
     default_nav_to_pose_bt_xml: /workspaces/njrh-v3/workspace1/install/robot_nav_config/share/robot_nav_config/behavior_trees/navigate_to_pose.xml
     default_nav_through_poses_bt_xml: /workspaces/njrh-v3/workspace1/install/robot_nav_config/share/robot_nav_config/behavior_trees/navigate_through_poses.xml
@@ -233,15 +267,15 @@ smoother_server:
 velocity_smoother:
   ros__parameters:
     use_sim_time: false
-    smoothing_frequency: 20.0
+    smoothing_frequency: 30.0
     scale_velocities: false
     feedback: "OPEN_LOOP"
-    max_velocity: [1.20, 0.0, 1.00]
-    min_velocity: [0.0, 0.0, -1.00]
-    max_accel: [1.2, 0.0, 2.0]
-    max_decel: [-1.2, 0.0, -2.0]
+    max_velocity: [1.20, 0.0, 0.70]
+    min_velocity: [-0.08, 0.0, -0.70]
+    max_accel: [0.55, 0.0, 0.90]
+    max_decel: [-0.95, 0.0, -1.10]
     odom_topic: /local_state/odometry
-    odom_duration: 0.1
+    odom_duration: 0.2
     deadband_velocity: [0.0, 0.0, 0.0]
     velocity_timeout: 1.0
 

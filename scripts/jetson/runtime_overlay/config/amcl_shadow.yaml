@@ -14,7 +14,7 @@ amcl:
     always_reset_initial_pose: false
     first_map_only: false
 
-    robot_model_type: nav2_amcl::DifferentialMotionModel
+    robot_model_type: nav2_amcl::OmniMotionModel
 
     # Ranger odom is a short-term motion prior only; map observations must be
     # allowed to correct drift instead of over-trusting the chassis model.

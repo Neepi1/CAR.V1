@@ -1,31 +1,31 @@
 # Phase R4 Ranger Official Passthrough
 
-Phase R4 makes `ranger_mini3_mode_controller` a safety/status passthrough layer
-by default instead of a repository-owned Ackermann shaping layer.
+Phase R4 no longer keeps a repository-owned Ranger Mini 3 Ackermann shaping
+model. The legacy `custom` profile was removed after field tests showed the
+official Ranger driver/SDK odometry and command interpretation are the trusted
+baseline.
 
-Production command chain stays:
+The mode controller now has one behavior: official passthrough. It observes the
+post-safety command mirror and publishes diagnostics:
 
 ```text
-Nav2 / final_yaw_align / docking / teleop
-  -> /cmd_vel_collision_checked or /cmd_vel_docking
-  -> robot_safety
+robot_safety
   -> /cmd_vel_safe
   -> ranger_mini3_mode_controller
-  -> /cmd_vel
-  -> official ranger_base_node
+  -> /ranger_mini3/mode_controller_shadow_cmd_vel
+  -> /ranger_mini3/desired_motion_mode
+  -> /ranger_mini3_mode_controller/status
 ```
 
-Default profile:
+In the current runtime, `robot_safety` remains the final `/cmd_vel` publisher and
+the official `ranger_base_node` remains the only CAN owner. The mode controller
+does not write CAN frames and does not run a second Ackermann model.
 
-```yaml
-mode_controller_profile: official_passthrough
-```
-
-In `official_passthrough`, normal navigation output preserves:
+Normal navigation output is preserved except for explicit guard rails:
 
 ```text
-output.linear.x == input.linear.x
-output.linear.y == input.linear.y
+output.linear.x == input.linear.x, except reverse is clamped without a fresh permit
+output.linear.y == input.linear.y, except normal-navigation lateral is rejected
 output.angular.z == input.angular.z
 ```
 
@@ -39,43 +39,28 @@ mode is diagnostic only and has source `predicted_from_cmd_vel_safe`. Actual
 mode still comes from `/motion_state` or `/system_state`. A desired/actual
 mismatch can warn, but it does not rewrite `/cmd_vel`.
 
-The previous custom model remains available:
+The status payload exposes:
 
-```bash
-bash scripts/jetson/runtime_overlay/scripts/set_ranger_mode_controller_profile.sh \
-  --profile custom \
-  --restart
+```text
+mode_controller_profile=official_passthrough
+legacy_custom_ackermann_removed=true
+cmd_vel_passthrough=true
 ```
 
-Return to production:
-
-```bash
-bash scripts/jetson/runtime_overlay/scripts/set_ranger_mode_controller_profile.sh \
-  --profile official_passthrough \
-  --restart
-```
+`mode_controller_profile=custom` is no longer accepted by helper scripts and is
+ignored by the node with a warning if a stale parameter override survives in an
+old deployment.
 
 Verify without moving the robot:
 
 ```bash
 bash scripts/jetson/runtime_overlay/scripts/verify_ranger_official_passthrough.sh \
-  --profile official_passthrough \
   --compare-cmd \
   --duration-sec 20
 ```
 
-A/B observation while the operator manually sends the same short navigation
-goal:
+Runtime restarts must use the full service owner:
 
 ```bash
-bash scripts/jetson/runtime_overlay/scripts/run_ranger_official_passthrough_ab.sh \
-  --profile official_passthrough \
-  --duration-sec 180 \
-  --apply \
-  --restart
+sudo systemctl restart njrh-runtime.service
 ```
-
-If official passthrough reduces Ackermann-turn localization error, the legacy
-custom curvature/yaw-rate shaping was a likely contributor. If the error remains,
-the next odometry phase should compare official feedback twist and steering
-against `/wheel/odom` and reduce reliance on `/wheel/odom.pose`.

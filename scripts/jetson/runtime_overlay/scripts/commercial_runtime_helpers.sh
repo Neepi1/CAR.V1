@@ -10,6 +10,8 @@ critical_nav2_lifecycle_nodes() {
   printf '%s\n' \
     /controller_server \
     /planner_server \
+    /behavior_server \
+    /smoother_server \
     /bt_navigator \
     /velocity_smoother \
     /collision_monitor
@@ -169,6 +171,8 @@ nav2_critical_processes_running() {
   local patterns=(
     "__node:=controller_server"
     "__node:=planner_server"
+    "__node:=behavior_server"
+    "__node:=smoother_server"
     "__node:=bt_navigator"
     "__node:=velocity_smoother"
     "__node:=collision_monitor"

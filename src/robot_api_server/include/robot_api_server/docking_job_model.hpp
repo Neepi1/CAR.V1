@@ -50,6 +50,8 @@ struct DockingJob
   bool resume_navigation{true};
   bool nav_goal_sent{false};
   bool nav_goal_succeeded{false};
+  bool predock_nav_early_handoff{false};
+  std::string predock_nav_handoff_detail;
   bool dock_staging_handoff_ready{false};
   bool predock_pose_verified{false};
   bool predock_xy_ok{false};
@@ -63,6 +65,9 @@ struct DockingJob
   bool predock_yaw_align_succeeded{false};
   bool predock_yaw_align_required_actual_spin{false};
   double predock_distance_m{-1.0};
+  double predock_forward_m{0.0};
+  double predock_lateral_m{0.0};
+  double predock_lateral_abs_m{0.0};
   double predock_expected_base_yaw{0.0};
   double predock_expected_contact_yaw{0.0};
   double predock_current_base_yaw{0.0};
@@ -75,6 +80,16 @@ struct DockingJob
   double predock_yaw_align_observed_yaw_motion_rad{0.0};
   std::string predock_yaw_align_detail;
   std::string predock_yaw_align_failure_code;
+  bool predock_lateral_align_attempted{false};
+  bool predock_lateral_aligned{false};
+  bool predock_lateral_align_succeeded{false};
+  bool predock_lateral_align_active{false};
+  double predock_lateral_align_initial_error_m{0.0};
+  double predock_lateral_align_final_error_m{0.0};
+  double predock_lateral_align_duration_sec{0.0};
+  double predock_lateral_align_observed_motion_m{0.0};
+  std::string predock_lateral_align_detail;
+  std::string predock_lateral_align_failure_code;
   bool fine_entry_checked{false};
   bool fine_entry_ok{false};
   bool fine_bridge_settle_started{false};
@@ -85,6 +100,7 @@ struct DockingJob
   std::string fine_bridge_settle_failure_code;
   std::string fine_bridge_settle_detail;
   double fine_entry_distance_m{-1.0};
+  double fine_entry_lateral_m{-1.0};
   double fine_entry_base_yaw_error_rad{0.0};
   double fine_entry_contact_yaw_error_rad{0.0};
   std::string fine_entry_failure_code;

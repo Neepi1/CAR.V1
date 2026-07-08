@@ -393,6 +393,14 @@ write_amcl_runtime_status() {
       effective_reason="AMCL seed has not completed"
     fi
   fi
+  if [[ "${MODE}" != "disabled" &&
+        "${start_result}" == "waiting_seed" &&
+        "${amcl_process_ready}" == "true" &&
+        "${amcl_seeded}" == "true" ]]; then
+    effective_start_result="ready"
+    effective_ready=true
+    effective_reason=""
+  fi
 
   local state="AMCL_FAILED"
   case "${effective_start_result}" in

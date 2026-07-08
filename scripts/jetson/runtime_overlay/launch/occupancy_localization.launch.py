@@ -37,6 +37,7 @@ def generate_launch_description():
     start_map_server = LaunchConfiguration("start_map_server")
     map_lifecycle_manager_enabled = LaunchConfiguration("map_lifecycle_manager_enabled")
     map_frame = LaunchConfiguration("map_frame")
+    log_level = LaunchConfiguration("log_level")
 
     map_server = Node(
         condition=IfCondition(start_map_server),
@@ -45,6 +46,7 @@ def generate_launch_description():
         name="map_server",
         output="screen",
         prefix=cpu_affinity_prefix("nav2_map_server"),
+        arguments=["--ros-args", "--log-level", log_level],
         parameters=[{
             "use_sim_time": use_sim_time,
             "yaml_filename": map_yaml,
@@ -63,6 +65,7 @@ def generate_launch_description():
         name="lifecycle_manager_map",
         output="screen",
         prefix=cpu_affinity_prefix("nav2_lifecycle_manager"),
+        arguments=["--ros-args", "--log-level", log_level],
         parameters=[{
             "use_sim_time": use_sim_time,
             "autostart": True,
@@ -97,6 +100,7 @@ def generate_launch_description():
         composable_node_descriptions=[occupancy_grid_localizer],
         output="screen",
         prefix=cpu_affinity_prefix("occupancy_grid_localizer"),
+        arguments=["--ros-args", "--log-level", log_level],
     )
 
     return LaunchDescription([
@@ -108,6 +112,7 @@ def generate_launch_description():
         DeclareLaunchArgument("start_map_server", default_value="true"),
         DeclareLaunchArgument("map_lifecycle_manager_enabled", default_value="true"),
         DeclareLaunchArgument("map_frame", default_value="map"),
+        DeclareLaunchArgument("log_level", default_value="info"),
         map_server,
         lifecycle_manager,
         localizer_container,

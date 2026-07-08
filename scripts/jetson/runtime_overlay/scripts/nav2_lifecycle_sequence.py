@@ -182,8 +182,12 @@ def bringup_node(
     per_node_timeout_sec: float,
     trust_change_state_response: bool,
 ) -> None:
+    start = time.monotonic()
     configure_node(node, node_name, per_node_timeout_sec, trust_change_state_response)
+    log(f"lifecycle configure complete node={node_name} elapsed_sec={time.monotonic() - start:.3f}")
+    start = time.monotonic()
     activate_node(node, node_name, per_node_timeout_sec, trust_change_state_response)
+    log(f"lifecycle activate complete node={node_name} elapsed_sec={time.monotonic() - start:.3f}")
 
 
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:

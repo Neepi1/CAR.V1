@@ -10,8 +10,8 @@ Phase N2 separates three concepts that were previously easy to mix together:
 
 `goal_completion_policy` is exposed in `/api/v1/navigation/state` and accepted on normal navigation requests when appropriate.
 
-- `pose_required`: default for normal delivery points. Phase N3 supersedes the N2 API-owned final-yaw step: ordinary delivery yaw is completed by Nav2 native `RotationShimController + SimpleGoalChecker` before action success, then the API performs read-only final pose verification. The legacy API `final_yaw_align` path remains only behind explicit emergency fallback configuration.
-- `position_only`: explicit opt-out for engineering cases where final heading is irrelevant. A fresh XY verification completes the goal. The API does not run mission-layer `final_yaw_align`.
+- `pose_required`: default for ordinary stored `delivery_point` poses, direct coordinate goals, and stored pose types that explicitly require heading (`delivery_pose_required`, `precise_pose`, `orientation_required`, `require_yaw`). Phase N3 makes Nav2 native `RotationShimController + SimpleGoalChecker` the primary XY/yaw completion path. The API then audits a fresh final pose; if Nav2 failed near the target but outside the yaw-alignable XY window, one same-goal Nav2 retry may run first. If Nav2 failed or returned with the robot already inside the yaw-alignable XY window but yaw remains outside tolerance, one bounded API `final_yaw_align` fallback may run through `/cmd_vel_api -> robot_safety -> /cmd_vel`. That fallback first waits for bridge smoothing to settle, then pauses `robot_localization_bridge` correction intake, so AMCL/Isaac cannot update `map->odom` during the final spin window.
+- `position_only`: explicit opt-out for diagnostics or special XY-only targets where final heading is not a business requirement. A fresh XY verification completes the goal. The API does not run mission-layer `final_yaw_align`. For position-only requests, the Nav2 action goal keeps the saved XY but uses the current approach heading as its yaw by default, so Nav2 is not asked to perform an unnecessary terminal turn toward a stale saved pose yaw.
 - `dock_staging`: reserved for `/api/v1/docking/start`. The predock Nav2 result must complete XY plus yaw before GS2 fine docking can start. Ordinary `final_yaw_align` is forbidden; the API performs read-only `PREDOCK_POSE_VERIFY`, and `PREDOCK_YAW_ALIGN_RECOVERY` is only an explicit fallback.
 
 ## App State Rules
@@ -26,6 +26,8 @@ The App should show arrival success only when `task_complete=true`.
 The navigation goal JSON includes:
 
 - `goal_completion_policy`
+- `nav2_goal_yaw_rad`
+- `nav2_goal_yaw_source`
 - `position_reached`
 - `yaw_align_required`
 - `yaw_align_active`
@@ -40,7 +42,7 @@ The navigation goal JSON includes:
 
 Ordinary final yaw and docking predock yaw are separate owners.
 
-- Ordinary `final_yaw_align` may publish only to `/cmd_vel_nav` or `/cmd_vel_collision_checked`.
+- Ordinary `final_yaw_align` publishes through `/cmd_vel_api -> robot_safety -> /cmd_vel` in production and must not share collision_monitor's `/cmd_vel_collision_checked` publisher.
 - Explicit `PREDOCK_YAW_ALIGN_RECOVERY` must publish only to `/cmd_vel_docking`.
 - The two owners must not be active at the same time.
 - If docking starts while ordinary final yaw is active, the API requests cancellation, sends a zero burst on the ordinary final-yaw stream, waits briefly for the owner to release, and then lets docking proceed.

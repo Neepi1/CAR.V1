@@ -51,8 +51,8 @@ Signed distances are supported for diagnostics. Reverse motion may be rejected
 unless the current runtime profile explicitly permits reverse.
 
 The command path remains:
-  test script -> /cmd_vel_collision_checked -> robot_safety -> /cmd_vel_safe
-              -> ranger_mini3_mode_controller -> /cmd_vel -> ranger_base
+  test script -> /cmd_vel_collision_checked -> robot_safety -> /cmd_vel -> ranger_base
+  /cmd_vel_safe is a robot_safety diagnostic mirror.
 EOF
 }
 

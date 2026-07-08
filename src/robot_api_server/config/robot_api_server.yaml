@@ -56,13 +56,16 @@ robot_api_server:
     docking_pre_dock_distance_m: 0.60
     docking_navigation_start_wait_sec: 45.0
     docking_predock_nav_timeout_sec: 180.0
+    # Keep Nav2 as the primary owner until it finishes the pre-dock goal.
+    # API yaw/lateral capture still runs after Nav2 success/abort verification.
+    docking_predock_early_handoff_enabled: false
     docking_relocalize_before_predock: false
     docking_relocalize_after_predock: false
     docking_relocalize_after_predock_required: false
     docking_relocalize_after_fine_docking: false
     docking_relocalize_after_fine_docking_required: false
     docking_validate_predock_pose_after_relocalization: true
-    docking_predock_pose_max_distance_m: 0.35
+    docking_predock_pose_max_distance_m: 0.30
     docking_predock_pose_max_yaw_rad: 0.35
     docking_manual_predock_distance_check_enable: false
     docking_manual_predock_min_distance_m: 0.50
@@ -85,9 +88,9 @@ robot_api_server:
     predock_yaw_align_enabled: true
     predock_yaw_align_fallback_enabled: true
     predock_yaw_align_cmd_topic: "/cmd_vel_docking"
-    predock_yaw_align_tolerance_rad: 0.105
-    predock_yaw_align_trigger_rad: 0.08
-    predock_yaw_align_hard_fail_rad: 0.80
+    predock_yaw_align_tolerance_rad: 0.0698
+    predock_yaw_align_trigger_rad: 0.0698
+    predock_yaw_align_hard_fail_rad: 3.14
     predock_yaw_align_timeout_sec: 10.0
     predock_yaw_align_min_speed_radps: 0.05
     predock_yaw_align_max_speed_radps: 0.20
@@ -99,14 +102,37 @@ robot_api_server:
     predock_yaw_align_mode_switch_timeout_sec: 2.0
     predock_yaw_align_no_yaw_motion_timeout_sec: 2.0
     predock_yaw_align_motion_epsilon_rad: 0.01
+    predock_lateral_align_enabled: true
+    predock_lateral_align_target_m: 0.03
+    predock_lateral_align_trigger_m: 0.03
+    predock_lateral_align_max_correction_m: 0.25
+    predock_lateral_align_yaw_slack_rad: 0.02
+    predock_staging_capture_max_cycles: 6
+    predock_forward_capture_min_m: -0.40
+    predock_forward_capture_max_m: 0.55
+    predock_lateral_align_timeout_sec: 14.0
+    predock_lateral_align_speed_mps: 0.04
+    predock_lateral_align_kp: 0.7
+    predock_lateral_align_period_ms: 67
+    predock_lateral_align_zero_cmd_count: 5
+    # Positive predock lateral error is reduced by negative Ranger side-slip y.
+    predock_lateral_align_command_sign: -1.0
+    predock_lateral_align_no_motion_timeout_sec: 2.0
+    predock_lateral_align_motion_epsilon_m: 0.005
+    predock_lateral_align_divergence_epsilon_m: 0.015
+    predock_lateral_align_divergence_count: 2
+    predock_lateral_align_auto_reverse_on_divergence: true
+    predock_lateral_align_forced_mode_topic: "/ranger_mini3/forced_mode"
+    predock_lateral_align_forced_mode: "side_slip"
+    predock_lateral_align_release_mode: "auto"
     fine_docking_entry_require_gs2_fresh: true
     fine_docking_entry_require_predock_yaw_aligned: true
     fine_docking_entry_max_distance_m: 0.35
-    fine_docking_entry_max_lateral_m: 0.12
-    fine_docking_entry_max_yaw_rad: 0.105
+    fine_docking_entry_max_lateral_m: 0.08
+    fine_docking_entry_max_yaw_rad: 0.0349
     fine_docking_retry_on_yaw_reject: true
     docking_fine_wait_for_bridge_smoothing_enabled: true
-    docking_fine_bridge_smoothing_wait_timeout_ms: 60000
+    docking_fine_bridge_smoothing_wait_timeout_ms: 5000
     docking_fine_bridge_smoothing_sample_period_ms: 100
     docking_fine_bridge_smoothing_stable_samples: 3
     docking_fine_bridge_smoothing_zero_cmd_during_wait: true
@@ -141,8 +167,8 @@ robot_api_server:
     post_relocalization_map_odom_publish_gap_fail_ms: 250.0
     post_undock_relocalization_settle_enabled: true
     post_undock_relocalization_settle_min_ms: 800
-    post_undock_relocalization_settle_max_ms: 3000
-    post_undock_stable_tf_samples: 5
+    post_undock_relocalization_settle_max_ms: 5000
+    post_undock_stable_tf_samples: 2
     post_undock_tf_sample_period_ms: 100
     post_undock_required_local_costmap_updates: 2
     post_undock_reject_if_new_message_filter_drop: true
@@ -151,7 +177,7 @@ robot_api_server:
     post_relocalization_large_correction_yaw_rad: 0.3
     post_relocalization_large_correction_min_ms: 1500
 
-    teleop_cmd_topic: "/cmd_vel_collision_checked"
+    teleop_cmd_topic: "/cmd_vel_api"
     teleop_reverse_enable_topic: "/ranger_mini3/teleop_allow_reverse"
     teleop_pose_topic: "/local_state/odometry"
     teleop_max_linear_x_mps: 1.00
@@ -171,6 +197,11 @@ robot_api_server:
     localization_bridge_acceptance_timeout_sec: 3.0
     localization_bridge_acceptance_max_distance_m: 1.0
     localization_bridge_acceptance_max_yaw_rad: 0.35
+    manual_relocalization_amcl_refine_enabled: false
+    manual_relocalization_amcl_refine_required: false
+    manual_relocalization_amcl_refine_timeout_sec: 8.0
+    manual_relocalization_amcl_refine_poll_ms: 100
+    manual_relocalization_amcl_refine_request_period_ms: 500
     # Enable the pre-goal relocalization gate, but do not force a map->odom
     # update before every normal same-map goal. Cold/unconfirmed runtime
     # context, stale map-frame pose, undock, docking, or explicit
@@ -180,38 +211,92 @@ robot_api_server:
     navigation_relocalize_before_goal_required: false
     navigation_relocalize_wait_sec: 8.0
     navigation_goal_result_timeout_sec: 600.0
-    navigation_goal_position_success_tolerance_m: 0.20
+    navigation_goal_position_success_tolerance_m: 0.06
+    navigation_terminal_speed_limit_enabled: true
+    navigation_terminal_speed_limit_topic: "/speed_limit"
+    navigation_terminal_speed_limit_far_distance_m: 2.4
+    navigation_terminal_speed_limit_mid_distance_m: 1.5
+    navigation_terminal_speed_limit_near_distance_m: 0.9
+    navigation_terminal_speed_limit_crawl_distance_m: 0.35
+    navigation_terminal_speed_limit_far_mps: 1.20
+    navigation_terminal_speed_limit_mid_mps: 0.65
+    navigation_terminal_speed_limit_near_mps: 0.32
+    navigation_terminal_speed_limit_crawl_mps: 0.16
+    navigation_terminal_speed_limit_final_mps: 0.08
     navigation_default_goal_completion_policy: "pose_required"
+    navigation_delivery_point_goal_completion_policy: "pose_required"
+    navigation_position_only_nav2_yaw_mode: "approach_heading"
+    navigation_position_only_approach_heading_min_distance_m: 0.20
     navigation_max_reposition_after_yaw_retry: 0
     navigation_reposition_after_yaw_drift_timeout_sec: 30.0
     nav2_native_goal_completion_enabled: true
     nav2_rotation_shim_enabled: true
-    api_final_yaw_align_fallback_enabled: false
-    post_nav2_final_verify_enabled: false
-    post_nav2_final_verify_wait_bridge_smoothing: false
+    api_final_yaw_align_fallback_enabled: true
+    post_nav2_final_verify_enabled: true
+    post_nav2_final_verify_wait_bridge_smoothing: true
     post_nav2_final_verify_bridge_wait_timeout_ms: 2000
     post_nav2_final_verify_bridge_wait_sample_period_ms: 100
-    post_nav2_final_verify_max_retry_count: 0
-    post_nav2_final_verify_acceptance_slack_m: 0.0
-    post_nav2_final_verify_xy_retry_min_error_m: 0.20
-    post_nav2_final_verify_xy_retry_max_error_m: 0.60
-    post_nav2_final_verify_yaw_retry_if_failed: false
-    post_nav2_final_verify_retry_uses_same_nav2_goal: false
-    post_nav2_final_verify_api_velocity_correction_enabled: false
-    navigation_final_yaw_align_enable: false
+    post_nav2_final_verify_request_amcl_nomotion_update: true
+    post_nav2_final_verify_amcl_nomotion_update_service: "/request_nomotion_update"
+    post_nav2_final_verify_max_retry_count: 3
+    post_nav2_final_verify_acceptance_slack_m: 0.02
+    post_nav2_final_verify_xy_retry_min_error_m: 0.06
+    post_nav2_final_verify_xy_retry_max_error_m: 0.35
+    post_nav2_final_verify_yaw_retry_if_failed: true
+    post_nav2_final_verify_retry_uses_same_nav2_goal: true
+    post_nav2_final_verify_api_velocity_correction_enabled: true
+    post_nav2_final_verify_reverse_permit_enabled: true
+    post_nav2_final_verify_reverse_enable_topic: "/ranger_mini3/allow_reverse"
+    post_nav2_final_verify_terminal_lateral_correction_enabled: true
+    post_nav2_final_verify_terminal_lateral_target_m: 0.03
+    post_nav2_final_verify_terminal_lateral_trigger_m: 0.07
+    post_nav2_final_verify_terminal_lateral_max_xy_m: 0.30
+    post_nav2_final_verify_terminal_lateral_max_forward_m: 0.12
+    post_nav2_final_verify_terminal_lateral_speed_mps: 0.08
+    post_nav2_final_verify_terminal_lateral_kp: 0.8
+    post_nav2_final_verify_terminal_lateral_timeout_sec: 8.0
+    post_nav2_final_verify_terminal_lateral_command_sign: 1.0
+    navigation_near_goal_stalled_handoff_enabled: true
+    navigation_near_goal_stalled_handoff_distance_m: 0.30
+    navigation_near_goal_stalled_handoff_min_wait_sec: 3.0
+    navigation_near_goal_stalled_handoff_stall_sec: 1.5
+    navigation_near_goal_stalled_handoff_improvement_epsilon_m: 0.02
+    navigation_nav2_failed_near_goal_retry_enabled: true
+    navigation_nav2_failed_near_goal_retry_max_count: 1
+    navigation_nav2_failed_near_goal_retry_max_distance_m: 0.35
+    navigation_nav2_failed_near_goal_retry_requires_yaw_error: false
+    navigation_final_yaw_align_enable: true
     navigation_final_yaw_tolerance_rad: 0.05
     navigation_final_yaw_align_trigger_rad: 0.08
-    navigation_final_yaw_align_speed_radps: 0.25
+    navigation_final_yaw_align_success_tolerance_rad: 0.045
+    navigation_final_yaw_align_speed_radps: 0.60
     navigation_final_yaw_align_min_speed_radps: 0.06
     navigation_final_yaw_align_kp: 1.2
-    navigation_final_yaw_align_max_speed_radps: 0.25
+    navigation_final_yaw_align_max_speed_radps: 0.60
+    navigation_final_yaw_align_slowdown_start_rad: 0.30
+    navigation_final_yaw_align_slow_max_speed_radps: 0.20
     navigation_final_yaw_align_timeout_sec: 8.0
     navigation_final_yaw_align_max_xy_drift_m: 0.08
     navigation_final_yaw_align_require_fresh_pose: true
-    # Legacy emergency fallback only. Ordinary pose_required navigation XY+yaw
-    # completion is owned by Nav2 RotationShim + SimpleGoalChecker before
-    # action success.
-    navigation_final_yaw_align_cmd_topic: "/cmd_vel_collision_checked"
+    # Bounded fallback for ordinary pose_required goals: if Nav2 aborts or
+    # succeeds with XY close enough but yaw outside tolerance, align yaw through
+    # /cmd_vel_api -> robot_safety instead of sharing collision_monitor's
+    # /cmd_vel_collision_checked publisher.
+    navigation_final_yaw_align_cmd_topic: "/cmd_vel_api"
     navigation_final_yaw_align_bypass_collision_monitor: true
     navigation_final_yaw_align_zero_cmd_count: 3
+    yaw_align_actual_stop_check_enabled: true
+    yaw_align_actual_stop_odom_topic: "/wheel/odom"
+    yaw_align_actual_wz_threshold_radps: 0.02
+    yaw_align_actual_wz_stable_samples: 5
+    yaw_align_actual_stop_timeout_ms: 800
+    yaw_align_actual_wz_max_age_sec: 0.20
+    yaw_align_stop_lead_enabled: true
+    yaw_align_stop_lead_time_sec: 0.125
+    yaw_align_stop_lead_min_rad: 0.0
+    yaw_align_stop_lead_max_rad: 0.09
+    navigation_final_yaw_align_wait_bridge_smoothing: true
+    navigation_final_yaw_align_bridge_wait_timeout_ms: 2000
+    navigation_final_yaw_align_bridge_wait_sample_period_ms: 100
+    navigation_pause_global_correction_during_final_yaw: true
     navigation_lifecycle_check_timeout_sec: 1.5

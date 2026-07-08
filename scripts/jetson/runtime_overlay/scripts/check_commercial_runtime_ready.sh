@@ -71,6 +71,18 @@ check_topic_once() {
   return 1
 }
 
+check_topic_publisher_node() {
+  local topic="$1"
+  local node_name="$2"
+  local timeout_sec="${3:-2}"
+  if wait_for_topic_publisher_from_node "${topic}" "${node_name}" "${timeout_sec}" >/dev/null 2>&1; then
+    printf 'OK   topic   %s publisher=%s\n' "${topic}" "${node_name}"
+    return 0
+  fi
+  printf 'MISS topic   %s publisher=%s\n' "${topic}" "${node_name}"
+  return 1
+}
+
 check_tf() {
   local target="$1"
   local source="$2"
@@ -119,6 +131,7 @@ run_check check_lifecycle_active "/collision_monitor" 12
 
 run_check check_topic "/local_state/odometry" 10
 run_check check_topic "/scan" 10
+run_check check_topic_publisher_node "/flatscan" "laser_scan_to_flatscan" 10
 run_check check_topic_once "/safety/status" 10
 run_check check_tf "odom" "base_link" 10
 run_check check_tf "map" "odom" 10

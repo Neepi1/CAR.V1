@@ -25,7 +25,7 @@ robot_localization_bridge:
     map_odom_large_correction_requires_recovery: true
     map_odom_online_hard_reject_translation_m: 0.80
     map_odom_online_hard_reject_yaw_rad: 0.80
-    tf_future_stamp_offset_sec: 0.10
+    tf_future_stamp_offset_sec: 0.0
     localization_topic: /global_localization/pose
     local_odom_topic: /local_state/odometry
     health_topic: /localization/health
@@ -37,6 +37,7 @@ robot_localization_bridge:
     # any non-triggered value is ignored by the bridge.
     continuous_localization_mode: triggered
     triggered_max_result_age_ms: 5000.0
+    force_accept_min_pose_stamp_slack_sec: 1.0
     max_odom_tf_age_ms: 100.0
     triggered_allow_large_correction: true
     triggered_hard_reject_translation_m: 20.0
@@ -45,22 +46,33 @@ robot_localization_bridge:
     amcl_runtime_status_ttl_sec: 5.0
     amcl_input_enabled: false
     amcl_gate_mode: shadow
-    amcl_max_result_age_ms: 500.0
-    amcl_small_correction_translation_m: 0.30
+    amcl_max_result_age_ms: 1000.0
+    amcl_small_correction_translation_m: 0.07
     amcl_small_correction_yaw_rad: 0.20
-    amcl_medium_correction_translation_m: 0.70
+    amcl_medium_correction_translation_m: 0.15
     amcl_medium_correction_yaw_rad: 0.20
     amcl_medium_correction_consistency_count: 3
-    amcl_hard_reject_translation_m: 1.20
+    amcl_accept_corrections_while_moving: true
+    amcl_moving_linear_speed_mps: 0.02
+    amcl_moving_angular_speed_radps: 0.02
+    amcl_hard_reject_translation_m: 0.30
     amcl_hard_reject_yaw_rad: 0.8
     amcl_min_pose_covariance_ok: true
-    amcl_max_xy_covariance: 1.0
-    amcl_max_yaw_covariance: 0.5
+    amcl_max_xy_covariance: 0.15
+    amcl_max_yaw_covariance: 0.10
     amcl_accept_when_isaac_recently_triggered_delay_sec: 2.0
+    amcl_post_isaac_refine_enabled: true
+    amcl_post_isaac_refine_window_sec: 10.0
+    amcl_post_isaac_refine_max_translation_m: 0.12
+    amcl_post_isaac_refine_max_yaw_rad: 0.10
+    amcl_post_isaac_refine_consistency_count: 2
+    amcl_post_isaac_refine_agreement_translation_m: 0.08
+    amcl_post_isaac_refine_agreement_yaw_rad: 0.08
+    amcl_post_isaac_refine_require_stationary: true
     amcl_initial_pose_topic: /initialpose
     amcl_initial_pose_seed_enabled: true
-    amcl_initial_pose_xy_covariance: 0.25
-    amcl_initial_pose_yaw_covariance: 0.25
+    amcl_initial_pose_xy_covariance: 0.01
+    amcl_initial_pose_yaw_covariance: 0.0076
     amcl_seed_service: /robot_localization_bridge/seed_amcl_initial_pose
     amcl_pose_max_age_ms: 1000.0
     amcl_initial_pose_publish_repetitions: 3

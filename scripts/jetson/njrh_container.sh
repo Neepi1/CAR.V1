@@ -469,6 +469,11 @@ start_common_services() {
   fi
   clear_stale_runtime_context
   docker exec -u "${RUNTIME_USER}" --workdir "${DASHBOARD_RUNTIME_ROOT}" "$CONTAINER_NAME" \
+    -e "NJRH_NAV_LOCAL_STATE_MODE=${NJRH_NAV_LOCAL_STATE_MODE:-}" \
+    -e "NJRH_LOCAL_STATE_EKF_PROFILE=${NJRH_LOCAL_STATE_EKF_PROFILE:-}" \
+    -e "LOCAL_STATE_EKF_PROFILE=${LOCAL_STATE_EKF_PROFILE:-}" \
+    -e "NJRH_FORCE_RESTART_CANONICAL_TF=${NJRH_FORCE_RESTART_CANONICAL_TF:-}" \
+    -e "NJRH_FORCE_RESTART_NAV_HELPERS=${NJRH_FORCE_RESTART_NAV_HELPERS:-}" \
     /bin/bash -lc "mkdir -p '${DASHBOARD_RUNTIME_ROOT}/web_dashboard/runtime_logs'; cd '${DASHBOARD_RUNTIME_ROOT}'; nohup env ROBOT_API_TOKEN='${ROBOT_API_TOKEN:-}' ROBOT_API_SERVER_PORT='${ROBOT_API_SERVER_PORT}' bash scripts/run_common_services.sh > '${DASHBOARD_RUNTIME_ROOT}/web_dashboard/runtime_logs/common_services.out.log' 2>&1 </dev/null &"
   sleep 2
   if common_services_running; then

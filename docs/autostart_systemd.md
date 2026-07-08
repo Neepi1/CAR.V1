@@ -36,6 +36,18 @@ systemctl status njrh-runtime.service --no-pager
 bash scripts/jetson/njrh_container.sh status
 ```
 
+Daily full-chain restart:
+
+```bash
+sudo systemctl restart njrh-runtime.service
+```
+
+Do not use `docker exec -d ... run_floor_navigation.sh` as a daily restart
+entrypoint. `run_floor_navigation.sh` is a compatibility/debug wrapper and is
+blocked by default because a transient owner can exit before resident navigation
+is ready and then clean up Nav2/localization children. `stop_floor_navigation.sh`
+is a broad debug cleanup script, not the product restart path.
+
 Environment is stored in:
 
 ```text
@@ -68,6 +80,13 @@ By default `run_common_services.sh` then runs
 it starts the resident localization/Nav2 runtime for that last manually selected
 map. If no valid last map exists, the robot remains in `NO_MAP` with common
 services alive.
+
+Startup keeps `NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE=false` so
+resident Nav2/localization is not launched before the canonical local-state
+owner exists. `NJRH_COMMON_LOCAL_STATE_BACKGROUND_START=false` is also the
+production default: starting `robot_local_state_common` in parallel with sensor
+initialization is kept only as an explicit A/B knob because field restarts showed
+it can fail local-state readiness and trigger a service restart.
 
 It does not start:
 

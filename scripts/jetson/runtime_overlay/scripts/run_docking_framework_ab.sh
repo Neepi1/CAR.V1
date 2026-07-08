@@ -103,7 +103,8 @@ summary="${OUTPUT_DIR}/summary.md"
   echo "- changed_pointcloud_qos_or_dds: no"
   echo "- changed_fastlio: no"
   echo "- changed_ranger_odom_or_ekf: no"
-  echo "- command_path: /cmd_vel_docking -> robot_safety -> /cmd_vel_safe -> ranger_mini3_mode_controller -> /cmd_vel"
+  echo "- command_path: /cmd_vel_docking -> robot_safety -> /cmd_vel"
+  echo "- cmd_vel_safe: robot_safety diagnostic mirror"
 } >"${summary}"
 
 bash "${SCRIPT_DIR}/verify_docking_framework_state_machine.sh" >"${OUTPUT_DIR}/verify.log" 2>&1

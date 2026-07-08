@@ -9,13 +9,13 @@ robot_description:
     gs2_frame: gs2_link
     charge_contact_frame: charge_contact_link
     base_footprint_frame: base_footprint
-    lidar_xyz: [0.25, 0.0, 0.85]
-    lidar_rpy: [0.0, -0.3490658503988659, 3.141592653589793]
+    lidar_xyz: [0.3686, 0.0000, 0.85]
+    lidar_rpy: [0.0, -0.3490658503988659, -3.127692216127]
     # JT128 raw axis alignment is applied by the canonical remap nodes before
     # publishing /lidar_points and /lidar_imu. Keep lidar_link canonical here.
     lidar_axis_rpy: [0.0, 0.0, 0.0]
-    imu_xyz: [0.25, 0.0, 0.85]
-    imu_rpy: [0.0, -0.3490658503988659, 3.141592653589793]
+    imu_xyz: [0.3686, 0.0000, 0.85]
+    imu_rpy: [0.0, -0.3490658503988659, -3.127692216127]
     # GS2 is mounted on the front centerline, flush with the front body plane.
     # X uses the current Nav2 footprint front edge; adjust after measuring the
     # exact base_link-to-front-panel distance on the finished body.

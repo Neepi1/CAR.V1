@@ -13,12 +13,16 @@ The validation target is:
 - `position_only` remains an explicit engineering opt-out;
 - `dock_staging` is reserved for `/api/v1/docking/start`;
 - manual `/api/v1/localization/trigger` succeeds on bridge-accepted correction
-  by default, not on the post-relocalization settle barrier;
+  by default, not on the post-relocalization settle barrier or AMCL
+  post-Isaac refine; strict AMCL refine remains available only when the
+  caller explicitly sets `amcl_refine=true` and `amcl_refine_required=true`;
 - predock yaw alignment is docking-owned and publishes only to
   `/cmd_vel_docking`;
-- fine docking entry requires predock yaw alignment, post-predock settle, GS2
-  freshness, bridge `map->odom` smoothing completion, and applied
-  global-correction pause.
+- predock lateral capture is docking-owned, requests Ranger `side_slip`, and
+  publishes only bounded `linear.y` commands to `/cmd_vel_docking`;
+- fine docking entry requires predock yaw alignment, predock lateral capture,
+  post-predock settle, GS2 freshness, bridge `map->odom` smoothing completion,
+  and applied global-correction pause.
 - ordinary navigation final verification may perform at most one same-goal Nav2
   retry after bridge smoothing; API-owned velocity correction remains disabled.
 
@@ -112,7 +116,7 @@ Required field checks before a full docking test:
   localization recovery is expected;
 - run the predock yaw probe with motion only in an open area with human stop
   supervision;
-- confirm `/cmd_vel_docking -> robot_safety -> /cmd_vel_safe -> ranger_mini3_mode_controller -> /cmd_vel -> ranger_base_node`;
+- confirm `/cmd_vel_docking -> robot_safety -> /cmd_vel -> ranger_base_node` and `/cmd_vel_safe` as the robot_safety diagnostic mirror;
 - confirm no hidden `/global_localization/trigger` is mixed into normal
   navigation or predock staging.
 

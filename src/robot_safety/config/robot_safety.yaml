@@ -4,10 +4,45 @@ robot_safety:
     watchdog_timeout_sec: 1.0
     publish_rate_hz: 10.0
     cmd_vel_in_topic: /cmd_vel_collision_checked
+    api_cmd_vel_in_topic: /cmd_vel_api
+    enable_api_cmd_priority: true
+    api_cmd_priority_timeout_sec: 0.25
     docking_cmd_vel_in_topic: /cmd_vel_docking
     enable_docking_cmd_priority: true
     docking_cmd_priority_timeout_sec: 0.25
-    cmd_vel_out_topic: /cmd_vel_safe
+    cmd_vel_out_topic: /cmd_vel
+    cmd_vel_mirror_topic: /cmd_vel_safe
+    cmd_vel_qos_depth: 1
+    zero_cmd_priority_enabled: true
+    zero_cmd_priority_epsilon: 0.0001
+    zero_cmd_priority_burst_sec: 0.25
+    spin_to_drive_settle_enabled: true
+    spin_to_drive_odom_topic: /wheel/odom
+    spin_to_drive_wz_threshold_radps: 0.02
+    spin_to_drive_stable_samples: 5
+    spin_to_drive_require_local_odom_stable: false
+    spin_to_drive_local_odom_topic: /local_state/odometry
+    spin_to_drive_local_wz_threshold_radps: 0.03
+    spin_to_drive_local_stable_samples: 5
+    spin_to_drive_local_stable_duration_sec: 0.30
+    spin_to_drive_local_yaw_delta_threshold_rad: 0.005
+    spin_to_drive_local_odom_max_age_sec: 0.20
+    spin_to_drive_require_imu_stable: true
+    spin_to_drive_imu_topic: /lidar_imu_bias_corrected
+    spin_to_drive_imu_wz_threshold_radps: 0.035
+    spin_to_drive_imu_stable_duration_sec: 0.30
+    spin_to_drive_imu_max_age_sec: 0.10
+    spin_to_drive_timeout_sec: 2.0
+    spin_to_drive_linear_epsilon_mps: 0.03
+    spin_to_drive_odom_max_age_sec: 0.20
+    mode_exit_guard_enabled: true
+    mode_controller_status_topic: /ranger_mini3_mode_controller/status
+    mode_exit_guard_probe_speed_mps: 0.06
+    mode_exit_guard_timeout_sec: 1.0
+    mode_exit_guard_status_max_age_sec: 0.5
+    final_cmd_lateral_deadband_mps: 0.001
+    allow_api_lateral_cmd: true
+    api_lateral_max_mps: 0.10
     estop_topic: /safety/estop
     localization_ok_topic: /localization/health
     require_localization_health: false

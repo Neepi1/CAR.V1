@@ -248,7 +248,13 @@ checks = [
     ("robot_safety allows docking cmd context", "current_snapshot(docking_command)" in safety_cpp and "allow_docking_cmd_when_docked_" in safety_cpp),
     ("robot_safety holds fresh docking command", "last_docking_cmd_" in safety_cpp and "fresh_docking_command_active()" in safety_cpp and "publish_command(last_docking_cmd_, snapshot)" in safety_cpp),
     ("mode controller fresh reverse permit", "effectiveAllowReverse" in mode_cpp and "reverse_enable_timeout_s_" in mode_cpp),
-    ("Nav2 reverse remains disabled", vx_min is not None and vx_min >= 0.0),
+    (
+        "Nav2 reverse is bounded to terminal correction",
+        vx_min is not None
+        and -0.08 <= vx_min <= 0.0
+        and "PreferForwardCritic" in nav2
+        and "threshold_to_consider: 0.50" in nav2,
+    ),
 ]
 print()
 print("| static check | result |")

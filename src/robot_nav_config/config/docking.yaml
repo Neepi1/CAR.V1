@@ -28,6 +28,7 @@ docking:
       reverse_enable_topic: /ranger_mini3/docking_allow_reverse
       use_crab_mode: true
       crab_forced_mode: side_slip
+      yaw_forced_mode: spinning
       release_forced_mode: auto
       park_on_docked: true
 
@@ -69,10 +70,10 @@ docking:
       progress_epsilon_m: 0.005
 
     tolerances:
-      lateral_soft_limit_m: 0.015
+      lateral_soft_limit_m: 0.030
       lateral_hard_limit_m: 0.050
-      yaw_soft_limit_deg: 2.0
-      yaw_hard_limit_deg: 4.0
+      yaw_soft_limit_deg: 5.0
+      yaw_hard_limit_deg: 7.0
       contact_confirm_timeout_s: 3.0
 
     safety:
@@ -84,10 +85,13 @@ docking:
 
     detector:
       min_points: 8
-      min_lateral_span_m: 0.045
+      min_lateral_span_m: 0.035
       lateral_gate_m: 0.20
       min_range_m: 0.025
       max_range_m: 0.30
+      front_cluster_x_window_m: 0.015
+      min_confidence: 0.10
+      yaw_fit_min_lateral_span_m: 0.055
       stable_frames_required: 3
       filter_alpha: 0.25
       use_yaw_fit: true
@@ -97,7 +101,7 @@ docking:
       ky: 0.55
       ky_lateral: 0.70
       lateral_command_sign: -1.0
-      kyaw: -0.70
+      kyaw: 0.70
       lateral_deadband_m: 0.005
       yaw_deadband_deg: 1.0
       min_align_speed_mps: 0.025
@@ -107,6 +111,7 @@ docking:
       yaw_priority_threshold_deg: 2.0
       max_forward_while_lateral_mps: 0.000
       lock_lateral_during_final_insert: true
+      yaw_spin_priority_enabled: true
       max_command_steering_rad: 0.35
       ackermann_wheelbase_m: 0.494
       contact_crawl_speed_mps: 0.025

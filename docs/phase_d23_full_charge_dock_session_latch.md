@@ -17,8 +17,12 @@ New charging evidence is stored as `source=charging_session` in
 `source=docking_job`. BMS `no_contact`, `current=0`, `present=false`, or
 `power_supply_status=UNKNOWN` cannot clear these strong sources by themselves.
 They clear only through controlled undock success with retreat-distance
-confirmation or explicit maintenance/manual clear. Old `source=bms` latch files
-remain weak evidence with the existing D2 TTL behavior.
+confirmation, explicit maintenance/manual clear, or a confirmed live-undocked
+contradiction with stable BMS `no_contact`. Restart-time idle/no-contact context
+without confirmed undock is not enough to clear a strong
+`source=charging_session` latch. Old `source=bms` latch files remain weak
+evidence with the existing D2 TTL behavior and can still use the no-live-dock
+context clear path.
 
 `pre_navigation_dock_check` now exposes:
 
@@ -37,6 +41,10 @@ Navigation admission treats `CONFIRMED_DOCKED`, `DOCKED_CHARGING`,
 `DOCKED_CHARGE_IDLE`, and `UNCERTAIN_ON_DOCK` as requiring controlled
 auto-undock or blocking direct Nav2 submission. `SOC=100` alone never creates a
 charging-session latch and does not prove the robot is on the dock.
+The confirmed-undock contradiction clear prevents a past charging session from
+causing an ordinary delivery point to be treated as docked after the robot has
+actually left the charger, without losing docked state during full-charge idle
+or after a runtime restart.
 
 Read-only verification:
 

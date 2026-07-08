@@ -110,24 +110,31 @@ run_goal_start = api_cpp.index("void run_navigation_goal_job(")
 run_goal_end = api_cpp.index("HttpResponse handle_navigation_state()")
 run_goal_block = api_cpp[run_goal_start:run_goal_end]
 
-check("N5 single completion owner marker exists", "Nav2 is the single completion owner" in api_cpp)
-check("N5 Nav2 native success detail exists", "navigation goal reached by Nav2 native completion" in api_cpp)
-check("run goal does not retry same Nav2 goal after success", "run_post_nav2_final_verify_retry(job_id, target, retry_reason, retry_phase)" not in run_goal_block)
-check("run goal does not call API final yaw fallback", "run_final_yaw_align(job_id, target, pose_check)" not in run_goal_block)
+check("commercial final verification marker exists", "commercial_final_verify=true" in api_cpp)
+check("commercial final verification success detail exists", "navigation goal reached by commercial final verification" in api_cpp)
+check("run goal can retry same Nav2 goal after final audit", "run_post_nav2_final_verify_retry(job_id, target, retry_reason, retry_phase)" in run_goal_block)
+check("run goal can use bounded API final yaw fallback through robot_safety", "run_final_yaw_align(job_id, target, pose_check)" in run_goal_block)
+check("run goal can use bounded terminal lateral correction", "run_post_nav2_terminal_lateral_correction(" in api_cpp)
+check("final verify retry can permit bounded reverse through mode controller", "publish_post_nav2_final_verify_reverse_permit(true)" in api_cpp and "/ranger_mini3/allow_reverse" in api_cpp)
 check("run goal does not reposition after yaw drift", "run_reposition_after_yaw_drift(job_id, target)" not in run_goal_block)
-check("run goal does not terminal-fail Nav2 success by final pose verify", '"failed_final_pose_verify"' not in run_goal_block)
+check("run goal degrades instead of false-completing final audit overrun", '"degraded_final_pose_verify"' in run_goal_block)
 check("run goal audits final pose", "final_pose_auditing" in run_goal_block)
 check("failed final pose terminal flag still exists for non-success legacy states", "final_verify_failure_is_terminal" in api_cpp)
-check("API final_yaw_align fallback disabled", "api_final_yaw_align_fallback_enabled: false" in api_cfg)
-check("API velocity correction disabled", "post_nav2_final_verify_api_velocity_correction_enabled: false" in api_cfg)
-check("max retry count disabled", "post_nav2_final_verify_max_retry_count: 0" in api_cfg)
-check("post-Nav2 acceptance slack disabled", "post_nav2_final_verify_acceptance_slack_m: 0.0" in api_cfg)
-check("bridge wait disabled for ordinary completion", "post_nav2_final_verify_wait_bridge_smoothing: false" in api_cfg)
-check("same Nav2 goal retry disabled", "post_nav2_final_verify_retry_uses_same_nav2_goal: false" in api_cfg)
+check("API final_yaw_align fallback enabled", "api_final_yaw_align_fallback_enabled: true" in api_cfg)
+check("API velocity correction enabled only for bounded terminal correction", "post_nav2_final_verify_api_velocity_correction_enabled: true" in api_cfg)
+check("terminal lateral correction enabled", "post_nav2_final_verify_terminal_lateral_correction_enabled: true" in api_cfg)
+check("final verify retry enabled", "post_nav2_final_verify_enabled: true" in api_cfg)
+check("max retry count enabled", "post_nav2_final_verify_max_retry_count: 3" in api_cfg)
+check("post-Nav2 acceptance slack allows 8cm after retries", "post_nav2_final_verify_acceptance_slack_m: 0.02" in api_cfg)
+check("bridge wait enabled for ordinary completion", "post_nav2_final_verify_wait_bridge_smoothing: true" in api_cfg)
+check("same Nav2 goal retry enabled", "post_nav2_final_verify_retry_uses_same_nav2_goal: true" in api_cfg)
 check("no cmd_vel_docking for normal final verify", "/cmd_vel_docking" not in run_goal_block)
 check("Nav2 controller still MPPI", "nav2_mppi_controller::MPPIController" in nav2_cfg)
 check("Nav2 planner still SmacPlanner2D", "nav2_smac_planner/SmacPlanner2D" in nav2_cfg)
-check("SimpleGoalChecker is non-stateful", "stateful: false" in nav2_cfg)
+check("SimpleGoalChecker rechecks XY every tick", "goal_checker:" in nav2_cfg and "stateful: false" in nav2_cfg)
+check("ordinary XY goal tolerance", "xy_goal_tolerance: 0.06" in nav2_cfg)
+check("tight yaw goal tolerance", "yaw_goal_tolerance: 0.05" in nav2_cfg)
+check("position-only goal checker is not in default Nav2 config", "nav2_controller::PositionGoalChecker" not in nav2_cfg)
 check("TF tolerance unchanged", "transform_tolerance: 0.10" in nav2_cfg)
 check("bridge max odom age unchanged", "max_odom_tf_age_ms: 100.0" in bridge_cfg)
 check("no broad force kill", ("pkill " + "-9") not in api_cpp)
@@ -136,11 +143,16 @@ mock_result = "not_run"
 if mock_nav2_succeeded and mock_final_distance:
     distance = float(mock_final_distance)
     _ = float(mock_yaw_error or "0.0")
-    mock_result = "task_complete"
+    if distance <= mock_tolerance:
+        mock_result = "task_complete"
+    elif distance <= 0.25:
+        mock_result = "retry_or_degraded"
+    else:
+        mock_result = "degraded"
     if expect_retry_xy:
-        check("mock expects retry xy", False, "N5 no longer retries after Nav2 success")
+        check("mock expects retry xy", mock_result in ("retry_or_degraded",), mock_result)
     if expect_final_fail:
-        check("mock expects final fail", False, "N5 no longer final-fails Nav2 success by audit")
+        check("mock expects final fail", mock_result == "degraded", mock_result)
     if expect_task_complete:
         check("mock expects task complete", mock_result == "task_complete", mock_result)
 

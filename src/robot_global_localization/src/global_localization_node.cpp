@@ -9,10 +9,12 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "rclcpp/serialized_message.hpp"
 #include "robot_interfaces/srv/apply_floor_assets.hpp"
 #include "robot_interfaces/srv/trigger_localization.hpp"
 #include "std_msgs/msg/string.hpp"
@@ -46,6 +48,11 @@ public:
     declare_parameter<double>("transient_stale_bridge_accept_timeout_sec", 5.0);
     declare_parameter<double>("map_to_odom_wait_timeout_sec", 8.0);
     declare_parameter<double>("map_to_odom_max_age_ms", 1000.0);
+    declare_parameter<bool>("localizer_input_freshness_enabled", true);
+    declare_parameter<std::string>("localizer_input_topic", "/flatscan");
+    declare_parameter<double>("localizer_input_wait_timeout_sec", 1.0);
+    declare_parameter<double>("localizer_input_max_age_sec", 0.5);
+    declare_parameter<double>("result_allowed_pretrigger_age_sec", 1.0);
     declare_parameter<bool>("require_grid_search_trigger", true);
     declare_parameter<bool>("require_bridge_acceptance", true);
     declare_parameter<std::string>("localization_result_topic", "/localization_result");
@@ -65,6 +72,14 @@ public:
       get_parameter("transient_stale_bridge_accept_timeout_sec").as_double();
     map_to_odom_wait_timeout_sec_ = get_parameter("map_to_odom_wait_timeout_sec").as_double();
     map_to_odom_max_age_ms_ = get_parameter("map_to_odom_max_age_ms").as_double();
+    localizer_input_freshness_enabled_ =
+      get_parameter("localizer_input_freshness_enabled").as_bool();
+    localizer_input_topic_ = get_parameter("localizer_input_topic").as_string();
+    localizer_input_wait_timeout_sec_ =
+      get_parameter("localizer_input_wait_timeout_sec").as_double();
+    localizer_input_max_age_sec_ = get_parameter("localizer_input_max_age_sec").as_double();
+    result_allowed_pretrigger_age_sec_ =
+      get_parameter("result_allowed_pretrigger_age_sec").as_double();
     require_grid_search_trigger_ = get_parameter("require_grid_search_trigger").as_bool();
     require_bridge_acceptance_ = get_parameter("require_bridge_acceptance").as_bool();
     mock_mode_ = get_parameter("mock_mode").as_bool();
@@ -122,19 +137,35 @@ private:
     std::string frame_id;
   };
 
+  struct LocalizerInputSnapshot
+  {
+    bool available{false};
+    std::uint64_t seq{0U};
+    double received_sec{0.0};
+    std::string topic_type;
+  };
+
   struct BridgeStatusSnapshot
   {
     bool available{false};
     double received_sec{0.0};
     std::uint64_t accepted_result_count{0U};
     std::uint64_t rejected_result_count{0U};
+    std::uint64_t last_explicit_relocalization_sequence{0U};
     bool has_map_to_odom{false};
+    bool safe_for_goal_start{false};
+    bool correction_active{false};
     double map_to_odom_age_ms{-1.0};
     double map_odom_publish_gap_ms{-1.0};
+    double remaining_translation_error_m{-1.0};
+    double remaining_yaw_error_rad{-1.0};
+    std::uint64_t force_accept_ignored_pretrigger_result_count{0U};
     std::string owner;
     std::string gate_mode;
     std::string last_accept_reason;
     std::string last_reject_reason;
+    std::string last_force_accept_ignored_reason;
+    std::string last_explicit_relocalization_source;
     std::string raw;
   };
 
@@ -153,9 +184,6 @@ private:
     const double map_to_odom_wait_timeout_sec =
       positive_or_default(map_to_odom_wait_timeout_sec_, 8.0);
 
-    const auto trigger_started_sec = now().seconds();
-    const auto initial_result = localization_result_snapshot();
-    const auto initial_bridge = bridge_status_snapshot();
     const auto service_timeout = std::chrono::duration<double>(service_call_timeout_sec);
     if (!grid_search_trigger_client_->wait_for_service(service_timeout)) {
       response->accepted = !require_grid_search_trigger_;
@@ -163,6 +191,18 @@ private:
         "failure_code=ISAAC_SERVICE_TIMEOUT service unavailable: " + grid_search_trigger_service_;
       return;
     }
+
+    std::string input_detail;
+    if (!wait_for_fresh_localizer_input(input_detail)) {
+      response->accepted = false;
+      response->message = input_detail;
+      last_trigger_status_ = response->message;
+      return;
+    }
+
+    const auto trigger_started_sec = now().seconds();
+    const auto initial_result = localization_result_snapshot();
+    const auto initial_bridge = bridge_status_snapshot();
 
     std::string force_accept_detail;
     const bool force_accept_armed =
@@ -214,7 +254,7 @@ private:
       response->message =
         "failure_code=LOCALIZATION_RESULT_TIMEOUT no localization_result or bridge_status update within " +
         std::to_string(result_wait_timeout_sec) + "s; " + force_accept_detail + "; " +
-        direct_service_detail;
+        direct_service_detail + "; " + input_detail;
       last_trigger_status_ = response->message;
       return;
     }
@@ -228,7 +268,9 @@ private:
         bridge_detail))
     {
       response->accepted = false;
-      response->message = bridge_detail + "; " + force_accept_detail + "; " + direct_service_detail;
+      response->message =
+        bridge_detail + "; " + force_accept_detail + "; " + direct_service_detail + "; " +
+        input_detail;
       last_trigger_status_ = response->message;
       return;
     }
@@ -236,7 +278,9 @@ private:
     std::string map_to_odom_detail;
     if (!wait_for_map_to_odom(map_to_odom_wait_timeout_sec, map_to_odom_detail)) {
       response->accepted = false;
-      response->message = map_to_odom_detail + "; " + force_accept_detail + "; " + direct_service_detail;
+      response->message =
+        map_to_odom_detail + "; " + force_accept_detail + "; " + direct_service_detail + "; " +
+        input_detail;
       last_trigger_status_ = response->message;
       return;
     }
@@ -247,6 +291,7 @@ private:
         << " explicit_trigger=" << (force_accept_armed ? "true" : "false")
         << "; " << force_accept_detail
         << "; " << direct_service_detail
+        << "; " << input_detail
         << "; " << bridge_detail
         << "; " << map_to_odom_detail
         << "; reason=" << request->reason;
@@ -321,16 +366,37 @@ private:
     snapshot.raw = msg->data;
     snapshot.accepted_result_count = json_uint_value(msg->data, "accepted_result_count", 0U);
     snapshot.rejected_result_count = json_uint_value(msg->data, "rejected_result_count", 0U);
+    snapshot.force_accept_ignored_pretrigger_result_count =
+      json_uint_value(msg->data, "force_accept_ignored_pretrigger_result_count", 0U);
+    snapshot.last_explicit_relocalization_sequence =
+      json_uint_value(msg->data, "last_explicit_relocalization_sequence", 0U);
     snapshot.has_map_to_odom = json_bool_value(msg->data, "has_map_to_odom", false);
+    snapshot.safe_for_goal_start = json_bool_value(msg->data, "safe_for_goal_start", false);
+    snapshot.correction_active = json_bool_value(msg->data, "correction_active", false);
     snapshot.map_to_odom_age_ms = json_double_value(msg->data, "map_to_odom_age_ms", -1.0);
     snapshot.map_odom_publish_gap_ms = json_double_value(msg->data, "map_odom_publish_gap_ms", -1.0);
+    snapshot.remaining_translation_error_m =
+      json_double_value(msg->data, "remaining_translation_error_m", -1.0);
+    snapshot.remaining_yaw_error_rad = json_double_value(msg->data, "remaining_yaw_error_rad", -1.0);
     snapshot.owner = json_string_value(msg->data, "map_to_odom_publisher_owner");
     snapshot.gate_mode = json_string_value(msg->data, "gate_mode");
     snapshot.last_accept_reason = json_string_value(msg->data, "last_accept_reason");
     snapshot.last_reject_reason = json_string_value(msg->data, "last_reject_reason");
+    snapshot.last_force_accept_ignored_reason =
+      json_string_value(msg->data, "last_force_accept_ignored_reason");
+    snapshot.last_explicit_relocalization_source =
+      json_string_value(msg->data, "last_explicit_relocalization_source");
 
     std::lock_guard<std::mutex> lock(state_mutex_);
     bridge_status_ = snapshot;
+  }
+
+  void on_localizer_input(std::shared_ptr<rclcpp::SerializedMessage>)
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    localizer_input_.available = true;
+    localizer_input_.seq++;
+    localizer_input_.received_sec = now().seconds();
   }
 
   static void append_missing(std::string & missing, const std::string & name,
@@ -470,6 +536,100 @@ private:
     return bridge_status_;
   }
 
+  LocalizerInputSnapshot localizer_input_snapshot()
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return localizer_input_;
+  }
+
+  bool ensure_localizer_input_subscription(std::string & detail)
+  {
+    if (!localizer_input_freshness_enabled_ || localizer_input_topic_.empty()) {
+      detail = "localizer input freshness gate disabled";
+      return true;
+    }
+    if (localizer_input_sub_) {
+      return true;
+    }
+
+    const auto topic_names_and_types = get_topic_names_and_types();
+    const auto iter = topic_names_and_types.find(localizer_input_topic_);
+    if (iter == topic_names_and_types.end() || iter->second.empty()) {
+      detail = "localizer input topic has no discovered type: " + localizer_input_topic_;
+      return false;
+    }
+
+    const std::string topic_type = iter->second.front();
+    try {
+      localizer_input_sub_ = create_generic_subscription(
+        localizer_input_topic_,
+        topic_type,
+        rclcpp::QoS(10),
+        std::bind(&GlobalLocalizationNode::on_localizer_input, this, std::placeholders::_1));
+      {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        localizer_input_.topic_type = topic_type;
+      }
+      detail = "localizer input subscription ready topic=" + localizer_input_topic_ +
+               " type=" + topic_type;
+      return true;
+    } catch (const std::exception & exc) {
+      detail = "localizer input subscription failed topic=" + localizer_input_topic_ +
+               " type=" + topic_type + ": " + exc.what();
+      return false;
+    }
+  }
+
+  bool wait_for_fresh_localizer_input(std::string & detail)
+  {
+    if (!localizer_input_freshness_enabled_ || localizer_input_topic_.empty()) {
+      detail = "localizer input freshness gate disabled";
+      return true;
+    }
+
+    const double timeout_sec = positive_or_default(localizer_input_wait_timeout_sec_, 1.0);
+    const double max_age_sec = positive_or_default(localizer_input_max_age_sec_, 0.5);
+    const auto deadline = steady_deadline(timeout_sec);
+    std::string subscription_detail;
+
+    while (std::chrono::steady_clock::now() <= deadline) {
+      if (ensure_localizer_input_subscription(subscription_detail)) {
+        const auto snapshot = localizer_input_snapshot();
+        if (snapshot.available) {
+          const double age_sec = now().seconds() - snapshot.received_sec;
+          if (age_sec >= 0.0 && age_sec <= max_age_sec) {
+            detail = "localizer input fresh topic=" + localizer_input_topic_ +
+                     " type=" + snapshot.topic_type +
+                     " age_sec=" + std::to_string(age_sec);
+            return true;
+          }
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    const auto snapshot = localizer_input_snapshot();
+    detail = "failure_code=LOCALIZER_INPUT_NOT_FRESH topic=" + localizer_input_topic_ +
+             " timeout_sec=" + std::to_string(timeout_sec) +
+             " max_age_sec=" + std::to_string(max_age_sec) +
+             " available=" + bool_string(snapshot.available) +
+             " seq=" + std::to_string(snapshot.seq) +
+             " last_age_sec=" +
+             (snapshot.available ? std::to_string(now().seconds() - snapshot.received_sec) : "-1") +
+             " subscription_detail=" + subscription_detail;
+    RCLCPP_WARN(get_logger(), "%s", detail.c_str());
+    return false;
+  }
+
+  bool localization_result_is_fresh_for_trigger(
+    const LocalizationResultSnapshot & snapshot,
+    const double trigger_started_sec) const
+  {
+    const double allowed_pretrigger_age_sec =
+      positive_or_default(result_allowed_pretrigger_age_sec_, 1.0);
+    return snapshot.header_stamp_sec >= trigger_started_sec - allowed_pretrigger_age_sec;
+  }
+
   bool localization_result_observed_after(
     const LocalizationResultSnapshot & initial,
     const double trigger_started_sec)
@@ -477,7 +637,8 @@ private:
     const auto snapshot = localization_result_snapshot();
     return snapshot.available &&
            snapshot.seq > initial.seq &&
-           snapshot.received_sec >= trigger_started_sec;
+           snapshot.received_sec >= trigger_started_sec &&
+           localization_result_is_fresh_for_trigger(snapshot, trigger_started_sec);
   }
 
   bool bridge_processed_after(
@@ -488,7 +649,9 @@ private:
     return snapshot.available &&
            snapshot.received_sec >= trigger_started_sec &&
            (snapshot.accepted_result_count > initial.accepted_result_count ||
-            snapshot.rejected_result_count > initial.rejected_result_count);
+            snapshot.rejected_result_count > initial.rejected_result_count ||
+            snapshot.force_accept_ignored_pretrigger_result_count >
+            initial.force_accept_ignored_pretrigger_result_count);
   }
 
   bool arm_bridge_force_accept(
@@ -551,27 +714,102 @@ private:
     std::string & detail)
   {
     auto active_deadline = steady_deadline(timeout_sec);
-    bool saw_transient_stale_reject = false;
     bool saw_nonfresh_bridge_accept = false;
+    std::uint64_t last_amcl_observe_only_reject_count = initial.rejected_result_count;
+    std::uint64_t last_pretrigger_ignored_count =
+      initial.force_accept_ignored_pretrigger_result_count;
+    bool saw_transient_stale_reject = false;
     std::uint64_t last_transient_stale_reject_count = initial.rejected_result_count;
+    auto transient_stale_deadline = active_deadline;
     BridgeStatusSnapshot latest;
     while (
       std::chrono::steady_clock::now() <= active_deadline)
     {
       latest = bridge_status_snapshot();
       if (latest.available && latest.received_sec >= trigger_started_sec) {
+        if (
+          bridge_explicit_trigger_accept_observed(initial, latest) &&
+          latest.has_map_to_odom)
+        {
+          if (map_to_odom_ready(latest))
+          {
+            detail = "bridge accepted explicit triggered relocalization"
+                     " gate_mode=" + latest.gate_mode +
+                     " accept_reason=" + latest.last_accept_reason +
+                     " explicit_sequence=" +
+                     std::to_string(latest.last_explicit_relocalization_sequence) +
+                     " explicit_source=" + latest.last_explicit_relocalization_source +
+                     " has_map_to_odom=true age_ms=" +
+                     std::to_string(latest.map_to_odom_age_ms) +
+                     " publish_gap_ms=" + std::to_string(latest.map_odom_publish_gap_ms) +
+                     " safe_for_goal_start=" + bool_string(latest.safe_for_goal_start) +
+                     " correction_active=" + bool_string(latest.correction_active) +
+                     " remaining_translation_error_m=" +
+                     std::to_string(latest.remaining_translation_error_m) +
+                     " remaining_yaw_error_rad=" +
+                     std::to_string(latest.remaining_yaw_error_rad);
+            return true;
+          }
+          saw_nonfresh_bridge_accept = true;
+          detail = "bridge accepted explicit triggered relocalization but map->odom is not fresh yet"
+                   " owner=" + latest.owner +
+                   " age_ms=" + std::to_string(latest.map_to_odom_age_ms) +
+                   " publish_gap_ms=" + std::to_string(latest.map_odom_publish_gap_ms) +
+                   " explicit_sequence=" +
+                   std::to_string(latest.last_explicit_relocalization_sequence) +
+                   " last_reject_reason=" + latest.last_reject_reason;
+        }
+        if (
+          latest.force_accept_ignored_pretrigger_result_count >
+          initial.force_accept_ignored_pretrigger_result_count)
+        {
+          if (
+            latest.force_accept_ignored_pretrigger_result_count >
+            last_pretrigger_ignored_count)
+          {
+            last_pretrigger_ignored_count =
+              latest.force_accept_ignored_pretrigger_result_count;
+            detail =
+              "failure_code=FRESH_LOCALIZATION_RETRY_REQUIRED "
+              "bridge ignored pre-force-accept stale localization_result; ignored_reason=" +
+              latest.last_force_accept_ignored_reason;
+            RCLCPP_WARN(get_logger(), "%s", detail.c_str());
+          }
+          return false;
+        }
         if (latest.rejected_result_count > initial.rejected_result_count) {
           if (bridge_reject_is_transient_triggered_stale(latest.last_reject_reason)) {
-            if (latest.rejected_result_count > last_transient_stale_reject_count) {
-              last_transient_stale_reject_count = latest.rejected_result_count;
+            if (
+              !saw_transient_stale_reject ||
+              latest.rejected_result_count > last_transient_stale_reject_count)
+            {
               saw_transient_stale_reject = true;
-              const auto shortened_deadline = steady_deadline(transient_stale_timeout_sec);
-              if (shortened_deadline < active_deadline) {
-                active_deadline = shortened_deadline;
-              }
-              detail = "bridge waiting for fresh triggered localization_result after transient stale reject: " +
-                       latest.last_reject_reason;
+              last_transient_stale_reject_count = latest.rejected_result_count;
+              const auto retry_window_deadline = steady_deadline(transient_stale_timeout_sec);
+              transient_stale_deadline =
+                retry_window_deadline < active_deadline ? retry_window_deadline : active_deadline;
+              detail = "bridge ignoring stale triggered localization_result while waiting for "
+                       "fresh result from the same trigger: " + latest.last_reject_reason;
               RCLCPP_WARN(get_logger(), "%s", detail.c_str());
+            }
+            if (std::chrono::steady_clock::now() <= transient_stale_deadline) {
+              std::this_thread::sleep_for(std::chrono::milliseconds(50));
+              continue;
+            }
+            detail =
+              "failure_code=FRESH_LOCALIZATION_RETRY_REQUIRED "
+              "bridge rejected stale triggered localization_result and no fresh result arrived "
+              "within same-trigger window; last_reject_reason=" +
+              latest.last_reject_reason;
+            RCLCPP_WARN(get_logger(), "%s", detail.c_str());
+            return false;
+          }
+          if (bridge_reject_is_expected_amcl_observe_only(latest.last_reject_reason)) {
+            if (latest.rejected_result_count > last_amcl_observe_only_reject_count) {
+              last_amcl_observe_only_reject_count = latest.rejected_result_count;
+              detail = "bridge ignoring AMCL observe-only reject while waiting for fresh "
+                       "triggered localization_result: " + latest.last_reject_reason;
+              RCLCPP_INFO(get_logger(), "%s", detail.c_str());
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
@@ -601,11 +839,9 @@ private:
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
-    detail = saw_transient_stale_reject ?
-      "failure_code=BRIDGE_ACCEPT_TIMEOUT bridge did not accept a fresh triggered localization_result after transient stale rejects" :
-      (saw_nonfresh_bridge_accept ?
+    detail = saw_nonfresh_bridge_accept ?
       "failure_code=BRIDGE_ACCEPT_TIMEOUT bridge accepted a result but map->odom did not become fresh" :
-      "failure_code=BRIDGE_ACCEPT_TIMEOUT bridge did not accept localization_result");
+      "failure_code=BRIDGE_ACCEPT_TIMEOUT bridge did not accept localization_result";
     if (latest.available) {
       detail += " last_reject_reason=" + latest.last_reject_reason;
       if (latest.last_reject_reason.find("tf_history_missing") != std::string::npos) {
@@ -619,6 +855,31 @@ private:
   {
     return reason.find("isaac_triggered_pose_stale_ms") != std::string::npos &&
            reason.find("gate_mode=triggered") != std::string::npos;
+  }
+
+  bool bridge_reject_is_expected_amcl_observe_only(const std::string & reason) const
+  {
+    return (
+      reason.find("AMCL_ROBOT_MOVING_OBSERVE_ONLY") != std::string::npos ||
+      reason.find("amcl_suppressed_after_isaac_triggered") != std::string::npos ||
+      reason.find("AMCL_CORRECTION_TOO_LARGE") != std::string::npos) &&
+      reason.find("amcl") != std::string::npos;
+  }
+
+  bool bridge_explicit_trigger_accept_observed(
+    const BridgeStatusSnapshot & initial,
+    const BridgeStatusSnapshot & latest) const
+  {
+    return latest.last_explicit_relocalization_sequence >
+           initial.last_explicit_relocalization_sequence ||
+           (
+      latest.accepted_result_count > initial.accepted_result_count &&
+      latest.last_accept_reason == "EXPLICIT_TRIGGERED_RELOCALIZATION");
+  }
+
+  static std::string bool_string(const bool value)
+  {
+    return value ? "true" : "false";
   }
 
   bool map_to_odom_tf_available()
@@ -691,6 +952,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr health_pub_;
   rclcpp::Client<std_srvs::srv::Empty>::SharedPtr grid_search_trigger_client_;
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr bridge_force_accept_client_;
+  rclcpp::GenericSubscription::SharedPtr localizer_input_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
     localization_result_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr bridge_status_sub_;
@@ -707,6 +969,7 @@ private:
   std::string localization_result_topic_;
   std::string bridge_status_topic_;
   std::string bridge_force_accept_service_;
+  std::string localizer_input_topic_;
   std::string map_frame_;
   std::string odom_frame_;
   double service_timeout_sec_{10.0};
@@ -716,10 +979,15 @@ private:
   double transient_stale_bridge_accept_timeout_sec_{5.0};
   double map_to_odom_wait_timeout_sec_{8.0};
   double map_to_odom_max_age_ms_{1000.0};
+  double localizer_input_wait_timeout_sec_{1.0};
+  double localizer_input_max_age_sec_{0.5};
+  double result_allowed_pretrigger_age_sec_{1.0};
+  bool localizer_input_freshness_enabled_{true};
   bool require_grid_search_trigger_{true};
   bool require_bridge_acceptance_{true};
   bool mock_mode_{false};
   std::string last_trigger_status_{"idle"};
+  LocalizerInputSnapshot localizer_input_;
   LocalizationResultSnapshot localization_result_;
   BridgeStatusSnapshot bridge_status_;
 };

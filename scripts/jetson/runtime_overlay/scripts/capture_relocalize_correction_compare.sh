@@ -231,6 +231,13 @@ mkdir -p "${OUTPUT_DIR}"
     /localization/bridge_status \
     /wheel/odom \
     /local_state/odometry \
+    /flatscan \
+    /scan_amcl \
+    /scan \
+    /flatscan_localization \
+    /localization_result \
+    /global_localization/pose \
+    /amcl_pose \
     /tf; do
     echo "### ${topic}"
     ros2 topic info "${topic}" -v 2>&1 || true
@@ -240,6 +247,7 @@ mkdir -p "${OUTPUT_DIR}"
   ros2 service list -t 2>&1 | grep -E 'global_localization|robot_localization_bridge|trigger_grid' || true
 } >"${OUTPUT_DIR}/environment.md"
 
+set +e
 python3 - \
   "${OUTPUT_DIR}" \
   "${REASON}" \
@@ -597,8 +605,34 @@ def main() -> int:
 if __name__ == "__main__":
     sys.exit(main())
 PY
-
 rc=$?
+set -e
+
+if [[ "${NJRH_CAPTURE_SCAN_MAP_ALIGNMENT:-true}" == "true" ]]; then
+  alignment_script="${SCRIPT_DIR}/diagnose_isaac_scan_map_alignment.py"
+  alignment_dir="${OUTPUT_DIR}/scan_map_alignment"
+  if [[ -f "${alignment_script}" && -f "${OUTPUT_DIR}/after_snapshot.json" ]]; then
+    alignment_rc=0
+    echo "[relocalize-capture] scan-map alignment diagnostics..."
+    python3 "${alignment_script}" \
+      --output-dir "${alignment_dir}" \
+      --after-snapshot "${OUTPUT_DIR}/after_snapshot.json" \
+      --timeout-sec "${NJRH_SCAN_MAP_ALIGNMENT_TIMEOUT_SEC:-8.0}" \
+      --tf-timeout-sec "${NJRH_SCAN_MAP_ALIGNMENT_TF_TIMEOUT_SEC:-4.0}" \
+      >"${OUTPUT_DIR}/scan_map_alignment.log" 2>&1 || alignment_rc=$?
+    if [[ "${alignment_rc}" != "0" ]]; then
+      {
+        echo "scan-map alignment diagnostics failed"
+        echo "return_code=${alignment_rc}"
+        echo "log=${OUTPUT_DIR}/scan_map_alignment.log"
+      } >"${OUTPUT_DIR}/scan_map_alignment_error.txt"
+      echo "[relocalize-capture] scan-map alignment failed rc=${alignment_rc}; see scan_map_alignment.log"
+    else
+      echo "[relocalize-capture] scan-map alignment: ${alignment_dir#${PROJECT_ROOT}/}/summary.md"
+    fi
+  fi
+fi
+
 tar -czf "${OUTPUT_DIR}.tgz" -C "$(dirname "${OUTPUT_DIR}")" "$(basename "${OUTPUT_DIR}")"
 echo "capture_dir=${OUTPUT_DIR#${PROJECT_ROOT}/}"
 echo "archive=${OUTPUT_DIR#${PROJECT_ROOT}/}.tgz"

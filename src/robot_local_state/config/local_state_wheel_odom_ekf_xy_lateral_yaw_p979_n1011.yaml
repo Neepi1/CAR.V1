@@ -1,0 +1,36 @@
+wheel_odom_ekf_input:
+  ros__parameters:
+    mock_mode: false
+    publish_tf: false
+    output_topic: /wheel/odom_ekf
+    input_odom_topic: /wheel/odom
+    input_base_frame: base_link
+    input_imu_topic: /lidar_imu
+    odom_frame: odom
+    base_frame: base_link
+    odom_yaw_offset_rad: 0.0
+    rotate_odom_position_with_yaw_offset: false
+    # Diagnostic combined calibration: keep the useful body-lateral correction
+    # from xy_lateral_m061, then scale positive and negative yaw separately.
+    # The previous valid legs showed positive-yaw odom over-rotation and
+    # negative-yaw odom under-rotation against post-relocalization truth.
+    odom_position_scale_x: 1.0
+    odom_position_scale_y: 1.0
+    odom_position_y_to_x_shear: 0.0
+    odom_position_x_to_y_shear: -0.061
+    odom_yaw_scale_positive: 0.979
+    odom_yaw_scale_negative: 1.011
+    scale_odom_twist_with_yaw_scale: true
+    anchor_pose_to_first_sample: true
+    apply_pose_covariance_floor: true
+    pose_covariance_floor_x: 0.05
+    pose_covariance_floor_y: 0.05
+    pose_covariance_floor_yaw: 0.08
+    apply_twist_covariance_floor: true
+    twist_covariance_floor_vx: 0.02
+    twist_covariance_floor_vy: 0.50
+    twist_covariance_floor_vyaw: 0.08
+    publish_rate_hz: 50.0
+    publish_on_callback: false
+    republish_latest: true
+    republish_latest_max_age_sec: 0.5

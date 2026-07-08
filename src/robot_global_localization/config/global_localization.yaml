@@ -13,6 +13,11 @@ robot_global_localization:
     transient_stale_bridge_accept_timeout_sec: 3.0
     map_to_odom_wait_timeout_sec: 8.0
     map_to_odom_max_age_ms: 1000.0
+    localizer_input_freshness_enabled: true
+    localizer_input_topic: /flatscan
+    localizer_input_wait_timeout_sec: 1.0
+    localizer_input_max_age_sec: 0.5
+    result_allowed_pretrigger_age_sec: 1.0
     require_grid_search_trigger: true
     require_bridge_acceptance: true
     localization_result_topic: /localization_result

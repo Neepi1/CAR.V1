@@ -29,7 +29,7 @@ container common-service layer and kept alive during normal operation:
 | Ranger chassis driver | `robot_chassis_bridge` / Ranger driver wrapper | Wheel odom and command sink |
 | Static robot TF | `robot_description` | Sensor extrinsics |
 | FAST-LIO2 runtime | `robot_fastlio_mapping` wrapper | Resident mapping/diagnostic frontend; optional explicit FAST-LIO local-state source |
-| Local state | `robot_local_state` | Only `odom->base_link` publisher, default wheel-odom + JT128-IMU EKF |
+| Local state | `robot_local_state` | Only `odom->base_link` publisher, default wheel-only EKF with corrected IMU kept resident for safety-side spin-tail detection |
 | Global localization service | `robot_global_localization` | Asset reload and relocalization trigger |
 | Localization bridge | `robot_localization_bridge` | Only `map->odom` publisher |
 | Local perception | `robot_local_perception` | `/perception/obstacle_points` and clearing cloud |
@@ -193,8 +193,9 @@ Undock:
 4. Move `map_server` and Nav2 ownership from `run_floor_navigation.sh` into the
    common resident layer. Done for the field runtime through
    `run_navigation_runtime_services.sh`.
-5. Change `run_floor_navigation.sh` to compatibility-only. Done: it delegates to
-   the resident navigation runtime.
+5. Change `run_floor_navigation.sh` to compatibility-only. Done: it is blocked
+   by default and delegates to the resident navigation runtime only with the
+   explicit debug override.
 6. Move task admission from script state into `robot_mode_manager` and
    `robot_mission_manager`.
 7. Make App endpoints call intent APIs only: map, localize, navigate, dock,
@@ -214,10 +215,14 @@ Ranger mode controller are common resident services. Lower-level localization
 and Nav2 scripts may start missing helper processes, but they must not kill or
 repair canonical odom owners as part of navigation startup.
 
-`run_floor_navigation.sh` remains for compatibility and immediately delegates to
-the resident entrypoint. `run_occupancy_grid_localization.sh` and
-`run_nav2_navigation.sh` remain lower-level repair/building blocks used by the
-resident runtime; they should not be App-owned process lifetimes.
+`run_floor_navigation.sh` remains for compatibility but is blocked by default.
+Daily restarts must use `sudo systemctl restart njrh-runtime.service`, which
+owns the foreground `run_common_services.sh` process and resident navigation
+autostart. The wrapper only delegates to the resident entrypoint when
+`NJRH_ALLOW_TRANSIENT_NAVIGATION_OWNER=1` is set for a debug-only manual run.
+`run_occupancy_grid_localization.sh` and `run_nav2_navigation.sh` remain
+lower-level repair/building blocks used by the resident runtime; they should not
+be App-owned process lifetimes.
 
 `robot_api_server` keeps core health subscriptions resident. `/safety/status`
 and `/safety/motion_allowed` are reliable transient-local state topics and are

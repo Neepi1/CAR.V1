@@ -223,13 +223,16 @@ supervise_flatscan_helper() {
     case "${flatscan_helper_mode}" in
       standalone)
         if ! flatscan_helper_running; then
-          restart_flatscan_helper_or_fail "laser_scan_to_flatscan exited" || return 1
+          if scan_publisher_exists; then
+            restart_flatscan_helper_or_fail "laser_scan_to_flatscan exited" || return 1
+          else
+            echo "[pointcloud-accel] WARN laser_scan_to_flatscan is not running but /scan publisher is not ready; waiting before helper restart" >&2
+          fi
         elif ! flatscan_publisher_exists; then
           if scan_publisher_exists; then
             restart_flatscan_helper_or_fail "CASE_FLATSCAN_HELPER_DEAD: standalone /scan exists but /flatscan publisher is missing while laser_scan_to_flatscan pid=${flatscan_pid} is still alive" || return 1
           else
-            echo "[pointcloud-accel] FAIL standalone scan chain lost /flatscan and /scan publisher is not ready" >&2
-            return 1
+            echo "[pointcloud-accel] WARN standalone scan chain temporarily lacks /flatscan while /scan publisher is not ready; keeping laser_scan_to_flatscan pid=${flatscan_pid} alive and retrying" >&2
           fi
         fi
         ;;

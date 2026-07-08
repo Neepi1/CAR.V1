@@ -31,6 +31,7 @@ esac
 AMCL_INPUT_ENABLED="false"
 AMCL_GATE_MODE="shadow"
 AMCL_SCAN_ADMISSION_ENABLED="false"
+AMCL_ACCEPT_CORRECTIONS_WHILE_MOVING="${NJRH_AMCL_ACCEPT_CORRECTIONS_WHILE_MOVING:-true}"
 if [[ "${AMCL_LOCALIZATION_MODE}" == "shadow" || "${AMCL_LOCALIZATION_MODE}" == "gated" ]]; then
   AMCL_INPUT_ENABLED="true"
   AMCL_GATE_MODE="${AMCL_LOCALIZATION_MODE}"
@@ -49,6 +50,7 @@ njrh_exec_affined robot_localization_bridge "${NODE_BIN}" --ros-args \
   -p "continuous_localization_mode:=triggered" \
   -p "amcl_input_enabled:=${AMCL_INPUT_ENABLED}" \
   -p "amcl_gate_mode:=${AMCL_GATE_MODE}" \
+  -p "amcl_accept_corrections_while_moving:=${AMCL_ACCEPT_CORRECTIONS_WHILE_MOVING}" \
   -p "amcl_pose_topic:=${NJRH_AMCL_POSE_TOPIC:-/amcl_pose}" \
   -p "amcl_runtime_status_file:=${NJRH_AMCL_RUNTIME_STATUS_FILE:-/tmp/njrh_amcl_runtime_status.env}" \
   -p "amcl_initial_pose_topic:=${NJRH_AMCL_INITIAL_POSE_TOPIC:-/initialpose}" \

@@ -103,5 +103,5 @@ print_process_rows "amcl_scan_admission_node" "amcl_scan_admission_node|amcl_sca
 print_process_rows "hesai_accel_driver_node" "hesai_accel_driver_node" "${NJRH_CPUSET_HESAI_ROS_DRIVER:-4}"
 print_process_rows "collision_monitor" "collision_monitor" "${NJRH_CPUSET_COLLISION_MONITOR:-1}"
 print_process_rows "velocity_smoother" "velocity_smoother" "${NJRH_CPUSET_VELOCITY_SMOOTHER:-1}"
-print_process_rows "bt_navigator" "bt_navigator" "${NJRH_CPUSET_BT_NAVIGATOR:-0}"
-print_process_rows "planner_server" "planner_server" "${NJRH_CPUSET_PLANNER_SERVER:-0}"
+print_process_rows "bt_navigator" "bt_navigator" "${NJRH_CPUSET_BT_NAVIGATOR:-3,5}"
+print_process_rows "planner_server" "planner_server" "${NJRH_CPUSET_PLANNER_SERVER:-3,5}"

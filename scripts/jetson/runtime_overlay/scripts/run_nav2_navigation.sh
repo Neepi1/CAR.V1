@@ -10,6 +10,7 @@ source "${SCRIPT_DIR}/pointcloud_accel_profile.sh"
 njrh_load_pointcloud_accel_profile
 
 export NJRH_NAV_LIFECYCLE_START_DELAY_SEC="${NJRH_NAV_LIFECYCLE_START_DELAY_SEC:-2.0}"
+export NJRH_NAV2_LAUNCH_NONCRITICAL_NODES="${NJRH_NAV2_LAUNCH_NONCRITICAL_NODES:-false}"
 export NAV2_PARAMS_FILE="${NAV2_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/nav2.yaml}"
 export NJRH_NAV2_HOLD_READY_FILE="${NJRH_NAV2_HOLD_READY_FILE:-/tmp/njrh_nav2_launch_hold_ready.env}"
 LAUNCH_FILE="${NJRH_PROJECT_ROOT}/src/robot_bringup/launch/standard_navigation.launch.py"
@@ -117,9 +118,9 @@ start_navigation_lifecycle_with_nav2_util() {
     controller_server
     velocity_smoother
     collision_monitor
-    bt_navigator
-    smoother_server
     behavior_server
+    smoother_server
+    bt_navigator
     waypoint_follower
   )
   echo "[runtime-overlay] starting Nav2 core lifecycle with nav2_util lifecycle_bringup timeout=${timeout_sec}s" >&2
@@ -145,11 +146,11 @@ start_navigation_lifecycle_with_repo_sequence() {
     controller_server
     velocity_smoother
     collision_monitor
+    behavior_server
+    smoother_server
     bt_navigator
   )
   local background_nodes=(
-    smoother_server
-    behavior_server
     waypoint_follower
   )
   local sequence_args=(--per-node-timeout-sec "${node_timeout}")
@@ -214,6 +215,7 @@ fi
 echo "[runtime-overlay] starting Nav2 without blocking map/topic/TF readiness probes" >&2
 echo "[runtime-overlay] Nav2 controller CPU profile=${NJRH_NAV2_CONTROLLER_CPU_PROFILE:-current} cpuset=${NJRH_CPUSET_CONTROLLER_SERVER:-unset}" >&2
 echo "[runtime-overlay] Nav2 speed filter enabled=${NJRH_ENABLE_SPEED_FILTER:-false}" >&2
+echo "[runtime-overlay] Nav2 noncritical nodes enabled=${NJRH_NAV2_LAUNCH_NONCRITICAL_NODES}" >&2
 if nav2_lifecycle_hold_enabled; then
   navigation_lifecycle_autostart="false"
   echo "[runtime-overlay] Nav2 core lifecycle autostart disabled; resident runtime is holding lifecycle activation" >&2
@@ -464,7 +466,8 @@ ros2 launch "${LAUNCH_FILE}" \
   navigation_lifecycle_autostart:="${navigation_lifecycle_autostart}" \
   params_file:="${NAV2_PARAMS_FILE}" \
   keepout_mask_yaml:="${NAV2_KEEP_OUT_MASK_YAML}" \
-  speed_mask_yaml:="${NAV2_SPEED_MASK_YAML}" &
+  speed_mask_yaml:="${NAV2_SPEED_MASK_YAML}" \
+  log_level:="${NJRH_NAV2_LOG_LEVEL:-warn}" &
 nav_pid=$!
 sleep "${NJRH_NAV2_LAUNCH_SETTLE_SEC:-1}"
 if ! kill -0 "${nav_pid}" 2>/dev/null; then

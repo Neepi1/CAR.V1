@@ -58,6 +58,11 @@ ensure_map_server_active() {
   }
   deadline=$((SECONDS + timeout_sec))
 
+  if [[ -n "${map_yaml}" ]] && map_server_publishing_requested_map "${map_yaml}"; then
+    echo "[runtime-overlay] requested map is already published after /map_server discovery; continuing without lifecycle state probe" >&2
+    return 0
+  fi
+
   if [[ -n "${map_yaml}" ]]; then
     echo "[runtime-overlay] expecting map_server asset: ${map_yaml}" >&2
   else

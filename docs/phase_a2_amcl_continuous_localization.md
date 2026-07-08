@@ -71,17 +71,17 @@ background localization.
 
 `NJRH_AMCL_LOCALIZATION_MODE` controls AMCL:
 
-- `gated`: production correction mode. Bridge accepts only small
-  covariance-gated AMCL corrections.
-- `shadow`: rollback/diagnostic mode. AMCL runs and bridge reports candidates,
-  but AMCL cannot change `map -> odom`.
+- `gated`: commercial navigation default. Bridge accepts only small
+  covariance-gated AMCL corrections into `map -> odom`.
+- `shadow`: field audit / odom-only rollback mode. AMCL runs and bridge reports
+  candidates, but AMCL cannot change `map -> odom`.
 - `disabled`: AMCL is stopped; only Isaac triggered relocalization is active.
 
-The runtime profile defaults to `gated` so AMCL corrects small accumulated odom
-error continuously through `robot_localization_bridge`. Large AMCL offsets still
-require Isaac triggered relocalization; `shadow` disables active correction while
-preserving AMCL candidate diagnostics, and `disabled` rolls back to
-Isaac-triggered-only localization.
+The runtime profile defaults to `gated` for commercial navigation after the
+two-point field loop showed odom-only/shadow runs could finish within the stale
+map frame while the post-goal triggered relocalization still moved `map -> odom`
+by about 0.28-0.29 m. Large AMCL offsets still require Isaac triggered
+relocalization, and `shadow` remains the odom-only audit rollback.
 
 ## Verification
 

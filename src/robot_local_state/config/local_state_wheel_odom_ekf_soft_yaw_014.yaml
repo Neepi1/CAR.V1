@@ -1,0 +1,27 @@
+wheel_odom_ekf_input:
+  ros__parameters:
+    mock_mode: false
+    publish_tf: false
+    output_topic: /wheel/odom_ekf
+    input_odom_topic: /wheel/odom
+    input_base_frame: base_link
+    input_imu_topic: /lidar_imu
+    odom_frame: odom
+    base_frame: base_link
+    odom_yaw_offset_rad: 0.0
+    rotate_odom_position_with_yaw_offset: false
+    anchor_pose_to_first_sample: true
+    apply_pose_covariance_floor: true
+    pose_covariance_floor_x: 0.05
+    pose_covariance_floor_y: 0.05
+    # Diagnostic only: slightly firmer than the 0.15 candidate, to test whether
+    # reverse yaw improves without losing the 0.15 profile's XY benefit.
+    pose_covariance_floor_yaw: 0.14
+    apply_twist_covariance_floor: true
+    twist_covariance_floor_vx: 0.02
+    twist_covariance_floor_vy: 0.50
+    twist_covariance_floor_vyaw: 0.14
+    publish_rate_hz: 50.0
+    publish_on_callback: false
+    republish_latest: true
+    republish_latest_max_age_sec: 0.5

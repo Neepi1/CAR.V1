@@ -40,7 +40,7 @@ require_text "${API_CPP}" "position_only"
 require_text "${API_CPP}" "pose_required"
 require_text "${API_CPP}" "dock_staging"
 require_text "${API_CPP}" "goal_completion_policy=dock_staging is reserved for /api/v1/docking/start"
-require_text "${API_CPP}" "goal_completion_policy=position_only; final yaw alignment not required"
+require_text "${API_CPP}" "under position_only policy"
 require_text "${API_CPP}" "position_reached_yaw_aligning"
 require_text "${API_CPP}" "task_complete"
 require_text "${API_CPP}" "yaw_align_active"
@@ -57,7 +57,8 @@ require_text "${API_CPP}" "docking_blocked_by_final_yaw_align"
 require_text "${API_CPP}" "PREDOCK_YAW_ALIGN_OWNER_CONFLICT"
 require_text "${API_CPP}" "predock_yaw_align_cmd_topic_ != \"/cmd_vel_docking\""
 require_text "${API_CPP}" "navigation_final_yaw_align_cmd_topic_ != \"/cmd_vel_nav\""
-require_text "${API_CPP}" "navigation_final_yaw_align_cmd_topic_ != \"/cmd_vel_collision_checked\""
+require_text "${API_CPP}" "navigation_final_yaw_align_cmd_topic_ != \"/cmd_vel_api\""
+require_text "${API_CPP}" "navigation_final_yaw_align_cmd_topic_ = \"/cmd_vel_api\""
 require_text "${API_CPP}" "fine_docking_entry_require_predock_yaw_aligned_ && !predock_yaw_aligned"
 require_text "${API_CPP}" "goal_completion_policy == \"pose_required\""
 require_text "${API_CPP}" "docking_job_.goal_completion_policy"
@@ -73,14 +74,21 @@ require_text "${DOCKING_JOB_CPP}" "dock_staging_handoff_ready"
 require_text "${DOCKING_JOB_CPP}" "predock_yaw_align_active"
 
 require_text "${ROBOT_API_CONFIG}" "navigation_default_goal_completion_policy: \"pose_required\""
-require_text "${ROBOT_API_CONFIG}" "navigation_max_reposition_after_yaw_retry: 1"
+require_text "${ROBOT_API_CONFIG}" "navigation_max_reposition_after_yaw_retry: 0"
 require_text "${ROBOT_API_CONFIG}" "navigation_reposition_after_yaw_drift_timeout_sec: 30.0"
+require_text "${ROBOT_API_CONFIG}" "navigation_final_yaw_align_cmd_topic: \"/cmd_vel_api\""
 require_text "${ROBOT_API_CONFIG}" "predock_yaw_align_cmd_topic: \"/cmd_vel_docking\""
 
 if grep -Fq 'navigation_final_yaw_align_cmd_topic: "/cmd_vel_docking"' "${ROBOT_API_CONFIG}"; then
   fail "ordinary final_yaw_align must not use /cmd_vel_docking"
 else
   pass "ordinary final_yaw_align does not use /cmd_vel_docking"
+fi
+
+if grep -Fq 'navigation_final_yaw_align_cmd_topic: "/cmd_vel_collision_checked"' "${ROBOT_API_CONFIG}"; then
+  fail "ordinary final_yaw_align must not publish to /cmd_vel_collision_checked"
+else
+  pass "ordinary final_yaw_align uses /cmd_vel_api instead of /cmd_vel_collision_checked"
 fi
 
 if grep -R "ros2 topic pub" "${SCRIPT_DIR}/observe_navigation_final_yaw_align.sh" >/dev/null 2>&1; then

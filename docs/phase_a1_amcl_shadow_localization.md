@@ -17,9 +17,10 @@ Supported values:
 - `shadow`: AMCL runs on `/scan_amcl` and publishes `/amcl_pose`; `robot_localization_bridge` computes candidate corrections but does not update `map -> odom`.
 - `gated`: opt-in active integration mode. AMCL runs on `/scan_amcl`; `robot_localization_bridge` accepts only small, covariance-gated corrections into `map -> odom`.
 
-`shadow` is the Phase A1.2 default so field runs can prove stable seed, scan
-admission, and fresh `/amcl_pose` before AMCL affects `map -> odom`. Use
-`gated` only after shadow evidence is acceptable, or `disabled` to return to
+`shadow` was the Phase A1.2 audit default so field runs could prove stable
+seed, scan admission, and fresh `/amcl_pose` before AMCL affected
+`map -> odom`. The current field navigation profile defaults to `gated`;
+use `shadow` explicitly for odom audit/rollback, or `disabled` to return to
 Isaac-triggered-only localization.
 
 ## TF Contract

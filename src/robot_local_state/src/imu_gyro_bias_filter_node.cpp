@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
@@ -15,6 +16,11 @@
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/imu.hpp"
+#include "tf2/LinearMath/Matrix3x3.h"
+#include "tf2/LinearMath/Quaternion.h"
+#include "tf2/LinearMath/Vector3.h"
+#include "tf2_ros/buffer.h"
+#include "tf2_ros/transform_listener.h"
 
 namespace
 {
@@ -43,6 +49,54 @@ double stamp_seconds(const builtin_interfaces::msg::Time & stamp)
 {
   return static_cast<double>(stamp.sec) + static_cast<double>(stamp.nanosec) * 1e-9;
 }
+
+geometry_msgs::msg::Vector3 rotate_vector(
+  const geometry_msgs::msg::Vector3 & input,
+  const tf2::Matrix3x3 & rotation_matrix)
+{
+  const tf2::Vector3 rotated = rotation_matrix * tf2::Vector3(input.x, input.y, input.z);
+  geometry_msgs::msg::Vector3 output;
+  output.x = rotated.x();
+  output.y = rotated.y();
+  output.z = rotated.z();
+  return output;
+}
+
+std::array<double, 9> rotate_covariance(
+  const std::array<double, 9> & covariance,
+  const tf2::Matrix3x3 & rotation_matrix)
+{
+  std::array<double, 9> rotated{};
+  for (int row = 0; row < 3; ++row) {
+    for (int col = 0; col < 3; ++col) {
+      double value = 0.0;
+      for (int left = 0; left < 3; ++left) {
+        for (int right = 0; right < 3; ++right) {
+          value += rotation_matrix[row][left] * covariance[left * 3 + right] *
+            rotation_matrix[col][right];
+        }
+      }
+      rotated[row * 3 + col] = value;
+    }
+  }
+  return rotated;
+}
+
+tf2::Matrix3x3 rotation_matrix_from_quaternion(
+  const geometry_msgs::msg::Quaternion & quaternion_msg)
+{
+  tf2::Quaternion quaternion(
+    quaternion_msg.x,
+    quaternion_msg.y,
+    quaternion_msg.z,
+    quaternion_msg.w);
+  if (quaternion.length2() <= 0.0) {
+    quaternion.setValue(0.0, 0.0, 0.0, 1.0);
+  } else {
+    quaternion.normalize();
+  }
+  return tf2::Matrix3x3(quaternion);
+}
 }  // namespace
 
 class ImuGyroBiasFilterNode : public rclcpp::Node
@@ -56,6 +110,13 @@ public:
     cmd_vel_topic_ = declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel_safe");
     output_imu_topic_ = declare_parameter<std::string>("output_imu_topic", "/lidar_imu_bias_corrected");
     bias_topic_ = declare_parameter<std::string>("bias_topic", "/local_state/imu_bias");
+    transform_output_to_target_frame_ =
+      declare_parameter<bool>("transform_output_to_target_frame", false);
+    output_target_frame_ = declare_parameter<std::string>("output_target_frame", "base_link");
+    transform_lookup_timeout_sec_ =
+      std::max(0.0, declare_parameter<double>("transform_lookup_timeout_sec", 0.02));
+    drop_output_on_transform_failure_ =
+      declare_parameter<bool>("drop_output_on_transform_failure", true);
     use_odom_stationary_ = declare_parameter<bool>("use_odom_stationary", true);
     use_cmd_vel_stationary_ = declare_parameter<bool>("use_cmd_vel_stationary", true);
     require_fresh_cmd_vel_ = declare_parameter<bool>("require_fresh_cmd_vel", false);
@@ -82,9 +143,18 @@ public:
     bias_publish_preserve_source_stamp_ =
       declare_parameter<bool>("bias_publish_preserve_source_stamp", true);
 
+    if (transform_output_to_target_frame_) {
+      if (output_target_frame_.empty()) {
+        throw std::runtime_error(
+          "output_target_frame must be non-empty when transform_output_to_target_frame is true");
+      }
+      tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
+      tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_, this, true);
+    }
+
     corrected_imu_pub_ = create_publisher<sensor_msgs::msg::Imu>(
       output_imu_topic_,
-      rclcpp::QoS(100));
+      rclcpp::SensorDataQoS().keep_last(100));
     bias_pub_ = create_publisher<geometry_msgs::msg::Vector3Stamped>(bias_topic_, rclcpp::QoS(10));
 
     if (use_odom_stationary_) {
@@ -261,14 +331,16 @@ private:
     RCLCPP_INFO(
       get_logger(),
       "IMU bias filter rates input=%.1fHz corrected_out=%.1fHz bias_out=%.1fHz "
-      "totals input=%" PRIu64 " corrected=%" PRIu64 " bias=%" PRIu64 " stale_skips=%" PRIu64,
+      "totals input=%" PRIu64 " corrected=%" PRIu64 " bias=%" PRIu64 " stale_skips=%" PRIu64
+      " transform_failures=%" PRIu64,
       input_hz,
       corrected_hz,
       bias_hz,
       input_imu_count_,
       output_corrected_count_,
       output_bias_count_,
-      stale_corrected_skip_count_);
+      stale_corrected_skip_count_,
+      output_transform_failure_count_);
     rate_window_start_sec_ = now_sec;
     input_imu_window_count_ = 0;
     output_corrected_window_count_ = 0;
@@ -340,6 +412,11 @@ private:
     if (!corrected_output_preserve_source_stamp_) {
       corrected.header.stamp = now();
     }
+    if (!transform_corrected_output(corrected)) {
+      ++output_transform_failure_count_;
+      maybe_report_rates(now_sec);
+      return;
+    }
     latest_corrected_imu_ = corrected;
     latest_imu_receive_sec_ = now_sec;
     latest_bias_msg_ = make_bias_msg(*msg);
@@ -350,11 +427,62 @@ private:
     maybe_report_rates(now_sec);
   }
 
+  bool transform_corrected_output(sensor_msgs::msg::Imu & corrected)
+  {
+    if (!transform_output_to_target_frame_) {
+      return true;
+    }
+    if (corrected.header.frame_id == output_target_frame_) {
+      return true;
+    }
+    if (corrected.header.frame_id.empty()) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(),
+        *get_clock(),
+        5000,
+        "Cannot transform corrected IMU output: input frame_id is empty");
+      return !drop_output_on_transform_failure_;
+    }
+
+    try {
+      const auto transform = tf_buffer_->lookupTransform(
+        output_target_frame_,
+        corrected.header.frame_id,
+        rclcpp::Time(0),
+        rclcpp::Duration::from_seconds(transform_lookup_timeout_sec_));
+      const auto rotation_matrix = rotation_matrix_from_quaternion(transform.transform.rotation);
+      corrected.angular_velocity = rotate_vector(corrected.angular_velocity, rotation_matrix);
+      corrected.linear_acceleration = rotate_vector(corrected.linear_acceleration, rotation_matrix);
+      corrected.angular_velocity_covariance = rotate_covariance(
+        corrected.angular_velocity_covariance,
+        rotation_matrix);
+      corrected.linear_acceleration_covariance = rotate_covariance(
+        corrected.linear_acceleration_covariance,
+        rotation_matrix);
+      corrected.header.frame_id = output_target_frame_;
+      return true;
+    } catch (const tf2::TransformException & ex) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(),
+        *get_clock(),
+        5000,
+        "Cannot transform corrected IMU output from '%s' to '%s': %s",
+        corrected.header.frame_id.c_str(),
+        output_target_frame_.c_str(),
+        ex.what());
+      return !drop_output_on_transform_failure_;
+    }
+  }
+
   std::string imu_topic_;
   std::string odom_topic_;
   std::string cmd_vel_topic_;
   std::string output_imu_topic_;
   std::string bias_topic_;
+  bool transform_output_to_target_frame_{false};
+  std::string output_target_frame_{"base_link"};
+  double transform_lookup_timeout_sec_{0.02};
+  bool drop_output_on_transform_failure_{true};
   bool use_odom_stationary_{true};
   bool use_cmd_vel_stationary_{true};
   bool require_fresh_cmd_vel_{false};
@@ -397,7 +525,10 @@ private:
   std::uint64_t output_corrected_window_count_{0};
   std::uint64_t output_bias_window_count_{0};
   std::uint64_t stale_corrected_skip_count_{0};
+  std::uint64_t output_transform_failure_count_{0};
 
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr corrected_imu_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr bias_pub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;

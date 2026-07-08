@@ -46,18 +46,21 @@ bridge_cpp="${WORKSPACE_ROOT}/src/robot_localization_bridge/src/localization_bri
 
 for phase in \
   DOCK_REQUESTED RESOLVE_DOCK_PROFILE BEFORE_PREDOCK_RELOCALIZE BEFORE_PREDOCK_SETTLE \
-  NAV_TO_STAGING_NATIVE_NAV2 STAGING_NAV2_GOAL_SUCCEEDED PREDOCK_POSE_VERIFY \
+  NAV_TO_STAGING_NATIVE_NAV2 STAGING_NAV2_EARLY_HANDOFF STAGING_NAV2_GOAL_SUCCEEDED PREDOCK_POSE_VERIFY \
   PREDOCK_NATIVE_GOAL_VERIFY_FAILED PREDOCK_YAW_ALIGN_RECOVERY \
-  PREDOCK_YAW_ALIGN_RECOVERY_SETTLE AFTER_PREDOCK_RELOCALIZE AFTER_PREDOCK_SETTLE \
+  PREDOCK_YAW_ALIGN_RECOVERY_SETTLE PREDOCK_LATERAL_ALIGN PREDOCK_LATERAL_ALIGN_VERIFY \
+  AFTER_PREDOCK_RELOCALIZE AFTER_PREDOCK_SETTLE \
   GS2_DOCK_DETECT FINE_DOCKING_BRIDGE_SETTLE PREDOCK_POSE_VERIFY_AFTER_BRIDGE_SETTLE \
   PREDOCK_YAW_ALIGN_AFTER_BRIDGE_SETTLE PREDOCK_YAW_ALIGN_AFTER_BRIDGE_SETTLE_VERIFY \
+  PREDOCK_LATERAL_ALIGN_AFTER_BRIDGE_SETTLE PREDOCK_LATERAL_ALIGN_AFTER_BRIDGE_SETTLE_VERIFY \
   FINE_DOCKING_ENTRY_CHECK FINE_ALIGN RESTAGE_RETRY; do
   require_text "${api_cpp}" "${phase}"
 done
 
 for symbol in \
   computeExpectedStagingYaw computePredockYawError computeContactYawError normalizeYawError \
-  run_predock_yaw_align evaluate_fine_docking_entry classify_fine_docking_failure_code; do
+  run_predock_yaw_align run_predock_lateral_align ensure_predock_lateral_alignment \
+  evaluate_fine_docking_entry classify_fine_docking_failure_code; do
   require_text "${api_cpp}" "${symbol}"
 done
 
@@ -67,7 +70,9 @@ for code in \
   PREDOCK_POSE_DRIFTED_AFTER_BRIDGE_SETTLE PREDOCK_YAW_NOT_ALIGNED_AFTER_BRIDGE_SETTLE \
   DOCK_FAILED_FINE_LOCALIZATION_TRANSITION_TIMEOUT \
   PREDOCK_YAW_NOT_ALIGNED PREDOCK_YAW_HARD_FAIL PREDOCK_YAW_ALIGN_TIMEOUT \
-  PREDOCK_YAW_ALIGN_MODE_SWITCHING_TIMEOUT PREDOCK_YAW_ALIGN_NO_YAW_MOTION \
+  PREDOCK_YAW_ALIGN_NO_YAW_MOTION \
+  PREDOCK_LATERAL_NOT_ALIGNED PREDOCK_LATERAL_HARD_FAIL PREDOCK_LATERAL_ALIGN_TIMEOUT \
+  PREDOCK_LATERAL_ALIGN_NO_LATERAL_MOTION PREDOCK_LATERAL_ALIGN_OWNER_CONFLICT \
   GS2_DOCK_DETECT_TIMEOUT FINE_DOCKING_ENTRY_CONDITION_FAILED \
   FINE_DOCKING_REJECTED_YAW_TOO_LARGE FINE_DOCKING_REJECTED_LATERAL_TOO_LARGE \
   FINE_DOCKING_TIMEOUT FINAL_INSERTION_NO_CONTACT DOCK_FAILED_SAFETY_BLOCKED; do
@@ -76,6 +81,8 @@ done
 
 require_text "${api_cpp}" 'predock_yaw_align_cmd_topic_ != "/cmd_vel_docking"'
 require_text "${api_cpp}" "create_publisher<geometry_msgs::msg::Twist>(predock_yaw_align_cmd_topic_"
+require_text "${api_cpp}" "publish_predock_lateral_forced_mode(predock_lateral_align_forced_mode_)"
+require_text "${api_cpp}" "twist.linear.y"
 require_text "${api_cpp}" "mode_controller_status_topic_"
 require_text "${api_cpp}" "actual_motion_mode_code == 2"
 require_text "${api_cpp}" "docking_gs2_scan_topic_"
@@ -87,9 +94,12 @@ require_text "${bridge_cpp}" "global_correction_paused"
 
 for field in \
   dock_profile_id approach_direction contact_frame sensor_frame max_retries retry_count \
+  predock_nav_early_handoff predock_nav_handoff_detail \
   predock_yaw_verified_by_nav2 reverse_yaw_offset_applied contact_frame_available \
+  predock_forward_m predock_lateral_m predock_lateral_abs_m \
   fine_bridge_settle_started fine_bridge_settle_complete fine_bridge_settle_failure_code \
-  predock_yaw_aligned predock_yaw_align_failure_code fine_entry_checked fine_entry_failure_code \
+  predock_yaw_aligned predock_yaw_align_failure_code predock_lateral_aligned \
+  predock_lateral_align_attempted predock_lateral_align_failure_code fine_entry_checked fine_entry_failure_code \
   global_correction_paused pause_reason display_pose_source; do
   require_text "${job_hpp}" "${field}"
 done
@@ -97,6 +107,7 @@ done
 for key in \
   docking_framework_state_machine_enabled predock_yaw_align_enabled \
   predock_yaw_align_fallback_enabled predock_yaw_align_cmd_topic \
+  predock_lateral_align_enabled predock_lateral_align_forced_mode \
   predock_yaw_align_require_actual_spin fine_docking_entry_require_gs2_fresh \
   fine_docking_entry_require_predock_yaw_aligned docking_pause_global_correction_during_fine \
   docking_fine_wait_for_bridge_smoothing_enabled docking_fine_bridge_smoothing_wait_timeout_ms \

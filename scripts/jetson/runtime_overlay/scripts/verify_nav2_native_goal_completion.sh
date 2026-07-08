@@ -57,16 +57,28 @@ require_file_text() {
   fi
 }
 
+reject_file_text() {
+  local label="$1"
+  local file="$2"
+  local text="$3"
+  if grep -Fq "$text" "$file"; then
+    fail "$label unexpectedly present: $text"
+  else
+    pass "$label"
+  fi
+}
+
 check_static_nav2() {
   [[ -f "${NAV2_PARAMS_FILE}" ]] || { fail "missing NAV2 params: ${NAV2_PARAMS_FILE}"; return; }
 
-  local follow_plugin primary rotate stateful xy yaw planner local_frame controller_plugins fallback transform_tol
+  local follow_plugin primary rotate goal_plugins goal_stateful goal_xy goal_yaw planner local_frame controller_plugins fallback transform_tol
   follow_plugin="$(read_yaml_value "${NAV2_PARAMS_FILE}" "controller_server.ros__parameters.FollowPath.plugin" || true)"
   primary="$(read_yaml_value "${NAV2_PARAMS_FILE}" "controller_server.ros__parameters.FollowPath.primary_controller" || true)"
   rotate="$(read_yaml_value "${NAV2_PARAMS_FILE}" "controller_server.ros__parameters.FollowPath.rotate_to_goal_heading" || true)"
-  stateful="$(read_yaml_value "${NAV2_PARAMS_FILE}" "controller_server.ros__parameters.goal_checker.stateful" || true)"
-  xy="$(read_yaml_value "${NAV2_PARAMS_FILE}" "controller_server.ros__parameters.goal_checker.xy_goal_tolerance" || true)"
-  yaw="$(read_yaml_value "${NAV2_PARAMS_FILE}" "controller_server.ros__parameters.goal_checker.yaw_goal_tolerance" || true)"
+  goal_plugins="$(read_yaml_value "${NAV2_PARAMS_FILE}" "controller_server.ros__parameters.goal_checker_plugins" || true)"
+  goal_stateful="$(read_yaml_value "${NAV2_PARAMS_FILE}" "controller_server.ros__parameters.goal_checker.stateful" || true)"
+  goal_xy="$(read_yaml_value "${NAV2_PARAMS_FILE}" "controller_server.ros__parameters.goal_checker.xy_goal_tolerance" || true)"
+  goal_yaw="$(read_yaml_value "${NAV2_PARAMS_FILE}" "controller_server.ros__parameters.goal_checker.yaw_goal_tolerance" || true)"
   planner="$(read_yaml_value "${NAV2_PARAMS_FILE}" "planner_server.ros__parameters.GridBased.plugin" || true)"
   local_frame="$(read_yaml_value "${NAV2_PARAMS_FILE}" "local_costmap.local_costmap.ros__parameters.global_frame" || true)"
   controller_plugins="$(read_yaml_value "${NAV2_PARAMS_FILE}" "controller_server.ros__parameters.controller_plugins" || true)"
@@ -82,15 +94,18 @@ check_static_nav2() {
   [[ "${rotate}" == "true" ]] \
     && pass "rotate_to_goal_heading=true" \
     || fail "rotate_to_goal_heading=${rotate:-missing}"
-  [[ "${stateful}" == "false" ]] \
-    && pass "SimpleGoalChecker stateful=false" \
-    || fail "goal_checker.stateful=${stateful:-missing}"
-  [[ "${xy}" == "0.20" || "${xy}" == "0.2" ]] \
-    && pass "xy_goal_tolerance=${xy}" \
-    || fail "xy_goal_tolerance=${xy:-missing}, expected 0.20"
-  [[ "${yaw}" == "0.0873" ]] \
-    && pass "yaw_goal_tolerance=${yaw}" \
-    || fail "yaw_goal_tolerance=${yaw:-missing}, expected 0.0873"
+  [[ "${goal_plugins}" == *"goal_checker"* ]] \
+    && pass "goal_checker_plugins include goal_checker" \
+    || fail "goal_checker_plugins=${goal_plugins:-missing}, expected goal_checker"
+  [[ "${goal_stateful}" == "false" ]] \
+    && pass "goal_checker.stateful=false" \
+    || fail "goal_checker.stateful=${goal_stateful:-missing}"
+  [[ "${goal_xy}" == "0.06" ]] \
+    && pass "goal_checker.xy_goal_tolerance=${goal_xy}" \
+    || fail "goal_checker.xy_goal_tolerance=${goal_xy:-missing}, expected 0.06"
+  [[ "${goal_yaw}" == "0.05" ]] \
+    && pass "goal_checker.yaw_goal_tolerance=${goal_yaw}" \
+    || fail "goal_checker.yaw_goal_tolerance=${goal_yaw:-missing}, expected 0.05"
   [[ "${planner}" == "nav2_smac_planner/SmacPlanner2D" ]] \
     && pass "planner unchanged: ${planner}" \
     || fail "planner changed or missing: ${planner}"
@@ -113,14 +128,29 @@ check_static_api() {
   require_file_text "pose_required remains default" "${API_PARAMS_FILE}" 'navigation_default_goal_completion_policy: "pose_required"'
   require_file_text "native goal completion enabled" "${API_PARAMS_FILE}" "nav2_native_goal_completion_enabled: true"
   require_file_text "rotation shim flag enabled" "${API_PARAMS_FILE}" "nav2_rotation_shim_enabled: true"
-  require_file_text "ordinary API final_yaw fallback disabled" "${API_PARAMS_FILE}" "api_final_yaw_align_fallback_enabled: false"
-  require_file_text "API final_yaw disabled for ordinary Nav2-owned completion" "${API_PARAMS_FILE}" "navigation_final_yaw_align_enable: false"
+  require_file_text "ordinary API final_yaw bounded fallback enabled" "${API_PARAMS_FILE}" "api_final_yaw_align_fallback_enabled: true"
+  require_file_text "API final_yaw enabled only as bounded fallback" "${API_PARAMS_FILE}" "navigation_final_yaw_align_enable: true"
+  require_file_text "API Nav2 failed near-goal retry enabled" "${API_PARAMS_FILE}" "navigation_nav2_failed_near_goal_retry_enabled: true"
+  require_file_text "API Nav2 failed near-goal retry count" "${API_PARAMS_FILE}" "navigation_nav2_failed_near_goal_retry_max_count: 1"
+  require_file_text "API final_yaw waits for bridge smoothing" "${API_PARAMS_FILE}" "navigation_final_yaw_align_wait_bridge_smoothing: true"
+  require_file_text "API final_yaw bridge wait timeout configured" "${API_PARAMS_FILE}" "navigation_final_yaw_align_bridge_wait_timeout_ms: 2000"
+  require_file_text "API final_yaw pauses global correction" "${API_PARAMS_FILE}" "navigation_pause_global_correction_during_final_yaw: true"
   require_file_text "dock staging predock yaw still uses docking topic" "${API_PARAMS_FILE}" 'predock_yaw_align_cmd_topic: "/cmd_vel_docking"'
   require_file_text "API exposes native_nav2_goal_completion" "${API_CPP}" "native_nav2_goal_completion"
   require_file_text "API exposes api_final_yaw_align_enabled" "${API_CPP}" "api_final_yaw_align_enabled"
-  require_file_text "API records Nav2 single completion owner audit" "${API_CPP}" "Nav2 is the single completion owner"
-  require_file_text "API success detail uses Nav2 native completion" "${API_CPP}" "navigation goal reached by Nav2 native completion"
-  require_file_text "Nav2 action failure phase exists" "${API_CPP}" '"nav2_failed"'
+  require_file_text "API records commercial completion owner audit" "${API_CPP}" "commercial_final_verify=true"
+  require_file_text "API success detail uses commercial final verification" "${API_CPP}" "navigation goal reached by commercial final verification"
+  reject_file_text "Nav2 action failure no longer bypasses commercial final verification" "${API_CPP}" '"nav2_failed"'
+  require_file_text "Nav2 failure can enter yaw fallback" "${API_CPP}" "nav2_failed_yaw_aligning"
+  require_file_text "Nav2 near-goal failure aligns yaw first" "${API_CPP}" "nav2_failed_near_goal_yaw_aligning"
+  require_file_text "Nav2 near-goal yaw-first documents retry order" "${API_CPP}" "aligning yaw before same-goal retry"
+  require_file_text "Nav2 failure can retry near-goal pose" "${API_CPP}" "retry_nav2_after_nav2_failed_near_goal"
+  require_file_text "Nav2 near-goal retry is audited" "${API_CPP}" "near_goal_nav2_retry_attempted=true"
+  require_file_text "commercial final verification can accept recovered final pose" "${API_CPP}" "commercial_final_verify=true"
+  require_file_text "yaw fallback waits for map smoothing first" "${API_CPP}" "waiting for bridge map->odom smoothing before final yaw alignment"
+  require_file_text "yaw fallback refuses active map smoothing" "${API_CPP}" "bridge_smoothing_active_before_final_yaw"
+  require_file_text "yaw fallback pauses AMCL/Isaac correction" "${API_CPP}" "global correction paused for final_yaw_align"
+  require_file_text "yaw fallback releases AMCL/Isaac correction pause" "${API_CPP}" "global correction resumed after final_yaw_align"
   require_file_text "dock_staging remains reserved" "${API_CPP}" "goal_completion_policy=dock_staging is reserved for /api/v1/docking/start"
   require_file_text "predock yaw owner conflict remains guarded" "${API_CPP}" "PREDOCK_YAW_ALIGN_OWNER_CONFLICT"
   require_file_text "predock yaw still uses /cmd_vel_docking" "${API_CPP}" 'predock_yaw_align_cmd_topic_ != "/cmd_vel_docking"'

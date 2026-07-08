@@ -7,25 +7,25 @@ lidar_level_frame: lidar_level_link
 imu_frame: imu_link
 gs2_frame: gs2_link
 charge_contact_frame: charge_contact_link
-lidar_x: 0.25
-lidar_y: 0.0
+lidar_x: 0.3686
+lidar_y: 0.0000
 lidar_z: 0.85
 # JT128 install extrinsic relative to base_link. Keep vehicle mounting here.
 lidar_roll: 0.0
 lidar_pitch: -0.3490658503988659
-lidar_yaw: 3.141592653589793
+lidar_yaw: -3.127692216127
 # JT128 raw axis alignment is applied inside the canonical remap nodes before
 # publishing /lidar_points and /lidar_imu. Keep lidar_link as the canonical
 # sensor frame under the physical mount.
 lidar_axis_roll: 0.0
 lidar_axis_pitch: 0.0
 lidar_axis_yaw: 0.0
-imu_x: 0.25
-imu_y: 0.0
+imu_x: 0.3686
+imu_y: 0.0000
 imu_z: 0.85
 imu_roll: 0.0
 imu_pitch: -0.3490658503988659
-imu_yaw: 3.141592653589793
+imu_yaw: -3.127692216127
 # GS2 near-field docking lidar: front centerline, flush with front body plane.
 # X follows the current Nav2 footprint front edge and should be refined after a
 # direct base_link-to-front-panel measurement.

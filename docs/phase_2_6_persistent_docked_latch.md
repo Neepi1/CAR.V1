@@ -17,9 +17,13 @@ The fix is explicit and non-position-based:
   weak TTL evidence for compatibility.
 - Odometry-confirmed undock or explicit clear clears the latch.
 - BMS contact false alone never clears a `source=charging_session` or
-  `source=docking_job` latch. Those strong sources clear only after controlled
-  undock success with retreat-distance confirmation or explicit maintenance
-  clear. Stale `source=bms` evidence still follows the D2 TTL rules.
+  `source=docking_job` latch while live docking context or full-charge-idle
+  evidence still suggests physical dock occupancy. Strong
+  `source=charging_session` evidence is not cleared by restart-time
+  idle/no-contact context; it can be auto-cleared only after confirmed live
+  undock plus stable BMS `no_contact`, or by explicit maintenance/session
+  clear. Stale `source=bms` evidence follows the D2 TTL rules and the
+  no-live-dock-context clear path.
 
 `pre_navigation_dock_check` now exposes `docked_state_class`,
 `docked_evidence`, and `docked_warnings`. `DOCKED_CONFIRMED` comes from live

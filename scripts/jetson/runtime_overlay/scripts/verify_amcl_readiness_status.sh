@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common_env.sh"
 
-MODE="${NJRH_AMCL_LOCALIZATION_MODE:-gated}"
+MODE="${NJRH_AMCL_LOCALIZATION_MODE:-shadow}"
 DURATION_SEC=10
 WATCH=false
 REQUEST_NOMOTION_UPDATE=false

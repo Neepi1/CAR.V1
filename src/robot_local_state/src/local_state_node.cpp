@@ -62,6 +62,14 @@ public:
     odom_yaw_offset_rad_ = declare_parameter<double>("odom_yaw_offset_rad", 0.0);
     rotate_odom_position_with_yaw_offset_ =
       declare_parameter<bool>("rotate_odom_position_with_yaw_offset", true);
+    odom_position_scale_x_ = declare_parameter<double>("odom_position_scale_x", 1.0);
+    odom_position_scale_y_ = declare_parameter<double>("odom_position_scale_y", 1.0);
+    odom_position_y_to_x_shear_ = declare_parameter<double>("odom_position_y_to_x_shear", 0.0);
+    odom_position_x_to_y_shear_ = declare_parameter<double>("odom_position_x_to_y_shear", 0.0);
+    odom_yaw_scale_positive_ = declare_parameter<double>("odom_yaw_scale_positive", 1.0);
+    odom_yaw_scale_negative_ = declare_parameter<double>("odom_yaw_scale_negative", 1.0);
+    scale_odom_twist_with_yaw_scale_ =
+      declare_parameter<bool>("scale_odom_twist_with_yaw_scale", true);
     anchor_pose_to_first_sample_ = declare_parameter<bool>("anchor_pose_to_first_sample", false);
     apply_twist_covariance_floor_ = declare_parameter<bool>("apply_twist_covariance_floor", false);
     apply_pose_covariance_floor_ = declare_parameter<bool>("apply_pose_covariance_floor", false);
@@ -130,6 +138,54 @@ private:
     }
     if (!std::isfinite(value) || value < floor) {
       value = floor;
+    }
+  }
+
+  void apply_planar_position_calibration(nav_msgs::msg::Odometry & odom) const
+  {
+    if (
+      std::abs(odom_position_scale_x_ - 1.0) < 1e-12 &&
+      std::abs(odom_position_scale_y_ - 1.0) < 1e-12 &&
+      std::abs(odom_position_y_to_x_shear_) < 1e-12 &&
+      std::abs(odom_position_x_to_y_shear_) < 1e-12)
+    {
+      return;
+    }
+
+    const double x = odom.pose.pose.position.x;
+    const double y = odom.pose.pose.position.y;
+    odom.pose.pose.position.x = odom_position_scale_x_ * x + odom_position_y_to_x_shear_ * y;
+    odom.pose.pose.position.y = odom_position_x_to_y_shear_ * x + odom_position_scale_y_ * y;
+  }
+
+  double yaw_scale_for(const double yaw_or_rate) const
+  {
+    const double scale = yaw_or_rate >= 0.0 ? odom_yaw_scale_positive_ : odom_yaw_scale_negative_;
+    if (!std::isfinite(scale) || scale <= 0.0) {
+      return 1.0;
+    }
+    return scale;
+  }
+
+  void apply_yaw_scale_calibration(nav_msgs::msg::Odometry & odom) const
+  {
+    if (
+      std::abs(odom_yaw_scale_positive_ - 1.0) < 1e-12 &&
+      std::abs(odom_yaw_scale_negative_ - 1.0) < 1e-12)
+    {
+      return;
+    }
+
+    const double yaw = yaw_from_quaternion(odom.pose.pose.orientation);
+    odom.pose.pose.orientation = quaternion_from_yaw(normalize_angle(yaw * yaw_scale_for(yaw)));
+
+    if (!scale_odom_twist_with_yaw_scale_) {
+      return;
+    }
+
+    auto & vyaw = odom.twist.twist.angular.z;
+    if (std::isfinite(vyaw)) {
+      vyaw *= yaw_scale_for(vyaw);
     }
   }
 
@@ -213,6 +269,8 @@ private:
     }
     nav_msgs::msg::Odometry local_odom = *msg;
     apply_pose_anchor(local_odom);
+    apply_planar_position_calibration(local_odom);
+    apply_yaw_scale_calibration(local_odom);
     apply_pose_covariance_floor(local_odom);
     apply_twist_covariance_floor(local_odom);
     apply_canonical_odom_transform(local_odom);
@@ -265,6 +323,13 @@ private:
   std::string base_frame_;
   double odom_yaw_offset_rad_{0.0};
   bool rotate_odom_position_with_yaw_offset_{true};
+  double odom_position_scale_x_{1.0};
+  double odom_position_scale_y_{1.0};
+  double odom_position_y_to_x_shear_{0.0};
+  double odom_position_x_to_y_shear_{0.0};
+  double odom_yaw_scale_positive_{1.0};
+  double odom_yaw_scale_negative_{1.0};
+  bool scale_odom_twist_with_yaw_scale_{true};
   bool anchor_pose_to_first_sample_{false};
   bool has_pose_anchor_{false};
   double anchor_x_{0.0};

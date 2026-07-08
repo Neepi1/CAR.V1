@@ -15,6 +15,19 @@ force_restart_nav_helpers_enabled() {
   [[ "${NJRH_FORCE_RESTART_NAV_HELPERS:-false}" == "true" ]]
 }
 
+forget_overlay_helper_pid() {
+  local pid_to_forget="$1"
+  local kept_pids=()
+  local helper_pid
+  for helper_pid in "${helper_pids[@]:-}"; do
+    [[ -n "${helper_pid}" ]] || continue
+    if [[ "${helper_pid}" != "${pid_to_forget}" ]]; then
+      kept_pids+=("${helper_pid}")
+    fi
+  done
+  helper_pids=("${kept_pids[@]}")
+}
+
 helper_process_pattern() {
   local helper_name="$1"
   case "${helper_name}" in
@@ -166,9 +179,6 @@ stop_existing_overlay_nav_helpers() {
   kill_overlay_pattern "${NJRH_OVERLAY_ROOT}/scripts/run_floor_manager.sh"
   kill_overlay_pattern "/install/robot_floor_manager/lib/robot_floor_manager/floor_manager_node"
   kill_overlay_pattern "robot_floor_manager/floor_manager_node"
-  kill_overlay_pattern "${NJRH_OVERLAY_ROOT}/scripts/run_global_localization.sh"
-  kill_overlay_pattern "/install/robot_global_localization/lib/robot_global_localization/global_localization_node"
-  kill_overlay_pattern "robot_global_localization/global_localization_node"
   kill_overlay_pattern "${NJRH_OVERLAY_ROOT}/scripts/run_ranger_mini3_mode_controller.sh"
   kill_overlay_pattern "ranger_mini3_mode_controller/mode_controller_node.py"
   kill_overlay_pattern "python3 .*mode_controller_node.py"
@@ -206,6 +216,16 @@ start_overlay_helper() {
     echo "[runtime-overlay] helper failed to stay alive: ${helper_name}. Check ${helper_log}" >&2
     return 1
   fi
+  case "${helper_name}" in
+    global_localization*)
+      # The resident navigation stack needs /global_localization/trigger after
+      # initial startup for explicit relocalization and post-test truth checks.
+      # Keep the wrapper alive independently from the occupancy-localization
+      # launch script; full runtime stop still removes it by process pattern.
+      disown "${helper_pid}" 2>/dev/null || true
+      forget_overlay_helper_pid "${helper_pid}"
+      ;;
+  esac
   echo "[runtime-overlay] helper ready: ${helper_name} (pid=${helper_pid})" >&2
 }
 

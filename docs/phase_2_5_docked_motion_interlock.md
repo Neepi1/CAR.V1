@@ -14,6 +14,17 @@ evidence, it preserves that session as `source=charging_session`; later BMS
 `no_contact`, `current=0`, or `present=false` cannot by itself prove that the
 robot has left the dock.
 
+That safety memory is not permanent dock truth, but its clear path depends on
+the source strength. If the runtime is no longer in docked, charging, docking,
+or undocking context and fresh BMS has reported stable `no_contact`,
+`robot_api_server` can clear stale legacy `source=bms` evidence before it blocks
+ordinary navigation or ordinary `final_yaw_align`. Strong
+`source=charging_session` evidence is not cleared by restart-time idle/no-contact
+context; it is auto-cleared only after confirmed live undock plus stable BMS
+`no_contact`, or by explicit maintenance/session clear. A retained latch still
+blocks direct Nav2 submission when live docking context or full-charge-idle
+evidence suggests the robot may physically remain on the charger.
+
 Normal navigation still enters `POST /api/v1/navigation/goal`. Before any
 `NavigateToPose` goal is sent, the API evaluates `pre_navigation_dock_check`.
 If docked, charging, contact, or the dock latch is active, the API must call

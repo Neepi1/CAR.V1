@@ -177,7 +177,9 @@ if [[ -n "$runtime_cmd_topic" ]]; then
   if [[ "$runtime_cmd_topic" == "/cmd_vel_safe" || "$runtime_cmd_topic" == "/cmd_vel" ]]; then
     fail "runtime final yaw cmd topic must not be $runtime_cmd_topic"
   elif [[ "$runtime_cmd_topic" == "/cmd_vel_collision_checked" ]]; then
-    warn "runtime final yaw uses /cmd_vel_collision_checked: robot_safety is kept, collision_monitor is bypassed"
+    fail "runtime final yaw must not share collision_monitor's /cmd_vel_collision_checked publisher"
+  elif [[ "$runtime_cmd_topic" == "/cmd_vel_api" ]]; then
+    pass "runtime final yaw uses /cmd_vel_api through robot_safety"
   else
     pass "runtime final yaw cmd topic is $runtime_cmd_topic"
   fi

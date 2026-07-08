@@ -24,13 +24,13 @@ lack of positional progress.
 | File | Parameter or function | Current value | Affects startup rotation | Affects progress failure | Overlaps mission final yaw | Recommendation | Risk |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `scripts/jetson/runtime_overlay/config/nav2.yaml` | `progress_checker.plugin` | `nav2_controller::PoseProgressChecker` | Yes | Yes | No | Count yaw progress during legal in-place startup alignment | Requires Humble plugin availability |
-| `scripts/jetson/runtime_overlay/config/nav2.yaml` | `required_movement_radius` | `0.10` | No | Yes | No | Keep unchanged | Too small would hide stalls |
-| `scripts/jetson/runtime_overlay/config/nav2.yaml` | `required_movement_angle` | `0.10` | Yes | Yes | No | Initial 5.7 degree yaw-progress threshold | Too small may count vibration |
-| `scripts/jetson/runtime_overlay/config/nav2.yaml` | `movement_time_allowance` | `12.0` | No | Yes | No | Keep unchanged | Increasing would mask the bug |
+| `scripts/jetson/runtime_overlay/config/nav2.yaml` | `required_movement_radius` | `0.03` | No | Yes | No | Keep legal terminal creep below the 6 cm point-goal gate | Larger values delay near-goal fallback |
+| `scripts/jetson/runtime_overlay/config/nav2.yaml` | `required_movement_angle` | `0.05` | Yes | Yes | No | Match the 0.05 rad terminal yaw gate | Larger values delay near-goal fallback |
+| `scripts/jetson/runtime_overlay/config/nav2.yaml` | `movement_time_allowance` | `12.0` | No | Yes | No | Avoid aborting measurable terminal creep or RotationShim yaw progress | Too large delays final yaw fallback |
 | `scripts/jetson/runtime_overlay/config/nav2.yaml` | `FollowPath.plugin` | `RotationShimController` | Yes | Indirect | Yes | Keep plugin type unchanged | Removing it changes controller architecture |
 | `scripts/jetson/runtime_overlay/config/nav2.yaml` | `FollowPath.primary_controller` | `MPPIController` | Yes | Indirect | No | Keep MPPI as primary controller | Changing controller would broaden the fix |
-| `scripts/jetson/runtime_overlay/config/nav2.yaml` | `angular_dist_threshold` | `1.20` | Yes | Indirect | No | Keep production default, evaluate A/B profiles only | Large changes can alter path entry behavior |
-| `scripts/jetson/runtime_overlay/config/nav2.yaml` | `rotate_to_goal_heading` | `false` | No | Indirect | Yes | Let mission-layer `final_yaw_align` own terminal heading | Requires final-yaw alignment to remain enabled |
+| `scripts/jetson/runtime_overlay/config/nav2.yaml` | `angular_dist_threshold` / `angular_disengage_threshold` | `0.45` / `0.075` | Yes | Indirect | No | Avoid entering RotationShim on small path changes, but exit only after yaw is close enough for smooth straight-line handoff | Too-low thresholds can make path following over-rotate on gentle curves |
+| `scripts/jetson/runtime_overlay/config/nav2.yaml` | `rotate_to_goal_heading` | `true` | Yes | Indirect | Yes | Let Nav2 own terminal heading first | API final-yaw alignment remains a bounded fallback |
 | `src/robot_api_server/src/robot_api_server_node.cpp` | `navigation_final_yaw_*` | mission-layer final yaw | No | No | Owns final yaw | Keep unchanged | Bypassing safety chain would be unsafe |
 | `src/robot_bringup/launch/standard_navigation.launch.py` | command remaps | `cmd_vel_nav_raw -> cmd_vel_nav -> cmd_vel_collision_checked -> robot_safety -> cmd_vel_safe -> cmd_vel` | No | Diagnosis path | No | Keep unchanged | Broken chain would hide root cause |
 
@@ -41,20 +41,36 @@ The progress checker now uses `nav2_controller::PoseProgressChecker`:
 ```yaml
 progress_checker:
   plugin: "nav2_controller::PoseProgressChecker"
-  required_movement_radius: 0.10
-  required_movement_angle: 0.10
+  required_movement_radius: 0.03
+  required_movement_angle: 0.05
   movement_time_allowance: 12.0
 ```
 
-The radius and timeout are unchanged. The new angle threshold lets legal
-RotationShim yaw movement count as progress, so a robot that is genuinely
-turning in place to align with the path is not falsely treated as completely
-stalled. If angular commands are present but yaw barely changes, the diagnostic
-script classifies that separately as `CASE_G_ROTATION_STALL`.
+The radius, angle, and timeout are intentionally close to the tight terminal
+goal tolerances. Legal RotationShim yaw movement still counts as progress, but
+a near-goal stall no longer waits through a long progress window before
+business-layer final yaw recovery can run. If angular commands are present but
+yaw barely changes, the diagnostic script classifies that separately as
+`CASE_G_ROTATION_STALL`.
 
-`FollowPath.rotate_to_goal_heading` is now `false`. Startup path alignment can
-still be handled by RotationShim. Terminal heading is owned by the API
-mission-layer `final_yaw_align` after the position has been verified.
+`FollowPath.rotate_to_goal_heading` is now `true`. Startup path alignment and
+terminal heading are attempted inside Nav2 first. API mission-layer
+`final_yaw_align` is only a bounded near-goal fallback after Nav2 fails.
+
+RotationShim path-entry engagement is now explicit:
+
+```yaml
+FollowPath:
+  angular_dist_threshold: 0.45
+  angular_disengage_threshold: 0.075
+```
+
+The entry threshold keeps RotationShim from interrupting ordinary mid-route
+Ackermann turns for small heading changes. The lower disengage threshold keeps
+the robot in pure-yaw alignment until residual yaw is small, while
+`robot_safety` checks both `/wheel/odom` yaw-rate settle and the
+`/local_state/odometry` heading state consumed by Nav2 before releasing the
+first following linear command after a pure spin.
 
 ## Diagnostics
 
@@ -88,8 +104,9 @@ bash scripts/jetson/runtime_overlay/scripts/run_nav2_rotation_shim_ab.sh --profi
 bash scripts/jetson/runtime_overlay/scripts/run_nav2_rotation_shim_ab.sh --restore --restart
 ```
 
-The production default keeps `angular_dist_threshold=1.20`. Relaxed thresholds
-are A/B diagnostics, not a permanent default.
+Legacy relaxed-threshold A/B profiles remain diagnostics only. The production
+default is the lower Ackermann startup gate above, not the older
+`angular_dist_threshold=1.20`.
 
 ## Non-Changes
 

@@ -1,0 +1,48 @@
+robot_local_state:
+  ros__parameters:
+    frequency: 50.0
+    sensor_timeout: 0.15
+    two_d_mode: true
+    transform_time_offset: 0.0
+    transform_timeout: 0.0
+    print_diagnostics: true
+    debug: false
+    publish_tf: true
+    publish_acceleration: false
+
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_link
+    world_frame: odom
+
+    # Drift-reduction experiment: keep chassis-integrated x/y as the local
+    # position anchor and wheel forward speed as the speed input, but let the
+    # corrected JT128 IMU gyro be the only yaw-rate measurement.
+    odom0: /wheel/odom_ekf
+    odom0_config: [true, true, false,
+                   false, false, false,
+                   true, false, false,
+                   false, false, false,
+                   false, false, false]
+    odom0_queue_size: 20
+    odom0_nodelay: true
+    odom0_differential: false
+    odom0_relative: false
+    odom0_pose_rejection_threshold: 5.0
+    odom0_twist_rejection_threshold: 1.5
+
+    imu0: /lidar_imu_bias_corrected
+    imu0_config: [false, false, false,
+                  false, false, false,
+                  false, false, false,
+                  false, false, true,
+                  false, false, false]
+    imu0_queue_size: 100
+    imu0_nodelay: true
+    imu0_differential: false
+    imu0_relative: false
+    imu0_remove_gravitational_acceleration: true
+    imu0_pose_rejection_threshold: 0.8
+    imu0_twist_rejection_threshold: 0.8
+
+    use_control: false

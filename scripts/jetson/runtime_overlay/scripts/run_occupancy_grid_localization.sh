@@ -178,6 +178,7 @@ launch_args=(
   "map_yaml:=${NAV2_MAP_YAML}"
   "localizer_map_yaml:=${LOCALIZER_MAP_YAML}"
   "use_sim_time:=false"
+  "log_level:=${NJRH_LOCALIZATION_LOG_LEVEL:-warn}"
 )
 if [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" == "legacy" ]]; then
   launch_args+=(
@@ -360,8 +361,9 @@ ensure_resident_fastlio_for_local_state() {
 }
 
 ensure_resident_local_state_for_localization() {
-  LOCAL_STATE_MODE="${NAV_LOCAL_STATE_MODE}" local_state_required_processes_running || {
-    echo "[runtime-overlay] resident local_state ${NAV_LOCAL_STATE_MODE} process is not running; common services must start it before occupancy localization" >&2
+  local timeout_sec="${NJRH_LOCALIZATION_LOCAL_STATE_WAIT_SEC:-20}"
+  LOCAL_STATE_MODE="${NAV_LOCAL_STATE_MODE}" wait_for_local_state_required_processes "${timeout_sec}" || {
+    echo "[runtime-overlay] resident local_state ${NAV_LOCAL_STATE_MODE} process did not become ready within ${timeout_sec}s; common services must start it before occupancy localization" >&2
     return 1
   }
   echo "[runtime-overlay] resident local_state ${NAV_LOCAL_STATE_MODE} process exists for occupancy localization; startup odom/TF probes are disabled" >&2

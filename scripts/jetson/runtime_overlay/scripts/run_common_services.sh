@@ -2,15 +2,27 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_STARTUP_EPOCH="${SECONDS}"
+
+log_common_startup_stage() {
+  local stage="$1"
+  local elapsed_sec=$((SECONDS - COMMON_STARTUP_EPOCH))
+  echo "[runtime-overlay] COMMON_STARTUP_STAGE stage=${stage} elapsed_sec=${elapsed_sec}" >&2
+}
+
+log_common_startup_stage "script_start"
 source "${SCRIPT_DIR}/canonical_tf_helpers.sh"
 source "${SCRIPT_DIR}/nav_runtime_helpers.sh"
 source "${SCRIPT_DIR}/cpu_affinity.sh"
 source "${SCRIPT_DIR}/pointcloud_accel_profile.sh"
+log_common_startup_stage "helpers_loaded"
 njrh_load_pointcloud_accel_profile
 njrh_load_pointcloud_ingress_profile
+log_common_startup_stage "profiles_loaded"
 
 common_pids=()
 runtime_health_guard_started=0
+ranger_chassis_common_health_failures=0
 NAV_LOCAL_STATE_MODE="${NJRH_NAV_LOCAL_STATE_MODE:-ekf}"
 # FAST-LIO2 is mapping-owned by default. Daily navigation uses wheel+IMU EKF
 # local odom, so common services must not keep the lidar-inertial frontend
@@ -52,7 +64,7 @@ cleanup_stale_amcl_runtime_status_owner() {
   if [[ -n "${pids}" ]]; then
     echo "[runtime-overlay] stopping stale AMCL runtime status heartbeat before common startup: ${pids}" >&2
     kill -INT ${pids} 2>/dev/null || true
-    sleep "${NJRH_AMCL_HEARTBEAT_STOP_INT_WAIT_SEC:-1}"
+    sleep "${NJRH_AMCL_HEARTBEAT_STOP_INT_WAIT_SEC:-0.2}"
     pids="$(stale_amcl_heartbeat_pids)"
     [[ -z "${pids}" ]] || kill -TERM ${pids} 2>/dev/null || true
   fi
@@ -60,10 +72,10 @@ cleanup_stale_amcl_runtime_status_owner() {
   if [[ -n "${pids}" ]]; then
     echo "[runtime-overlay] stopping stale AMCL seed helper before common startup: ${pids}" >&2
     kill -INT ${pids} 2>/dev/null || true
-    sleep "${NJRH_AMCL_SEED_HELPER_STOP_INT_WAIT_SEC:-0.5}"
+    sleep "${NJRH_AMCL_SEED_HELPER_STOP_INT_WAIT_SEC:-0.2}"
     pids="$(stale_amcl_seed_helper_pids)"
     [[ -z "${pids}" ]] || kill -TERM ${pids} 2>/dev/null || true
-    sleep "${NJRH_AMCL_SEED_HELPER_STOP_TERM_WAIT_SEC:-0.5}"
+    sleep "${NJRH_AMCL_SEED_HELPER_STOP_TERM_WAIT_SEC:-0.2}"
     pids="$(stale_amcl_seed_helper_pids)"
     if [[ -n "${pids}" ]]; then
       echo "[runtime-overlay] killing stale AMCL seed helper before common startup: ${pids}" >&2
@@ -166,7 +178,7 @@ wait_for_runtime_health_local_state_ready() {
 }
 
 wait_for_runtime_health_local_state_endpoint_ready() {
-  local timeout_sec="${NJRH_RUNTIME_HEALTH_LOCAL_STATE_ENDPOINT_TIMEOUT_SEC:-3}"
+  local timeout_sec="${NJRH_RUNTIME_HEALTH_LOCAL_STATE_ENDPOINT_TIMEOUT_SEC:-0}"
   local deadline=$((SECONDS + timeout_sec))
   local key="local_state_endpoint"
   if [[ "${NAV_LOCAL_STATE_MODE}" == "fastlio" ]]; then
@@ -181,6 +193,66 @@ wait_for_runtime_health_local_state_endpoint_ready() {
   done
   echo "[runtime-overlay] runtime health did not confirm ${key} within ${timeout_sec}s; continuing because robot_local_state endpoint direct readiness already passed" >&2
   return 0
+}
+
+verify_ranger_chassis_common_health_or_exit() {
+  [[ "${NJRH_COMMON_RANGER_CHASSIS_HEALTH_MONITOR:-false}" == "true" ]] || return 0
+  local timeout_sec="${NJRH_COMMON_RANGER_CHASSIS_HEALTH_TIMEOUT_SEC:-3}"
+  local max_failures="${NJRH_COMMON_RANGER_CHASSIS_HEALTH_MAX_FAILURES:-5}"
+  if ranger_chassis_liveness_ready "${timeout_sec}" >/dev/null 2>&1; then
+    ranger_chassis_common_health_failures=0
+    return 0
+  fi
+  ranger_chassis_common_health_failures=$((ranger_chassis_common_health_failures + 1))
+  if (( ranger_chassis_common_health_failures < max_failures )); then
+    echo "[runtime-overlay] ranger_chassis_common liveness degraded (${ranger_chassis_common_health_failures}/${max_failures}); waiting before next health check" >&2
+    return 0
+  fi
+  if [[ "${NJRH_COMMON_RANGER_CHASSIS_HEALTH_EXIT_ON_LOSS:-false}" != "true" ]]; then
+    echo "[runtime-overlay] ranger_chassis_common health lost after ${ranger_chassis_common_health_failures} consecutive checks; continuing because NJRH_COMMON_RANGER_CHASSIS_HEALTH_EXIT_ON_LOSS=false" >&2
+    ranger_chassis_common_health_failures=0
+    return 0
+  fi
+  echo "[runtime-overlay] ranger_chassis_common health lost after ${ranger_chassis_common_health_failures} consecutive checks; exiting common runtime so systemd restarts the complete navigation chain" >&2
+  return 1
+}
+
+start_robot_local_state_common() {
+  NJRH_LOCAL_STATE_START_READY_MODE="${NJRH_COMMON_LOCAL_STATE_START_READY_MODE:-endpoint}" \
+  start_canonical_helper \
+    "robot_local_state_common" \
+    env NJRH_LOCAL_STATE_START_READY_MODE="${NJRH_COMMON_LOCAL_STATE_START_READY_MODE:-endpoint}" \
+      LOCAL_STATE_MODE="${NAV_LOCAL_STATE_MODE}" \
+      bash "${SCRIPT_DIR}/run_local_state.sh"
+}
+
+can_start_robot_local_state_common_in_background() {
+  [[ "${NJRH_COMMON_LOCAL_STATE_BACKGROUND_START:-true}" == "true" ]] || return 1
+  [[ "${NAV_LOCAL_STATE_MODE}" != "fastlio" ]] || return 1
+}
+
+robot_local_state_common_background_pid=""
+start_robot_local_state_common_background_if_enabled() {
+  if ! can_start_robot_local_state_common_in_background; then
+    return 0
+  fi
+  echo "[runtime-overlay] starting robot_local_state_common in background while common sensors initialize" >&2
+  start_robot_local_state_common &
+  robot_local_state_common_background_pid=$!
+}
+
+wait_for_robot_local_state_common_background_if_started() {
+  if [[ -z "${robot_local_state_common_background_pid}" ]]; then
+    start_robot_local_state_common
+    return $?
+  fi
+  if wait "${robot_local_state_common_background_pid}"; then
+    robot_local_state_common_background_pid=""
+    return 0
+  fi
+  robot_local_state_common_background_pid=""
+  echo "[runtime-overlay] robot_local_state_common background startup failed" >&2
+  return 1
 }
 
 resident_navigation_context_status() {
@@ -320,7 +392,7 @@ cleanup_resident_navigation_runtime_layers() {
     return 0
   fi
   timeout --kill-after="${NJRH_COMMON_AMCL_STOP_KILL_AFTER_SEC:-1}" \
-    "${NJRH_COMMON_AMCL_STOP_TIMEOUT_SEC:-3}" \
+    "${NJRH_COMMON_AMCL_STOP_TIMEOUT_SEC:-1.5}" \
     env \
       NJRH_AMCL_LIFECYCLE_SHUTDOWN_TIMEOUT_SEC="${NJRH_AMCL_LIFECYCLE_SHUTDOWN_TIMEOUT_SEC:-1}" \
       NJRH_AMCL_HEARTBEAT_STOP_INT_WAIT_SEC="${NJRH_AMCL_HEARTBEAT_STOP_INT_WAIT_SEC:-0.1}" \
@@ -330,8 +402,10 @@ cleanup_resident_navigation_runtime_layers() {
       NJRH_AMCL_SCAN_ADMISSION_STOP_INT_WAIT_SEC="${NJRH_AMCL_SCAN_ADMISSION_STOP_INT_WAIT_SEC:-0.1}" \
       NJRH_AMCL_STOP_INT_WAIT_SEC="${NJRH_AMCL_STOP_INT_WAIT_SEC:-0.1}" \
       bash "${SCRIPT_DIR}/run_amcl_shadow_localization.sh" --stop >/dev/null 2>&1 || true
-  stop_existing_standard_nav_stack || true
-  stop_existing_localization_stack || true
+  NJRH_STANDARD_NAV_STACK_STOP_INT_WAIT_SEC="${NJRH_STANDARD_NAV_STACK_STOP_INT_WAIT_SEC:-0.2}" \
+    stop_existing_standard_nav_stack || true
+  NJRH_LOCALIZATION_STACK_STOP_WAIT_SEC="${NJRH_LOCALIZATION_STACK_STOP_WAIT_SEC:-0.2}" \
+    stop_existing_localization_stack || true
   rm -f /tmp/njrh_runtime_map_context.json /tmp/njrh_amcl_runtime_status.env 2>/dev/null || true
 }
 
@@ -385,6 +459,8 @@ start_resident_navigation_autostart_if_selected() {
       NJRH_NAVIGATION_RESUME_LOG_FILE="${NJRH_RUNTIME_LOG_DIR}/resident_navigation_runtime.log" \
       NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION="${NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION:-false}" \
       NJRH_INITIAL_GLOBAL_LOCALIZATION_BACKGROUND_START="${NJRH_INITIAL_GLOBAL_LOCALIZATION_BACKGROUND_START:-false}" \
+      NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK="${NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK:-false}" \
+      NJRH_NAV2_LIFECYCLE_PARALLEL_CORE="${NJRH_NAV2_LIFECYCLE_PARALLEL_CORE:-false}" \
       NJRH_MAP_ID="${autostart_map_id}" \
       NJRH_MAP_DISPLAY_NAME="${autostart_display_name}" \
       NJRH_MAP_CONTEXT_BUILDING_ID="${autostart_building_id}" \
@@ -395,7 +471,8 @@ start_resident_navigation_autostart_if_selected() {
 
 wait_for_resident_navigation_autostart_if_started() {
   [[ "${resident_navigation_autostart_started}" -eq 1 ]] || return 0
-  wait_for_resident_navigation_context_ready
+  echo "[runtime-overlay] resident navigation autostart launched; common services will not block on navigation readiness" >&2
+  return 0
 }
 
 stop_stale_pointcloud_accel_pipeline_processes() {
@@ -684,9 +761,13 @@ trap cleanup EXIT
 trap on_signal INT TERM
 
 require_can_interface_up
+log_common_startup_stage "can_ready"
 
 start_canonical_helper "ranger_chassis_common" bash "${SCRIPT_DIR}/run_ranger_chassis.sh"
+log_common_startup_stage "ranger_chassis_ready"
 start_canonical_helper "robot_description_static_tf_common" bash "${SCRIPT_DIR}/run_robot_description.sh"
+log_common_startup_stage "static_tf_ready"
+start_robot_local_state_common_background_if_enabled
 
 if reuse_common_services_enabled && canonical_jt128_runtime_complete; then
   echo "[runtime-overlay] reusing existing jt128_driver; canonical driver/remap chain is complete" >&2
@@ -700,6 +781,7 @@ else
       bash "${SCRIPT_DIR}/run_pointcloud_accel_pipeline.sh"
   fi
 fi
+log_common_startup_stage "pointcloud_ready"
 if [[ "${FASTLIO_AUTOSTART}" == "true" ]] || { [[ "${NAV_LOCAL_STATE_MODE}" == "fastlio" ]] && fastlio_runtime_running; }; then
   start_fastlio_common
 elif [[ "${NAV_LOCAL_STATE_MODE}" == "fastlio" ]]; then
@@ -709,16 +791,19 @@ else
   stop_non_mapping_fastlio_runtime_processes
   echo "[runtime-overlay] FAST-LIO2 common autostart disabled; mapping starts FAST-LIO2 only while mapping is active" >&2
 fi
+log_common_startup_stage "fastlio_policy_done"
 if [[ "${NJRH_GS2_AUTOSTART:-true}" == "true" ]]; then
   start_common_process "gs2_driver" "robot_eai_gs2/gs2_driver_node|gs2_driver_node --ros-args|ros2 launch robot_eai_gs2 gs2.launch.py" \
     bash "${SCRIPT_DIR}/run_gs2_driver.sh"
 fi
+log_common_startup_stage "gs2_ready"
 if [[ "${NJRH_RUNTIME_HEALTH_GUARD_AUTOSTART:-true}" == "true" ]]; then
   start_runtime_health_guard_common
 else
   echo "[runtime-overlay] runtime_health_guard autostart disabled; startup readiness probes are disabled" >&2
 fi
-if [[ "${NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE:-true}" == "true" ]]; then
+log_common_startup_stage "runtime_health_guard_ready"
+if [[ "${NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE:-false}" == "true" ]]; then
   start_resident_navigation_autostart_if_selected
 fi
 if [[ "${NAV_LOCAL_STATE_MODE}" == "passthrough" || "${NAV_LOCAL_STATE_MODE}" == "legacy" ]]; then
@@ -727,11 +812,8 @@ if [[ "${NAV_LOCAL_STATE_MODE}" == "passthrough" || "${NAV_LOCAL_STATE_MODE}" ==
   kill_canonical_pattern "robot_localization/ekf_node"
   kill_canonical_pattern "ekf_node --ros-args.*__node:=robot_local_state"
 fi
-start_canonical_helper \
-  "robot_local_state_common" \
-  env NJRH_LOCAL_STATE_START_READY_MODE="${NJRH_COMMON_LOCAL_STATE_START_READY_MODE:-endpoint}" \
-    LOCAL_STATE_MODE="${NAV_LOCAL_STATE_MODE}" \
-    bash "${SCRIPT_DIR}/run_local_state.sh"
+wait_for_robot_local_state_common_background_if_started
+log_common_startup_stage "local_state_ready"
 if [[ "${NJRH_RUNTIME_HEALTH_GUARD_AUTOSTART:-true}" == "true" ]]; then
   if [[ "${NJRH_COMMON_LOCAL_STATE_START_READY_MODE:-endpoint}" == "endpoint" ]]; then
     wait_for_runtime_health_local_state_endpoint_ready
@@ -739,28 +821,37 @@ if [[ "${NJRH_RUNTIME_HEALTH_GUARD_AUTOSTART:-true}" == "true" ]]; then
     wait_for_runtime_health_local_state_ready
   fi
 fi
+log_common_startup_stage "local_state_health_checked"
 if [[ "${NJRH_RESIDENT_NAVIGATION_EARLY_AUTOSTART:-true}" == "true" ]]; then
   start_resident_navigation_autostart_if_selected
 fi
+log_common_startup_stage "resident_navigation_started"
 echo "[runtime-overlay] local_perception_common disabled; local costmap/collision_monitor consume /scan for standard marking+clearing" >&2
 start_overlay_helper "floor_manager_common" bash "${SCRIPT_DIR}/run_floor_manager.sh"
+log_common_startup_stage "floor_manager_ready"
 start_overlay_helper "robot_safety_common" bash "${SCRIPT_DIR}/run_robot_safety.sh"
+log_common_startup_stage "robot_safety_ready"
 start_overlay_helper "ranger_mini3_mode_controller_common" bash "${SCRIPT_DIR}/run_ranger_mini3_mode_controller.sh"
+log_common_startup_stage "mode_controller_ready"
 if [[ "${NJRH_DOCKING_MANAGER_AUTOSTART:-true}" == "true" ]]; then
   start_common_process "docking_manager" "robot_docking_manager/docking_manager_node|docking_manager_node --ros-args|run_docking_manager.sh" \
     bash "${SCRIPT_DIR}/run_docking_manager.sh"
 else
   echo "[runtime-overlay] docking_manager autostart disabled; set NJRH_DOCKING_MANAGER_AUTOSTART=true for resident /docking services" >&2
 fi
+log_common_startup_stage "docking_manager_ready"
 start_common_process "robot_api_server" "run_robot_api_server.sh|run_robot_api_server_supervised.sh|robot_api_server/robot_api_server_node|robot_api_server_node --ros-args" \
   bash "${SCRIPT_DIR}/run_robot_api_server_supervised.sh"
+log_common_startup_stage "robot_api_server_ready"
 
 if [[ "${RESIDENT_NAVIGATION_AUTOSTART}" != "false" ]]; then
   start_resident_navigation_autostart_if_selected
   wait_for_resident_navigation_autostart_if_started
 fi
+log_common_startup_stage "common_services_ready"
 
 echo "[runtime-overlay] common services are running; start mapping or resident navigation scripts in reuse mode" >&2
 while true; do
-  sleep 3600
+  sleep "${NJRH_COMMON_MAIN_HEALTH_PERIOD_SEC:-5}"
+  verify_ranger_chassis_common_health_or_exit
 done

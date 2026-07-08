@@ -2,6 +2,7 @@ import importlib.util
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -34,8 +35,8 @@ def assert_nav2_local_costmap_frame_contract(nav2_yaml: str, local_costmap: str)
     assert "footprint_clearing_enabled: true" in local_costmap
     assert 'plugin: "nav2_controller::PoseProgressChecker"' in nav2_yaml
     assert 'plugin: "nav2_controller::SimpleProgressChecker"' not in nav2_yaml
-    assert "required_movement_radius: 0.10" in nav2_yaml
-    assert "required_movement_angle: 0.10" in nav2_yaml
+    assert "required_movement_radius: 0.03" in nav2_yaml
+    assert "required_movement_angle: 0.05" in nav2_yaml
     assert "movement_time_allowance: 12.0" in nav2_yaml
     assert (
         "        scan:\n"
@@ -77,6 +78,72 @@ def test_navigation_failure_observer_uses_ros2_rosout_log_type():
     assert "stores_full_costmap\": False" in script
 
 
+def test_navigation_terminal_adjustment_observer_is_read_only_and_captures_handoff():
+    script = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "observe_navigation_terminal_adjustment.sh"
+    ).read_text(encoding="utf-8")
+    assert "does not send goals, publish velocity, call services, set params, or restart nodes" in script
+    assert "from rcl_interfaces.msg import Log" in script
+    assert "from nav2_msgs.msg import SpeedLimit" in script
+    assert '"/cmd_vel_nav_raw"' in script
+    assert '"/cmd_vel_api"' in script
+    assert '"/speed_limit"' in script
+    assert '"/navigate_to_pose/_action/status"' in script
+    assert "/api/v1/navigation/state" in script
+    assert "/api/v1/robot/pose" in script
+    assert "DURATION_SEC=40" in script
+    assert "--stop-when-terminal" in script
+    assert "goal_terminal_elapsed_sec" in script
+    assert "capture_stopped_after_terminal_goal" in script
+    assert "observed_goal_id" in script
+    assert "ignored_pre_active_samples" in script
+    assert "current_observed_goal and near_goal" in script
+    assert "no_running_goal_observed_after_observer_start" in script
+    assert "nav2_near_goal_tiny_cmd_elapsed_sec" in script
+    assert "near_goal_to_api_yaw_delay_sec" in script
+    assert "api_final_yaw_started_after_" in script
+    assert "ros2 topic pub" not in script
+    assert "ros2 service call" not in script
+    assert "ros2 param set" not in script
+
+
+def test_navigation_amcl_odom_correlation_observer_is_read_only():
+    script = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "record_navigation_amcl_odom_correlation.sh"
+    ).read_text(encoding="utf-8")
+    assert "does not send goals, publish velocity, call services, set params, or restart nodes" in script
+    assert "tf2_ros.TransformListener" in script
+    assert '"/localization/bridge_status"' in script
+    assert '"/motion_state"' in script
+    assert '"/wheel/odom"' in script
+    assert '"/wheel/odom_ekf"' in script
+    assert '"/local_state/odometry"' in script
+    assert '"/cmd_vel_nav_raw"' in script
+    assert '"/cmd_vel_api"' in script
+    assert '"/cmd_vel"' in script
+    assert '"/speed_limit"' in script
+    assert "/api/v1/navigation/state" in script
+    assert "/api/v1/robot/pose" in script
+    assert "amcl_bridge_events.csv" in script
+    assert "delta_amcl_accepted_count" in script
+    assert "delta_amcl_rejected_count" in script
+    assert "last_candidate_correction_translation_m" in script
+    assert "last_accepted_correction_translation_m" in script
+    assert "Largest Rejected Candidate Events" in script
+    assert "Largest Accepted Correction Events" in script
+    assert "--stop-when-terminal" in script
+    assert "create_publisher" not in script
+    assert "ros2 topic pub" not in script
+    assert "ros2 action send_goal" not in script
+    assert "ros2 service call" not in script
+    assert "ros2 param set" not in script
+
+
 def test_local_costmap_scan_clearing_observer_is_read_only():
     script = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "observe_local_costmap_scan_clearing.sh"
@@ -93,6 +160,56 @@ def test_local_costmap_scan_clearing_observer_is_read_only():
     assert '"clears_costmap": False' in script
     assert "clear_entirely_local_costmap" not in script
     assert "ros2 service call" not in script
+
+
+def test_initial_localization_wrapper_timeout_fallback_accepts_plain_tf_edge():
+    script = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "run_navigation_runtime_services.sh"
+    ).read_text(encoding="utf-8")
+    start = script.index("initial_localization_ready_from_bridge_after_wrapper_failure()")
+    end = script.index("\n}\n\ntrigger_global_localization_for_navigation()", start)
+    fallback = script[start:end]
+    assert 'wait_for_fresh_tf_transform "map" "odom" "${tf_timeout}" "${max_tf_age_sec}"' in fallback
+    assert 'wait_for_tf_transform "map" "odom" "${tf_timeout}"' in fallback
+    assert "plain TF edge exists" in fallback
+    assert "active bridge/map->odom ownership was already verified" in fallback
+
+
+def test_resident_navigation_prewarms_localization_before_local_state_gate():
+    script = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "run_navigation_runtime_services.sh"
+    ).read_text(encoding="utf-8")
+    local_state_index = script.index("ensure_common_local_state_ready_for_navigation_start || {")
+    localization_index = script.index('bash "${SCRIPT_DIR}/run_occupancy_grid_localization.sh" &')
+    held_prestart_index = script.index('env_flag_true "${NJRH_NAV2_HELD_PRESTART_AFTER_LOCAL_STATE:-true}"')
+    localization_stack_index = script.index("ensure_localization_stack_ready_for_navigation || {")
+    assert localization_index < local_state_index < held_prestart_index < localization_stack_index
+
+
+def test_nav2_helper_cleanup_does_not_kill_global_localization_wrapper():
+    helpers = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "nav_runtime_helpers.sh"
+    ).read_text(encoding="utf-8")
+    start = helpers.index("stop_existing_overlay_nav_helpers()")
+    end = helpers.index("\n}\n\nstart_overlay_helper()", start)
+    cleanup = helpers[start:end]
+    assert "robot_global_localization" not in cleanup
+    assert "run_global_localization.sh" not in cleanup
 
 
 def test_production_local_obstacle_scan_slice_is_not_too_low():
@@ -112,36 +229,93 @@ def test_nav_defaults_are_fixed():
     overlay_nav2 = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "nav2.yaml").read_text(
         encoding="utf-8"
     )
+    nav_to_pose_bt = (ROOT / "src" / "robot_nav_config" / "behavior_trees" / "navigate_to_pose.xml").read_text(
+        encoding="utf-8"
+    )
+    nav_through_poses_bt = (
+        ROOT / "src" / "robot_nav_config" / "behavior_trees" / "navigate_through_poses.xml"
+    ).read_text(encoding="utf-8")
     nav2_local_costmap = local_costmap_config_block(nav2)
     overlay_local_costmap = local_costmap_config_block(overlay_nav2)
     assert "SmacPlanner2D" in nav2
     assert "MPPIController" in nav2
     assert "RegulatedPurePursuitController" in nav2
+    assert "tolerance: 0.05" in nav2
+    assert "tolerance: 0.05" in overlay_nav2
+    assert "tolerance: 0.25" not in nav2
+    assert "tolerance: 0.25" not in overlay_nav2
     assert 'motion_model: "Ackermann"' in nav2
     assert "AckermannConstraints:" in nav2
     assert "min_turning_r: 0.81" in nav2
-    assert "vx_std: 0.45" in nav2
+    assert "time_steps: 48" in nav2
+    assert "vx_std: 0.30" in nav2
     assert "vy_std: 0.0" in nav2
-    assert "wz_std: 0.45" in nav2
+    assert "wz_std: 0.32" in nav2
     assert "vx_max: 1.20" in nav2
-    assert "vx_min: 0.0" in nav2
+    assert "vx_min: -0.08" in nav2
+    assert "vx_min: -0.08" in overlay_nav2
+    assert "vx_min: 0.0" not in nav2
+    assert "vx_min: 0.0" not in overlay_nav2
+    assert "vx_min: -0.20" not in nav2
+    assert "vx_min: -0.20" not in overlay_nav2
     assert "vy_max: 0.0" in nav2
     assert "wz_max: 0.70" in nav2
+    assert "ax_max:" not in nav2
+    assert "ax_min:" not in nav2
+    assert "az_max:" not in nav2
     for cfg in (nav2, overlay_nav2):
+        assert "GoalCritic:" in cfg
+        assert "cost_weight: 16.0" in cfg
+        assert "threshold_to_consider: 1.5" in cfg
+        assert "GoalAngleCritic:" in cfg
+        assert "cost_weight: 6.0" in cfg
+        assert "PathAlignCritic:" in cfg
+        assert "cost_weight: 2.4" in cfg
+        assert "PathFollowCritic:" in cfg
+        assert "cost_weight: 7.0" in cfg
+        assert "TwirlingCritic:" in cfg
+        assert "cost_weight: 1.0" in cfg
+        assert "twirling_cost_weight" not in cfg
+        assert "twirling_cost_power" not in cfg
+        assert '- "PreferForwardCritic"' in cfg
+        assert "PreferForwardCritic:" in cfg
+        assert "cost_weight: 20.0" in cfg
+        assert "threshold_to_consider: 0.50" in cfg
         assert '- "VelocityDeadbandCritic"' in cfg
         assert "VelocityDeadbandCritic:" in cfg
         assert "deadband_velocities: [0.025, 0.0, 0.025]" in cfg
-        assert "cost_weight: 35.0" in cfg
+        assert "cost_weight: 90.0" in cfg
     assert "desired_linear_vel: 0.80" in nav2
-    assert "max_velocity: [1.20, 0.0, 1.00]" in nav2
+    assert 'feedback: "OPEN_LOOP"' in nav2
+    assert 'feedback: "OPEN_LOOP"' in overlay_nav2
+    assert "odom_duration: 0.2" in nav2
+    assert "odom_duration: 0.2" in overlay_nav2
+    assert "max_velocity: [1.20, 0.0, 0.70]" in nav2
+    assert "max_velocity: [1.20, 0.0, 0.70]" in overlay_nav2
+    assert "min_velocity: [-0.08, 0.0, -0.70]" in nav2
+    assert "min_velocity: [-0.08, 0.0, -0.70]" in overlay_nav2
+    assert "min_velocity: [0.0, 0.0, -1.00]" not in nav2
+    assert "min_velocity: [0.0, 0.0, -1.00]" not in overlay_nav2
+    assert "min_velocity: [-0.20, 0.0, -1.00]" not in nav2
+    assert "min_velocity: [-0.20, 0.0, -1.00]" not in overlay_nav2
+    assert "max_accel: [0.55, 0.0, 0.90]" in nav2
+    assert "max_accel: [0.55, 0.0, 0.90]" in overlay_nav2
+    assert "max_decel: [-0.95, 0.0, -1.10]" in nav2
+    assert "max_decel: [-0.95, 0.0, -1.10]" in overlay_nav2
     assert "nav2_rotation_shim_controller::RotationShimController" in nav2
     assert 'primary_controller: "nav2_mppi_controller::MPPIController"' in nav2
-    assert "angular_dist_threshold: 1.20" in nav2
+    assert "angular_dist_threshold: 0.45" in nav2
+    assert "angular_disengage_threshold: 0.075" in nav2
+    assert "angular_dist_threshold: 0.45" in overlay_nav2
+    assert "angular_disengage_threshold: 0.075" in overlay_nav2
+    assert "angular_dist_threshold: 1.20" not in nav2
+    assert "angular_dist_threshold: 1.20" not in overlay_nav2
     assert "angular_dist_threshold: 3.20" not in nav2
+    assert "angular_dist_threshold: 3.20" not in overlay_nav2
     assert 'plugin: "nav2_controller::PoseProgressChecker"' in nav2
     assert 'plugin: "nav2_controller::SimpleProgressChecker"' not in nav2
-    assert "required_movement_radius: 0.10" in nav2
-    assert "required_movement_angle: 0.10" in nav2
+    assert "required_movement_radius: 0.03" in nav2
+    assert "required_movement_angle: 0.05" in nav2
     assert "movement_time_allowance: 12.0" in nav2
     assert "movement_time_allowance: 20.0" not in nav2
     assert "rotate_to_goal_heading: true" in nav2
@@ -175,13 +349,13 @@ def test_nav_defaults_are_fixed():
     assert "clearing: false" not in nav2_local_costmap
     assert "clearing: false" not in overlay_local_costmap
     assert "observation_persistence: 0.0" in nav2
-    assert "controller_frequency: 12.0" in nav2
+    assert "controller_frequency: 15.0" in nav2
     assert "bt_loop_duration: 50" in nav2
-    assert "default_server_timeout: 1000" in nav2
-    assert "wait_for_service_timeout: 2000" in nav2
+    assert "default_server_timeout: 5000" in nav2
+    assert "wait_for_service_timeout: 8000" in nav2
     assert "bt_loop_duration: 50" in overlay_nav2
-    assert "default_server_timeout: 1000" in overlay_nav2
-    assert "wait_for_service_timeout: 2000" in overlay_nav2
+    assert "default_server_timeout: 5000" in overlay_nav2
+    assert "wait_for_service_timeout: 8000" in overlay_nav2
     assert "transform_tolerance: 0.10" in nav2
     assert "transform_tolerance: 0.15" in nav2_local_costmap
     assert "transform_tolerance: 0.15" in overlay_local_costmap
@@ -191,8 +365,11 @@ def test_nav_defaults_are_fixed():
     assert "transform_tolerance: 0.50" not in nav2
     assert "transform_tolerance: 0.5" not in nav2
     assert "speed_limit_topic: /speed_limit" in nav2
-    assert "time_steps: 44" in nav2
-    assert "model_dt: 0.0833333333" in nav2
+    assert "time_steps: 48" in nav2
+    assert "time_steps: 48" in overlay_nav2
+    assert "time_steps: 44" not in nav2
+    assert "time_steps: 44" not in overlay_nav2
+    assert "model_dt: 0.0666666667" in nav2
     assert (
         "default_nav_to_pose_bt_xml: "
         "/workspaces/njrh-v3/workspace1/install/robot_nav_config/share/robot_nav_config/behavior_trees/navigate_to_pose.xml"
@@ -213,29 +390,47 @@ def test_nav_defaults_are_fixed():
     assert "navigate_to_pose_w_replanning_and_recovery.xml" not in overlay_nav2
     assert "navigate_through_poses_w_replanning_and_recovery.xml" not in nav2
     assert "navigate_through_poses_w_replanning_and_recovery.xml" not in overlay_nav2
+    for bt_xml in (nav_to_pose_bt, nav_through_poses_bt):
+        assert '<RateController hz="0.33">' not in bt_xml
+        assert "<SmoothPath " not in bt_xml
+        assert 'smoother_id="SavitzkyGolay"' not in bt_xml
+        assert 'max_smoothing_duration="0.10"' not in bt_xml
+        assert 'check_for_collisions="true"' not in bt_xml
+        assert '<FollowPath path="{path}" controller_id="FollowPath"/>' in bt_xml
+        assert '<Wait wait_duration="1.0"/>' not in bt_xml
+        assert '<Wait wait_duration="5.0"/>' not in bt_xml
+    assert 'smoother_plugins: ["SimpleSmoother"]' in nav2
+    assert 'smoother_plugins: ["SimpleSmoother"]' in overlay_nav2
+    assert 'plugin: "nav2_smoother::SimpleSmoother"' in nav2
+    assert 'plugin: "nav2_smoother::SimpleSmoother"' in overlay_nav2
+    assert "SavitzkyGolay" not in nav2
+    assert "SavitzkyGolay" not in overlay_nav2
     for bt_plugin in (
         "nav2_compute_path_to_pose_action_bt_node",
         "nav2_compute_path_through_poses_action_bt_node",
         "nav2_follow_path_action_bt_node",
         "nav2_pipeline_sequence_bt_node",
-        "nav2_navigate_to_pose_action_bt_node",
-        "nav2_navigate_through_poses_action_bt_node",
     ):
         assert bt_plugin in nav2
         assert bt_plugin in overlay_nav2
     for unused_bt_plugin in (
+        "nav2_navigate_to_pose_action_bt_node",
+        "nav2_navigate_through_poses_action_bt_node",
         "nav2_spin_action_bt_node",
-        "nav2_wait_action_bt_node",
         "nav2_back_up_action_bt_node",
-        "nav2_clear_costmap_service_bt_node",
         "nav2_goal_updated_condition_bt_node",
-        "nav2_rate_controller_bt_node",
-        "nav2_recovery_node_bt_node",
         "nav2_round_robin_node_bt_node",
         "nav2_remove_passed_goals_action_bt_node",
+        "nav2_smooth_path_action_bt_node",
+        "nav2_recovery_node_bt_node",
+        "nav2_rate_controller_bt_node",
+        "nav2_clear_costmap_service_bt_node",
+        "nav2_wait_action_bt_node",
     ):
         assert unused_bt_plugin not in nav2
         assert unused_bt_plugin not in overlay_nav2
+    assert "failure_tolerance: 3.0" in nav2
+    assert "failure_tolerance: 3.0" in overlay_nav2
     assert "batch_size: 1200" in nav2
     assert "width: 10" in nav2
     assert "height: 10" in nav2
@@ -264,16 +459,34 @@ def test_nav_defaults_are_fixed():
     assert "filter_info_topic: /costmap_filter_info/keepout" in nav2
     assert 'plugin: "nav2_costmap_2d::SpeedFilter"' in nav2
     assert "filter_info_topic: /costmap_filter_info/speed" in nav2
-    assert "yaw_goal_tolerance: 0.0873" in nav2
-    assert "yaw_goal_tolerance: 0.0873" in overlay_nav2
+    assert "xy_goal_tolerance: 0.06" in nav2
+    assert "xy_goal_tolerance: 0.06" in overlay_nav2
+    assert "xy_goal_tolerance: 0.10" not in nav2
+    assert "xy_goal_tolerance: 0.10" not in overlay_nav2
+    assert "xy_goal_tolerance: 0.20" not in nav2
+    assert "xy_goal_tolerance: 0.20" not in overlay_nav2
+    assert "yaw_goal_tolerance: 0.05" in nav2
+    assert "yaw_goal_tolerance: 0.05" in overlay_nav2
+    assert "yaw_goal_tolerance: 0.0873" not in nav2
+    assert "yaw_goal_tolerance: 0.0873" not in overlay_nav2
     assert "yaw_goal_tolerance: 0.15" not in nav2
     assert "yaw_goal_tolerance: 0.15" not in overlay_nav2
     assert 'plugin: "nav2_controller::PoseProgressChecker"' in overlay_nav2
     assert 'plugin: "nav2_controller::SimpleProgressChecker"' not in overlay_nav2
-    assert "required_movement_angle: 0.10" in overlay_nav2
+    assert "required_movement_angle: 0.05" in overlay_nav2
     assert "rotate_to_goal_heading: true" in overlay_nav2
     assert "rotate_to_goal_heading: false" not in overlay_nav2
+    assert "rotate_to_heading_angular_vel: 0.60" in overlay_nav2
+    assert "max_angular_accel: 1.2" in overlay_nav2
+    assert 'goal_checker_plugins: ["goal_checker"]' in overlay_nav2
+    assert "goal_checker:" in overlay_nav2
+    assert "pose_goal_checker:" not in overlay_nav2
+    assert "position_goal_checker:" not in overlay_nav2
+    assert 'plugin: "nav2_controller::PositionGoalChecker"' not in overlay_nav2
+    assert "stateful: false" in nav2
     assert "stateful: false" in overlay_nav2
+    assert "stateful: true" not in nav2
+    assert "stateful: true" not in overlay_nav2
 
     local_perception = (
         ROOT / "src" / "robot_local_perception" / "config" / "local_perception.yaml"
@@ -294,6 +507,80 @@ def test_nav_defaults_are_fixed():
         assert "/perception/obstacle_points" not in cfg
         assert "/perception/clearing_points" not in cfg
         assert "/perception/local_perception_status" not in cfg
+
+
+def test_normal_navigation_terminal_speed_limit_matches_ranger_dynamics():
+    api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    api_cfg = (ROOT / "src" / "robot_api_server" / "config" / "robot_api_server.yaml").read_text(
+        encoding="utf-8"
+    )
+    overlay_api_cfg = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "robot_api_server.yaml"
+    ).read_text(encoding="utf-8")
+
+    for cfg in (api_cfg, overlay_api_cfg):
+        assert "navigation_terminal_speed_limit_enabled: true" in cfg
+        assert 'navigation_terminal_speed_limit_topic: "/speed_limit"' in cfg
+        assert "navigation_terminal_speed_limit_far_distance_m: 2.4" in cfg
+        assert "navigation_terminal_speed_limit_mid_distance_m: 1.5" in cfg
+        assert "navigation_terminal_speed_limit_near_distance_m: 0.9" in cfg
+        assert "navigation_terminal_speed_limit_crawl_distance_m: 0.35" in cfg
+        assert "navigation_terminal_speed_limit_far_mps: 1.20" in cfg
+        assert "navigation_terminal_speed_limit_mid_mps: 0.65" in cfg
+        assert "navigation_terminal_speed_limit_near_mps: 0.32" in cfg
+        assert "navigation_terminal_speed_limit_crawl_mps: 0.16" in cfg
+        assert "navigation_terminal_speed_limit_final_mps: 0.08" in cfg
+
+    assert '#include "nav2_msgs/msg/speed_limit.hpp"' in api_cpp
+    assert "create_publisher<nav2_msgs::msg::SpeedLimit>" in api_cpp
+    assert "navigation_terminal_speed_limit_for_distance" in api_cpp
+    assert "publish_navigation_terminal_speed_limit_for_goal(target)" in api_cpp
+    assert "clear_navigation_terminal_speed_limit()" in api_cpp
+    assert "publish_navigation_terminal_speed_limit_value(navigation_terminal_speed_limit_far_mps_);" in api_cpp
+    assert "publish_navigation_terminal_speed_limit_value(0.0);" not in api_cpp
+    assert "msg.speed_limit = std::max(0.0, speed_limit_mps);" in api_cpp
+    assert "msg.speed_limit = 0.0" not in api_cpp
+
+
+def test_docking_predock_nav_reuses_terminal_speed_limit_loop():
+    api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    predock_block = api_cpp[
+        api_cpp.index("StoredPose predock_speed_limit_target"):
+        api_cpp.index("if (nav2_predock_succeeded)")
+    ]
+
+    assert "predock_speed_limit_target.x = job.approach_x;" in predock_block
+    assert "predock_speed_limit_target.y = job.approach_y;" in predock_block
+    assert "while (result_future.wait_for(200ms) != std::future_status::ready)" in predock_block
+    assert predock_block.count(
+        "publish_navigation_terminal_speed_limit_for_goal(predock_speed_limit_target);"
+    ) >= 2
+    assert "clear_navigation_terminal_speed_limit();" in predock_block
+
+
+def test_fine_docking_yaw_retry_uses_fine_entry_tolerance():
+    api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    yaw_align_block = api_cpp[
+        api_cpp.index("PredockYawAlignResult run_predock_yaw_align("):
+        api_cpp.index("PredockLateralAlignResult run_predock_lateral_align(")
+    ]
+    fine_retry_block = api_cpp[
+        api_cpp.index('fine_entry_failure_code == "FINE_DOCKING_REJECTED_YAW_TOO_LARGE"'):
+        api_cpp.index("record_fine_entry_check(", api_cpp.index('fine_entry_failure_code == "FINE_DOCKING_REJECTED_YAW_TOO_LARGE"'))
+    ]
+
+    assert "const double success_tolerance_rad = -1.0" in yaw_align_block
+    assert "target_tolerance_rad" in yaw_align_block
+    assert "initial_check.base_yaw_error_rad <= target_tolerance_rad" in yaw_align_block
+    assert "result.final_error_rad <= target_tolerance_rad" in yaw_align_block
+    assert "fine_docking_entry_max_yaw_rad_" in fine_retry_block
+    assert "run_predock_yaw_align(\n        job_id,\n        fine_entry_check.expected_base_yaw,\n        fine_entry_check,\n        fine_docking_entry_max_yaw_rad_)" in fine_retry_block
 
 
 def test_nav2_local_costmap_frame_contract():
@@ -355,6 +642,39 @@ def test_verify_navigation_final_yaw_align_script_contract():
     assert "final_yaw_align_attempted" in script
 
 
+def test_navigation_goal_diagnostic_records_bridge_status_contract():
+    script = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "record_navigation_goal_diagnostic.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "/localization/bridge_status" in script
+    assert "echo_bridge_status" in script
+    assert "ros2 topic echo --field data /localization/bridge_status" in script
+    assert "--post-goal-file" in script
+    assert "--data-binary @\"${POST_GOAL_FILE}\"" in script
+    assert "/ranger_mini3/allow_reverse" in script
+    assert "echo_nav_action_feedback" in script
+    assert "/compute_path_to_pose/_action/status" in script
+    assert "/compute_path_to_pose/_action/feedback" in script
+    assert "/follow_path/_action/status" in script
+    assert "/follow_path/_action/feedback" in script
+    assert "ranger_allow_reverse_true_observed" in script
+    assert 'stripped.startswith("data:")' in script
+    assert "hz_bridge_status" in script
+    assert "AMCL Bridge Corrections" in script
+    assert "amcl_accepted_delta" in script
+    assert "amcl_rejected_delta" in script
+    assert "last_accepted_correction_translation_m" in script
+    assert "last_accepted_correction_yaw_rad" in script
+    assert "final_verify_retry_count" in script
+    assert "task_complete" in script
+
+
 def test_phase_n2_goal_completion_semantics_contracts():
     api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
         encoding="utf-8"
@@ -394,8 +714,20 @@ def test_phase_n2_goal_completion_semantics_contracts():
         assert token in api_cpp
 
     assert 'navigation_default_goal_completion_policy", "pose_required"' in api_cpp
+    assert 'navigation_delivery_point_goal_completion_policy", "pose_required"' in api_cpp
+    assert 'navigation_position_only_nav2_yaw_mode", "approach_heading"' in api_cpp
+    assert "stored_pose_type_uses_delivery_default" in api_cpp
+    assert "resolve_nav2_goal_yaw_for_policy" in api_cpp
+    assert "nav2_goal_yaw_source" in api_cpp
+    assert "approach_heading" in api_cpp
     assert 'navigation_default_goal_completion_policy: "pose_required"' in config
+    assert 'navigation_delivery_point_goal_completion_policy: "pose_required"' in config
+    assert 'navigation_position_only_nav2_yaw_mode: "approach_heading"' in config
+    assert "navigation_position_only_approach_heading_min_distance_m: 0.20" in config
     assert 'navigation_default_goal_completion_policy: "pose_required"' in overlay_config
+    assert 'navigation_delivery_point_goal_completion_policy: "pose_required"' in overlay_config
+    assert 'navigation_position_only_nav2_yaw_mode: "approach_heading"' in overlay_config
+    assert "navigation_position_only_approach_heading_min_distance_m: 0.20" in overlay_config
     assert "navigation_max_reposition_after_yaw_retry: 0" in config
     assert "navigation_max_reposition_after_yaw_retry: 0" in overlay_config
     assert "navigation_reposition_after_yaw_drift_timeout_sec: 30.0" in config
@@ -404,8 +736,8 @@ def test_phase_n2_goal_completion_semantics_contracts():
     assert "nav2_native_goal_completion_enabled: true" in overlay_config
     assert "nav2_rotation_shim_enabled: true" in config
     assert "nav2_rotation_shim_enabled: true" in overlay_config
-    assert "api_final_yaw_align_fallback_enabled: false" in config
-    assert "api_final_yaw_align_fallback_enabled: false" in overlay_config
+    assert "api_final_yaw_align_fallback_enabled: true" in config
+    assert "api_final_yaw_align_fallback_enabled: true" in overlay_config
 
     assert "goal_completion_policy=dock_staging is reserved for /api/v1/docking/start" in api_cpp
     assert "under position_only policy" in api_cpp
@@ -415,37 +747,71 @@ def test_phase_n2_goal_completion_semantics_contracts():
     assert "post_relocalization_settle_ok" in api_cpp
     assert "run_reposition_after_yaw_drift" in api_cpp
     assert "REPOSITION_AFTER_YAW_DRIFT" in api_cpp
-    assert "Nav2 native goal completion failed with result code" in api_cpp
-    assert '"nav2_failed"' in api_cpp
-    assert "Nav2 is the single completion owner" in api_cpp
-    assert "navigation goal reached by Nav2 native completion" in api_cpp
+    assert "nav2_failed_yaw_aligning" in api_cpp
+    assert "navigation_pause_global_correction_during_final_yaw" in api_cpp
+    assert "waiting for bridge map->odom smoothing before final yaw alignment" in api_cpp
+    assert "bridge smoothing wait timed out before final yaw alignment" in api_cpp
+    assert "navigation_nav2_failed_near_goal_retry_enabled" in api_cpp
+    assert "nav2_failed_near_goal_retry_allowed" in api_cpp
+    assert "nav2_failed_near_goal_yaw_aligning" in api_cpp
+    assert "aligning yaw before same-goal retry" in api_cpp
+    assert "retry_nav2_after_nav2_failed_near_goal" in api_cpp
+    assert "near_goal_nav2_retry_attempted=true" in api_cpp
+    assert "global correction paused for final_yaw_align" in api_cpp
+    assert "global correction resumed after final_yaw_align" in api_cpp
+    assert "commercial_final_verify=true" in api_cpp
+    assert "degraded_final_pose_verify" in api_cpp
+    assert "Nav2 native goal completion succeeded but final yaw alignment fallback failed" not in api_cpp
+    assert '"failed_final_yaw_align"' not in api_cpp[api_cpp.index("void run_navigation_goal_job("):]
+    assert "navigation goal reached by commercial final verification" in api_cpp
     assert "position_reached_yaw_warning" not in api_cpp
 
     assert "ordinary_final_yaw_align_active_" in api_cpp
     assert "predock_yaw_align_active_" in api_cpp
+    assert "predock_lateral_align_active_" in api_cpp
     assert "PREDOCK_YAW_ALIGN_OWNER_CONFLICT" in api_cpp
+    assert "PREDOCK_LATERAL_ALIGN_OWNER_CONFLICT" in api_cpp
+    assert "STAGING_NAV2_EARLY_HANDOFF" in api_cpp
+    assert "predock native Nav2 early handoff to docking-owned yaw/lateral capture" in api_cpp
+    assert "predock Nav2 goal canceled for docking-owned final capture" in api_cpp
     assert "docking request preempts ordinary final_yaw_align" in api_cpp
     assert 'navigation_final_yaw_align_cmd_topic_ != "/cmd_vel_nav"' in api_cpp
-    assert 'navigation_final_yaw_align_cmd_topic_ != "/cmd_vel_collision_checked"' in api_cpp
+    assert 'navigation_final_yaw_align_cmd_topic_ != "/cmd_vel_api"' in api_cpp
+    assert 'navigation_final_yaw_align_cmd_topic_ = "/cmd_vel_api"' in api_cpp
+    assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel_collision_checked"' not in api_cpp
     assert 'predock_yaw_align_cmd_topic_ != "/cmd_vel_docking"' in api_cpp
     assert 'navigation_final_yaw_align_cmd_topic: "/cmd_vel_docking"' not in config
+    assert 'navigation_final_yaw_align_cmd_topic: "/cmd_vel_collision_checked"' not in config
     assert 'predock_yaw_align_cmd_topic: "/cmd_vel_docking"' in config
     assert 'predock_yaw_align_cmd_topic: "/cmd_vel_docking"' in overlay_config
     assert "predock_yaw_align_enabled: true" in config
     assert "predock_yaw_align_enabled: true" in overlay_config
     assert "predock_yaw_align_fallback_enabled: true" in config
     assert "predock_yaw_align_fallback_enabled: true" in overlay_config
+    assert "predock_lateral_align_enabled: true" in config
+    assert "predock_lateral_align_enabled: true" in overlay_config
+    assert 'predock_lateral_align_forced_mode_topic: "/ranger_mini3/forced_mode"' in config
+    assert 'predock_lateral_align_forced_mode_topic: "/ranger_mini3/forced_mode"' in overlay_config
+    assert 'predock_lateral_align_forced_mode: "side_slip"' in config
+    assert 'predock_lateral_align_forced_mode: "side_slip"' in overlay_config
 
     for token in (
         "goal_completion_policy",
+        "predock_nav_early_handoff",
+        "predock_nav_handoff_detail",
         "dock_staging_handoff_ready",
         "post_predock_settle_complete",
         "predock_pose_verified",
         "predock_yaw_verified_by_nav2",
         "reverse_yaw_offset_applied",
         "contact_frame_available",
+        "predock_forward_m",
+        "predock_lateral_m",
+        "predock_lateral_abs_m",
         "ordinary_final_yaw_align_active",
         "predock_yaw_align_active",
+        "predock_lateral_align_active",
+        "predock_lateral_align_failure_code",
         "cmd_owner_conflict_detected",
         "final_yaw_align_blocked_by_docking",
         "docking_blocked_by_final_yaw_align",
@@ -456,10 +822,16 @@ def test_phase_n2_goal_completion_semantics_contracts():
 
     assert "global_correction_pause_applied" in api_cpp
     assert "fine_docking_entry_require_predock_yaw_aligned_ && !predock_yaw_aligned" in api_cpp
+    assert "predock_pose_inside_handoff_window" in api_cpp
+    assert "predock_yaw_target_met" in api_cpp
+    assert "predock_lateral_target_met" in api_cpp
     assert "fine_docking_retry_on_yaw_reject_" in api_cpp
     assert "FINE_DOCKING_REJECTED_YAW_TOO_LARGE" in api_cpp
     assert "PREDOCK_YAW_ALIGN" in api_cpp
+    assert "PREDOCK_LATERAL_ALIGN" in api_cpp
     assert "RESTAGE_RETRY" in api_cpp
+    assert "docking_max_retries: 2" in config
+    assert "docking_max_retries: 2" in overlay_config
 
     assert "verify_goal_completion_semantics.sh" in verify_script
     assert "observe_navigation_final_yaw_align.sh" in verify_script
@@ -487,6 +859,9 @@ def test_phase_n3_nav2_native_goal_completion_contracts():
     observe_script = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "observe_nav2_native_pose_required_goal.sh"
     ).read_text(encoding="utf-8")
+    pose_bt = (ROOT / "src" / "robot_nav_config" / "behavior_trees" / "navigate_to_pose.xml").read_text(
+        encoding="utf-8"
+    )
     audit_reports = list((ROOT / "reports").glob("nav2_rotation_shim_compat_audit_*.md"))
     audit_text = "\n".join(p.read_text(encoding="utf-8") for p in audit_reports)
 
@@ -495,10 +870,21 @@ def test_phase_n3_nav2_native_goal_completion_contracts():
         assert 'primary_controller: "nav2_mppi_controller::MPPIController"' in params
         assert "rotate_to_goal_heading: true" in params
         assert "rotate_to_goal_heading: false" not in params
+        assert "rotate_to_heading_angular_vel: 0.60" in params
+        assert "max_angular_accel: 1.2" in params
+        assert 'goal_checker_plugins: ["goal_checker"]' in params
         assert 'plugin: "nav2_controller::SimpleGoalChecker"' in params
+        assert 'plugin: "nav2_controller::PositionGoalChecker"' not in params
+        assert "goal_checker:" in params
+        assert "pose_goal_checker:" not in params
+        assert "position_goal_checker:" not in params
         assert "stateful: false" in params
-        assert "xy_goal_tolerance: 0.20" in params
-        assert "yaw_goal_tolerance: 0.0873" in params
+        assert "stateful: true" not in params
+        assert "xy_goal_tolerance: 0.06" in params
+        assert "xy_goal_tolerance: 0.10" not in params
+        assert "xy_goal_tolerance: 0.20" not in params
+        assert "yaw_goal_tolerance: 0.05" in params
+        assert "yaw_goal_tolerance: 0.0873" not in params
         assert 'plugin: "nav2_smac_planner/SmacPlanner2D"' in params
         assert 'plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"' in params
         assert "transform_tolerance: 0.10" in params
@@ -508,47 +894,89 @@ def test_phase_n3_nav2_native_goal_completion_contracts():
 
     for params in (config, overlay_config):
         assert 'navigation_default_goal_completion_policy: "pose_required"' in params
+        assert 'navigation_delivery_point_goal_completion_policy: "pose_required"' in params
+        assert 'navigation_position_only_nav2_yaw_mode: "approach_heading"' in params
+        assert "navigation_position_only_approach_heading_min_distance_m: 0.20" in params
         assert "nav2_native_goal_completion_enabled: true" in params
         assert "nav2_rotation_shim_enabled: true" in params
-        assert "api_final_yaw_align_fallback_enabled: false" in params
-        assert "navigation_final_yaw_align_enable: false" in params
+        assert "api_final_yaw_align_fallback_enabled: true" in params
+        assert "navigation_final_yaw_align_enable: true" in params
+        assert "navigation_nav2_failed_near_goal_retry_enabled: true" in params
+        assert "navigation_nav2_failed_near_goal_retry_max_count: 1" in params
+        assert "navigation_nav2_failed_near_goal_retry_max_distance_m: 0.35" in params
+        assert "navigation_final_yaw_align_wait_bridge_smoothing: true" in params
+        assert "navigation_final_yaw_align_bridge_wait_timeout_ms: 2000" in params
+        assert "navigation_final_yaw_align_bridge_wait_sample_period_ms: 100" in params
+        assert "navigation_pause_global_correction_during_final_yaw: true" in params
+        assert "yaw_align_stop_lead_enabled: true" in params
+        assert "yaw_align_stop_lead_time_sec: 0.125" in params
+        assert "yaw_align_stop_lead_max_rad: 0.09" in params
+        assert "navigation_pose_required_behavior_tree:" not in params
+        assert "navigation_position_only_behavior_tree:" not in params
         assert "predock_yaw_align_enabled: true" in params
         assert "predock_yaw_align_fallback_enabled: true" in params
         assert 'predock_yaw_align_cmd_topic: "/cmd_vel_docking"' in params
-        assert "predock_yaw_align_tolerance_rad: 0.105" in params
-        assert "fine_docking_entry_max_yaw_rad: 0.105" in params
+        assert "docking_predock_pose_max_yaw_rad: 0.35" in params
+        assert "predock_yaw_align_tolerance_rad: 0.0698" in params
+        assert "predock_yaw_align_trigger_rad: 0.0698" in params
+        assert "predock_lateral_align_enabled: true" in params
+        assert "predock_lateral_align_target_m: 0.03" in params
+        assert "predock_lateral_align_trigger_m: 0.03" in params
+        assert "predock_lateral_align_max_correction_m: 0.25" in params
+        assert 'predock_lateral_align_forced_mode: "side_slip"' in params
+        assert "predock_lateral_align_timeout_sec: 14.0" in params
+        assert "predock_lateral_align_speed_mps: 0.04" in params
+        assert "fine_docking_entry_max_lateral_m: 0.08" in params
+        assert "fine_docking_entry_max_yaw_rad: 0.0349" in params
         assert 'navigation_final_yaw_align_cmd_topic: "/cmd_vel_docking"' not in params
 
     assert "native_nav2_goal_completion" in api_cpp
     assert "api_final_yaw_align_enabled" in api_cpp
     assert "nav2_rotation_shim_enabled" in api_cpp
-    assert "Nav2 native goal completion failed with result code" in api_cpp
-    assert '"nav2_failed"' in api_cpp
-    assert "Nav2 is the single completion owner" in api_cpp
-    assert "navigation goal reached by Nav2 native completion" in api_cpp
+    assert "navigation_behavior_tree_for_goal_completion_policy" not in api_cpp
+    assert "goal.behavior_tree = navigation_behavior_tree_for_goal_completion_policy(goal_completion_policy);" not in api_cpp
+    assert "commercial_final_verify=true" in api_cpp
+    assert "navigation goal reached by commercial final verification" in api_cpp
+    assert "navigation goal reached by Nav2 native completion" not in api_cpp
     run_goal_block = api_cpp[
         api_cpp.index("void run_navigation_goal_job("):api_cpp.index("HttpResponse handle_navigation_state()")
     ]
-    assert "api_final_yaw_align_enabled" not in run_goal_block
-    assert "run_final_yaw_align(job_id, target, pose_check)" not in run_goal_block
+    assert "final_yaw_align_allowed" in run_goal_block
+    assert "nav2_failed_yaw_aligning" in run_goal_block
+    assert '"nav2_failed"' not in run_goal_block
+    assert "run_final_yaw_align(job_id, target, pose_check)" in run_goal_block
+    final_yaw_block = api_cpp[
+        api_cpp.index("FinalYawAlignResult run_final_yaw_align("):api_cpp.index(
+            "NavigationRepositionResult run_reposition_after_yaw_drift("
+        )
+    ]
+    assert "navigation_pause_global_correction_during_final_yaw_" in final_yaw_block
+    assert "wait_for_bridge_smoothing_before_final_yaw_align(job_id)" in final_yaw_block
+    assert "bridge_smoothing_active_before_final_yaw" in final_yaw_block
+    assert "request_localization_bridge_correction_pause(" in final_yaw_block
     assert "goal_completion_policy=dock_staging is reserved for /api/v1/docking/start" in api_cpp
     assert "PREDOCK_YAW_ALIGN_RECOVERY" in api_cpp
+    assert "PREDOCK_LATERAL_ALIGN" in api_cpp
     assert "PREDOCK_NATIVE_GOAL_VERIFY_FAILED" in api_cpp
     assert "PREDOCK_YAW_NOT_ALIGNED_AFTER_NAV2" in api_cpp
     assert 'predock_yaw_align_cmd_topic_ != "/cmd_vel_docking"' in api_cpp
     assert "PREDOCK_YAW_ALIGN_OWNER_CONFLICT" in api_cpp
+    assert "PREDOCK_LATERAL_ALIGN_OWNER_CONFLICT" in api_cpp
     assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel_safe"' not in api_cpp
     assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel"' not in api_cpp
 
     assert "requires_nav2_rotation_shim_backport_or_upgrade`: false" in audit_text
     assert "RotationShimController is supported" in audit_text
     assert "rotate_to_goal_heading=true" in verify_script
-    assert "api_final_yaw_align_fallback_enabled: false" in verify_script
+    assert "api_final_yaw_align_fallback_enabled: true" in verify_script
     assert "/api/v1/navigation/state" in observe_script
     assert "Read-only observer" in observe_script
     assert "api_final_yaw_align_used" in observe_script
     assert "final_yaw_handled_by_nav2" in observe_script
     assert "cmd_owner_conflict" in observe_script
+    assert "goal_checker_id=" not in pose_bt
+    assert "position_goal_checker" not in pose_bt
+    assert not (ROOT / "src" / "robot_nav_config" / "behavior_trees" / "navigate_to_pose_position_only.xml").exists()
 
 
 def test_phase_n4_post_nav2_final_verify_recovery_contracts():
@@ -572,8 +1000,10 @@ def test_phase_n4_post_nav2_final_verify_recovery_contracts():
     for token in (
         "post_nav2_final_verify_enabled",
         "final_pose_auditing",
-        "Nav2 is the single completion owner",
-        "navigation goal reached by Nav2 native completion",
+        "commercial_final_verify=true",
+        "navigation goal reached by commercial final verification",
+        "commercial_final_verify_retry_attempted=true",
+        "degraded_final_pose_verify",
         "final_verify_failure_is_terminal",
         "final_verify_retry_count",
         "final_verify_retry_reason",
@@ -582,37 +1012,164 @@ def test_phase_n4_post_nav2_final_verify_recovery_contracts():
         assert token in api_cpp
 
     for params in (api_cfg, overlay_api_cfg):
-        assert "post_nav2_final_verify_enabled: false" in params
-        assert "post_nav2_final_verify_wait_bridge_smoothing: false" in params
+        assert "navigation_goal_position_success_tolerance_m: 0.06" in params
+        assert "post_nav2_final_verify_enabled: true" in params
+        assert "post_nav2_final_verify_wait_bridge_smoothing: true" in params
         assert "post_nav2_final_verify_bridge_wait_timeout_ms: 2000" in params
         assert "post_nav2_final_verify_bridge_wait_sample_period_ms: 100" in params
-        assert "post_nav2_final_verify_max_retry_count: 0" in params
-        assert "post_nav2_final_verify_acceptance_slack_m: 0.0" in params
-        assert "post_nav2_final_verify_xy_retry_min_error_m: 0.20" in params
-        assert "post_nav2_final_verify_xy_retry_max_error_m: 0.60" in params
-        assert "post_nav2_final_verify_yaw_retry_if_failed: false" in params
-        assert "post_nav2_final_verify_retry_uses_same_nav2_goal: false" in params
-        assert "post_nav2_final_verify_api_velocity_correction_enabled: false" in params
-        assert "api_final_yaw_align_fallback_enabled: false" in params
-        assert "navigation_final_yaw_align_enable: false" in params
+        assert "post_nav2_final_verify_request_amcl_nomotion_update: true" in params
+        assert 'post_nav2_final_verify_amcl_nomotion_update_service: "/request_nomotion_update"' in params
+        assert "post_nav2_final_verify_max_retry_count: 3" in params
+        assert "post_nav2_final_verify_acceptance_slack_m: 0.02" in params
+        assert "post_nav2_final_verify_xy_retry_min_error_m: 0.06" in params
+        assert "post_nav2_final_verify_xy_retry_max_error_m: 0.35" in params
+        assert "post_nav2_final_verify_yaw_retry_if_failed: true" in params
+        assert "post_nav2_final_verify_retry_uses_same_nav2_goal: true" in params
+        assert "post_nav2_final_verify_api_velocity_correction_enabled: true" in params
+        assert "post_nav2_final_verify_reverse_permit_enabled: true" in params
+        assert 'post_nav2_final_verify_reverse_enable_topic: "/ranger_mini3/allow_reverse"' in params
+        assert "post_nav2_final_verify_terminal_lateral_correction_enabled: true" in params
+        assert "post_nav2_final_verify_terminal_lateral_target_m: 0.03" in params
+        assert "post_nav2_final_verify_terminal_lateral_trigger_m: 0.07" in params
+        assert "post_nav2_final_verify_terminal_lateral_max_xy_m: 0.30" in params
+        assert "post_nav2_final_verify_terminal_lateral_max_forward_m: 0.12" in params
+        assert "post_nav2_final_verify_terminal_lateral_speed_mps: 0.08" in params
+        assert "post_nav2_final_verify_terminal_lateral_timeout_sec: 8.0" in params
+        assert "post_nav2_final_verify_terminal_lateral_command_sign: 1.0" in params
+        assert "predock_lateral_align_command_sign: -1.0" in params
+        assert "navigation_near_goal_stalled_handoff_enabled: true" in params
+        assert "navigation_near_goal_stalled_handoff_distance_m: 0.30" in params
+        assert "navigation_near_goal_stalled_handoff_min_wait_sec: 3.0" in params
+        assert "navigation_near_goal_stalled_handoff_stall_sec: 1.5" in params
+        assert "navigation_near_goal_stalled_handoff_improvement_epsilon_m: 0.02" in params
+        assert "api_final_yaw_align_fallback_enabled: true" in params
+        assert "navigation_final_yaw_align_enable: true" in params
 
     run_goal_block = api_cpp[
         api_cpp.index("void run_navigation_goal_job(") : api_cpp.index("HttpResponse handle_navigation_state()")
     ]
-    assert "run_post_nav2_final_verify_retry(job_id, target, retry_reason, retry_phase)" not in run_goal_block
-    assert "post_nav2_final_verify_retry_allowed(" not in run_goal_block
-    assert "post_nav2_final_verify_acceptance_slack_allowed(" not in run_goal_block
-    assert "run_final_yaw_align(job_id, target, pose_check)" not in run_goal_block
+    assert "nav2_failed_near_goal_retry_allowed(" in run_goal_block
+    assert "nav2_failed_near_goal_yaw_first_candidate()" in run_goal_block
+    assert "!nav2_failed_near_goal_yaw_first_candidate()" in run_goal_block
+    assert "nav2_failed_near_goal_yaw_aligning" in run_goal_block
+    assert "run_post_nav2_final_verify_retry(job_id, target, retry_reason, retry_phase)" in run_goal_block
+    assert "publish_post_nav2_final_verify_reverse_permit(true)" in api_cpp
+    assert "publish_post_nav2_final_verify_reverse_permit(false)" in api_cpp
+    assert "run_post_nav2_terminal_lateral_correction(" in api_cpp
+    assert "terminal_lateral_correction_attempted=true" in api_cpp
+    assert "maybe_navigation_near_goal_stalled_handoff(" in api_cpp
+    assert "cancel_navigation_goal_for_api_handoff(" in api_cpp
+    assert "near_goal_nav2_stalled_handoff=true" in run_goal_block
+    assert "waiting_for_nav2_result_near_goal_watch" in run_goal_block
+    assert "post-Nav2 final verify retry handed off near goal before Nav2 result" in api_cpp
+    assert "publish_predock_lateral_forced_mode(predock_lateral_align_forced_mode_)" in api_cpp
+    assert "publish_final_yaw_align_command(twist)" in api_cpp
+    assert "direction_reversed" in api_cpp
+    assert "terminal lateral correction diverged after side-slip command" in api_cpp
+    assert "terminal lateral correction kept original side-slip direction after meaningful progress" in api_cpp
+    assert "reversal_min_progress_m" in api_cpp
+    assert 'declare_parameter<double>("post_nav2_final_verify_terminal_lateral_command_sign", 1.0)' in api_cpp
+    assert 'declare_parameter<double>("post_nav2_final_verify_terminal_lateral_max_xy_m", 0.30)' in api_cpp
+    assert 'declare_parameter<double>("post_nav2_final_verify_terminal_lateral_timeout_sec", 8.0)' in api_cpp
+    assert 'declare_parameter<double>("navigation_near_goal_stalled_handoff_distance_m", 0.30)' in api_cpp
+    assert 'declare_parameter<double>("navigation_near_goal_stalled_handoff_min_wait_sec", 3.0)' in api_cpp
+    assert 'declare_parameter<double>("navigation_near_goal_stalled_handoff_stall_sec", 1.5)' in api_cpp
+    assert "terminal lateral correction reached commercial final pose gate" in api_cpp
+    assert "twist.linear.x" in api_cpp
+    assert "correcting_lateral" in api_cpp
+    assert "correcting_forward" in api_cpp
+    assert "correcting_yaw" in api_cpp
+    assert "terminal_pose_yaw_aligning" in api_cpp
+    assert "terminal_pose_lateral_correcting" in api_cpp
+    assert "terminal_pose_forward_correcting" in api_cpp
+    assert "terminal pose correction: yaw first" in api_cpp
+    assert "terminal pose correction: lateral second" in api_cpp
+    assert "terminal pose correction: forward/reverse third" in api_cpp
+    assert "terminal recovery axis-staged: lateral first, then forward only" in api_cpp
+    assert "twist.linear.x = 0.0;" in api_cpp
+    assert "twist.linear.y = 0.0;" in api_cpp
+    assert "terminal_lateral_candidate_before_salvage" in api_cpp
+    assert "!terminal_lateral_candidate_before_salvage" in api_cpp
+    assert "terminal pose correction skipped" in api_cpp
+    assert "needs_terminal_xy_correction" in api_cpp
+    assert "needs_terminal_yaw_correction" in api_cpp
+    assert "post_nav2_final_verify_terminal_lateral_target_m_ * 0.5" in api_cpp
+    assert "lateral_abs > post_nav2_final_verify_terminal_lateral_target_m_" in api_cpp
+    terminal_allowed_block = api_cpp[
+        api_cpp.index("bool post_nav2_terminal_lateral_correction_allowed(") :
+        api_cpp.index("TerminalLateralCorrectionResult run_post_nav2_terminal_lateral_correction(")
+    ]
+    assert "check.yaw_error_rad > navigation_final_yaw_tolerance_rad_" not in terminal_allowed_block
+    terminal_pose_block = api_cpp[
+        api_cpp.index("TerminalLateralCorrectionResult run_post_nav2_terminal_lateral_correction(") :
+        api_cpp.index("bool request_navigation_goal_cancel(")
+    ]
+    yaw_stage = terminal_pose_block[
+        terminal_pose_block.index("if (correcting_yaw)") :
+        terminal_pose_block.index("} else if (correcting_lateral)")
+    ]
+    assert "twist.angular.z" in yaw_stage
+    assert "twist.linear.x =" not in yaw_stage
+    assert "twist.linear.y =" not in yaw_stage
+    lateral_stage = terminal_pose_block[
+        terminal_pose_block.index("} else if (correcting_lateral)") :
+        terminal_pose_block.index("} else if (correcting_forward)")
+    ]
+    assert "twist.linear.y" in lateral_stage
+    assert "twist.angular.z" not in lateral_stage
+    forward_stage = terminal_pose_block[
+        terminal_pose_block.index("} else if (correcting_forward)") :
+        terminal_pose_block.index("publish_final_yaw_align_command(twist);")
+    ]
+    assert "twist.linear.x" in forward_stage
+    assert "twist.angular.z" not in forward_stage
+    assert "near_goal_nav2_retry_attempted=true" in run_goal_block
+    assert "post_nav2_final_verify_retry_allowed(" in run_goal_block
+    assert "post_nav2_final_verify_acceptance_slack_allowed(" in run_goal_block
+    assert "wait_for_bridge_smoothing_before_final_verify(job_id)" in run_goal_block
+    final_verify_bridge_wait_block = api_cpp[
+        api_cpp.index("PostNav2BridgeWaitResult wait_for_bridge_smoothing_before_final_verify(") :
+        api_cpp.index("PostNav2BridgeWaitResult wait_for_bridge_smoothing_before_final_yaw_align(")
+    ]
+    assert "request_amcl_nomotion_update_for_final_verify(" in final_verify_bridge_wait_block
+    assert "bridge_status_safe_for_final_pose_verify(" in final_verify_bridge_wait_block
+    assert "bridge_status_safe_for_goal_start(bridge, \"post-Nav2 final verification\"" not in final_verify_bridge_wait_block
+    final_verify_gate_block = api_cpp[
+        api_cpp.index("bool bridge_status_safe_for_final_pose_verify(") :
+        api_cpp.index("bool bridge_safe_for_goal_start(", api_cpp.index("bool bridge_status_safe_for_final_pose_verify("))
+    ]
+    assert "amcl_static_pending_is_standby" in final_verify_gate_block
+    assert "bridge.amcl_static_standby && bridge.amcl_not_moving_no_update_ok" in final_verify_gate_block
+    assert "bridge.amcl_input_enabled && bridge.amcl_correction_pending && !amcl_static_pending_is_standby" in final_verify_gate_block
+    assert "AMCL static standby pending tolerated for final pose verify" in final_verify_gate_block
+    assert "std_srvs/srv/empty.hpp" in api_cpp
+    assert "run_final_yaw_align(job_id, target, pose_check)" in run_goal_block
+    final_yaw_block = api_cpp[
+        api_cpp.index("FinalYawAlignResult run_final_yaw_align(") :
+        api_cpp.index("NavigationRepositionResult run_reposition_after_yaw_drift(")
+    ]
+    assert "navigation_final_yaw_align_success_tolerance_rad_" in final_yaw_block
+    assert "result.final_yaw_error_rad <= navigation_final_yaw_align_success_tolerance_rad_" in final_yaw_block
+    assert "yaw_align_stop_threshold_rad(" in final_yaw_block
+    assert "reset_yaw_align_actual_stop_stability()" in final_yaw_block
+    assert "final_pose_bridge_ready &&" in run_goal_block
+    assert "final_pose_bridge_wait_detail=" in run_goal_block
     assert "run_reposition_after_yaw_drift(job_id, target)" not in run_goal_block
     assert "api_final_yaw_align_enabled" not in run_goal_block
-    assert '"failed_final_pose_verify"' not in run_goal_block
+    assert '"failed_final_yaw_align"' not in run_goal_block
     assert "final_pose_auditing" in run_goal_block
-    assert "Nav2 is the single completion owner" in run_goal_block
-    assert "navigation goal reached by Nav2 native completion" in run_goal_block
+    assert '"nav2_failed"' not in run_goal_block
+    assert "commercial_final_verify=true" in run_goal_block
+    assert "navigation goal reached by commercial final verification" in run_goal_block
+    assert "degraded_final_pose_verify" in run_goal_block
+    assert "final pose audit warning" not in run_goal_block
+    assert run_goal_block.index("if (!commercial_position_complete || !commercial_yaw_complete)") < run_goal_block.index(
+        "navigation goal reached by commercial final verification"
+    )
     assert "/cmd_vel_docking" not in run_goal_block
-    assert "post_nav2_final_verify_api_velocity_correction_enabled_" not in run_goal_block
+    assert "post_nav2_final_verify_api_velocity_correction_enabled_" in api_cpp
     assert "publish_predock_yaw_align_command" not in run_goal_block
-    assert 'navigation_goal_job_.state = canceled ? "canceled" : (succeeded ? "succeeded" : "failed")' in api_cpp
+    assert 'degraded ? "degraded" : "failed"' in api_cpp
 
     assert 'primary_controller: "nav2_mppi_controller::MPPIController"' in nav2_cfg
     assert 'plugin: "nav2_smac_planner/SmacPlanner2D"' in nav2_cfg
@@ -625,8 +1182,7 @@ def test_phase_n4_post_nav2_final_verify_recovery_contracts():
 
     assert verify_path.exists()
     assert observe_path.exists()
-    assert "does not send Nav2 goals" in verify
-    assert "single completion owner" in verify
+    assert "commercial final verification" in verify
     assert "--mock-final-distance" in verify
     assert "--expect-task-complete" in verify
     assert "--expect-final-fail" in verify
@@ -648,6 +1204,67 @@ def test_phase_n4_post_nav2_final_verify_recovery_contracts():
             subprocess.run([bash, "-n", str(observe_path)], check=True)
 
 
+def test_manual_relocalization_keeps_amcl_post_isaac_refine_explicit():
+    overlay = ROOT / "scripts" / "jetson" / "runtime_overlay"
+    api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    api_cfg = (ROOT / "src" / "robot_api_server" / "config" / "robot_api_server.yaml").read_text(
+        encoding="utf-8"
+    )
+    overlay_api_cfg = (overlay / "config" / "robot_api_server.yaml").read_text(encoding="utf-8")
+    bridge_cfg = (
+        ROOT / "src" / "robot_localization_bridge" / "config" / "localization_bridge.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_bridge_cfg = (overlay / "config" / "localization_bridge.yaml").read_text(
+        encoding="utf-8"
+    )
+
+    trigger_block = api_cpp[
+        api_cpp.index("HttpResponse handle_trigger_localization") :
+        api_cpp.index("std::chrono::nanoseconds docking_navigation_start_timeout")
+    ]
+    refine_wait_block = api_cpp[
+        api_cpp.index("bool wait_for_manual_relocalization_amcl_refine(") :
+        api_cpp.index("void set_docking_global_correction_pause_state(")
+    ]
+    bridge_status_block = api_cpp[
+        api_cpp.index("void handle_localization_bridge_status") :
+        api_cpp.index("BridgeStatusSnapshot bridge_status_snapshot")
+    ]
+
+    assert "wait_for_manual_relocalization_amcl_refine(" in trigger_block
+    assert "manual_relocalization_amcl_refine_requested" in trigger_block
+    assert "manual_relocalization_amcl_refine_ok" in trigger_block
+    assert "manual_relocalization_amcl_refine_detail" in trigger_block
+    assert 'json_bool_value(body, "amcl_refine", manual_relocalization_amcl_refine_enabled_)' in trigger_block
+    assert (
+        'json_bool_value(body, "amcl_refine_required", '
+        "manual_relocalization_amcl_refine_required_)"
+    ) in trigger_block
+    assert "request_amcl_nomotion_update(" in refine_wait_block
+    assert '"manual_relocalization_amcl_refine"' in refine_wait_block
+    assert "bridge.amcl_post_isaac_refined_sequence == relocalization_sequence" in refine_wait_block
+    assert "manual relocalization AMCL refine timed out" in refine_wait_block
+    assert "json_uint64_value" in bridge_status_block
+    assert '"amcl_post_isaac_refined_sequence"' in bridge_status_block
+    assert '"amcl_post_isaac_refine_candidate_count"' in bridge_status_block
+    assert "json_string_value" in bridge_status_block
+    assert '"amcl_last_reject_reason"' in bridge_status_block
+
+    for cfg in (api_cfg, overlay_api_cfg):
+        assert "manual_relocalization_amcl_refine_enabled: false" in cfg
+        assert "manual_relocalization_amcl_refine_required: false" in cfg
+        assert "manual_relocalization_amcl_refine_timeout_sec: 8.0" in cfg
+        assert "manual_relocalization_amcl_refine_poll_ms: 100" in cfg
+        assert "manual_relocalization_amcl_refine_request_period_ms: 500" in cfg
+
+    for cfg in (bridge_cfg, overlay_bridge_cfg):
+        assert "amcl_initial_pose_xy_covariance: 0.01" in cfg
+        assert "amcl_initial_pose_yaw_covariance: 0.0076" in cfg
+        assert "amcl_post_isaac_refine_enabled: true" in cfg
+
+
 def test_nav2_rotation_progress_scripts_contract():
     scripts_root = ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts"
     ab = (scripts_root / "run_nav2_rotation_shim_ab.sh").read_text(encoding="utf-8")
@@ -662,7 +1279,7 @@ def test_nav2_rotation_progress_scripts_contract():
     assert "--apply" in ab
     assert "--restart" in ab
     assert "nav2_controller::PoseProgressChecker" in ab
-    assert "required_movement_angle=0.10" in ab
+    assert "required_movement_angle=0.05" in ab
     assert "movement_time_allowance=12.0" in ab
     assert "pointcloud, DDS/RMW, EKF, FAST-LIO2, App API" in ab
     assert "pkill -9" not in ab
@@ -701,6 +1318,7 @@ def test_nav2_rotation_progress_scripts_contract():
     assert "progress_checker.required_movement_angle" in verify
     assert "FollowPath.rotate_to_goal_heading" in verify
     assert "FollowPath.angular_dist_threshold" in verify
+    assert "FollowPath.angular_disengage_threshold" in verify
     assert "local_costmap.global_frame=odom" in verify
     assert "/cmd_vel_safe" in verify
     assert "/cmd_vel" in verify
@@ -802,8 +1420,10 @@ def test_robot_description_includes_gs2_mount():
     assert "charge_contact_frame: charge_contact_link" in sensors
     assert "gs2_xyz: [0.36, 0.0, 0.290]" in sensors
     assert "gs2_rpy: [0.0, 0.0, 0.0]" in sensors
-    assert "lidar_rpy: [0.0, -0.3490658503988659, 3.141592653589793]" in sensors
-    assert "imu_rpy: [0.0, -0.3490658503988659, 3.141592653589793]" in sensors
+    assert "lidar_xyz: [0.3686, 0.0000, 0.85]" in sensors
+    assert "lidar_rpy: [0.0, -0.3490658503988659, -3.127692216127]" in sensors
+    assert "imu_xyz: [0.3686, 0.0000, 0.85]" in sensors
+    assert "imu_rpy: [0.0, -0.3490658503988659, -3.127692216127]" in sensors
     assert "charge_contact_xyz: [0.398, 0.0, 0.255]" in sensors
     assert "ranger_base_frame: ranger_base_link" in sensors
     assert "gs2_frame: gs2_link" in overlay_sensors
@@ -811,9 +1431,11 @@ def test_robot_description_includes_gs2_mount():
     assert "ranger_base_frame: ranger_base_link" in overlay_sensors
     assert "gs2_x: 0.36" in overlay_sensors
     assert "gs2_z: 0.290" in overlay_sensors
-    assert "lidar_yaw: 3.141592653589793" in overlay_sensors
+    assert "lidar_x: 0.3686" in overlay_sensors
+    assert "lidar_yaw: -3.127692216127" in overlay_sensors
     assert "lidar_axis_yaw: 0.0" in overlay_sensors
-    assert "imu_yaw: 3.141592653589793" in overlay_sensors
+    assert "imu_x: 0.3686" in overlay_sensors
+    assert "imu_yaw: -3.127692216127" in overlay_sensors
     assert "charge_contact_x: 0.398" in overlay_sensors
     assert '<link name="$(arg ranger_base_frame)"/>' in urdf
     assert '<link name="$(arg gs2_frame)"/>' in urdf
@@ -847,6 +1469,7 @@ def test_docking_geometry_is_configured():
         assert "reverse_enable_topic: /ranger_mini3/docking_allow_reverse" in cfg
         assert "use_crab_mode: true" in cfg
         assert "crab_forced_mode: side_slip" in cfg
+        assert "yaw_forced_mode: spinning" in cfg
         assert "gs2_z_m: 0.290" in cfg
         assert "charge_contact_x_m: 0.398" in cfg
         assert "gs2_to_contact_x_m: 0.038" in cfg
@@ -856,7 +1479,11 @@ def test_docking_geometry_is_configured():
         assert "electrode_vertical_width_m: 0.030" in cfg
         assert "positive_electrode_position: upper" in cfg
         assert "min_points: 8" in cfg
+        assert "min_lateral_span_m: 0.035" in cfg
         assert "lateral_gate_m: 0.20" in cfg
+        assert "front_cluster_x_window_m: 0.015" in cfg
+        assert "min_confidence: 0.10" in cfg
+        assert "yaw_fit_min_lateral_span_m: 0.055" in cfg
         assert "stable_frames_required: 3" in cfg
         assert "filter_alpha: 0.25" in cfg
         assert "use_yaw_fit: true" in cfg
@@ -886,17 +1513,20 @@ def test_docking_geometry_is_configured():
         assert "ky: 0.55" in cfg
         assert "ky_lateral: 0.70" in cfg
         assert "lateral_command_sign: -1.0" in cfg
-        assert "kyaw: -0.70" in cfg
+        assert "kyaw: 0.70" in cfg
         assert "lateral_deadband_m: 0.005" in cfg
         assert "min_align_speed_mps: 0.025" in cfg
         assert "min_lateral_speed_mps: 0.025" in cfg
         assert "max_lateral_speed_mps: 0.04" in cfg
         assert "max_forward_while_lateral_mps: 0.000" in cfg
         assert "lock_lateral_during_final_insert: true" in cfg
+        assert "yaw_spin_priority_enabled: true" in cfg
         assert "max_command_steering_rad: 0.35" in cfg
         assert "contact_crawl_speed_mps: 0.025" in cfg
-        assert "lateral_soft_limit_m: 0.015" in cfg
+        assert "lateral_soft_limit_m: 0.030" in cfg
         assert "lateral_hard_limit_m: 0.050" in cfg
+        assert "yaw_soft_limit_deg: 5.0" in cfg
+        assert "yaw_hard_limit_deg: 7.0" in cfg
         assert "contact_voltage_min_v: 40.0" in cfg
         assert "contact_voltage_max_v: 1000.0" in cfg
         assert "full_soc_threshold_pct: 99.0" in cfg
@@ -938,6 +1568,7 @@ def test_robot_docking_manager_is_safety_chained_cpp():
     assert 'declare_parameter<std::string>("mode.reverse_enable_topic", "/ranger_mini3/docking_allow_reverse")' in node
     assert 'declare_parameter<bool>("mode.use_crab_mode", true)' in node
     assert 'declare_parameter<std::string>("mode.crab_forced_mode", "side_slip")' in node
+    assert 'declare_parameter<std::string>("mode.yaw_forced_mode", "spinning")' in node
     assert "create_service<std_srvs::srv::Trigger>" in node
     assert "create_subscription<sensor_msgs::msg::LaserScan>" in node
     assert "create_subscription<sensor_msgs::msg::BatteryState>" in node
@@ -985,6 +1616,14 @@ def test_robot_docking_manager_is_safety_chained_cpp():
     assert "full_soc_present_voltage_valid" in node
     assert "normalized_soc_percent" in node
     assert "docked_stop(\"docked_charging_detected\")" in node
+    assert 'declare_parameter<double>("detector.front_cluster_x_window_m", 0.015)' in node
+    assert 'declare_parameter<double>("detector.min_confidence", 0.10)' in node
+    assert 'declare_parameter<double>("detector.yaw_fit_min_lateral_span_m", 0.055)' in node
+    assert "detector_front_cluster_x_window_m_ > 0.0" in node
+    assert "front_x_max = *nearest_x_it + detector_front_cluster_x_window_m_" in node
+    assert "if (xs[i] <= front_x_max)" in node
+    assert "detection.lateral_span >= detector_yaw_fit_min_lateral_span_m_" in node
+    assert "detection.confidence > detector_min_confidence_" in node
     assert 'declare_parameter<bool>("detector.use_yaw_fit", false)' in node
     assert "estimate_yaw_error" in node
     assert "filter_detection" in node
@@ -992,7 +1631,13 @@ def test_robot_docking_manager_is_safety_chained_cpp():
     assert "valid_detection_streak_" in node
     assert "min_align_speed_mps_" in node
     assert "lateral_command_sign_ * ky_lateral_ * lateral_error" in node
+    assert "yaw_spin_priority_enabled_ && !yaw_ok" in node
+    assert "publish_forced_mode(yaw_forced_mode_)" in node
+    assert '"yaw_spin"' in node
     assert "cmd.angular.z = clamp(kyaw_ * yaw_error" in node
+    assert "cmd.angular.z = 0.0;" in node
+    assert "pivot_compensation_vy = 0.0;" in node
+    assert "Mixing angular.z with side-slip near the dock" in node
     assert "min_lateral_speed_mps_" in node
     assert "lock_lateral_during_final_insert_" in node
     assert "cmd.linear.y = 0.0;" in node
@@ -1004,10 +1649,11 @@ def test_robot_docking_manager_is_safety_chained_cpp():
     assert "Python fallback has been removed" in runner
     assert "/cmd_vel_docking" in readme
     assert "/cmd_vel_collision_checked" in readme
-    assert "controller.kyaw=-0.70" in readme
+    assert "controller.kyaw=0.70" in readme
+    assert "/ranger_mini3/forced_mode=spinning" in readme
     assert "/ranger_mini3/forced_mode=side_slip" in readme
-    assert "`linear.y` can correct lateral offset" in readme
-    assert "yaw tolerance is `2deg`" in readme
+    assert "`linear.y` alone corrects lateral offset" in readme
+    assert "yaw soft tolerance is `5deg`" in readme
     assert "/docking/undock" in readme
     assert "/local_state/odometry" in readme
     assert "elapsed command time is not treated as distance" in readme
@@ -1114,7 +1760,7 @@ def test_undock_motion_start_state_machine_publishes_before_waiting():
     assert "speed_mps: 0.06" in (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "docking.yaml"
     ).read_text(encoding="utf-8")
-    assert yaml_number(nav2, "vx_min") >= 0.0
+    assert yaml_number(nav2, "vx_min") >= -0.08
     assert "CASE_DOCKING_MANAGER_NO_CMD" in diagnose
     assert "status_has_waiting_first_motion_with_cmd" in diagnose
     assert "CASE_DOCKING_MANAGER_WAITING_FIRST_MOTION_WITH_CMD" in diagnose
@@ -1201,12 +1847,8 @@ def test_navigation_goal_pre_undock_gate_observability_contract():
     assert "const bool by_pose_id = !pose_id.empty();" in goal_block
     assert '"navigation_goal"' in goal_block
     assert "pre_navigation_dock_check_payload" in goal_block
-    assert "undock_before_navigation_if_needed(" in goal_block
-    assert goal_block.index("undock_before_navigation_if_needed(") < goal_block.index("NavigateToPose::Goal goal")
-    assert "navigation requires successful undock first" in goal_block
-    assert goal_block.index("navigation requires successful undock first") < goal_block.index(
-        "NavigateToPose::Goal goal"
-    )
+    assert "undock_before_navigation_if_needed(" not in goal_block
+    assert "bridge_safe_for_goal_start(\"navigation goal\"" not in goal_block
     assert "pre_navigation_undock" in goal_block
     assert "pre_navigation_undock_detail" in goal_block
     assert "pre_navigation_dock_check" in goal_block
@@ -1227,7 +1869,38 @@ def test_navigation_goal_pre_undock_gate_observability_contract():
     assert "async_send_goal" not in precheck_block
     assert "call_undock_service_with_charging_retry" not in precheck_block
     assert "navigation_lifecycle_snapshot()" not in goal_block
-    assert "bridge_safe_for_goal_start(\"navigation goal\"" in goal_block
+    assert "async_send_goal(goal)" not in goal_block
+    assert "run_navigation_goal_job_guarded" in goal_block
+    assert "queued controlled undock in navigation background job" in goal_block
+    assert "goal-start readiness will be checked in navigation background job" in goal_block
+    assert "pre_navigation_dock_check]() {" in goal_block
+
+    pre_send_block = node_cpp[
+        node_cpp.index("bool run_navigation_goal_pre_send_sequence") : node_cpp.index(
+            "void run_navigation_goal_job_guarded"
+        )
+    ]
+    assert "undock_before_navigation_if_needed(" in pre_send_block
+    assert "navigation requires successful undock first" in pre_send_block
+    assert "navigation requires post-undock localization readiness before goal start" in pre_send_block
+    assert "wait_for_navigation_goal_start_readiness(job_id, readiness_detail)" in pre_send_block
+    assert "navigation_goal_job_.pre_navigation_relocalization_succeeded = false;" in pre_send_block
+    readiness_block = node_cpp[
+        node_cpp.index("bool wait_for_navigation_goal_start_readiness") : node_cpp.index(
+            "bool run_navigation_goal_pre_send_sequence"
+        )
+    ]
+    assert "bridge_safe_for_goal_start(\"navigation goal\"" in readiness_block
+    assert '"waiting_for_goal_start_readiness"' in readiness_block
+    assert '"failed_goal_start_readiness"' in readiness_block
+    goal_send_block = node_cpp[
+        node_cpp.index("bool send_initial_navigation_goal_to_nav2") : node_cpp.index(
+            "void run_navigation_goal_job("
+        )
+    ]
+    assert "async_send_goal(goal)" in goal_send_block
+    assert '"sending_nav2_goal"' in goal_send_block
+    assert '"failed_send_nav2_goal"' in goal_send_block
 
     assert "pre_navigation_dock_check" in script
     assert "/api/v1/navigation/pre_goal_check" in script
@@ -1548,6 +2221,9 @@ def test_phase_d23_full_charge_charging_session_dock_gate_contract():
     bms_latch_block = api_cpp[
         api_cpp.index("void maybe_update_bms_dock_contact_latch") : api_cpp.index("void handle_bms_state")
     ]
+    update_latch_block = api_cpp[
+        api_cpp.index("void update_dock_contact_latch") : api_cpp.index("bool bms_latch_write_allowed_by_runtime")
+    ]
 
     assert "charging_session" in api_cpp
     assert '"charging_session"' in bms_latch_block
@@ -1579,9 +2255,25 @@ def test_phase_d23_full_charge_charging_session_dock_gate_contract():
 
     assert "check.dock_latch.source_bms" in gate_block
     assert "stale_bms_latch_cleared_live_undocked_no_contact" in gate_block
+    assert "latch_source_can_be_cleared_by_live_no_contact" in gate_block
+    assert "bms_latch_can_be_cleared_by_live_no_contact" in gate_block
+    assert "charging_session_latch_can_be_cleared_by_live_no_contact" in gate_block
+    assert "check.dock_latch.source_charging_session" in gate_block
+    assert (
+        "check.dock_latch.source_charging_session && check.live_docking_state_undocked"
+        in gate_block
+    )
+    assert "charging_session_latch_cleared_confirmed_undocked_no_contact" in gate_block
+    assert "stale_charging_session_latch_cleared_live_undocked_no_contact" not in gate_block
     assert "latch_source_is_docking_evidence(check.dock_latch.source)" in gate_block
     assert "latch_source_is_manual_evidence(check.dock_latch.source)" in gate_block
     assert "BMS no_contact" not in api_cpp
+    assert update_latch_block.index("const auto previous = read_dock_contact_latch();") < update_latch_block.index(
+        "if (have_last_dock_contact_latch_write_"
+    )
+    assert "previous.latched_docked == docked" in update_latch_block
+    assert "previous.source == source" in update_latch_block
+    assert "previous.reason == reason" in update_latch_block
 
     for field in [
         "dock_occupancy_state",
@@ -1653,17 +2345,356 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     wheel_only_ekf_cfg = (
         ROOT / "src" / "robot_local_state" / "config" / "local_state_ekf_wheel_only.yaml"
     ).read_text(encoding="utf-8")
+    twist_imu_ekf_cfg = (
+        ROOT / "src" / "robot_local_state" / "config" / "local_state_ekf_twist_imu.yaml"
+    ).read_text(encoding="utf-8")
+    twist_imu_vyaw_only_ekf_cfg = (
+        ROOT / "src" / "robot_local_state" / "config" / "local_state_ekf_twist_imu_vyaw_only.yaml"
+    ).read_text(encoding="utf-8")
+    twist_wheel_yaw_imu_ekf_cfg = (
+        ROOT / "src" / "robot_local_state" / "config" / "local_state_ekf_twist_wheel_yaw_imu.yaml"
+    ).read_text(encoding="utf-8")
+    wheel_xy_imu_yaw_ekf_cfg = (
+        ROOT / "src" / "robot_local_state" / "config" / "local_state_ekf_wheel_xy_imu_yaw.yaml"
+    ).read_text(encoding="utf-8")
+    wheel_xy_diff_yaw_imu_ekf_cfg = (
+        ROOT / "src" / "robot_local_state" / "config" / "local_state_ekf_wheel_xy_diff_yaw_imu.yaml"
+    ).read_text(encoding="utf-8")
+    wheel_xy_imu_vyaw_ekf_cfg = (
+        ROOT / "src" / "robot_local_state" / "config" / "local_state_ekf_wheel_xy_imu_vyaw.yaml"
+    ).read_text(encoding="utf-8")
+    wheel_pose_imu_vyaw_ekf_cfg = (
+        ROOT / "src" / "robot_local_state" / "config" / "local_state_ekf_wheel_pose_imu_vyaw.yaml"
+    ).read_text(encoding="utf-8")
     overlay_ekf_cfg = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "local_state_ekf.yaml"
     ).read_text(encoding="utf-8")
     overlay_wheel_only_ekf_cfg = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "local_state_ekf_wheel_only.yaml"
     ).read_text(encoding="utf-8")
+    overlay_twist_imu_ekf_cfg = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "local_state_ekf_twist_imu.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_twist_imu_vyaw_only_ekf_cfg = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "local_state_ekf_twist_imu_vyaw_only.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_twist_wheel_yaw_imu_ekf_cfg = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "local_state_ekf_twist_wheel_yaw_imu.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_wheel_xy_imu_yaw_ekf_cfg = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "local_state_ekf_wheel_xy_imu_yaw.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_wheel_xy_diff_yaw_imu_ekf_cfg = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "local_state_ekf_wheel_xy_diff_yaw_imu.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_wheel_xy_imu_vyaw_ekf_cfg = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "local_state_ekf_wheel_xy_imu_vyaw.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_wheel_pose_imu_vyaw_ekf_cfg = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "local_state_ekf_wheel_pose_imu_vyaw.yaml"
+    ).read_text(encoding="utf-8")
     overlay_wheel_odom_cfg = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "local_state_wheel_odom_ekf.yaml"
     ).read_text(encoding="utf-8")
     source_wheel_odom_cfg = (
         ROOT / "src" / "robot_local_state" / "config" / "local_state_wheel_odom_ekf.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_pose_soft_yaw_015_wheel_odom_cfg = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "local_state_wheel_odom_ekf_pose_soft_yaw_015.yaml"
+    ).read_text(encoding="utf-8")
+    source_pose_soft_yaw_015_wheel_odom_cfg = (
+        ROOT
+        / "src"
+        / "robot_local_state"
+        / "config"
+        / "local_state_wheel_odom_ekf_pose_soft_yaw_015.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_twist_soft_yaw_012_wheel_odom_cfg = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "local_state_wheel_odom_ekf_twist_soft_yaw_012.yaml"
+    ).read_text(encoding="utf-8")
+    source_twist_soft_yaw_012_wheel_odom_cfg = (
+        ROOT
+        / "src"
+        / "robot_local_state"
+        / "config"
+        / "local_state_wheel_odom_ekf_twist_soft_yaw_012.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_twist_soft_yaw_010_wheel_odom_cfg = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "local_state_wheel_odom_ekf_twist_soft_yaw_010.yaml"
+    ).read_text(encoding="utf-8")
+    source_twist_soft_yaw_010_wheel_odom_cfg = (
+        ROOT
+        / "src"
+        / "robot_local_state"
+        / "config"
+        / "local_state_wheel_odom_ekf_twist_soft_yaw_010.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_twist_soft_yaw_015_wheel_odom_cfg = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "local_state_wheel_odom_ekf_twist_soft_yaw_015.yaml"
+    ).read_text(encoding="utf-8")
+    source_twist_soft_yaw_015_wheel_odom_cfg = (
+        ROOT
+        / "src"
+        / "robot_local_state"
+        / "config"
+        / "local_state_wheel_odom_ekf_twist_soft_yaw_015.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_yaw_offset_m061_wheel_odom_cfg = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "local_state_wheel_odom_ekf_yaw_offset_m061.yaml"
+    ).read_text(encoding="utf-8")
+    source_yaw_offset_m061_wheel_odom_cfg = (
+        ROOT
+        / "src"
+        / "robot_local_state"
+        / "config"
+        / "local_state_wheel_odom_ekf_yaw_offset_m061.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_xy_shear_p062_wheel_odom_cfg = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "local_state_wheel_odom_ekf_xy_shear_p062.yaml"
+    ).read_text(encoding="utf-8")
+    source_xy_shear_p062_wheel_odom_cfg = (
+        ROOT
+        / "src"
+        / "robot_local_state"
+        / "config"
+        / "local_state_wheel_odom_ekf_xy_shear_p062.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_xy_lateral_m061_wheel_odom_cfg = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "local_state_wheel_odom_ekf_xy_lateral_m061.yaml"
+    ).read_text(encoding="utf-8")
+    source_xy_lateral_m061_wheel_odom_cfg = (
+        ROOT
+        / "src"
+        / "robot_local_state"
+        / "config"
+        / "local_state_wheel_odom_ekf_xy_lateral_m061.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_xy_lateral_m040_wheel_odom_cfg = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "local_state_wheel_odom_ekf_xy_lateral_m040.yaml"
+    ).read_text(encoding="utf-8")
+    source_xy_lateral_m040_wheel_odom_cfg = (
+        ROOT
+        / "src"
+        / "robot_local_state"
+        / "config"
+        / "local_state_wheel_odom_ekf_xy_lateral_m040.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_xy_lateral_m050_wheel_odom_cfg = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "local_state_wheel_odom_ekf_xy_lateral_m050.yaml"
+    ).read_text(encoding="utf-8")
+    source_xy_lateral_m050_wheel_odom_cfg = (
+        ROOT
+        / "src"
+        / "robot_local_state"
+        / "config"
+        / "local_state_wheel_odom_ekf_xy_lateral_m050.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_xy_lateral_m085_wheel_odom_cfg = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "local_state_wheel_odom_ekf_xy_lateral_m085.yaml"
+    ).read_text(encoding="utf-8")
+    source_xy_lateral_m085_wheel_odom_cfg = (
+        ROOT
+        / "src"
+        / "robot_local_state"
+        / "config"
+        / "local_state_wheel_odom_ekf_xy_lateral_m085.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_xy_lateral_m120_wheel_odom_cfg = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "local_state_wheel_odom_ekf_xy_lateral_m120.yaml"
+    ).read_text(encoding="utf-8")
+    source_xy_lateral_m120_wheel_odom_cfg = (
+        ROOT
+        / "src"
+        / "robot_local_state"
+        / "config"
+        / "local_state_wheel_odom_ekf_xy_lateral_m120.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_xy_lateral_soft_yaw_016_wheel_odom_cfg = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "local_state_wheel_odom_ekf_xy_lateral_soft_yaw_016.yaml"
+    ).read_text(encoding="utf-8")
+    source_xy_lateral_soft_yaw_016_wheel_odom_cfg = (
+        ROOT
+        / "src"
+        / "robot_local_state"
+        / "config"
+        / "local_state_wheel_odom_ekf_xy_lateral_soft_yaw_016.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_xy_lateral_yaw_p979_n1011_wheel_odom_cfg = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "local_state_wheel_odom_ekf_xy_lateral_yaw_p979_n1011.yaml"
+    ).read_text(encoding="utf-8")
+    source_xy_lateral_yaw_p979_n1011_wheel_odom_cfg = (
+        ROOT
+        / "src"
+        / "robot_local_state"
+        / "config"
+        / "local_state_wheel_odom_ekf_xy_lateral_yaw_p979_n1011.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_soft_yaw_018_wheel_odom_cfg = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "local_state_wheel_odom_ekf_soft_yaw_018.yaml"
+    ).read_text(encoding="utf-8")
+    source_soft_yaw_018_wheel_odom_cfg = (
+        ROOT
+        / "src"
+        / "robot_local_state"
+        / "config"
+        / "local_state_wheel_odom_ekf_soft_yaw_018.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_soft_yaw_016_wheel_odom_cfg = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "local_state_wheel_odom_ekf_soft_yaw_016.yaml"
+    ).read_text(encoding="utf-8")
+    source_soft_yaw_016_wheel_odom_cfg = (
+        ROOT
+        / "src"
+        / "robot_local_state"
+        / "config"
+        / "local_state_wheel_odom_ekf_soft_yaw_016.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_soft_yaw_010_wheel_odom_cfg = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "local_state_wheel_odom_ekf_soft_yaw_010.yaml"
+    ).read_text(encoding="utf-8")
+    source_soft_yaw_010_wheel_odom_cfg = (
+        ROOT
+        / "src"
+        / "robot_local_state"
+        / "config"
+        / "local_state_wheel_odom_ekf_soft_yaw_010.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_soft_yaw_014_wheel_odom_cfg = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "local_state_wheel_odom_ekf_soft_yaw_014.yaml"
+    ).read_text(encoding="utf-8")
+    source_soft_yaw_014_wheel_odom_cfg = (
+        ROOT
+        / "src"
+        / "robot_local_state"
+        / "config"
+        / "local_state_wheel_odom_ekf_soft_yaw_014.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_soft_yaw_wheel_odom_cfg = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "local_state_wheel_odom_ekf_soft_yaw.yaml"
+    ).read_text(encoding="utf-8")
+    source_soft_yaw_wheel_odom_cfg = (
+        ROOT / "src" / "robot_local_state" / "config" / "local_state_wheel_odom_ekf_soft_yaw.yaml"
+    ).read_text(encoding="utf-8")
+    overlay_soft_yaw_015_wheel_odom_cfg = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "local_state_wheel_odom_ekf_soft_yaw_015.yaml"
+    ).read_text(encoding="utf-8")
+    source_soft_yaw_015_wheel_odom_cfg = (
+        ROOT / "src" / "robot_local_state" / "config" / "local_state_wheel_odom_ekf_soft_yaw_015.yaml"
     ).read_text(encoding="utf-8")
     fastlio_cfg = (ROOT / "src" / "robot_local_state" / "config" / "local_state_fastlio.yaml").read_text(
         encoding="utf-8"
@@ -1695,6 +2726,9 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     overlay_tf_helpers = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "canonical_tf_helpers.sh"
     ).read_text(encoding="utf-8")
+    overlay_common_runner = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_common_services.sh"
+    ).read_text(encoding="utf-8")
     local_state_node = (ROOT / "src" / "robot_local_state" / "src" / "local_state_node.cpp").read_text(
         encoding="utf-8"
     )
@@ -1707,14 +2741,28 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     ranger_chassis_runner = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_ranger_chassis.sh"
     ).read_text(encoding="utf-8")
+    ranger_messenger = (
+        ROOT
+        / "external_sources"
+        / "jetson_ranger_ros2_20260620"
+        / "ranger_base"
+        / "src"
+        / "ranger_messenger.cpp"
+    ).read_text(encoding="utf-8")
+    cmd_vel_stop_latency = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "record_cmd_vel_stop_latency.sh"
+    ).read_text(encoding="utf-8")
     readme = (ROOT / "src" / "robot_local_state" / "README.md").read_text(encoding="utf-8")
 
     assert "find_package(sensor_msgs REQUIRED)" in cmake
+    assert "find_package(tf2 REQUIRED)" in cmake
     assert "add_executable(imu_gyro_bias_filter_node" in cmake
     assert "target_compile_features(imu_gyro_bias_filter_node PUBLIC cxx_std_17)" in cmake
     assert "sensor_msgs" in cmake
+    assert "tf2" in cmake
     assert "<exec_depend>robot_localization</exec_depend>" in package_xml
     assert "<depend>sensor_msgs</depend>" in package_xml
+    assert "<depend>tf2</depend>" in package_xml
     assert 'package="robot_localization"' in launch_file
     assert 'executable="local_state_node"' in launch_file
     assert 'name="wheel_odom_ekf_input"' in launch_file
@@ -1743,12 +2791,51 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     assert "-r __node:=wheel_odom_ekf_input" in overlay_runner
     assert "LOCAL_STATE_EKF_PROFILE" in overlay_runner
     assert "NJRH_LOCAL_STATE_EKF_PROFILE" in overlay_runner
+    assert "local_state_ekf_wheel_pose_imu_vyaw.yaml" in overlay_runner
+    assert "local_state_wheel_odom_ekf_pose_soft_yaw_015.yaml" in overlay_runner
+    assert "local_state_wheel_odom_ekf_twist_soft_yaw_012.yaml" in overlay_runner
+    assert "local_state_wheel_odom_ekf_twist_soft_yaw_010.yaml" in overlay_runner
+    assert "local_state_wheel_odom_ekf_twist_soft_yaw_015.yaml" in overlay_runner
+    assert "local_state_wheel_odom_ekf_yaw_offset_m061.yaml" in overlay_runner
+    assert "local_state_wheel_odom_ekf_xy_shear_p062.yaml" in overlay_runner
+    assert "local_state_wheel_odom_ekf_xy_lateral_m061.yaml" in overlay_runner
+    assert "local_state_wheel_odom_ekf_xy_lateral_m040.yaml" in overlay_runner
+    assert "local_state_wheel_odom_ekf_xy_lateral_m050.yaml" in overlay_runner
+    assert "local_state_wheel_odom_ekf_xy_lateral_m085.yaml" in overlay_runner
+    assert "local_state_wheel_odom_ekf_xy_lateral_m120.yaml" in overlay_runner
+    assert "local_state_wheel_odom_ekf_xy_lateral_soft_yaw_016.yaml" in overlay_runner
+    assert "local_state_wheel_odom_ekf_xy_lateral_yaw_p979_n1011.yaml" in overlay_runner
+    assert "local_state_wheel_odom_ekf_soft_yaw_018.yaml" in overlay_runner
+    assert "local_state_wheel_odom_ekf_soft_yaw_016.yaml" in overlay_runner
+    assert "local_state_wheel_odom_ekf_soft_yaw_015.yaml" in overlay_runner
+    assert "local_state_wheel_odom_ekf_soft_yaw_014.yaml" in overlay_runner
+    assert "local_state_wheel_odom_ekf_soft_yaw_010.yaml" in overlay_runner
+    assert "local_state_wheel_odom_ekf_soft_yaw.yaml" in overlay_runner
+    assert "local_state_ekf_wheel_xy_imu_vyaw.yaml" in overlay_runner
+    assert "local_state_ekf_wheel_xy_imu_yaw.yaml" in overlay_runner
+    assert "local_state_ekf_wheel_xy_diff_yaw_imu.yaml" in overlay_runner
+    assert "local_state_ekf_twist_imu.yaml" in overlay_runner
+    assert "local_state_ekf_twist_imu_vyaw_only.yaml" in overlay_runner
+    assert "local_state_ekf_twist_wheel_yaw_imu.yaml" in overlay_runner
     assert "local_state_ekf_wheel_only.yaml" in overlay_runner
-    assert 'invalid LOCAL_STATE_EKF_PROFILE=${EKF_PROFILE}; expected wheel_imu or wheel_only' in overlay_runner
-    assert 'LOCAL_STATE_EKF_PROFILE=wheel_only; skipping IMU gyro bias filter' in overlay_runner
+    assert (
+        'invalid LOCAL_STATE_EKF_PROFILE=${EKF_PROFILE}; expected wheel_imu, wheel_pose_imu_vyaw, wheel_imu_pose_soft_yaw_015, wheel_imu_twist_soft_yaw_012, wheel_imu_twist_soft_yaw_010, wheel_imu_twist_soft_yaw_015, wheel_imu_yaw_offset_m061, wheel_imu_xy_shear_p062, wheel_imu_xy_lateral_m061, wheel_imu_xy_lateral_m040, wheel_imu_xy_lateral_m050, wheel_imu_xy_lateral_m085, wheel_imu_xy_lateral_m120, wheel_imu_xy_lateral_soft_yaw_016, wheel_imu_xy_lateral_yaw_p979_n1011, wheel_imu_soft_yaw_018, wheel_imu_soft_yaw_016, wheel_imu_soft_yaw_015, wheel_imu_soft_yaw_014, wheel_imu_soft_yaw_010, wheel_imu_soft_yaw, wheel_xy_imu_vyaw, wheel_xy_imu_yaw, wheel_xy_diff_yaw_imu, twist_imu, twist_imu_vyaw_only, twist_wheel_yaw_imu, or wheel_only'
+        in overlay_runner
+    )
+    assert "LOCAL_STATE_IMU_BIAS_FILTER_ENABLED" in overlay_runner
+    assert (
+        "EKF imu0 fusion disabled while IMU bias filter stays available for safety consumers"
+        in overlay_runner
+    )
+    assert "LOCAL_STATE_IMU_BIAS_FILTER_ENABLED=false; skipping IMU gyro bias filter" in overlay_runner
     assert "LOCAL_STATE_IMU_BIAS_FILTER_PARAMS_FILE" in overlay_runner
     assert "imu_gyro_bias_filter_node" in overlay_runner
     assert "-r __node:=imu_gyro_bias_filter" in overlay_runner
+    assert "LOCAL_STATE_IMU_BIAS_FILTER_READY_CHECK" in overlay_runner
+    assert 'publisher-from-node \\\n      "${CORRECTED_IMU_TOPIC}" imu_gyro_bias_filter' in overlay_runner
+    assert 'runtime_readiness_probe topic "${CORRECTED_IMU_TOPIC}"' in overlay_runner
+    assert 'publisher-from-node \\\n      "${IMU_BIAS_TOPIC}" imu_gyro_bias_filter' in overlay_runner
+    assert 'runtime_readiness_probe topic "${IMU_BIAS_TOPIC}"' in overlay_runner
     assert "njrh_start_affined_background wheel_odom_pid robot_local_state_odom_preprocessor" in overlay_runner
     assert "njrh_start_affined_background imu_bias_pid robot_local_state_imu_bias_filter" in overlay_runner
     assert "njrh_start_affined_background ekf_pid robot_local_state" in overlay_runner
@@ -1781,10 +2868,44 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     assert "-r /odometry/filtered:=/local_state/odometry" in overlay_runner
     assert "LOCAL_STATE_MODE=ekf" in readme
     assert "LOCAL_STATE_EKF_PROFILE=wheel_only" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_pose_imu_vyaw" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_imu_pose_soft_yaw_015" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_imu_twist_soft_yaw_012" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_imu_twist_soft_yaw_010" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_imu_twist_soft_yaw_015" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_imu_yaw_offset_m061" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_imu_xy_shear_p062" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_imu_xy_lateral_m061" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_imu_xy_lateral_m040" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_imu_xy_lateral_m050" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_imu_xy_lateral_m085" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_imu_xy_lateral_m120" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_imu_xy_lateral_soft_yaw_016" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_imu_xy_lateral_yaw_p979_n1011" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_imu_soft_yaw_018" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_imu_soft_yaw_016" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_imu_soft_yaw_010" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_imu_soft_yaw_015" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_imu_soft_yaw_014" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_imu_soft_yaw" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_xy_imu_vyaw" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_xy_imu_yaw" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_xy_diff_yaw_imu" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=twist_imu" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=twist_imu_vyaw_only" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=twist_wheel_yaw_imu" in readme
+    assert "LOCAL_STATE_EKF_PROFILE=wheel_only" in readme
     assert "LOCAL_STATE_EKF_PROFILE=wheel_imu" in readme
     assert "LOCAL_STATE_MODE=passthrough" in readme
     assert 'declare_parameter<double>("odom_yaw_offset_rad", 0.0)' in local_state_node
     assert 'declare_parameter<bool>("rotate_odom_position_with_yaw_offset", true)' in local_state_node
+    assert 'declare_parameter<double>("odom_position_scale_x", 1.0)' in local_state_node
+    assert 'declare_parameter<double>("odom_position_scale_y", 1.0)' in local_state_node
+    assert 'declare_parameter<double>("odom_position_y_to_x_shear", 0.0)' in local_state_node
+    assert 'declare_parameter<double>("odom_position_x_to_y_shear", 0.0)' in local_state_node
+    assert 'declare_parameter<double>("odom_yaw_scale_positive", 1.0)' in local_state_node
+    assert 'declare_parameter<double>("odom_yaw_scale_negative", 1.0)' in local_state_node
+    assert 'declare_parameter<bool>("scale_odom_twist_with_yaw_scale", true)' in local_state_node
     assert 'declare_parameter<bool>("anchor_pose_to_first_sample", false)' in local_state_node
     assert 'declare_parameter<bool>("apply_pose_covariance_floor", false)' in local_state_node
     assert 'declare_parameter<double>("pose_covariance_floor_yaw", 0.0)' in local_state_node
@@ -1793,6 +2914,8 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     assert 'declare_parameter<bool>("republish_latest", true)' in local_state_node
     assert 'declare_parameter<double>("republish_latest_max_age_sec", 0.5)' in local_state_node
     assert "apply_pose_anchor(local_odom)" in local_state_node
+    assert "apply_planar_position_calibration(local_odom)" in local_state_node
+    assert "apply_yaw_scale_calibration(local_odom)" in local_state_node
     assert "apply_canonical_odom_transform(local_odom)" in local_state_node
     assert "apply_pose_covariance_floor(local_odom)" in local_state_node
     assert "apply_twist_covariance_floor(local_odom)" in local_state_node
@@ -1804,6 +2927,112 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     assert "if (publish_tf_)" in local_state_node
     assert "if (!publish_tf_ || !tf_broadcaster_)" in local_state_node
     assert 'export BASE_FRAME="${BASE_FRAME:-base_link}"' in ranger_chassis_runner
+    assert 'RANGER_SPINNING_BASE_TO_CENTER_X="${RANGER_SPINNING_BASE_TO_CENTER_X:-0.0}"' in ranger_chassis_runner
+    assert 'RANGER_SPINNING_BASE_TO_CENTER_Y="${RANGER_SPINNING_BASE_TO_CENTER_Y:-0.0}"' in ranger_chassis_runner
+    assert 'RANGER_SPINNING_YAW_SCALE_POSITIVE="${RANGER_SPINNING_YAW_SCALE_POSITIVE:-0.976386}"' in ranger_chassis_runner
+    assert 'RANGER_SPINNING_YAW_SCALE_NEGATIVE="${RANGER_SPINNING_YAW_SCALE_NEGATIVE:-0.977672}"' in ranger_chassis_runner
+    assert (
+        'RANGER_DUAL_ACKERMANN_LINEAR_ODOM_SCALE="${RANGER_DUAL_ACKERMANN_LINEAR_ODOM_SCALE:-0.960}"'
+        in ranger_chassis_runner
+    )
+    assert (
+        'RANGER_DUAL_ACKERMANN_LINEAR_ODOM_SCALE_MAX_ABS_YAW_RATE="${RANGER_DUAL_ACKERMANN_LINEAR_ODOM_SCALE_MAX_ABS_YAW_RATE:-0.060}"'
+        in ranger_chassis_runner
+    )
+    assert (
+        'RANGER_DUAL_ACKERMANN_YAW_SCALE_MAX_ABS_YAW_RATE="${RANGER_DUAL_ACKERMANN_YAW_SCALE_MAX_ABS_YAW_RATE:-0.060}"'
+        in ranger_chassis_runner
+    )
+    assert (
+        'RANGER_DUAL_ACKERMANN_NEAR_STRAIGHT_YAW_SCALE_POSITIVE="${RANGER_DUAL_ACKERMANN_NEAR_STRAIGHT_YAW_SCALE_POSITIVE:-1.120}"'
+        in ranger_chassis_runner
+    )
+    assert (
+        'RANGER_DUAL_ACKERMANN_NEAR_STRAIGHT_YAW_SCALE_NEGATIVE="${RANGER_DUAL_ACKERMANN_NEAR_STRAIGHT_YAW_SCALE_NEGATIVE:-1.120}"'
+        in ranger_chassis_runner
+    )
+    assert (
+        'RANGER_DUAL_ACKERMANN_YAW_BIAS_MAX_ABS_YAW_RATE="${RANGER_DUAL_ACKERMANN_YAW_BIAS_MAX_ABS_YAW_RATE:-0.030}"'
+        in ranger_chassis_runner
+    )
+    assert (
+        'RANGER_DUAL_ACKERMANN_NEAR_STRAIGHT_YAW_BIAS_PER_METER="${RANGER_DUAL_ACKERMANN_NEAR_STRAIGHT_YAW_BIAS_PER_METER:--0.0041}"'
+        in ranger_chassis_runner
+    )
+    assert "Keep navigation base_link at the chassis motion center" in ranger_chassis_runner
+    assert "violates the canonical Nav2" in ranger_chassis_runner
+    assert '"spinning_base_to_center_x:=${RANGER_SPINNING_BASE_TO_CENTER_X}"' in ranger_chassis_runner
+    assert '"spinning_base_to_center_y:=${RANGER_SPINNING_BASE_TO_CENTER_Y}"' in ranger_chassis_runner
+    assert '"spinning_yaw_scale_positive:=${RANGER_SPINNING_YAW_SCALE_POSITIVE}"' in ranger_chassis_runner
+    assert '"spinning_yaw_scale_negative:=${RANGER_SPINNING_YAW_SCALE_NEGATIVE}"' in ranger_chassis_runner
+    assert '"dual_ackermann_odom_use_feedback_twist:=${RANGER_DUAL_ACKERMANN_ODOM_USE_FEEDBACK_TWIST}"' in ranger_chassis_runner
+    assert '"dual_ackermann_linear_odom_scale:=${RANGER_DUAL_ACKERMANN_LINEAR_ODOM_SCALE}"' in ranger_chassis_runner
+    assert (
+        '"dual_ackermann_linear_odom_scale_max_abs_yaw_rate:=${RANGER_DUAL_ACKERMANN_LINEAR_ODOM_SCALE_MAX_ABS_YAW_RATE}"'
+        in ranger_chassis_runner
+    )
+    assert (
+        '"dual_ackermann_yaw_scale_max_abs_yaw_rate:=${RANGER_DUAL_ACKERMANN_YAW_SCALE_MAX_ABS_YAW_RATE}"'
+        in ranger_chassis_runner
+    )
+    assert (
+        '"dual_ackermann_near_straight_yaw_scale_positive:=${RANGER_DUAL_ACKERMANN_NEAR_STRAIGHT_YAW_SCALE_POSITIVE}"'
+        in ranger_chassis_runner
+    )
+    assert (
+        '"dual_ackermann_near_straight_yaw_scale_negative:=${RANGER_DUAL_ACKERMANN_NEAR_STRAIGHT_YAW_SCALE_NEGATIVE}"'
+        in ranger_chassis_runner
+    )
+    assert (
+        '"dual_ackermann_yaw_bias_max_abs_yaw_rate:=${RANGER_DUAL_ACKERMANN_YAW_BIAS_MAX_ABS_YAW_RATE}"'
+        in ranger_chassis_runner
+    )
+    assert (
+        '"dual_ackermann_near_straight_yaw_bias_per_meter:=${RANGER_DUAL_ACKERMANN_NEAR_STRAIGHT_YAW_BIAS_PER_METER}"'
+        in ranger_chassis_runner
+    )
+    assert '"spinning_zero_cmd_hold_enabled:=${RANGER_SPINNING_ZERO_CMD_HOLD_ENABLED}"' in ranger_chassis_runner
+    assert (
+        '"spinning_zero_cmd_hold_wz_threshold_radps:=${RANGER_SPINNING_ZERO_CMD_HOLD_WZ_THRESHOLD_RADPS}"'
+        in ranger_chassis_runner
+    )
+    assert "const auto feedback_motion_mode = state.motion_mode_state.motion_mode" in ranger_messenger
+    assert "motion_mode_ = feedback_motion_mode" in ranger_messenger
+    assert ranger_messenger.index("motion_mode_ = feedback_motion_mode") < ranger_messenger.index("UpdateOdometry(")
+    assert 'declare_parameter<double>("dual_ackermann_linear_odom_scale", 1.0)' in ranger_messenger
+    assert 'declare_parameter<double>(\n          "dual_ackermann_linear_odom_scale_max_abs_yaw_rate", 0.06)' in ranger_messenger
+    assert 'declare_parameter<double>(\n          "dual_ackermann_yaw_scale_max_abs_yaw_rate", 0.06)' in ranger_messenger
+    assert 'declare_parameter<double>(\n          "dual_ackermann_near_straight_yaw_scale_positive", 1.0)' in ranger_messenger
+    assert 'declare_parameter<double>(\n          "dual_ackermann_near_straight_yaw_scale_negative", 1.0)' in ranger_messenger
+    assert 'declare_parameter<double>(\n          "dual_ackermann_yaw_bias_max_abs_yaw_rate", 0.03)' in ranger_messenger
+    assert 'declare_parameter<double>(\n          "dual_ackermann_near_straight_yaw_bias_per_meter", 0.0)' in ranger_messenger
+    assert "dual_ackermann_linear_odom_scale_ > 0.0" in ranger_messenger
+    assert "const bool near_straight = std::abs(yaw_rate) <= yaw_rate_scale_limit" in ranger_messenger
+    assert "const double body_vx = raw_body_vx * linear_scale" in ranger_messenger
+    assert "SelectDualAckermannYawRate(raw_body_vx, angular, angle)" in ranger_messenger
+    assert "ScaleDualAckermannYawRate(yaw_rate, linear)" in ranger_messenger
+    assert "dual_ackermann_near_straight_yaw_scale_positive_" in ranger_messenger
+    assert "dual_ackermann_near_straight_yaw_scale_negative_" in ranger_messenger
+    assert "dual_ackermann_near_straight_yaw_bias_per_meter_" in ranger_messenger
+    assert "dual_ackermann_odom_use_feedback_twist" in ranger_messenger
+    assert "dual_ackermann_linear_odom_scale" in ranger_messenger
+    assert "spinning_base_to_center_x_" in ranger_messenger
+    assert "spinning_base_to_center_y_" in ranger_messenger
+    assert "spinning_yaw_scale_positive" in ranger_messenger
+    assert "spinning_yaw_scale_negative" in ranger_messenger
+    assert "ScaleSpinningYawRate(angular)" in ranger_messenger
+    assert 'declare_parameter<bool>("spinning_zero_cmd_hold_enabled", true)' in ranger_messenger
+    assert 'declare_parameter<double>("spinning_zero_cmd_hold_wz_threshold_radps", 0.03)' in ranger_messenger
+    assert "latest_feedback_mode_changing_" in ranger_messenger
+    assert "latest_odom_twist_valid_" in ranger_messenger
+    assert "latest_odom_angular_velocity_" in ranger_messenger
+    assert "const double stop_angular_velocity" in ranger_messenger
+    assert "ShouldHoldZeroCommandInSpinningMode()" in ranger_messenger
+    assert "robot_->SetMotionCommand(0.0, 0.0, 0.0)" in ranger_messenger
+    assert "--linear-speed MPS" in cmd_vel_stop_latency
+    assert "linear_speed = float(sys.argv[3])" in cmd_vel_stop_latency
+    assert '"wheel_vx"' in cmd_vel_stop_latency
+    assert "first_time_zero_twist" in cmd_vel_stop_latency
     assert "input_base_frame: base_link" in overlay_passthrough_cfg
     assert "odom_yaw_offset_rad: 0.0" in overlay_passthrough_cfg
     assert "rotate_odom_position_with_yaw_offset: false" in overlay_passthrough_cfg
@@ -1821,8 +3050,17 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     assert "fastlio_odom_bridge_process_running()" in overlay_tf_helpers
     assert "local_state_required_processes_running()" in overlay_tf_helpers
     assert "wait_for_local_state_required_processes()" in overlay_tf_helpers
+    assert "canonical_cmdline_matches()" in overlay_tf_helpers
+    assert "CANONICAL_CMDLINE_PATTERN" in overlay_tf_helpers
+    assert 'os.listdir("/proc")' in overlay_tf_helpers
+    assert 'pgrep -f "robot_localization/ekf_node|ekf_node --ros-args.*__node:=robot_local_state"' not in overlay_tf_helpers
     assert "fastlio_odom_bridge_process_running && local_state_node_process_running" in overlay_tf_helpers
     assert 'canonical_helper_start_ready "${helper_name}"' in overlay_tf_helpers
+    assert "LOCAL_STATE_START_READY_STAGE stage=processes_ready" in overlay_tf_helpers
+    assert "LOCAL_STATE_START_READY_STAGE stage=endpoint_ready" in overlay_tf_helpers
+    assert "LOCAL_STATE_START_READY_STAGE stage=fresh_tf_ready" in overlay_tf_helpers
+    assert 'local_state_endpoint_ready "${LOCAL_STATE_START_READY_TIMEOUT_SEC:-12}" || return 1' in overlay_tf_helpers
+    assert 'local_state_runtime_ready "${LOCAL_STATE_START_READY_TIMEOUT_SEC:-12}" || return 1' in overlay_tf_helpers
     assert "helper child process did not become ready" in overlay_tf_helpers
     assert "canonical_wait_for_pid_exit()" in overlay_tf_helpers
     assert "terminate_canonical_helper_pid()" in overlay_tf_helpers
@@ -1842,6 +3080,34 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     assert 'fresh-tf "odom" "base_link" "${timeout_sec}" "${max_age_sec}"' in overlay_tf_helpers
     assert "NJRH_RUNTIME_READINESS_PROBE_EXIT_GRACE_SEC" in overlay_tf_helpers
     assert "fresh TF probe did not exit after success" in overlay_tf_helpers
+    assert "ranger_chassis_runtime_ready()" in overlay_tf_helpers
+    assert "ranger_chassis_liveness_ready()" in overlay_tf_helpers
+    assert 'wait_for_topic_publisher_from_node "/wheel/odom" "ranger_base_node"' in overlay_tf_helpers
+    assert 'wait_for_fresh_header_topic_message "/wheel/odom"' in overlay_tf_helpers
+    assert 'wait_for_topic_publisher_from_node "/motion_state" "ranger_base_node"' in overlay_tf_helpers
+    assert 'wait_for_topic_message "/motion_state"' in overlay_tf_helpers
+    assert 'canonical_process_running "${process_pattern}"' in overlay_tf_helpers
+    liveness_block = overlay_tf_helpers[
+        overlay_tf_helpers.index("ranger_chassis_liveness_ready()") :
+        overlay_tf_helpers.index("canonical_helper_ready()", overlay_tf_helpers.index("ranger_chassis_liveness_ready()"))
+    ]
+    assert 'wait_for_topic_message "/motion_state"' not in liveness_block
+    assert 'wait_for_topic_publisher_from_node "/motion_state"' not in liveness_block
+    assert 'ranger_chassis_runtime_ready "${RANGER_CHASSIS_REUSE_READY_TIMEOUT_SEC:-3}"' in overlay_tf_helpers
+    assert 'ranger_chassis_runtime_ready "${RANGER_CHASSIS_START_READY_TIMEOUT_SEC:-8}"' in overlay_tf_helpers
+    assert "RANGER_CHASSIS_START_READY_STAGE stage=topics_ready" in overlay_tf_helpers
+    assert "ranger_chassis_common_health_failures=0" in overlay_common_runner
+    assert 'NJRH_COMMON_RANGER_CHASSIS_HEALTH_MONITOR:-false' in overlay_common_runner
+    assert 'ranger_chassis_liveness_ready "${timeout_sec}"' in overlay_common_runner
+    assert "NJRH_COMMON_RANGER_CHASSIS_HEALTH_MAX_FAILURES" in overlay_common_runner
+    assert 'NJRH_COMMON_RANGER_CHASSIS_HEALTH_TIMEOUT_SEC:-3' in overlay_common_runner
+    assert 'NJRH_COMMON_RANGER_CHASSIS_HEALTH_MAX_FAILURES:-5' in overlay_common_runner
+    assert "ranger_chassis_common liveness degraded" in overlay_common_runner
+    assert "ranger_chassis_common health lost after" in overlay_common_runner
+    assert "NJRH_COMMON_RANGER_CHASSIS_HEALTH_EXIT_ON_LOSS:-false" in overlay_common_runner
+    assert "continuing because NJRH_COMMON_RANGER_CHASSIS_HEALTH_EXIT_ON_LOSS=false" in overlay_common_runner
+    assert "waiting before next health check" in overlay_common_runner
+    assert 'ranger_chassis_runtime_ready "${timeout_sec}"' not in overlay_common_runner
     assert 'local_state_runtime_ready "${LOCAL_STATE_REUSE_READY_TIMEOUT_SEC:-3}"' in overlay_tf_helpers
     assert 'local_state_runtime_ready "${LOCAL_STATE_START_READY_TIMEOUT_SEC:-12}"' in overlay_tf_helpers
     assert "helper endpoint readiness failed" not in overlay_tf_helpers
@@ -1886,6 +3152,94 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
         assert "odom0_config: [true, true, false," in cfg
         assert "false, false, true," in cfg
         assert "imu0: /lidar_imu_bias_corrected" in cfg
+    for cfg in (wheel_xy_imu_yaw_ekf_cfg, overlay_wheel_xy_imu_yaw_ekf_cfg):
+        assert "frequency: 50.0" in cfg
+        assert "two_d_mode: true" in cfg
+        assert "publish_tf: true" in cfg
+        assert "world_frame: odom" in cfg
+        assert "base_link_frame: base_link" in cfg
+        assert "odom0: /wheel/odom_ekf" in cfg
+        assert "odom0_config: [true, true, false," in cfg
+        assert "false, false, false," in cfg
+        assert "true, false, false," in cfg
+        assert "false, false, true," in cfg
+        assert "imu0: /lidar_imu_bias_corrected" in cfg
+    for cfg in (wheel_xy_imu_vyaw_ekf_cfg, overlay_wheel_xy_imu_vyaw_ekf_cfg):
+        assert "frequency: 50.0" in cfg
+        assert "two_d_mode: true" in cfg
+        assert "publish_tf: true" in cfg
+        assert "world_frame: odom" in cfg
+        assert "base_link_frame: base_link" in cfg
+        assert "odom0: /wheel/odom_ekf" in cfg
+        assert "odom0_config: [true, true, false," in cfg
+        assert "false, false, false," in cfg
+        assert "true, false, false," in cfg
+        assert "imu0: /lidar_imu_bias_corrected" in cfg
+        assert "corrected JT128 IMU gyro be the only yaw-rate measurement" in cfg
+    for cfg in (wheel_xy_diff_yaw_imu_ekf_cfg, overlay_wheel_xy_diff_yaw_imu_ekf_cfg):
+        assert "frequency: 50.0" in cfg
+        assert "two_d_mode: true" in cfg
+        assert "publish_tf: true" in cfg
+        assert "world_frame: odom" in cfg
+        assert "base_link_frame: base_link" in cfg
+        assert "odom0: /wheel/odom_ekf" in cfg
+        assert "odom0_config: [false, false, false," in cfg
+        assert "false, false, true," in cfg
+        assert "true, false, false," in cfg
+        assert "odom1: /wheel/odom_ekf" in cfg
+        assert "odom1_config: [true, true, false," in cfg
+        assert "odom1_differential: true" in cfg
+        assert "imu0: /lidar_imu_bias_corrected" in cfg
+        assert "absolute wheel pose" in cfg
+    for cfg in (wheel_pose_imu_vyaw_ekf_cfg, overlay_wheel_pose_imu_vyaw_ekf_cfg):
+        assert "frequency: 50.0" in cfg
+        assert "two_d_mode: true" in cfg
+        assert "publish_tf: true" in cfg
+        assert "world_frame: odom" in cfg
+        assert "base_link_frame: base_link" in cfg
+        assert "odom0: /wheel/odom_ekf" in cfg
+        assert "odom0_config: [true, true, false," in cfg
+        assert "false, false, true," in cfg
+        assert "true, false, false," in cfg
+        assert "false, false, false," in cfg
+        assert "imu0: /lidar_imu_bias_corrected" in cfg
+        assert "only yaw-rate input" in cfg
+    for cfg in (twist_imu_ekf_cfg, overlay_twist_imu_ekf_cfg):
+        assert "frequency: 50.0" in cfg
+        assert "two_d_mode: true" in cfg
+        assert "publish_tf: true" in cfg
+        assert "world_frame: odom" in cfg
+        assert "base_link_frame: base_link" in cfg
+        assert "odom0: /wheel/odom_ekf" in cfg
+        assert "odom0_config: [false, false, false," in cfg
+        assert "true, false, false," in cfg
+        assert "false, false, true," in cfg
+        assert "imu0: /lidar_imu_bias_corrected" in cfg
+    for cfg in (twist_imu_vyaw_only_ekf_cfg, overlay_twist_imu_vyaw_only_ekf_cfg):
+        assert "frequency: 50.0" in cfg
+        assert "two_d_mode: true" in cfg
+        assert "publish_tf: true" in cfg
+        assert "world_frame: odom" in cfg
+        assert "base_link_frame: base_link" in cfg
+        assert "odom0: /wheel/odom_ekf" in cfg
+        assert "odom0_config: [false, false, false," in cfg
+        assert "false, false, false," in cfg
+        assert "true, false, false," in cfg
+        assert "imu0: /lidar_imu_bias_corrected" in cfg
+        assert "corrected JT128 IMU gyro is the only yaw-rate measurement" in cfg
+    for cfg in (twist_wheel_yaw_imu_ekf_cfg, overlay_twist_wheel_yaw_imu_ekf_cfg):
+        assert "frequency: 50.0" in cfg
+        assert "two_d_mode: true" in cfg
+        assert "publish_tf: true" in cfg
+        assert "world_frame: odom" in cfg
+        assert "base_link_frame: base_link" in cfg
+        assert "odom0: /wheel/odom_ekf" in cfg
+        assert "odom0_config: [false, false, false," in cfg
+        assert "false, false, true," in cfg
+        assert "true, false, false," in cfg
+        assert "false, false, true," in cfg
+        assert "imu0: /lidar_imu_bias_corrected" in cfg
+        assert "do not fuse the chassis-integrated" in cfg
     for cfg in (wheel_only_ekf_cfg, overlay_wheel_only_ekf_cfg):
         assert "frequency: 50.0" in cfg
         assert "two_d_mode: true" in cfg
@@ -1911,12 +3265,287 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
         assert "pose_covariance_floor_yaw: 0.08" in wheel_cfg
         assert "apply_twist_covariance_floor: true" in wheel_cfg
         assert "twist_covariance_floor_vyaw: 0.08" in wheel_cfg
+    for wheel_cfg in (source_yaw_offset_m061_wheel_odom_cfg, overlay_yaw_offset_m061_wheel_odom_cfg):
+        assert "output_topic: /wheel/odom_ekf" in wheel_cfg
+        assert "input_odom_topic: /wheel/odom" in wheel_cfg
+        assert "publish_rate_hz: 50.0" in wheel_cfg
+        assert "anchor_pose_to_first_sample: true" in wheel_cfg
+        assert "odom_yaw_offset_rad: -0.061" in wheel_cfg
+        assert "rotate_odom_position_with_yaw_offset: true" in wheel_cfg
+        assert "apply_pose_covariance_floor: true" in wheel_cfg
+        assert "pose_covariance_floor_x: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_y: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_yaw: 0.08" in wheel_cfg
+        assert "apply_twist_covariance_floor: true" in wheel_cfg
+        assert "twist_covariance_floor_vyaw: 0.08" in wheel_cfg
+        assert "Diagnostic calibration candidate" in wheel_cfg
+    for wheel_cfg in (source_xy_shear_p062_wheel_odom_cfg, overlay_xy_shear_p062_wheel_odom_cfg):
+        assert "output_topic: /wheel/odom_ekf" in wheel_cfg
+        assert "input_odom_topic: /wheel/odom" in wheel_cfg
+        assert "publish_rate_hz: 50.0" in wheel_cfg
+        assert "anchor_pose_to_first_sample: true" in wheel_cfg
+        assert "odom_yaw_offset_rad: 0.0" in wheel_cfg
+        assert "rotate_odom_position_with_yaw_offset: false" in wheel_cfg
+        assert "odom_position_scale_x: 1.0" in wheel_cfg
+        assert "odom_position_scale_y: 1.0" in wheel_cfg
+        assert "odom_position_y_to_x_shear: 0.062" in wheel_cfg
+        assert "odom_position_x_to_y_shear: 0.0" in wheel_cfg
+        assert "apply_pose_covariance_floor: true" in wheel_cfg
+        assert "pose_covariance_floor_yaw: 0.08" in wheel_cfg
+        assert "apply_twist_covariance_floor: true" in wheel_cfg
+        assert "twist_covariance_floor_vyaw: 0.08" in wheel_cfg
+        assert "Diagnostic shear candidate" in wheel_cfg
+    for wheel_cfg in (source_xy_lateral_m061_wheel_odom_cfg, overlay_xy_lateral_m061_wheel_odom_cfg):
+        assert "output_topic: /wheel/odom_ekf" in wheel_cfg
+        assert "input_odom_topic: /wheel/odom" in wheel_cfg
+        assert "publish_rate_hz: 50.0" in wheel_cfg
+        assert "anchor_pose_to_first_sample: true" in wheel_cfg
+        assert "odom_yaw_offset_rad: 0.0" in wheel_cfg
+        assert "rotate_odom_position_with_yaw_offset: false" in wheel_cfg
+        assert "odom_position_scale_x: 1.0" in wheel_cfg
+        assert "odom_position_scale_y: 1.0" in wheel_cfg
+        assert "odom_position_y_to_x_shear: 0.0" in wheel_cfg
+        assert "odom_position_x_to_y_shear: -0.061" in wheel_cfg
+        assert "apply_pose_covariance_floor: true" in wheel_cfg
+        assert "pose_covariance_floor_yaw: 0.08" in wheel_cfg
+        assert "apply_twist_covariance_floor: true" in wheel_cfg
+        assert "twist_covariance_floor_vyaw: 0.08" in wheel_cfg
+        assert "Diagnostic body-lateral candidate" in wheel_cfg
+    for wheel_cfg in (source_xy_lateral_m040_wheel_odom_cfg, overlay_xy_lateral_m040_wheel_odom_cfg):
+        assert "output_topic: /wheel/odom_ekf" in wheel_cfg
+        assert "input_odom_topic: /wheel/odom" in wheel_cfg
+        assert "publish_rate_hz: 50.0" in wheel_cfg
+        assert "anchor_pose_to_first_sample: true" in wheel_cfg
+        assert "odom_yaw_offset_rad: 0.0" in wheel_cfg
+        assert "rotate_odom_position_with_yaw_offset: false" in wheel_cfg
+        assert "odom_position_scale_x: 1.0" in wheel_cfg
+        assert "odom_position_scale_y: 1.0" in wheel_cfg
+        assert "odom_position_y_to_x_shear: 0.0" in wheel_cfg
+        assert "odom_position_x_to_y_shear: -0.040" in wheel_cfg
+        assert "apply_pose_covariance_floor: true" in wheel_cfg
+        assert "pose_covariance_floor_yaw: 0.08" in wheel_cfg
+        assert "apply_twist_covariance_floor: true" in wheel_cfg
+        assert "twist_covariance_floor_vyaw: 0.08" in wheel_cfg
+        assert "Diagnostic small body-lateral candidate" in wheel_cfg
+    for wheel_cfg in (source_xy_lateral_m050_wheel_odom_cfg, overlay_xy_lateral_m050_wheel_odom_cfg):
+        assert "output_topic: /wheel/odom_ekf" in wheel_cfg
+        assert "input_odom_topic: /wheel/odom" in wheel_cfg
+        assert "publish_rate_hz: 50.0" in wheel_cfg
+        assert "anchor_pose_to_first_sample: true" in wheel_cfg
+        assert "odom_yaw_offset_rad: 0.0" in wheel_cfg
+        assert "rotate_odom_position_with_yaw_offset: false" in wheel_cfg
+        assert "odom_position_scale_x: 1.0" in wheel_cfg
+        assert "odom_position_scale_y: 1.0" in wheel_cfg
+        assert "odom_position_y_to_x_shear: 0.0" in wheel_cfg
+        assert "odom_position_x_to_y_shear: -0.050" in wheel_cfg
+        assert "apply_pose_covariance_floor: true" in wheel_cfg
+        assert "pose_covariance_floor_yaw: 0.08" in wheel_cfg
+        assert "apply_twist_covariance_floor: true" in wheel_cfg
+        assert "twist_covariance_floor_vyaw: 0.08" in wheel_cfg
+        assert "Diagnostic interpolated body-lateral candidate" in wheel_cfg
+    for wheel_cfg in (source_xy_lateral_m085_wheel_odom_cfg, overlay_xy_lateral_m085_wheel_odom_cfg):
+        assert "output_topic: /wheel/odom_ekf" in wheel_cfg
+        assert "input_odom_topic: /wheel/odom" in wheel_cfg
+        assert "publish_rate_hz: 50.0" in wheel_cfg
+        assert "anchor_pose_to_first_sample: true" in wheel_cfg
+        assert "odom_yaw_offset_rad: 0.0" in wheel_cfg
+        assert "rotate_odom_position_with_yaw_offset: false" in wheel_cfg
+        assert "odom_position_scale_x: 1.0" in wheel_cfg
+        assert "odom_position_scale_y: 1.0" in wheel_cfg
+        assert "odom_position_y_to_x_shear: 0.0" in wheel_cfg
+        assert "odom_position_x_to_y_shear: -0.085" in wheel_cfg
+        assert "apply_pose_covariance_floor: true" in wheel_cfg
+        assert "pose_covariance_floor_yaw: 0.08" in wheel_cfg
+        assert "apply_twist_covariance_floor: true" in wheel_cfg
+        assert "twist_covariance_floor_vyaw: 0.08" in wheel_cfg
+        assert "Diagnostic mid body-lateral candidate" in wheel_cfg
+    for wheel_cfg in (source_xy_lateral_m120_wheel_odom_cfg, overlay_xy_lateral_m120_wheel_odom_cfg):
+        assert "output_topic: /wheel/odom_ekf" in wheel_cfg
+        assert "input_odom_topic: /wheel/odom" in wheel_cfg
+        assert "publish_rate_hz: 50.0" in wheel_cfg
+        assert "anchor_pose_to_first_sample: true" in wheel_cfg
+        assert "odom_yaw_offset_rad: 0.0" in wheel_cfg
+        assert "rotate_odom_position_with_yaw_offset: false" in wheel_cfg
+        assert "odom_position_scale_x: 1.0" in wheel_cfg
+        assert "odom_position_scale_y: 1.0" in wheel_cfg
+        assert "odom_position_y_to_x_shear: 0.0" in wheel_cfg
+        assert "odom_position_x_to_y_shear: -0.120" in wheel_cfg
+        assert "apply_pose_covariance_floor: true" in wheel_cfg
+        assert "pose_covariance_floor_yaw: 0.08" in wheel_cfg
+        assert "apply_twist_covariance_floor: true" in wheel_cfg
+        assert "twist_covariance_floor_vyaw: 0.08" in wheel_cfg
+        assert "Diagnostic stronger body-lateral candidate" in wheel_cfg
+    for wheel_cfg in (
+        source_xy_lateral_soft_yaw_016_wheel_odom_cfg,
+        overlay_xy_lateral_soft_yaw_016_wheel_odom_cfg,
+    ):
+        assert "output_topic: /wheel/odom_ekf" in wheel_cfg
+        assert "input_odom_topic: /wheel/odom" in wheel_cfg
+        assert "publish_rate_hz: 50.0" in wheel_cfg
+        assert "anchor_pose_to_first_sample: true" in wheel_cfg
+        assert "odom_yaw_offset_rad: 0.0" in wheel_cfg
+        assert "rotate_odom_position_with_yaw_offset: false" in wheel_cfg
+        assert "odom_position_scale_x: 1.0" in wheel_cfg
+        assert "odom_position_scale_y: 1.0" in wheel_cfg
+        assert "odom_position_y_to_x_shear: 0.0" in wheel_cfg
+        assert "odom_position_x_to_y_shear: -0.061" in wheel_cfg
+        assert "apply_pose_covariance_floor: true" in wheel_cfg
+        assert "pose_covariance_floor_yaw: 0.16" in wheel_cfg
+        assert "apply_twist_covariance_floor: true" in wheel_cfg
+        assert "twist_covariance_floor_vyaw: 0.16" in wheel_cfg
+        assert "Diagnostic combo candidate" in wheel_cfg
+    for wheel_cfg in (
+        source_xy_lateral_yaw_p979_n1011_wheel_odom_cfg,
+        overlay_xy_lateral_yaw_p979_n1011_wheel_odom_cfg,
+    ):
+        assert "output_topic: /wheel/odom_ekf" in wheel_cfg
+        assert "input_odom_topic: /wheel/odom" in wheel_cfg
+        assert "publish_rate_hz: 50.0" in wheel_cfg
+        assert "anchor_pose_to_first_sample: true" in wheel_cfg
+        assert "odom_yaw_offset_rad: 0.0" in wheel_cfg
+        assert "rotate_odom_position_with_yaw_offset: false" in wheel_cfg
+        assert "odom_position_scale_x: 1.0" in wheel_cfg
+        assert "odom_position_scale_y: 1.0" in wheel_cfg
+        assert "odom_position_y_to_x_shear: 0.0" in wheel_cfg
+        assert "odom_position_x_to_y_shear: -0.061" in wheel_cfg
+        assert "odom_yaw_scale_positive: 0.979" in wheel_cfg
+        assert "odom_yaw_scale_negative: 1.011" in wheel_cfg
+        assert "scale_odom_twist_with_yaw_scale: true" in wheel_cfg
+        assert "apply_pose_covariance_floor: true" in wheel_cfg
+        assert "pose_covariance_floor_yaw: 0.08" in wheel_cfg
+        assert "apply_twist_covariance_floor: true" in wheel_cfg
+        assert "twist_covariance_floor_vyaw: 0.08" in wheel_cfg
+        assert "Diagnostic combined calibration" in wheel_cfg
+    for wheel_cfg in (source_pose_soft_yaw_015_wheel_odom_cfg, overlay_pose_soft_yaw_015_wheel_odom_cfg):
+        assert "output_topic: /wheel/odom_ekf" in wheel_cfg
+        assert "input_odom_topic: /wheel/odom" in wheel_cfg
+        assert "publish_rate_hz: 50.0" in wheel_cfg
+        assert "anchor_pose_to_first_sample: true" in wheel_cfg
+        assert "apply_pose_covariance_floor: true" in wheel_cfg
+        assert "pose_covariance_floor_x: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_y: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_yaw: 0.15" in wheel_cfg
+        assert "apply_twist_covariance_floor: true" in wheel_cfg
+        assert "twist_covariance_floor_vyaw: 0.08" in wheel_cfg
+        assert "soften integrated wheel yaw while keeping wheel yaw-rate" in wheel_cfg
+    for wheel_cfg in (source_twist_soft_yaw_015_wheel_odom_cfg, overlay_twist_soft_yaw_015_wheel_odom_cfg):
+        assert "output_topic: /wheel/odom_ekf" in wheel_cfg
+        assert "input_odom_topic: /wheel/odom" in wheel_cfg
+        assert "publish_rate_hz: 50.0" in wheel_cfg
+        assert "anchor_pose_to_first_sample: true" in wheel_cfg
+        assert "apply_pose_covariance_floor: true" in wheel_cfg
+        assert "pose_covariance_floor_x: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_y: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_yaw: 0.08" in wheel_cfg
+        assert "apply_twist_covariance_floor: true" in wheel_cfg
+        assert "twist_covariance_floor_vyaw: 0.15" in wheel_cfg
+        assert "soften wheel" in wheel_cfg
+    for wheel_cfg in (source_twist_soft_yaw_012_wheel_odom_cfg, overlay_twist_soft_yaw_012_wheel_odom_cfg):
+        assert "output_topic: /wheel/odom_ekf" in wheel_cfg
+        assert "input_odom_topic: /wheel/odom" in wheel_cfg
+        assert "publish_rate_hz: 50.0" in wheel_cfg
+        assert "anchor_pose_to_first_sample: true" in wheel_cfg
+        assert "apply_pose_covariance_floor: true" in wheel_cfg
+        assert "pose_covariance_floor_x: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_y: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_yaw: 0.08" in wheel_cfg
+        assert "apply_twist_covariance_floor: true" in wheel_cfg
+        assert "twist_covariance_floor_vyaw: 0.12" in wheel_cfg
+        assert "larger 0.15 candidate" in wheel_cfg
+    for wheel_cfg in (source_twist_soft_yaw_010_wheel_odom_cfg, overlay_twist_soft_yaw_010_wheel_odom_cfg):
+        assert "output_topic: /wheel/odom_ekf" in wheel_cfg
+        assert "input_odom_topic: /wheel/odom" in wheel_cfg
+        assert "publish_rate_hz: 50.0" in wheel_cfg
+        assert "anchor_pose_to_first_sample: true" in wheel_cfg
+        assert "apply_pose_covariance_floor: true" in wheel_cfg
+        assert "pose_covariance_floor_x: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_y: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_yaw: 0.08" in wheel_cfg
+        assert "apply_twist_covariance_floor: true" in wheel_cfg
+        assert "twist_covariance_floor_vyaw: 0.10" in wheel_cfg
+        assert "smallest yaw-rate-only step above the stable 0.08 default" in wheel_cfg
+    for wheel_cfg in (source_soft_yaw_018_wheel_odom_cfg, overlay_soft_yaw_018_wheel_odom_cfg):
+        assert "output_topic: /wheel/odom_ekf" in wheel_cfg
+        assert "input_odom_topic: /wheel/odom" in wheel_cfg
+        assert "publish_rate_hz: 50.0" in wheel_cfg
+        assert "anchor_pose_to_first_sample: true" in wheel_cfg
+        assert "apply_pose_covariance_floor: true" in wheel_cfg
+        assert "pose_covariance_floor_x: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_y: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_yaw: 0.18" in wheel_cfg
+        assert "apply_twist_covariance_floor: true" in wheel_cfg
+        assert "twist_covariance_floor_vyaw: 0.18" in wheel_cfg
+        assert "slightly softer than the 0.15 candidate" in wheel_cfg
+    for wheel_cfg in (source_soft_yaw_016_wheel_odom_cfg, overlay_soft_yaw_016_wheel_odom_cfg):
+        assert "output_topic: /wheel/odom_ekf" in wheel_cfg
+        assert "input_odom_topic: /wheel/odom" in wheel_cfg
+        assert "publish_rate_hz: 50.0" in wheel_cfg
+        assert "anchor_pose_to_first_sample: true" in wheel_cfg
+        assert "apply_pose_covariance_floor: true" in wheel_cfg
+        assert "pose_covariance_floor_x: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_y: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_yaw: 0.16" in wheel_cfg
+        assert "apply_twist_covariance_floor: true" in wheel_cfg
+        assert "twist_covariance_floor_vyaw: 0.16" in wheel_cfg
+        assert "just softer than the 0.15 candidate" in wheel_cfg
+    for wheel_cfg in (source_soft_yaw_010_wheel_odom_cfg, overlay_soft_yaw_010_wheel_odom_cfg):
+        assert "output_topic: /wheel/odom_ekf" in wheel_cfg
+        assert "input_odom_topic: /wheel/odom" in wheel_cfg
+        assert "publish_rate_hz: 50.0" in wheel_cfg
+        assert "anchor_pose_to_first_sample: true" in wheel_cfg
+        assert "apply_pose_covariance_floor: true" in wheel_cfg
+        assert "pose_covariance_floor_x: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_y: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_yaw: 0.10" in wheel_cfg
+        assert "apply_twist_covariance_floor: true" in wheel_cfg
+        assert "twist_covariance_floor_vyaw: 0.10" in wheel_cfg
+        assert "smallest soft-yaw step above the stable 0.08 default" in wheel_cfg
+    for wheel_cfg in (source_soft_yaw_014_wheel_odom_cfg, overlay_soft_yaw_014_wheel_odom_cfg):
+        assert "output_topic: /wheel/odom_ekf" in wheel_cfg
+        assert "input_odom_topic: /wheel/odom" in wheel_cfg
+        assert "publish_rate_hz: 50.0" in wheel_cfg
+        assert "anchor_pose_to_first_sample: true" in wheel_cfg
+        assert "apply_pose_covariance_floor: true" in wheel_cfg
+        assert "pose_covariance_floor_x: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_y: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_yaw: 0.14" in wheel_cfg
+        assert "apply_twist_covariance_floor: true" in wheel_cfg
+        assert "twist_covariance_floor_vyaw: 0.14" in wheel_cfg
+        assert "slightly firmer than the 0.15 candidate" in wheel_cfg
+    for wheel_cfg in (source_soft_yaw_wheel_odom_cfg, overlay_soft_yaw_wheel_odom_cfg):
+        assert "output_topic: /wheel/odom_ekf" in wheel_cfg
+        assert "input_odom_topic: /wheel/odom" in wheel_cfg
+        assert "publish_rate_hz: 50.0" in wheel_cfg
+        assert "anchor_pose_to_first_sample: true" in wheel_cfg
+        assert "apply_pose_covariance_floor: true" in wheel_cfg
+        assert "pose_covariance_floor_x: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_y: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_yaw: 0.25" in wheel_cfg
+        assert "apply_twist_covariance_floor: true" in wheel_cfg
+        assert "twist_covariance_floor_vyaw: 0.25" in wheel_cfg
+        assert "make wheel heading less dominant" in wheel_cfg
+    for wheel_cfg in (source_soft_yaw_015_wheel_odom_cfg, overlay_soft_yaw_015_wheel_odom_cfg):
+        assert "output_topic: /wheel/odom_ekf" in wheel_cfg
+        assert "input_odom_topic: /wheel/odom" in wheel_cfg
+        assert "publish_rate_hz: 50.0" in wheel_cfg
+        assert "anchor_pose_to_first_sample: true" in wheel_cfg
+        assert "apply_pose_covariance_floor: true" in wheel_cfg
+        assert "pose_covariance_floor_x: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_y: 0.05" in wheel_cfg
+        assert "pose_covariance_floor_yaw: 0.15" in wheel_cfg
+        assert "apply_twist_covariance_floor: true" in wheel_cfg
+        assert "twist_covariance_floor_vyaw: 0.15" in wheel_cfg
+        assert "moderate wheel-heading softening" in wheel_cfg
     for imu_cfg in (source_imu_bias_cfg, overlay_imu_bias_cfg):
         assert "imu_topic: /lidar_imu" in imu_cfg
         assert "odom_topic: /wheel/odom_ekf" in imu_cfg
         assert "cmd_vel_topic: /cmd_vel_safe" in imu_cfg
         assert "output_imu_topic: /lidar_imu_bias_corrected" in imu_cfg
         assert "bias_topic: /local_state/imu_bias" in imu_cfg
+        assert "transform_output_to_target_frame: true" in imu_cfg
+        assert "output_target_frame: base_link" in imu_cfg
+        assert "transform_lookup_timeout_sec: 0.02" in imu_cfg
+        assert "drop_output_on_transform_failure: true" in imu_cfg
         assert "stationary_required_sec: 1.0" in imu_cfg
         assert "accumulator_alpha: 0.02" in imu_cfg
         assert "zero_output_when_stationary: true" in imu_cfg
@@ -1933,6 +3562,10 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     assert "imu_topic: /lidar_imu_bias_corrected" not in mapping_fastlio_cfg
     assert 'declare_parameter<std::string>("output_imu_topic", "/lidar_imu_bias_corrected")' in imu_bias_node
     assert 'declare_parameter<std::string>("bias_topic", "/local_state/imu_bias")' in imu_bias_node
+    assert 'declare_parameter<bool>("transform_output_to_target_frame", false)' in imu_bias_node
+    assert 'declare_parameter<std::string>("output_target_frame", "base_link")' in imu_bias_node
+    assert 'declare_parameter<double>("transform_lookup_timeout_sec", 0.02)' in imu_bias_node
+    assert 'declare_parameter<bool>("drop_output_on_transform_failure", true)' in imu_bias_node
     assert 'declare_parameter<double>("corrected_output_rate_hz", 100.0)' in imu_bias_node
     assert 'declare_parameter<double>("bias_publish_rate_hz", 10.0)' in imu_bias_node
     assert 'declare_parameter<bool>("corrected_output_latest_on_timer", true)' in imu_bias_node
@@ -1941,8 +3574,11 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     assert 'declare_parameter<bool>("bias_publish_preserve_source_stamp", true)' in imu_bias_node
     assert "stationary_confirmed" in imu_bias_node
     assert "sample_is_safe_for_bias_update" in imu_bias_node
+    assert "lookupTransform(" in imu_bias_node
+    assert "rotate_covariance(" in imu_bias_node
+    assert "corrected.header.frame_id = output_target_frame_" in imu_bias_node
     assert "create_publisher<sensor_msgs::msg::Imu>(" in imu_bias_node
-    assert "rclcpp::QoS(100)" in imu_bias_node
+    assert "rclcpp::SensorDataQoS().keep_last(100)" in imu_bias_node
     assert "corrected_output_timer_" in imu_bias_node
     assert "bias_publish_timer_" in imu_bias_node
     assert "latest_corrected_imu_" in imu_bias_node
@@ -1956,12 +3592,45 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     assert "LOCAL_STATE_EKF_PROFILE_FILE" in common_env
     assert "local_state_ekf_profile.env" in common_env
     assert 'source "${LOCAL_STATE_EKF_PROFILE_FILE}"' in common_env
-    assert 'export NJRH_LOCAL_STATE_EKF_PROFILE="${NJRH_LOCAL_STATE_EKF_PROFILE:-wheel_only}"' in local_state_ekf_profile_env
+    assert (
+        'export NJRH_LOCAL_STATE_EKF_PROFILE="${NJRH_LOCAL_STATE_EKF_PROFILE:-wheel_only}"'
+        in local_state_ekf_profile_env
+    )
+    assert "wheel_pose_imu_vyaw" in local_state_ekf_profile_env
+    assert "wheel_imu_pose_soft_yaw_015" in local_state_ekf_profile_env
+    assert "wheel_imu_twist_soft_yaw_012" in local_state_ekf_profile_env
+    assert "wheel_imu_twist_soft_yaw_010" in local_state_ekf_profile_env
+    assert "wheel_imu_twist_soft_yaw_015" in local_state_ekf_profile_env
+    assert "wheel_imu_yaw_offset_m061" in local_state_ekf_profile_env
+    assert "wheel_imu_xy_shear_p062" in local_state_ekf_profile_env
+    assert "wheel_imu_xy_lateral_m061" in local_state_ekf_profile_env
+    assert "wheel_imu_xy_lateral_m040" in local_state_ekf_profile_env
+    assert "wheel_imu_xy_lateral_m050" in local_state_ekf_profile_env
+    assert "wheel_imu_xy_lateral_m085" in local_state_ekf_profile_env
+    assert "wheel_imu_xy_lateral_m120" in local_state_ekf_profile_env
+    assert "wheel_imu_xy_lateral_soft_yaw_016" in local_state_ekf_profile_env
+    assert "wheel_imu_xy_lateral_yaw_p979_n1011" in local_state_ekf_profile_env
+    assert "wheel_imu_soft_yaw_018" in local_state_ekf_profile_env
+    assert "wheel_imu_soft_yaw_016" in local_state_ekf_profile_env
+    assert "wheel_imu_soft_yaw_010" in local_state_ekf_profile_env
+    assert "wheel_imu_soft_yaw_015" in local_state_ekf_profile_env
+    assert "wheel_imu_soft_yaw_014" in local_state_ekf_profile_env
+    assert "wheel_imu_soft_yaw" in local_state_ekf_profile_env
+    assert "wheel_xy_imu_vyaw" in local_state_ekf_profile_env
+    assert "wheel_xy_imu_yaw" in local_state_ekf_profile_env
+    assert "wheel_xy_diff_yaw_imu" in local_state_ekf_profile_env
+    assert "twist_imu" in local_state_ekf_profile_env
+    assert "twist_imu_vyaw_only" in local_state_ekf_profile_env
+    assert "twist_wheel_yaw_imu" in local_state_ekf_profile_env
     assert "wheel_imu" in local_state_ekf_profile_env
     assert "record_rate /lidar_imu " in verify_local_state_rates
-    assert "record_rate /lidar_imu_bias_corrected " in verify_local_state_rates
+    assert "record_rate /lidar_imu_bias_corrected 30 best_effort" in verify_local_state_rates
     assert "record_rate /local_state/imu_bias " in verify_local_state_rates
-    assert "LOCAL_STATE_EKF_PROFILE=wheel_only skips IMU rate checks" in verify_local_state_rates
+    assert "ReliabilityPolicy.BEST_EFFORT" in verify_local_state_rates
+    assert "candidate == node || candidate == \"/\" node" in verify_local_state_rates
+    assert "LOCAL_STATE_IMU_BIAS_FILTER_ENABLED=false skips corrected IMU rate checks" in verify_local_state_rates
+    assert "/lidar_imu_bias_corrected has imu_gyro_bias_filter publisher" in verify_local_state_rates
+    assert "/lidar_imu_bias_corrected is missing imu_gyro_bias_filter publisher" in verify_local_state_rates
     assert "wheel_only profile must not have EKF subscriber on /lidar_imu_bias_corrected" in verify_local_state_rates
     assert "wheel_only profile has no EKF subscriber on /lidar_imu_bias_corrected" in verify_local_state_rates
     assert "record_rate /wheel/odom_ekf " in verify_local_state_rates
@@ -1984,6 +3653,395 @@ def test_local_state_uses_robot_localization_ekf_with_system_time_driver():
     assert "angular_velocity_covariance_diagonal:" in imu_remap_cfg
     assert "- 0.25" in imu_remap_cfg
     assert "mark_orientation_unavailable: true" in imu_remap_cfg
+
+
+def test_ekf_ab_report_validator_rejects_dirty_navigation_samples(tmp_path):
+    script_path = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "validate_ekf_ab_report.py"
+    )
+    replay_script_path = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "replay_navigation_pingpong_ekf_gate.py"
+    )
+    profile_ab_script = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "run_ekf_profile_delivery_ab_guarded.sh"
+    ).read_text(encoding="utf-8")
+    pingpong_script = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "run_navigation_delivery_pingpong_guarded.sh"
+    ).read_text(encoding="utf-8")
+    script_text = script_path.read_text(encoding="utf-8")
+    replay_script = replay_script_path.read_text(encoding="utf-8")
+    assert "offline-only" in script_text
+    assert "ros2 " not in script_text
+    assert "curl " not in script_text
+    assert "final_pose_verified_not_true" in script_text
+    assert "post_relocalize_trigger_not_accepted" in script_text
+    assert "trace_last_api_nav_state_not_succeeded" in script_text
+    assert "--max-map-base-translation-m" in script_text
+    assert "--max-map-odom-translation-m" in script_text
+    assert 'VALIDATOR="${SCRIPT_DIR}/validate_ekf_ab_report.py"' in pingpong_script
+    assert "--max-online-xy-m" in pingpong_script
+    assert "--max-online-yaw-rad" in pingpong_script
+    assert "--target-a" in pingpong_script
+    assert "--target-b" in pingpong_script
+    assert "normalize_delivery_id()" in pingpong_script
+    assert 'run_navigation_pose_error_test.sh" \\' in pingpong_script
+    assert '--pose-id "$(pose_id_for_target "${target}")"' in pingpong_script
+    assert "--goal-completion-policy" in pingpong_script
+    assert 'GOAL_COMPLETION_POLICY="pose_required"' in pingpong_script
+    assert '--goal-completion-policy "${GOAL_COMPLETION_POLICY}"' in pingpong_script
+    assert "--inter-leg-ready-timeout-sec" in pingpong_script
+    assert "wait_for_api_navigation_ready()" in pingpong_script
+    assert '"post_relocalization_settle_complete"' in pingpong_script
+    assert '"active_navigation_goal"' in pingpong_script
+    assert "stop_api_not_ready" in pingpong_script
+    assert "--max-map-base-translation-m" in pingpong_script
+    assert "--max-map-odom-translation-m" in pingpong_script
+    assert "--max-correction-yaw-deg" in pingpong_script
+    assert "leg${leg}_delivery_${target}_ekf_ab_validation.json" in pingpong_script
+    assert "validator_rc" in pingpong_script
+    assert "stop_ekf_ab_rejected" in pingpong_script
+    assert "correction_metrics.json" not in pingpong_script
+    assert "read-only/offline helper" in replay_script
+    assert "never sends navigation goals" in replay_script
+    assert "never triggers relocalization" in replay_script
+    assert "never publishes velocity" in replay_script
+    assert "import validate_ekf_ab_report as validator" in replay_script
+    assert "--pose-report" in replay_script
+    assert "--trace-report" in replay_script
+    assert "replay_results.json" in replay_script
+    assert "summary.md" in replay_script
+    assert "ros2 " not in replay_script
+    assert "curl " not in replay_script
+    assert 'APPLY="false"' in profile_ab_script
+    assert 'PREFLIGHT_ONLY="false"' in profile_ab_script
+    assert "--apply" in profile_ab_script
+    assert "--preflight-only" in profile_ab_script
+    assert "--target-a" in profile_ab_script
+    assert "--target-b" in profile_ab_script
+    assert "normalize_delivery_id()" in profile_ab_script
+    assert "parse_poses_yaml" in profile_ab_script
+    assert "--target-a ${TARGET_A} --target-b ${TARGET_B}" in profile_ab_script
+    assert "Default mode is dry-run" in profile_ab_script
+    assert "does not restart" in profile_ab_script
+    assert "Does not restart nodes or move the robot" in profile_ab_script
+    assert "wheel_imu_twist_soft_yaw_012|twist_soft_yaw_012" in profile_ab_script
+    assert "wheel_imu_twist_soft_yaw_010|twist_soft_yaw_010" in profile_ab_script
+    assert "--nav-restart-ready-timeout-sec" in profile_ab_script
+    assert "send navigation goals" in profile_ab_script
+    assert "--expected-start" in profile_ab_script
+    assert "--start-guard-policy" in profile_ab_script
+    assert 'START_GUARD_POLICY="readiness_only"' in profile_ab_script
+    assert "readiness_only|pose_required" in profile_ab_script
+    assert 'policy=${START_GUARD_POLICY}' in profile_ab_script
+    assert 'EXPECTED_START="${TARGET_B}"' in profile_ab_script
+    assert 'EXPECTED_START="${TARGET_A}"' in profile_ab_script
+    assert "--max-start-xy-m" in profile_ab_script
+    assert "--max-start-yaw-deg" in profile_ab_script
+    assert "--goal-completion-policy" in profile_ab_script
+    assert 'GOAL_COMPLETION_POLICY="pose_required"' in profile_ab_script
+    assert '--goal-completion-policy "${GOAL_COMPLETION_POLICY}"' in profile_ab_script
+    assert "--goal-completion-policy ${GOAL_COMPLETION_POLICY}" in profile_ab_script
+    assert "run_start_guard()" in profile_ab_script
+    assert '"start_guard_policy": policy' in profile_ab_script
+    assert '"pose_within_start_gate": pose_ok' in profile_ab_script
+    assert "pose_ok or not pose_required" in profile_ab_script
+    assert 'get_json("/api/v1/robot/pose")' in profile_ab_script
+    assert 'get_json("/api/v1/navigation/state")' in profile_ab_script
+    assert 'get_json("/api/v1/status")' in profile_ab_script
+    assert 'status_response.get("localization")' in profile_ab_script
+    assert "safe_for_goal_start" in profile_ab_script
+    assert "safe_for_goal_start is True" in profile_ab_script
+    assert "active_navigation_goal" in profile_ab_script
+    assert 'if [[ "${PREFLIGHT_ONLY}" == "true" ]]; then' in profile_ab_script
+    assert "preflight-only complete rc=" in profile_ab_script
+    assert "no EKF profile switch or navigation was executed" in profile_ab_script
+    assert "start guard failed; no EKF profile switch or navigation was executed" in profile_ab_script
+    assert 'RESTORE_PROFILE="wheel_only"' in profile_ab_script
+    assert "trap restore_stable_profile EXIT" in profile_ab_script
+    assert "LOCAL_STATE_EKF_PROFILE=${profile}" in profile_ab_script
+    assert "NJRH_LOCAL_STATE_EKF_PROFILE=${profile}" in profile_ab_script
+    assert "LOCAL_STATE_EKF_PROFILE=${PROFILE}" in profile_ab_script
+    assert "restart_navigation_runtime_with_profile()" in profile_ab_script
+    assert 'FULL_RUNTIME_RESTART_CMD="${NJRH_FULL_RUNTIME_RESTART_CMD:-sudo systemctl restart njrh-runtime.service}"' in profile_ab_script
+    assert 'RUNTIME_OVERRIDE_ENV="${NJRH_RUNTIME_OVERRIDE_ENV:-/tmp/njrh_runtime_override.env}"' in profile_ab_script
+    assert "write_runtime_override_profile()" in profile_ab_script
+    assert "restart_full_runtime_owner()" in profile_ab_script
+    assert "NJRH_NAV_LOCAL_STATE_MODE=ekf" in profile_ab_script
+    assert 'bash -lc "${FULL_RUNTIME_RESTART_CMD}"' in profile_ab_script
+    assert 'bash "${SCRIPT_DIR}/stop_floor_navigation.sh"' not in profile_ab_script
+    assert 'nohup bash "${SCRIPT_DIR}/run_floor_navigation.sh"' not in profile_ab_script
+    assert 'bash "${SCRIPT_DIR}/check_commercial_runtime_ready.sh"' in profile_ab_script
+    assert "wait_for_api_navigation_ready()" in profile_ab_script
+    assert "run_api_ready_relocalize()" in profile_ab_script
+    assert "api_ready_relocalize_${label}_${profile}" in profile_ab_script
+    assert "ekf_ab_${label}_${profile}_api_ready_seed" in profile_ab_script
+    assert 'api_get("/api/v1/status")' in profile_ab_script
+    assert 'api_get("/api/v1/navigation/state")' in profile_ab_script
+    assert '"safe_for_goal_start"' in profile_ab_script
+    assert "API navigation context profile=${profile} did not become ready" in profile_ab_script
+    assert "run_local_state.sh" not in profile_ab_script
+    assert "start_local_state_profile" not in profile_ab_script
+    assert "capture_relocalize_correction_compare.sh" in profile_ab_script
+    assert "run_navigation_delivery_pingpong_guarded.sh" in profile_ab_script
+    assert "restore_relocalize" in profile_ab_script
+    assert "pre_ab_relocalize" in profile_ab_script
+    assert profile_ab_script.index('run_api_ready_relocalize "${profile}" "${label}"') < profile_ab_script.index('wait_for_api_navigation_ready "${profile}" "${label}"')
+    assert "movement_path" in profile_ab_script
+    assert "robot_api_server/Nav2 -> robot_safety -> chassis" in profile_ab_script
+    assert profile_ab_script.index('if [[ "${PREFLIGHT_ONLY}" == "true" ]]; then') < profile_ab_script.index('if [[ "${APPLY}" != "true" ]]; then')
+    assert profile_ab_script.index('run_start_guard "${OUT_DIR}/start_guard"\nstart_guard_rc=$?') < profile_ab_script.index("trap restore_stable_profile EXIT")
+    assert profile_ab_script.index("trap restore_stable_profile EXIT") < profile_ab_script.index('restart_navigation_runtime_with_profile "${PROFILE}" "candidate"')
+    assert "ros2 topic pub" not in profile_ab_script
+    assert "ros2 action send_goal" not in profile_ab_script
+    assert "curl " not in profile_ab_script
+
+    clean = tmp_path / "clean_pose"
+    clean_post = clean / "post_relocalize_compare"
+    clean_post.mkdir(parents=True)
+    clean.joinpath("summary.md").write_text(
+        "\n".join(
+            [
+                "# Navigation Pose Error Test Summary",
+                "- state: `succeeded`",
+                "- phase: `final_pose_verified`",
+                "- nav2_result_code: `4`",
+                "- final_distance_m: `0.120`",
+                "- final_yaw_error_rad: `0.030`",
+                "- final_pose_verified: `True`",
+                "- relocalize_exit_code: `0`",
+                "- map_base_link_delta: translation_m=`0.200`, dyaw_deg=`1.000`, forward_m=`0.0`, left_m=`0.0`",
+                "- map_odom_delta: translation_m=`0.100`, dyaw_deg=`1.000`, forward_m=`0.0`, left_m=`0.0`",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    clean_post.joinpath("summary.md").write_text(
+        "\n".join(
+            [
+                "# Relocalize Correction Compare",
+                "- trigger_accepted: `true`",
+                "- trigger_message: `bridge accepted result gate_mode=triggered`",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    dirty = tmp_path / "dirty_pose"
+    dirty_post = dirty / "post_relocalize_compare"
+    dirty_post.mkdir(parents=True)
+    dirty.joinpath("summary.md").write_text(
+        "\n".join(
+            [
+                "# Navigation Pose Error Test Summary",
+                "- state: `failed`",
+                "- phase: `nav2_failed`",
+                "- nav2_result_code: `6`",
+                "- final_distance_m: `10.703`",
+                "- final_yaw_error_rad: `3.063`",
+                "- final_pose_verified: `False`",
+                "- relocalize_exit_code: `1`",
+                "- map_base_link_delta: translation_m=`0.4216`, dyaw_deg=`-0.310`, forward_m=`0.0`, left_m=`0.0`",
+                "- map_odom_delta: translation_m=`0.2549`, dyaw_deg=`2.153`, forward_m=`0.0`, left_m=`0.0`",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    dirty_post.joinpath("summary.md").write_text(
+        "\n".join(
+            [
+                "# Relocalize Correction Compare",
+                "- trigger_accepted: `false`",
+                "- trigger_message: `failure_code=BRIDGE_REJECTED_RESULT last_reject_reason=`",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    dirty_trace = tmp_path / "dirty_trace"
+    dirty_trace.mkdir()
+    dirty_trace.joinpath("summary.md").write_text(
+        "\n".join(
+            [
+                "# Navigation Terminal Yaw Trace",
+                "- child_rc: `0`",
+                "- last_api_nav_state: `failed`",
+                "- last_api_nav_phase: `nav2_failed`",
+                "- last_api_nav2_result_code: `6`",
+                "- last_api_final_distance_m: `10.703`",
+                "- last_api_final_yaw_error_rad: `3.063`",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    clean_result = subprocess.run(
+        [sys.executable, str(script_path), "--pose-report", str(clean), "--json"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert clean_result.returncode == 0, clean_result.stdout + clean_result.stderr
+    assert '"accepted": true' in clean_result.stdout
+
+    dirty_result = subprocess.run(
+        [
+            sys.executable,
+            str(script_path),
+            "--pose-report",
+            str(dirty),
+            "--trace-report",
+            str(dirty_trace),
+            "--json",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert dirty_result.returncode == 10
+    for reason in (
+        "nav2_result_code_not_4:6",
+        "final_pose_verified_not_true:False",
+        "post_relocalize_trigger_not_accepted",
+        "trace_last_api_nav_state_not_succeeded:failed",
+    ):
+        assert reason in dirty_result.stdout
+
+    replay_output = tmp_path / "replay"
+    replay_result = subprocess.run(
+        [
+            sys.executable,
+            str(replay_script_path),
+            "--pose-report",
+            str(clean),
+            "--trace-report",
+            "NONE",
+            "--pose-report",
+            str(dirty),
+            "--trace-report",
+            str(dirty_trace),
+            "--output-dir",
+            str(replay_output),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert replay_result.returncode == 10
+    summary = replay_output.joinpath("summary.md").read_text(encoding="utf-8")
+    results = replay_output.joinpath("replay_results.json").read_text(encoding="utf-8")
+    assert "- read_only: `true`" in summary
+    assert "- sends_navigation_goals: `false`" in summary
+    assert "| 1 | ACCEPT |" in summary
+    assert "| 2 | REJECT |" in summary
+    assert "trace_last_api_nav_state_not_succeeded:failed" in summary
+    assert '"accepted": false' in results
+
+
+def test_navigation_terminal_yaw_trace_records_motion_state_and_best_effort_imu():
+    script = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "run_navigation_terminal_yaw_trace.sh"
+    ).read_text(encoding="utf-8")
+    assert "This script never publishes velocity commands." in script
+    assert "from rclpy.qos import qos_profile_sensor_data" in script
+    assert 'create_subscription(Imu, "/lidar_imu_bias_corrected", self.on_imu, qos_profile_sensor_data)' in script
+    assert 'self.node.create_subscription(MotionState, "/motion_state", self.on_motion_state, 20)' in script
+    for field in (
+        "motion_linear_velocity",
+        "motion_lateral_velocity",
+        "motion_angular_velocity",
+        "motion_steering_angle",
+        "max_abs_motion_linear_velocity",
+        "max_abs_motion_angular_velocity",
+        "max_abs_motion_steering_angle",
+    ):
+        assert field in script
+    assert 'motion_float(msg, "linear_velocity")' in script
+    assert 'motion_float(msg, "angular_velocity")' in script
+    assert "ros2 topic pub" not in script
+    assert "ros2 action send_goal" not in script
+
+
+def test_navigation_pose_error_waits_for_motion_quiet_before_post_relocalize():
+    script = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "run_navigation_pose_error_test.sh"
+    ).read_text(encoding="utf-8")
+    wait_call = 'wait_for_motion_quiet "${OUT_DIR}/post_goal_motion_settle.json"'
+    relocalize_call = (
+        'bash "${SCRIPT_DIR}/capture_relocalize_correction_compare.sh" \\\n'
+        '    --output-dir "${OUT_DIR}/post_relocalize_compare"'
+    )
+    assert "navigation_pose_error_motion_settle_wait" in script
+    assert 'GOAL_POST_TIMEOUT_SEC="30.0"' in script
+    assert "--goal-post-timeout-sec" in script
+    assert "pose_required|position_only|api_default" in script
+    assert 'body.pop("goal_completion_policy", None)' in script
+    assert '"goal_completion_policy",' in script
+    assert '"nav2_goal_yaw_rad",' in script
+    assert '"nav2_goal_yaw_source",' in script
+    assert "goal_post_timeout_sec = max(float(sys.argv[6]), 1.0)" in script
+    assert 'timeout=goal_post_timeout_sec' in script
+    assert "timeout=8.0" not in script
+    assert "--motion-settle-timeout-sec" in script
+    assert "## Post-Goal Motion Settle" in script
+    assert wait_call in script
+    assert relocalize_call in script
+    assert script.index(wait_call) < script.index(relocalize_call)
+    assert 'nav_rc="${motion_settle_rc}"' in script
+    assert "post-goal relocalize skipped because motion did not settle" in script
+
+
+def test_navigation_pose_error_records_read_only_odom_motion_samples():
+    script = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "run_navigation_pose_error_test.sh"
+    ).read_text(encoding="utf-8")
+    assert "navigation_pose_error_odom_motion_sampler" in script
+    assert "odom_motion_samples.jsonl" in script
+    assert "odom_motion_summary.json" in script
+    assert 'for topic in ("/wheel/odom", "/wheel/odom_ekf", "/local_state/odometry")' in script
+    assert 'for topic in ("/cmd_vel_nav", "/cmd_vel_collision_checked", "/cmd_vel_safe", "/cmd_vel")' in script
+    assert 'node.create_subscription(' in script
+    assert 'create_publisher' not in script[script.index("start_odom_sampler()") : script.index("summarize_odom_sampler()")]
+    assert "## Odom/Motion Samples" in script
+    assert "--no-odom-sampler" in script
 
 
 def test_local_reuse_manifest_exists():
@@ -2135,6 +4193,9 @@ def test_commercial_runtime_architecture_contract_is_documented():
     overlay_nav2_script = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_nav2_navigation.sh"
     ).read_text(encoding="utf-8")
+    standard_navigation_launch = (
+        ROOT / "src" / "robot_bringup" / "launch" / "standard_navigation.launch.py"
+    ).read_text(encoding="utf-8")
     overlay_common_services = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_common_services.sh"
     ).read_text(encoding="utf-8")
@@ -2201,9 +4262,10 @@ def test_commercial_runtime_architecture_contract_is_documented():
         )
     ]
     assert "__node:=planner_server" in nav2_critical_block
+    assert "__node:=smoother_server" in nav2_critical_block
     assert "__node:=velocity_smoother" in nav2_critical_block
     assert "__node:=collision_monitor" in nav2_critical_block
-    assert "__node:=behavior_server" not in nav2_critical_block
+    assert "__node:=behavior_server" in nav2_critical_block
     assert "Nav2 lifecycle manager reported managed nodes active and critical processes are running" in commercial_helpers
     assert "Nav2 repo lifecycle sequence reported point-navigation core nodes active" in commercial_helpers
     assert "nav2_lifecycle_node_active()" in commercial_helpers
@@ -2228,6 +4290,7 @@ def test_commercial_runtime_architecture_contract_is_documented():
     assert "resolve_floor_assets" in resident_runtime
     assert "run_occupancy_grid_localization.sh" in resident_runtime
     assert "run_nav2_navigation.sh" in resident_runtime
+    assert 'NJRH_SKIP_PRESTART_NAV2_STOP="${NJRH_SKIP_PRESTART_NAV2_STOP:-true}"' in resident_runtime
     assert "ensure_common_local_state_ready_for_navigation_start()" in resident_runtime
     assert 'runtime_health_check "local_state_ready"' in resident_runtime
     assert "common local_state ready from runtime health snapshot before navigation startup" in resident_runtime
@@ -2251,6 +4314,7 @@ def test_commercial_runtime_architecture_contract_is_documented():
     assert 'log_startup_stage "initial_global_localization_ready"' in resident_runtime
     assert "trigger_output_reports_startup_service_race()" in resident_runtime
     assert "trigger_output_reports_transient_stale_bridge_timeout()" in resident_runtime
+    assert "trigger_output_reports_fresh_localization_retry_required()" in resident_runtime
     assert "trigger_output_reports_transient_map_to_odom_timeout()" in resident_runtime
     assert "trigger_output_reports_transient_localization_result_timeout()" in resident_runtime
     assert "NJRH_INITIAL_LOCALIZATION_REQUIRE_RESULT_PUBLISHER:-false" in resident_runtime
@@ -2269,6 +4333,16 @@ def test_commercial_runtime_architecture_contract_is_documented():
     assert "hit startup service race; retrying" in resident_runtime
     assert "could not reach service; retrying" in resident_runtime
     assert "saw transient stale Isaac result; retrying for fresh result" in resident_runtime
+    fresh_retry_block = resident_runtime[
+        resident_runtime.index("trigger_output_reports_transient_stale_bridge_timeout()") :
+        resident_runtime.index(
+            "trigger_output_reports_fresh_localization_retry_required()",
+            resident_runtime.index("trigger_output_reports_transient_stale_bridge_timeout()"),
+        )
+    ]
+    assert "failure_code=FRESH_LOCALIZATION_RETRY_REQUIRED" in fresh_retry_block
+    assert "failure_code=BRIDGE_ACCEPT_TIMEOUT" in fresh_retry_block
+    assert "return 0" in fresh_retry_block
     assert "transient stale map->odom during startup; retrying" in resident_runtime
     assert "transient localization result timeout during startup; retrying" in resident_runtime
     assert "NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION:-false" in resident_runtime
@@ -2299,6 +4373,8 @@ def test_commercial_runtime_architecture_contract_is_documented():
     assert "--trust-change-state-response" in nav2_lifecycle_sequence
     assert "--configure-all-before-activate" in nav2_lifecycle_sequence
     assert "lifecycle sequence: configuring all managed nodes before activation" in nav2_lifecycle_sequence
+    assert "lifecycle configure complete node=" in nav2_lifecycle_sequence
+    assert "lifecycle activate complete node=" in nav2_lifecycle_sequence
     assert "NJRH_NAV2_LIFECYCLE_NODE_TIMEOUT_SEC:-60" in resident_runtime
     assert "lifecycle_manager_navigation external lifecycle sequence: Managed nodes are active" in resident_runtime
     assert "NJRH_NAV2_LIFECYCLE_PARALLEL_CORE:-true" not in resident_runtime
@@ -2307,24 +4383,31 @@ def test_commercial_runtime_architecture_contract_is_documented():
     assert "NAV2_HOLD_READY_WRAPPER_PID" in overlay_nav2_script
     assert "NAV2_HOLD_READY_CONTROLLER_PID" in overlay_nav2_script
     assert 'rm -f "${NJRH_NAV2_HOLD_READY_FILE}"' in overlay_nav2_script
+    assert 'NJRH_NAV2_LAUNCH_NONCRITICAL_NODES="${NJRH_NAV2_LAUNCH_NONCRITICAL_NODES:-false}"' in overlay_nav2_script
+    assert "Nav2 noncritical nodes enabled=" in overlay_nav2_script
+    assert "NJRH_NAV2_LAUNCH_NONCRITICAL_NODES" in standard_navigation_launch
+    assert "launch_noncritical_navigation_nodes" in standard_navigation_launch
+    assert "noncritical_navigation_nodes = []" in standard_navigation_launch
     assert "start_navigation_lifecycle_with_repo_sequence()" in overlay_nav2_script
     assert "NJRH_NAV2_USE_REPO_LIFECYCLE_SEQUENCE:-true" in overlay_nav2_script
     assert "NJRH_NAV2_BACKGROUND_NONCRITICAL_LIFECYCLE:-true" in overlay_nav2_script
     assert "lifecycle_manager_navigation external repo lifecycle sequence: point-navigation core nodes are active" in overlay_nav2_script
-    assert overlay_nav2_script.index("bt_navigator") < overlay_nav2_script.index("smoother_server")
-    assert overlay_nav2_script.index("bt_navigator") < overlay_nav2_script.index("behavior_server")
+    assert overlay_nav2_script.index("behavior_server") < overlay_nav2_script.index("smoother_server")
+    assert overlay_nav2_script.index("smoother_server") < overlay_nav2_script.index("bt_navigator")
     assert overlay_nav2_script.index("bt_navigator") < overlay_nav2_script.index("waypoint_follower")
     assert "Nav2 point-navigation core lifecycle nodes are active" in commercial_helpers
     critical_lifecycle_block = commercial_helpers[
         commercial_helpers.index("critical_nav2_lifecycle_nodes()") :
         commercial_helpers.index("nav2_lifecycle_node_active()", commercial_helpers.index("critical_nav2_lifecycle_nodes()"))
     ]
-    assert "/behavior_server" not in critical_lifecycle_block
+    assert "/behavior_server" in critical_lifecycle_block
+    assert "/smoother_server" in critical_lifecycle_block
     critical_process_block = commercial_helpers[
         commercial_helpers.index("nav2_critical_processes_running()") :
         commercial_helpers.index("standard_nav_stack_lifecycle_active()", commercial_helpers.index("nav2_critical_processes_running()"))
     ]
-    assert "__node:=behavior_server" not in critical_process_block
+    assert "__node:=behavior_server" in critical_process_block
+    assert "__node:=smoother_server" in critical_process_block
     resident_prestart_lifecycle_nodes = resident_runtime[
         resident_runtime.index("activate_prestarted_nav2_lifecycle()") :
         resident_runtime.index("ensure_navigation_layer_alive || return 1", resident_runtime.index("activate_prestarted_nav2_lifecycle()"))
@@ -2333,8 +4416,14 @@ def test_commercial_runtime_architecture_contract_is_documented():
         "controller_server"
     )
     assert "waypoint_follower" not in resident_prestart_lifecycle_nodes
-    assert "smoother_server" not in resident_prestart_lifecycle_nodes
-    assert "behavior_server" not in resident_prestart_lifecycle_nodes
+    assert "behavior_server" in resident_prestart_lifecycle_nodes
+    assert "smoother_server" in resident_prestart_lifecycle_nodes
+    assert resident_prestart_lifecycle_nodes.index("behavior_server") < resident_prestart_lifecycle_nodes.index(
+        "smoother_server"
+    )
+    assert resident_prestart_lifecycle_nodes.index("smoother_server") < resident_prestart_lifecycle_nodes.index(
+        "bt_navigator"
+    )
     resident_background_lifecycle_nodes = resident_runtime[
         resident_runtime.index("start_prestarted_nav2_lifecycle_background()") :
         resident_runtime.index(
@@ -2343,8 +4432,8 @@ def test_commercial_runtime_architecture_contract_is_documented():
         )
     ]
     assert "waypoint_follower" not in resident_background_lifecycle_nodes
-    assert "smoother_server" not in resident_background_lifecycle_nodes
-    assert "behavior_server" not in resident_background_lifecycle_nodes
+    assert "behavior_server" in resident_background_lifecycle_nodes
+    assert "smoother_server" in resident_background_lifecycle_nodes
     assert 'log_startup_stage "nav2_lifecycle_activation_started"' in resident_runtime
     assert "NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION:-false" in resident_runtime
     assert "prestarting resident AMCL warmup before initial global localization" in resident_runtime
@@ -2374,6 +4463,8 @@ def test_commercial_runtime_architecture_contract_is_documented():
     assert "complete_amcl_readiness_with_retries_for_navigation()" in resident_runtime
     assert "AMCL readiness running in background" in resident_runtime
     assert "NJRH_REQUIRE_AMCL_TRACKING_FOR_NAV_READY:-false" in resident_runtime
+    assert "NJRH_AMCL_READINESS_BEFORE_NAV2_LIFECYCLE:-false" in resident_runtime
+    assert "deferring AMCL readiness until after Nav2 lifecycle activation" in resident_runtime
     assert "AMCL tracking readiness continues in background" in resident_runtime
     assert "AMCL tracking continues in background" in resident_runtime
     resident_amcl_background_block = resident_runtime[
@@ -2549,6 +4640,8 @@ def test_project_runtime_helpers_are_wired():
         "run_nav2_navigation.sh",
         "run_occupancy_grid_localization.sh",
         "standard_navigation.launch.py",
+        "robot_docking_manager/docking_manager_node",
+        "docking_manager_node --ros-args",
         "occupancy_grid_localizer_container",
         "robot_localization_bridge/localization_bridge_node",
         "amcl --ros-args",
@@ -2569,6 +4662,8 @@ def test_project_runtime_helpers_are_wired():
     assert "stale ros2 diagnostics cli" in autostart_runner
     assert "ros2_cli_pattern" in autostart_runner
     assert 'ros2_cli_pattern="/' in autostart_runner
+    assert '$0 !~ /docker exec/' in autostart_runner
+    assert '$0 !~ /njrh_systemd_runtime\\.sh/' in autostart_runner
     assert "service call /amcl/(change_state|get_state)" in autostart_runner
     assert "NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION=false" in autostart_installer
     assert (
@@ -2592,14 +4687,22 @@ def test_project_runtime_helpers_are_wired():
         "${NJRH_COMMON_LOCAL_STATE_START_READY_MODE:-endpoint}"
     ) in autostart_runner
     assert (
+        "NJRH_COMMON_LOCAL_STATE_BACKGROUND_START="
+        "${NJRH_COMMON_LOCAL_STATE_BACKGROUND_START:-true}"
+    ) in autostart_runner
+    assert (
         "NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE="
-        "${NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE:-true}"
+        "${NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE:-false}"
     ) in autostart_runner
     assert "NJRH_COMMON_LOCAL_STATE_START_READY_MODE=endpoint" in autostart_installer
-    assert "NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE=true" in autostart_installer
+    assert "NJRH_COMMON_LOCAL_STATE_BACKGROUND_START=true" in autostart_installer
+    assert "NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE=false" in autostart_installer
     assert "NJRH_LOCAL_STATE_START_READY_MODE=\"${NJRH_COMMON_LOCAL_STATE_START_READY_MODE:-endpoint}\"" in overlay_common_services
+    assert "NJRH_COMMON_LOCAL_STATE_BACKGROUND_START:-true" in overlay_common_services
+    assert '[[ "${NAV_LOCAL_STATE_MODE}" != "fastlio" ]] || return 1' in overlay_common_services
     assert "wait_for_runtime_health_local_state_endpoint_ready" in overlay_common_services
-    assert "NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE:-true" in overlay_common_services
+    assert "NJRH_RUNTIME_HEALTH_LOCAL_STATE_ENDPOINT_TIMEOUT_SEC:-0" in overlay_common_services
+    assert "NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE:-false" in overlay_common_services
     assert "common local_state ready from runtime health snapshot before navigation startup" in resident_runtime
     assert "wait_for_fresh_tf_transform \"odom\" \"base_link\"" in resident_runtime
     assert (
@@ -2663,7 +4766,8 @@ def test_project_runtime_helpers_are_wired():
     assert "require_localization_health" in robot_safety
     assert "status_topic: /safety/status" in robot_safety
     assert "motion_allowed_topic: /safety/motion_allowed" in robot_safety
-    assert "cmd_vel_out_topic: /cmd_vel_safe" in robot_safety
+    assert "cmd_vel_out_topic: /cmd_vel" in robot_safety
+    assert "cmd_vel_mirror_topic: /cmd_vel_safe" in robot_safety
     assert "local_perception helper disabled" in overlay_nav
     assert "run_floor_manager.sh" in overlay_nav
     assert "run_robot_safety.sh" in overlay_nav
@@ -2770,6 +4874,7 @@ def test_project_runtime_helpers_are_wired():
     assert 'NJRH_NAVIGATION_LIFECYCLE_AUTOSTART", "true"' in standard_navigation_launch
     assert 'NJRH_NAV_LIFECYCLE_START_DELAY_SEC", "2.0"' in standard_navigation_launch
     assert 'export NJRH_NAV_LIFECYCLE_START_DELAY_SEC="${NJRH_NAV_LIFECYCLE_START_DELAY_SEC:-2.0}"' in overlay_nav
+    assert 'log_level:="${NJRH_NAV2_LOG_LEVEL:-warn}"' in overlay_nav
     assert 'NJRH_COSTMAP_FILTER_MASK_STABLE_WAIT_SEC:-0.5' in overlay_nav
     assert 'NJRH_NAV2_LAUNCH_SETTLE_SEC:-1' in overlay_nav
     assert 'enable_costmap_filter_servers = os.environ.get(' in standard_navigation_launch
@@ -2810,10 +4915,13 @@ def test_project_runtime_helpers_are_wired():
     assert "Nav2 core lifecycle autostart disabled; lifecycle_bringup will manage core nodes" in overlay_nav
     assert "lifecycle_manager_navigation external lifecycle_bringup: Managed nodes are active" in overlay_nav
     assert 'with_cpu_affinity("controller_server", node_kwargs)' in standard_navigation_launch
+    assert 'with_cpu_affinity("smoother_server", node_kwargs)' in standard_navigation_launch
     assert 'with_cpu_affinity("velocity_smoother", node_kwargs)' in standard_navigation_launch
     assert 'with_cpu_affinity("collision_monitor", node_kwargs)' in standard_navigation_launch
+    assert standard_navigation_launch.index('"smoother_server",') < standard_navigation_launch.index('"bt_navigator",')
     assert standard_navigation_launch.index('"velocity_smoother",') < standard_navigation_launch.index('"bt_navigator",')
     assert standard_navigation_launch.index('"collision_monitor",') < standard_navigation_launch.index('"bt_navigator",')
+    assert nav2_yaml.index("- smoother_server") < nav2_yaml.index("- bt_navigator")
     assert nav2_yaml.index("- velocity_smoother") < nav2_yaml.index("- bt_navigator")
     assert nav2_yaml.index("- collision_monitor") < nav2_yaml.index("- bt_navigator")
     assert "keepout_filter_mask_server" in standard_navigation_launch
@@ -2930,9 +5038,14 @@ def test_project_runtime_helpers_are_wired():
         overlay_common_services.index("cleanup_resident_navigation_runtime_layers()") :
         overlay_common_services.index('bash "${SCRIPT_DIR}/run_amcl_shadow_localization.sh" --stop')
     ]
-    assert "NJRH_COMMON_AMCL_STOP_TIMEOUT_SEC:-3" in overlay_common_services
+    assert "NJRH_AMCL_HEARTBEAT_STOP_INT_WAIT_SEC:-0.2" in overlay_common_services
+    assert "NJRH_AMCL_SEED_HELPER_STOP_INT_WAIT_SEC:-0.2" in overlay_common_services
+    assert "NJRH_AMCL_SEED_HELPER_STOP_TERM_WAIT_SEC:-0.2" in overlay_common_services
+    assert "NJRH_COMMON_AMCL_STOP_TIMEOUT_SEC:-1.5" in overlay_common_services
     assert "NJRH_COMMON_AMCL_STOP_KILL_AFTER_SEC:-1" in overlay_common_services
     assert 'bash "${SCRIPT_DIR}/run_amcl_shadow_localization.sh" --stop' in overlay_common_services
+    assert "NJRH_STANDARD_NAV_STACK_STOP_INT_WAIT_SEC=\"${NJRH_STANDARD_NAV_STACK_STOP_INT_WAIT_SEC:-0.2}\"" in overlay_common_services
+    assert "NJRH_LOCALIZATION_STACK_STOP_WAIT_SEC=\"${NJRH_LOCALIZATION_STACK_STOP_WAIT_SEC:-0.2}\"" in overlay_common_services
     assert "stop_existing_standard_nav_stack || true" in overlay_common_services
     assert "stop_existing_localization_stack || true" in overlay_common_services
     assert "rm -f /tmp/njrh_runtime_map_context.json /tmp/njrh_amcl_runtime_status.env" in overlay_common_services
@@ -2947,6 +5060,13 @@ def test_project_runtime_helpers_are_wired():
     assert "hard timeout" in overlay_common_services
     assert "resident navigation context ready" in overlay_common_services
     assert "resident navigation context did not become ready" in overlay_common_services
+    resident_autostart_wait_block = overlay_common_services[
+        overlay_common_services.index("wait_for_resident_navigation_autostart_if_started()") :
+        overlay_common_services.index("stop_stale_pointcloud_accel_pipeline_processes()")
+    ]
+    assert "common services will not block on navigation readiness" in resident_autostart_wait_block
+    assert "wait_for_resident_navigation_context_ready" not in resident_autostart_wait_block
+    assert "return 0" in resident_autostart_wait_block
     assert "no valid last navigation map; common services stay alive in NO_MAP mode" in overlay_common_services
     assert "last_navigation_map.json" in overlay_common_services
     resident_navigation_runtime = (
@@ -2965,7 +5085,7 @@ def test_project_runtime_helpers_are_wired():
     assert overlay_common_services.index("prepare_resident_navigation_autostart") < overlay_common_services.index(
         'start_common_process "resident_navigation_runtime"'
     )
-    assert overlay_common_services.index("wait_for_resident_navigation_context_ready") < overlay_common_services.index(
+    assert overlay_common_services.index("wait_for_resident_navigation_autostart_if_started") < overlay_common_services.index(
         "common services are running; start mapping or resident navigation scripts in reuse mode"
     )
     overlay_gs2_driver = (
@@ -3058,7 +5178,7 @@ def test_runtime_overlay_cpu_affinity_policy_is_wired():
         ("NJRH_CPUSET_BASE_CONTROL", "1"),
         ("NJRH_CPUSET_TF_STATE", "2"),
         ("NJRH_CPUSET_NAV_CONTROL", "3"),
-        ("NJRH_CPUSET_NAV_PLANNING", "0"),
+        ("NJRH_CPUSET_NAV_PLANNING", "3,5"),
         ("NJRH_CPUSET_LIDAR_PERCEPTION", "4,5"),
         ("NJRH_CPUSET_LIDAR_DRIVER", "4"),
         ("NJRH_CPUSET_LIDAR_PIPELINE", "5"),
@@ -3643,7 +5763,7 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "sensor_msgs::msg::LaserScan" in node_cpp
     assert "tf2_msgs::msg::TFMessage" in node_cpp
     assert "/ws/v1/teleop" in node_cpp
-    assert "/cmd_vel_collision_checked" in node_cpp
+    assert "/cmd_vel_api" in node_cpp
     assert "std_msgs::msg::Bool" in node_cpp
     assert "robot_interfaces::srv::SwitchFloor" in node_cpp
     assert "robot_interfaces::srv::TriggerLocalization" in node_cpp
@@ -3839,8 +5959,8 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "navigation_final_yaw_align_max_xy_drift_m" in node_cpp
     assert "navigation_final_yaw_align_cmd_topic" in node_cpp
     assert 'navigation_final_yaw_align_cmd_topic_ != "/cmd_vel_nav"' in node_cpp
-    assert 'navigation_final_yaw_align_cmd_topic_ != "/cmd_vel_collision_checked"' in node_cpp
-    assert 'navigation_final_yaw_align_cmd_topic_ = "/cmd_vel_collision_checked"' in node_cpp
+    assert 'navigation_final_yaw_align_cmd_topic_ != "/cmd_vel_api"' in node_cpp
+    assert 'navigation_final_yaw_align_cmd_topic_ = "/cmd_vel_api"' in node_cpp
     assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel_safe"' not in node_cpp
     assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel"' not in node_cpp
     assert "final_pose_auditing" in node_cpp
@@ -3859,15 +5979,16 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "yaw_align_failed" in node_cpp
     assert "REPOSITION_AFTER_YAW_DRIFT" in node_cpp
     assert "run_reposition_after_yaw_drift" in node_cpp
-    assert "navigation goal reached by Nav2 native completion" in node_cpp
-    assert "Nav2 is the single completion owner" in node_cpp
+    assert "navigation goal reached by commercial final verification" in node_cpp
+    assert "commercial_final_verify=true" in node_cpp
+    assert "degraded_final_pose_verify" in node_cpp
     assert "under position_only policy" in node_cpp
     assert "bool position_reached = pose_check.position_reached;" in node_cpp
     assert "bool position_reached = nav2_succeeded" not in node_cpp
     run_goal_block = node_cpp[node_cpp.index("void run_navigation_goal_job("):node_cpp.index("HttpResponse handle_navigation_state()")]
     assert "Nav2 reported success but read-only final pose verification failed" not in run_goal_block
     assert '"failed_final_pose_verify"' in node_cpp
-    assert '"nav2_failed"' in node_cpp
+    assert '"nav2_failed"' not in run_goal_block
     assert '"position_not_reached"' not in node_cpp[node_cpp.index("void run_navigation_goal_job("):]
     assert "final_yaw_align_blocked" in node_cpp
     assert "final_yaw_align_attempted" in node_cpp
@@ -4050,33 +6171,42 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "navigation_relocalize_wait_sec: 8.0" in config
     assert "navigation_lifecycle_check_timeout_sec: 1.5" in config
     assert "navigation_goal_result_timeout_sec: 600.0" in config
-    assert "navigation_goal_position_success_tolerance_m: 0.20" in config
+    assert "navigation_goal_position_success_tolerance_m: 0.06" in config
     assert "navigation_default_goal_completion_policy: \"pose_required\"" in config
+    assert "navigation_delivery_point_goal_completion_policy: \"pose_required\"" in config
+    assert "navigation_position_only_nav2_yaw_mode: \"approach_heading\"" in config
+    assert "navigation_position_only_approach_heading_min_distance_m: 0.20" in config
     assert "navigation_max_reposition_after_yaw_retry: 0" in config
     assert "navigation_reposition_after_yaw_drift_timeout_sec: 30.0" in config
     assert "nav2_native_goal_completion_enabled: true" in config
     assert "nav2_rotation_shim_enabled: true" in config
-    assert "api_final_yaw_align_fallback_enabled: false" in config
-    assert "navigation_final_yaw_align_enable: false" in config
+    assert "api_final_yaw_align_fallback_enabled: true" in config
+    assert "navigation_final_yaw_align_enable: true" in config
     assert "navigation_final_yaw_tolerance_rad: 0.05" in config
     assert "navigation_final_yaw_align_trigger_rad: 0.08" in config
-    assert "navigation_final_yaw_align_speed_radps: 0.25" in config
+    assert "navigation_final_yaw_align_success_tolerance_rad: 0.045" in config
+    assert "navigation_final_yaw_align_speed_radps: 0.60" in config
     assert "navigation_final_yaw_align_min_speed_radps: 0.06" in config
     assert "navigation_final_yaw_align_kp: 1.2" in config
-    assert "navigation_final_yaw_align_max_speed_radps: 0.25" in config
+    assert "navigation_final_yaw_align_max_speed_radps: 0.60" in config
     assert "navigation_final_yaw_align_timeout_sec: 8.0" in config
     assert "navigation_final_yaw_align_max_xy_drift_m: 0.08" in config
     assert "navigation_final_yaw_align_require_fresh_pose: true" in config
-    assert "navigation_final_yaw_align_cmd_topic: \"/cmd_vel_collision_checked\"" in config
+    assert "navigation_final_yaw_align_cmd_topic: \"/cmd_vel_api\"" in config
+    assert "navigation_final_yaw_align_cmd_topic: \"/cmd_vel_collision_checked\"" not in config
     assert "navigation_final_yaw_align_bypass_collision_monitor: true" in config
     assert "navigation_final_yaw_align_zero_cmd_count: 3" in config
+    assert "navigation_pause_global_correction_during_final_yaw: true" in config
+    assert "yaw_align_stop_lead_enabled: true" in config
+    assert "yaw_align_stop_lead_time_sec: 0.125" in config
+    assert "yaw_align_stop_lead_max_rad: 0.09" in config
     assert "docking_relocalize_before_predock: false" in config
     assert "docking_relocalize_after_predock: false" in config
     assert "docking_relocalize_after_predock_required: false" in config
     assert "docking_relocalize_after_fine_docking: false" in config
     assert "docking_relocalize_after_fine_docking_required: false" in config
     assert "docking_validate_predock_pose_after_relocalization: true" in config
-    assert "docking_predock_pose_max_distance_m: 0.35" in config
+    assert "docking_predock_pose_max_distance_m: 0.30" in config
     assert "docking_predock_pose_max_yaw_rad: 0.35" in config
     assert "docking_manual_predock_distance_check_enable: false" in config
     assert "docking_manual_predock_min_distance_m: 0.50" in config
@@ -4117,7 +6247,8 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "scan_topic: \"/scan\"" in config
     assert "tf_topic: \"/tf\"" in config
     assert "subscription_default_ttl_ms: 10000" in config
-    assert "teleop_cmd_topic: \"/cmd_vel_collision_checked\"" in config
+    assert "teleop_cmd_topic: \"/cmd_vel_api\"" in config
+    assert "teleop_cmd_topic: \"/cmd_vel_collision_checked\"" not in config
     assert "teleop_reverse_enable_topic: \"/ranger_mini3/teleop_allow_reverse\"" in config
     assert "teleop_pose_topic: \"/local_state/odometry\"" in config
     assert "teleop_max_linear_x_mps: 1.00" in config
@@ -4164,26 +6295,35 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "navigation_relocalize_wait_sec: 8.0" in overlay_config
     assert "navigation_lifecycle_check_timeout_sec: 1.5" in overlay_config
     assert "navigation_goal_result_timeout_sec: 600.0" in overlay_config
-    assert "navigation_goal_position_success_tolerance_m: 0.20" in overlay_config
+    assert "navigation_goal_position_success_tolerance_m: 0.06" in overlay_config
     assert "navigation_default_goal_completion_policy: \"pose_required\"" in overlay_config
+    assert "navigation_delivery_point_goal_completion_policy: \"pose_required\"" in overlay_config
+    assert "navigation_position_only_nav2_yaw_mode: \"approach_heading\"" in overlay_config
+    assert "navigation_position_only_approach_heading_min_distance_m: 0.20" in overlay_config
     assert "navigation_max_reposition_after_yaw_retry: 0" in overlay_config
     assert "navigation_reposition_after_yaw_drift_timeout_sec: 30.0" in overlay_config
     assert "nav2_native_goal_completion_enabled: true" in overlay_config
     assert "nav2_rotation_shim_enabled: true" in overlay_config
-    assert "api_final_yaw_align_fallback_enabled: false" in overlay_config
-    assert "navigation_final_yaw_align_enable: false" in overlay_config
+    assert "api_final_yaw_align_fallback_enabled: true" in overlay_config
+    assert "navigation_final_yaw_align_enable: true" in overlay_config
     assert "navigation_final_yaw_tolerance_rad: 0.05" in overlay_config
     assert "navigation_final_yaw_align_trigger_rad: 0.08" in overlay_config
-    assert "navigation_final_yaw_align_speed_radps: 0.25" in overlay_config
+    assert "navigation_final_yaw_align_success_tolerance_rad: 0.045" in overlay_config
+    assert "navigation_final_yaw_align_speed_radps: 0.60" in overlay_config
     assert "navigation_final_yaw_align_min_speed_radps: 0.06" in overlay_config
     assert "navigation_final_yaw_align_kp: 1.2" in overlay_config
-    assert "navigation_final_yaw_align_max_speed_radps: 0.25" in overlay_config
+    assert "navigation_final_yaw_align_max_speed_radps: 0.60" in overlay_config
     assert "navigation_final_yaw_align_timeout_sec: 8.0" in overlay_config
     assert "navigation_final_yaw_align_max_xy_drift_m: 0.08" in overlay_config
     assert "navigation_final_yaw_align_require_fresh_pose: true" in overlay_config
-    assert "navigation_final_yaw_align_cmd_topic: \"/cmd_vel_collision_checked\"" in overlay_config
+    assert "navigation_final_yaw_align_cmd_topic: \"/cmd_vel_api\"" in overlay_config
+    assert "navigation_final_yaw_align_cmd_topic: \"/cmd_vel_collision_checked\"" not in overlay_config
     assert "navigation_final_yaw_align_bypass_collision_monitor: true" in overlay_config
     assert "navigation_final_yaw_align_zero_cmd_count: 3" in overlay_config
+    assert "navigation_pause_global_correction_during_final_yaw: true" in overlay_config
+    assert "yaw_align_stop_lead_enabled: true" in overlay_config
+    assert "yaw_align_stop_lead_time_sec: 0.125" in overlay_config
+    assert "yaw_align_stop_lead_max_rad: 0.09" in overlay_config
     assert "localization_result_topic: \"/localization_result\"" in overlay_config
     assert "docking_relocalize_before_predock: false" in overlay_config
     assert "docking_relocalize_after_predock: false" in overlay_config
@@ -4218,7 +6358,8 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "docking_pre_dock_distance_m: 0.60" in overlay_config
     assert "navigation_auto_undock_timeout_sec: 28.0" in overlay_config
     assert "docking_undock_charging_retry_sec: 3.0" in overlay_config
-    assert "teleop_cmd_topic: \"/cmd_vel_collision_checked\"" in overlay_config
+    assert "teleop_cmd_topic: \"/cmd_vel_api\"" in overlay_config
+    assert "teleop_cmd_topic: \"/cmd_vel_collision_checked\"" not in overlay_config
     assert "teleop_reverse_enable_topic: \"/ranger_mini3/teleop_allow_reverse\"" in overlay_config
     assert "teleop_max_linear_x_mps: 1.00" in overlay_config
     assert "teleop_socket_idle_timeout_sec: 5.0" in overlay_config
@@ -4234,7 +6375,10 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "ros2 run robot_api_server robot_api_server_node" in overlay_supervisor_script
     assert "colcon build --packages-select robot_interfaces robot_api_server" in overlay_script
     assert "umask 0002" in overlay_script
-    assert "compatibility wrapper" in floor_navigation_script
+    assert "compatibility-only and is blocked by default" in floor_navigation_script
+    assert "sudo systemctl restart njrh-runtime.service" in floor_navigation_script
+    assert "NJRH_ALLOW_TRANSIENT_NAVIGATION_OWNER" in floor_navigation_script
+    assert "NJRH_ALLOW_MANUAL_NAV_OWNER" in floor_navigation_script
     assert "run_navigation_runtime_services.sh" in floor_navigation_script
     assert "NJRH_RUNTIME_MAP_CONTEXT_FILE" in commercial_runtime_helpers
     assert "runtime_map_context_matches_current_floor()" in commercial_runtime_helpers
@@ -4268,6 +6412,15 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "wait_for_bridge_has_map_to_odom()" in resident_runtime_script
     assert "trigger_output_reports_map_to_odom_ready()" in resident_runtime_script
     assert "wrapper already verified bridge map->odom readiness" in resident_runtime_script
+    assert "initial_localization_ready_from_bridge_after_wrapper_failure()" in resident_runtime_script
+    assert (
+        "global localization wrapper did not return accepted before timeout, but bridge map->odom and fresh TF are ready"
+    ) in resident_runtime_script
+    assert "bridge_status did not report has_map_to_odom before wrapper timeout fallback" in resident_runtime_script
+    assert 'wait_for_fresh_tf_transform "map" "odom" "${tf_timeout}" "${max_tf_age_sec}"' in resident_runtime_script
+    assert (
+        'initial_localization_ready_from_bridge_after_wrapper_failure "${bridge_timeout}" "${tf_timeout}"'
+    ) in resident_runtime_script
     assert "map->odom ready owner=robot_localization_bridge" in resident_runtime_script
     assert "bridge_status.has_map_to_odom=true was not observed" in resident_runtime_script
     assert "map->odom TF was not published after bridge acceptance" in resident_runtime_script
@@ -4313,6 +6466,7 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "blocking readiness probes are disabled" in overlay_nav2_script
     assert 'MAP_SERVER_READY_TIMEOUT="${NJRH_LOCALIZATION_MAP_SERVER_READY_TIMEOUT:-75}"' in occupancy_localization_script
     assert 'LOCALIZATION_MAP_EXTERNAL_LIFECYCLE_BRINGUP="${NJRH_LOCALIZATION_MAP_EXTERNAL_LIFECYCLE_BRINGUP:-true}"' in occupancy_localization_script
+    assert '"log_level:=${NJRH_LOCALIZATION_LOG_LEVEL:-warn}"' in occupancy_localization_script
     assert 'map_lifecycle_manager_enabled:=false' in occupancy_localization_script
     map_lifecycle_block = occupancy_localization_script[
         occupancy_localization_script.index("start_map_server_lifecycle_with_nav2_util()") :
@@ -4324,6 +6478,8 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "map_lifecycle_bringup_pid" in occupancy_localization_script
     assert 'export NJRH_LOCALIZATION_MAP_EXTERNAL_LIFECYCLE_BRINGUP="${NJRH_LOCALIZATION_MAP_EXTERNAL_LIFECYCLE_BRINGUP:-true}"' in resident_runtime_script
     assert "map_lifecycle_manager_enabled" in occupancy_localization_launch
+    assert 'DeclareLaunchArgument("log_level", default_value="info")' in occupancy_localization_launch
+    assert 'arguments=["--ros-args", "--log-level", log_level]' in occupancy_localization_launch
     assert "PythonExpression" in occupancy_localization_launch
     assert 'ensure_map_server_active "${NAV2_MAP_YAML}" "${MAP_SERVER_READY_TIMEOUT}"' not in occupancy_localization_script
     assert "localization pointcloud startup probe disabled" in occupancy_localization_script
@@ -4402,7 +6558,7 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "does not convert `PGM` to `PNG` during the request" in app_doc
     assert "WS   /ws/v1/teleop" in app_doc
     assert "Teleop stops automatically" in app_doc
-    assert "/cmd_vel_collision_checked -> robot_safety -> /cmd_vel_safe" in app_doc
+    assert "/cmd_vel_api -> robot_safety -> /cmd_vel" in app_doc
     assert "/ranger_mini3/teleop_allow_reverse" in app_doc
     assert "mapping_state" in app_doc
     assert "resume_navigation" in app_doc
@@ -4442,6 +6598,7 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "map_odom_publish_gap_ms" in global_localization_node
     assert "map_to_odom_bridge_publish_healthy" in global_localization_node
     assert "map_to_odom_ready(latest)" in global_localization_node
+    assert "failure_code=FRESH_LOCALIZATION_RETRY_REQUIRED" in global_localization_node
     assert "failure_code=BRIDGE_ACCEPT_TIMEOUT" in global_localization_node
     assert "failure_code=MAP_TO_ODOM_TIMEOUT" in global_localization_node
     assert "done.wait" not in global_localization_node
@@ -4511,6 +6668,7 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "map_server_param_matches_yaml" not in map_publishing_body
     assert "requested map is already published on /map; continuing without waiting for /map_server discovery" in map_server_helpers
     assert "/map_server node discovery unavailable, but requested map is being published; continuing" in map_server_helpers
+    assert "requested map is already published after /map_server discovery; continuing without lifecycle state probe" in map_server_helpers
     assert "timeout 3 ros2 lifecycle get /map_server" in map_server_helpers
     assert "localization_map_external_lifecycle_bringup_enabled()" in map_server_helpers
     assert "external lifecycle_bringup is managing /map_server" in map_server_helpers
@@ -4615,9 +6773,9 @@ def test_ranger_mini3_mode_controller_is_cpp_and_rejects_lateral_reverse():
     verify_passthrough = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "verify_ranger_official_passthrough.sh"
     ).read_text(encoding="utf-8")
-    ab_runner = (
+    ab_runner_path = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_ranger_official_passthrough_ab.sh"
-    ).read_text(encoding="utf-8")
+    )
     assert "ament_cmake" in cmake
     assert "rclcpp" in package_xml
     assert "ranger_msgs" in package_xml
@@ -4634,16 +6792,15 @@ def test_ranger_mini3_mode_controller_is_cpp_and_rejects_lateral_reverse():
     assert "UNKNOWN = 255" in mode_header
     assert "ranger_motion_mode_from_code" in mode_header
     assert "ranger_motion_mode_json" in mode_header
-    assert "mode_controller_profile: official_passthrough" in config
-    assert "mode_controller_profile: official_passthrough" in overlay_config
+    assert "cmd_vel_out_topic: /ranger_mini3/mode_controller_shadow_cmd_vel" in config
+    assert "cmd_vel_out_topic: /ranger_mini3/mode_controller_shadow_cmd_vel" in overlay_config
+    assert "mode_controller_profile:" not in config
+    assert "mode_controller_profile:" not in overlay_config
     assert 'declare_parameter<std::string>("mode_controller_profile", "official_passthrough")' in node_cpp
-    assert 'mode_controller_profile_ == "official_passthrough"' in node_cpp
-    assert 'mode_controller_profile_ == "custom"' in node_cpp
+    assert '"/ranger_mini3/mode_controller_shadow_cmd_vel"' in node_cpp
     assert "computeOfficialPassthrough" in node_cpp
-    assert "cmdVelPassthrough()" in node_cpp
-    assert "customAckermannEnabled()" in node_cpp
-    assert "custom_ackermann_enabled" in node_cpp
-    assert "custom_ackermann_diagnostic_only" in node_cpp
+    assert "legacy custom Ackermann shaping was removed" in node_cpp
+    assert "legacy_custom_ackermann_removed" in node_cpp
     assert "cmd_vel_passthrough" in node_cpp
     assert "passthrough_preserves_twist" in node_cpp
     assert "output_diff_from_input" in node_cpp
@@ -4654,38 +6811,32 @@ def test_ranger_mini3_mode_controller_is_cpp_and_rejects_lateral_reverse():
     assert "park_requested" in node_cpp
     assert "timeout_zero" in node_cpp
     assert "lateral_policy: reject" in config
-    assert "max_lateral_mps: 0.08" in config
-    assert "max_crab_yaw_radps: 0.15" in config
     assert "allow_reverse: false" in config
     assert "reverse_enable_topic: /ranger_mini3/allow_reverse" in config
     assert "docking_reverse_enable_topic: /ranger_mini3/docking_allow_reverse" in config
     assert "teleop_reverse_enable_topic: /ranger_mini3/teleop_allow_reverse" in config
     assert "reverse_enable_timeout_s: 0.75" in config
-    assert "spin_steering_threshold_rad: 0.698" in config
-    assert "spin_enter_steering_threshold_rad: 0.698" in config
-    assert "auto_spin_max_linear_mps: 0.08" in config
-    assert "spin_on_high_curvature_while_moving: false" in config
+    assert "linear_epsilon_mps: 0.02" in config
+    assert "lateral_epsilon_mps: 0.02" in config
+    assert "yaw_epsilon_radps: 0.02" in config
     assert "desired_mode_topic: /ranger_mini3/desired_motion_mode" in config
     assert "actual_motion_state_topic: /motion_state" in config
     assert "actual_system_state_topic: /system_state" in config
     assert "actual_motion_mode_max_age_sec: 0.5" in config
     assert "mode_alignment_warn_after_sec: 0.25" in config
     assert "lateral_policy: reject" in overlay_config
-    assert "max_lateral_mps: 0.08" in overlay_config
-    assert "max_crab_yaw_radps: 0.15" in overlay_config
     assert "allow_reverse: false" in overlay_config
     assert "reverse_enable_topic: /ranger_mini3/allow_reverse" in overlay_config
     assert "docking_reverse_enable_topic: /ranger_mini3/docking_allow_reverse" in overlay_config
     assert "teleop_reverse_enable_topic: /ranger_mini3/teleop_allow_reverse" in overlay_config
-    assert "spin_enter_steering_threshold_rad: 0.698" in overlay_config
-    assert "auto_spin_max_linear_mps: 0.08" in overlay_config
-    assert "spin_on_high_curvature_while_moving: false" in overlay_config
+    assert "linear_epsilon_mps: 0.02" in overlay_config
+    assert "lateral_epsilon_mps: 0.02" in overlay_config
+    assert "yaw_epsilon_radps: 0.02" in overlay_config
     assert "desired_mode_topic: /ranger_mini3/desired_motion_mode" in overlay_config
     assert "actual_motion_state_topic: /motion_state" in overlay_config
     assert "actual_system_state_topic: /system_state" in overlay_config
     assert "actual_motion_mode_max_age_sec: 0.5" in overlay_config
     assert "mode_alignment_warn_after_sec: 0.25" in overlay_config
-    assert "Lateral / crab commands are disabled" in node_cpp
     assert '#include "ranger_msgs/msg/motion_state.hpp"' in node_cpp
     assert '#include "ranger_msgs/msg/system_state.hpp"' in node_cpp
     assert "create_subscription<ranger_msgs::msg::MotionState>" in node_cpp
@@ -4700,55 +6851,82 @@ def test_ranger_mini3_mode_controller_is_cpp_and_rejects_lateral_reverse():
     assert "odom guards must use actual motion_mode" in node_cpp
     assert "forced_policy_ = \"crab\"" in node_cpp
     assert "forced_policy_ = \"side_slip\"" in node_cpp
+    assert "forced_policy_ = \"spin\"" in node_cpp
     assert "forcedLateralAllowed()" in node_cpp
     assert "forced lateral mode active under official_passthrough" in node_cpp
     assert "MotionMode::kSideSlip" in node_cpp
     assert "RangerMotionMode::SIDE_SLIP" in node_cpp
     assert 'mode == "motion_mode_side_slip" || mode == "3"' in node_cpp
     assert "!forcedLateralAllowed()" in node_cpp
-    assert "msg.linear.y = command.lateral_mps" in node_cpp
-    assert "spin_on_high_curvature_while_moving_ || low_speed_spin_allowed" in node_cpp
-    assert "auto_spin_max_linear_mps_" in node_cpp
-    assert node_cpp.index("computeOfficialPassthrough") < node_cpp.index("RangerCommand computeCommand")
-    official_branch = node_cpp[
-        node_cpp.index("PublishDecision computeOfficialPassthrough"):
-        node_cpp.index("RangerCommand computeCommand")
-    ]
-    assert "dualAckermannInnerAngleFromTwist" not in official_branch
-    assert "dualAckermannVirtualAngleFromTwist" not in official_branch
-    assert "maxInnerAckermannYawRate" not in official_branch
-    assert "maxVirtualAckermannYawRate" not in official_branch
-    assert "speedLimitForAngle" not in official_branch
-    assert "rawAckermannAngle" not in official_branch
+    assert "decision.output.linear.y = 0.0" in node_cpp
     assert "effectiveAllowReverse" in node_cpp
     assert "reverse_permits_by_source_" in node_cpp
     assert "subscribeReversePermit(\"docking\"" in node_cpp
     assert "subscribeReversePermit(\"teleop\"" in node_cpp
-    assert "vx = std::max(0.0, vx)" in node_cpp
-    assert "return makeSpin(wz)" in node_cpp
+    assert "decision.output.linear.x = 0.0" in node_cpp
+
+    removed_tokens = (
+        "RangerCommand",
+        "cmdVelPassthrough",
+        "customAckermannEnabled",
+        "custom_ackermann_enabled",
+        "custom_ackermann_diagnostic_only",
+        "custom_profile",
+        'mode_controller_profile_ == "custom"',
+        "dualAckermannInnerAngleFromTwist",
+        "dualAckermannVirtualAngleFromTwist",
+        "maxInnerAckermannYawRate",
+        "maxVirtualAckermannYawRate",
+        "speedLimitForAngle",
+        "rawAckermannAngle",
+        "makeDualAckermann",
+        "makeCrab",
+        "makeSideSlip",
+        "makeSpin",
+        "spinHysteresisReason",
+        "resetSpinHysteresis",
+        "wheelbase_m_",
+        "track_m_",
+        "max_lateral_mps",
+        "max_crab_yaw_radps",
+        "spin_enter_steering_threshold_rad",
+        "auto_spin_max_linear_mps",
+        "spin_on_high_curvature_while_moving",
+    )
+    for token in removed_tokens:
+        assert token not in node_cpp
+        assert token not in config
+        assert token not in overlay_config
+
     assert "python3" not in overlay_runner
     assert "set +u" in overlay_runner
     assert 'source "${REPO_ROOT}/install/local_setup.bash"' in overlay_runner
     assert "set -u" in overlay_runner
     assert "colcon build --packages-select ranger_mini3_mode_controller" in overlay_runner
-    assert "--profile official_passthrough|custom" in set_profile
-    assert "kill -TERM" in set_profile
+    assert "--profile official_passthrough [--print]" in set_profile
+    assert "legacy custom Ackermann profile was removed" in set_profile
+    assert "single-node restart is disabled" in set_profile
+    assert "legacy_custom_ackermann_removed=true" in set_profile
+    assert "kill -TERM" not in set_profile
     assert "killall -9" not in set_profile
     assert "pkill -9" not in set_profile
-    assert "run_ranger_mini3_mode_controller.sh" in set_profile
+    assert "run_ranger_mini3_mode_controller.sh" not in set_profile
     assert "/cmd_vel_safe" in set_profile
     assert "/cmd_vel" in set_profile
     assert "--compare-cmd" in verify_passthrough
+    assert "--profile official_passthrough" in verify_passthrough
+    assert "--restart is disabled; restart the full njrh-runtime.service owner" in verify_passthrough
+    assert "/cmd_vel publisher is robot_safety" in verify_passthrough
+    assert "/ranger_mini3/mode_controller_shadow_cmd_vel" in verify_passthrough
     assert "mode_controller_profile" in verify_passthrough
-    assert "custom_ackermann_enabled" in verify_passthrough
+    assert "legacy_custom_ackermann_removed" in verify_passthrough
+    assert "custom_ackermann_enabled" not in verify_passthrough
+    assert "custom_profile" not in verify_passthrough
     assert "cmd_vel_passthrough" in verify_passthrough
     assert "ranger_base_node" in verify_passthrough
     assert "/ranger_mini3/docking_allow_reverse" in verify_passthrough
     assert "/ranger_mini3/teleop_allow_reverse" in verify_passthrough
-    assert "--duration-sec" in ab_runner
-    assert "reports/ranger_official_passthrough_ab_" in ab_runner
-    assert "/wheel/odom" in ab_runner
-    assert "/localization/bridge_status" in ab_runner
+    assert not ab_runner_path.exists()
 
 
 def test_occupancy_builder_package_exists():
@@ -4827,6 +7005,22 @@ def test_local_perception_node_ports_validated_base_link_filter_contract():
 def test_robot_safety_node_exports_stateful_final_cmd_vel_contract():
     node_script = (ROOT / "src" / "robot_safety" / "src" / "robot_safety_node.cpp").read_text(encoding="utf-8")
     config_text = (ROOT / "src" / "robot_safety" / "config" / "robot_safety.yaml").read_text(encoding="utf-8")
+    overlay_config_text = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "robot_safety.yaml"
+    ).read_text(encoding="utf-8")
+    api_node = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(encoding="utf-8")
+    docking_node = (
+        ROOT / "src" / "robot_docking_manager" / "src" / "docking_manager_node.cpp"
+    ).read_text(encoding="utf-8")
+    mode_node = (
+        ROOT / "src" / "ranger_mini3_mode_controller" / "src" / "mode_controller_node.cpp"
+    ).read_text(encoding="utf-8")
+    cmd_vel_stop_latency = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "record_cmd_vel_stop_latency.sh"
+    ).read_text(encoding="utf-8")
+    spin_imu_yaw = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_ranger_spin_imu_yaw_test.sh"
+    ).read_text(encoding="utf-8")
     assert "enum class SafetyState" in node_script
     assert '"status_topic", "/safety/status"' in node_script
     assert '"motion_allowed_topic", "/safety/motion_allowed"' in node_script
@@ -4834,19 +7028,126 @@ def test_robot_safety_node_exports_stateful_final_cmd_vel_contract():
     assert "LOCALIZATION_INVALID" in node_script
     assert "status_topic: /safety/status" in config_text
     assert "motion_allowed_topic: /safety/motion_allowed" in config_text
-    assert "cmd_vel_out_topic: /cmd_vel_safe" in config_text
+    assert "cmd_vel_out_topic: /cmd_vel" in config_text
+    assert "cmd_vel_mirror_topic: /cmd_vel_safe" in config_text
+    assert "cmd_vel_qos_depth: 1" in config_text
+    assert "zero_cmd_priority_enabled: true" in config_text
+    assert "zero_cmd_priority_epsilon: 0.0001" in config_text
+    assert "zero_cmd_priority_burst_sec: 0.25" in config_text
+    assert "cmd_vel_qos_depth: 1" in overlay_config_text
+    assert "zero_cmd_priority_enabled: true" in overlay_config_text
+    assert "zero_cmd_priority_epsilon: 0.0001" in overlay_config_text
+    assert "zero_cmd_priority_burst_sec: 0.25" in overlay_config_text
+    assert "spin_to_drive_require_local_odom_stable: false" in config_text
+    assert "spin_to_drive_local_odom_topic: /local_state/odometry" in config_text
+    assert "spin_to_drive_local_wz_threshold_radps: 0.03" in config_text
+    assert "spin_to_drive_local_stable_samples: 5" in config_text
+    assert "spin_to_drive_local_stable_duration_sec: 0.30" in config_text
+    assert "spin_to_drive_local_yaw_delta_threshold_rad: 0.005" in config_text
+    assert "spin_to_drive_require_imu_stable: true" in config_text
+    assert "spin_to_drive_imu_topic: /lidar_imu_bias_corrected" in config_text
+    assert "spin_to_drive_imu_wz_threshold_radps: 0.035" in config_text
+    assert "spin_to_drive_imu_stable_duration_sec: 0.30" in config_text
+    assert "spin_to_drive_imu_max_age_sec: 0.10" in config_text
+    assert "spin_to_drive_timeout_sec: 2.0" in config_text
+    assert "mode_exit_guard_enabled: true" in config_text
+    assert "mode_controller_status_topic: /ranger_mini3_mode_controller/status" in config_text
+    assert "mode_exit_guard_probe_speed_mps: 0.06" in config_text
+    assert "mode_exit_guard_timeout_sec: 1.0" in config_text
+    assert "final_cmd_lateral_deadband_mps: 0.001" in config_text
+    assert "allow_api_lateral_cmd: true" in config_text
+    assert "api_lateral_max_mps: 0.10" in config_text
+    assert "api_cmd_vel_in_topic: /cmd_vel_api" in config_text
+    assert "enable_api_cmd_priority: true" in config_text
+    assert "api_cmd_priority_timeout_sec: 0.25" in config_text
     assert "docking_cmd_vel_in_topic: /cmd_vel_docking" in config_text
     assert "enable_docking_cmd_priority: true" in config_text
     assert "docking_cmd_priority_timeout_sec: 0.25" in config_text
+    assert 'declare_parameter<std::string>("cmd_vel_out_topic", "/cmd_vel")' in node_script
+    assert 'declare_parameter<std::string>("cmd_vel_mirror_topic", "/cmd_vel_safe")' in node_script
+    assert 'declare_parameter<int>("cmd_vel_qos_depth", 1)' in node_script
+    assert 'declare_parameter<bool>("zero_cmd_priority_enabled", true)' in node_script
+    assert 'declare_parameter<double>("zero_cmd_priority_epsilon", 0.0001)' in node_script
+    assert 'declare_parameter<double>("zero_cmd_priority_burst_sec", 0.25)' in node_script
+    assert "rclcpp::QoS(rclcpp::KeepLast(cmd_vel_qos_depth_)).reliable()" in node_script
+    assert "const auto command_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable();" in api_node
+    assert "create_publisher<geometry_msgs::msg::Twist>(teleop_cmd_topic_, command_qos)" in api_node
+    assert (
+        "create_publisher<geometry_msgs::msg::Twist>(navigation_final_yaw_align_cmd_topic_, command_qos)"
+        in api_node
+    )
+    assert "create_publisher<geometry_msgs::msg::Twist>(predock_yaw_align_cmd_topic_, command_qos)" in api_node
+    assert "cmd_vel_topic_, rclcpp::QoS(rclcpp::KeepLast(1)).reliable()" in docking_node
+    assert "rclcpp::QoS(rclcpp::KeepLast(1)).reliable()" in mode_node
+    assert "cmd_qos = QoSProfile(depth=1)" in cmd_vel_stop_latency
+    assert "cmd_qos = QoSProfile(depth=1)" in spin_imu_yaw
+    assert "handle_zero_priority_command" in node_script
+    assert "zero_cmd_priority_active()" in node_script
+    assert "publish_stop_priority_command" in node_script
+    assert "twist_near_zero(cmd, zero_cmd_priority_epsilon_)" in node_script
+    assert 'declare_parameter<bool>("spin_to_drive_require_local_odom_stable", false)' in node_script
+    assert 'declare_parameter<std::string>("spin_to_drive_local_odom_topic", "/local_state/odometry")' in node_script
+    assert "on_spin_to_drive_local_odom" in node_script
+    assert "on_spin_to_drive_imu" in node_script
+    assert "spin_to_drive_local_odom_stable()" in node_script
+    assert "spin_to_drive_imu_stable()" in node_script
+    assert "spin_to_drive_actual_wz_stable() && spin_to_drive_local_odom_stable() &&" in node_script
+    assert "spin_to_drive_imu_stable())" in node_script
+    assert "spin_to_drive_linear_hold_started_time_" in node_script
+    assert "spin_to_drive_local_stable_since_time_" in node_script
+    assert "spin_to_drive_imu_stable_since_time_" in node_script
+    assert 'declare_parameter<double>("spin_to_drive_local_stable_duration_sec", 0.30)' in node_script
+    assert 'declare_parameter<bool>("spin_to_drive_require_imu_stable", true)' in node_script
+    assert 'declare_parameter<std::string>("spin_to_drive_imu_topic", "/lidar_imu_bias_corrected")' in node_script
+    assert 'declare_parameter<double>("spin_to_drive_imu_wz_threshold_radps", 0.035)' in node_script
+    assert 'declare_parameter<double>("spin_to_drive_imu_stable_duration_sec", 0.30)' in node_script
+    assert 'declare_parameter<double>("spin_to_drive_imu_max_age_sec", 0.10)' in node_script
+    assert 'declare_parameter<double>("spin_to_drive_timeout_sec", 2.0)' in node_script
+    assert "spin_to_drive settle timed out while holding linear drive" in node_script
+    assert 'declare_parameter<bool>("mode_exit_guard_enabled", true)' in node_script
+    assert 'declare_parameter<std::string>("mode_controller_status_topic", "/ranger_mini3_mode_controller/status")' in node_script
+    assert "on_mode_controller_status" in node_script
+    assert "parse_actual_motion_mode_code" in node_script
+    assert "actual_motion_mode_code_ == 1 || actual_motion_mode_code_ == 3" in node_script
+    assert "apply_mode_exit_guard" in node_script
+    assert "sanitize_command_for_mode_contract" in node_script
+    assert "allow_api_lateral_cmd" in node_script
+    assert "api_lateral_max_mps" in node_script
+    assert "source == CommandSource::DOCKING" in node_script
+    assert "source == CommandSource::API && allow_api_lateral_cmd_" in node_script
+    assert "sanitized.linear.y = 0.0" in node_script
+    assert "std::clamp(" in node_script
+    assert "mode_exit_guard releasing stale lateral motion_mode" in node_script
+    assert "mode_exit_guard probing DUAL_ACKERMAN" in node_script
+    assert "std::max(std::abs(cmd.linear.x), mode_exit_guard_probe_speed_mps_)" in node_script
+    assert 'declare_parameter<std::string>("api_cmd_vel_in_topic", "/cmd_vel_api")' in node_script
+    assert 'declare_parameter<bool>("enable_api_cmd_priority", true)' in node_script
     assert 'declare_parameter<std::string>("docking_cmd_vel_in_topic", "/cmd_vel_docking")' in node_script
     assert 'declare_parameter<bool>("enable_docking_cmd_priority", true)' in node_script
+    assert "api_command_fresh" in node_script
+    assert "fresh_api_command_active()" in node_script
+    assert "last_api_cmd_ = *msg" in node_script
+    assert "have_last_api_cmd_ = true" in node_script
+    assert "prepare_checked_command(last_api_cmd_, CommandSource::API)" in node_script
     assert "docking_command_fresh" in node_script
     assert "fresh_docking_command_active()" in node_script
     assert "last_docking_cmd_ = *msg" in node_script
     assert "have_last_docking_cmd_ = true" in node_script
-    assert "publish_command(last_docking_cmd_, snapshot)" in node_script
+    assert "prepare_checked_command(last_docking_cmd_, CommandSource::DOCKING)" in node_script
     assert "on_docking_cmd" in node_script
     assert "on_normal_cmd" in node_script
+
+    sdk = (
+        ROOT
+        / "external_sources"
+        / "jetson_ranger_ros2_20260620"
+        / "ranger_base"
+        / "src"
+        / "ranger_messenger.cpp"
+    ).read_text(encoding="utf-8")
+    assert "kCmdVelLateralDeadband" in sdk
+    assert "msg->linear.y = 0.0;" in sdk
+    assert "std::abs(msg->linear.y) > kCmdVelLateralDeadband" in sdk
 
 
 def test_robot_bringup_wires_repo_owned_localization_and_navigation_launches():
@@ -5169,7 +7470,7 @@ def test_localization_bridge_uses_pose_receive_time_for_freshness():
     assert "publish_rate_hz: 50.0" in (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "localization_bridge.yaml"
     ).read_text(encoding="utf-8")
-    assert "tf_future_stamp_offset_sec: 0.10" in (
+    assert "tf_future_stamp_offset_sec: 0.0" in (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "localization_bridge.yaml"
     ).read_text(encoding="utf-8")
     assert "install/robot_localization_bridge/lib/robot_localization_bridge/localization_bridge_node" in overlay_runner
@@ -5346,6 +7647,8 @@ def test_navigation_localization_uses_canonical_lidar_points_with_fastlio_odom_o
     assert "-r /tf:=/tf_fastlio_internal" not in localization_script
     assert "ensure_resident_fastlio_for_local_state()" in localization_script
     assert "ensure_resident_local_state_for_localization()" in localization_script
+    assert "NJRH_LOCALIZATION_LOCAL_STATE_WAIT_SEC:-20" in localization_script
+    assert 'wait_for_local_state_required_processes "${timeout_sec}"' in localization_script
     assert "managed FAST-LIO process exists for explicit fastlio local-state mode; startup topic probes are disabled" in localization_script
     assert "resident local_state ${NAV_LOCAL_STATE_MODE} process exists for occupancy localization; startup odom/TF probes are disabled" in localization_script
     assert "timed out waiting for localization pointcloud" not in localization_script
@@ -6839,6 +9142,7 @@ def test_phase115_flatscan_lifecycle_hardening_contracts():
 
     run_pipeline = (scripts_dir / "run_pointcloud_accel_pipeline.sh").read_text(encoding="utf-8")
     common_services = (scripts_dir / "run_common_services.sh").read_text(encoding="utf-8")
+    commercial_ready = (scripts_dir / "check_commercial_runtime_ready.sh").read_text(encoding="utf-8")
     verify_profile = (scripts_dir / "verify_pointcloud_accel_profile.sh").read_text(encoding="utf-8")
     nav_runtime = (scripts_dir / "run_navigation_runtime_services.sh").read_text(encoding="utf-8")
     ab_runner = (scripts_dir / "run_pointcloud_accel_ab.sh").read_text(encoding="utf-8")
@@ -6868,6 +9172,9 @@ def test_phase115_flatscan_lifecycle_hardening_contracts():
     assert "FLATSCAN_HELPER_RESTART_COUNT" in run_pipeline
     assert "CASE_FLATSCAN_HELPER_DEAD" in run_pipeline
     assert "standalone /scan exists but /flatscan publisher is missing while laser_scan_to_flatscan pid=" in run_pipeline
+    assert "waiting before helper restart" in run_pipeline
+    assert "standalone scan chain temporarily lacks /flatscan while /scan publisher is not ready" in run_pipeline
+    assert "FAIL standalone scan chain lost /flatscan and /scan publisher is not ready" not in run_pipeline
     assert "legacy_scan_pid=$!" not in run_pipeline
     assert "jt128_localization_sensing.launch.py" not in run_pipeline
     assert 'flatscan_helper_mode="legacy_launch"' not in run_pipeline
@@ -6926,6 +9233,8 @@ def test_phase115_flatscan_lifecycle_hardening_contracts():
     assert "flatscan helper restart count" in ab_runner
     assert "flatscan case" in ab_runner
     assert "CASE_FLATSCAN_HELPER_DEAD" in ab_runner
+    assert "check_topic_publisher_node()" in commercial_ready
+    assert 'run_check check_topic_publisher_node "/flatscan" "laser_scan_to_flatscan" 10' in commercial_ready
 
     assert "global_frame: odom" in nav2
     assert "global_frame: base_link" not in nav2
@@ -6976,6 +9285,8 @@ def test_phase_a2_amcl_replaces_isaac_continuous_localization_contracts():
     assert "continuous_localization_mode: triggered" in bridge_src_cfg
     assert "triggered_max_result_age_ms: 5000.0" in bridge_cfg
     assert "triggered_max_result_age_ms: 5000.0" in bridge_src_cfg
+    assert "force_accept_min_pose_stamp_slack_sec: 1.0" in bridge_cfg
+    assert "force_accept_min_pose_stamp_slack_sec: 1.0" in bridge_src_cfg
     assert "continuous_max_result_age_ms:" not in bridge_cfg
     assert "continuous_max_result_age_ms:" not in bridge_src_cfg
     assert "triggered_allow_large_correction: true" in bridge_cfg
@@ -7012,6 +9323,11 @@ def test_phase_a2_amcl_replaces_isaac_continuous_localization_contracts():
     assert "map_to_odom_y" in bridge_cpp
     assert "continuous_localization_mode_" in bridge_cpp
     assert "triggered_max_result_age_ms_" in bridge_cpp
+    assert "force_accept_min_pose_stamp_slack_sec_" in bridge_cpp
+    assert "force_accept_armed_sec_" in bridge_cpp
+    assert "should_ignore_force_accept_pretrigger_result" in bridge_cpp
+    assert "force_accept_ignored_pretrigger_result_count" in bridge_cpp
+    assert "last_force_accept_ignored_reason" in bridge_cpp
     assert "mark_latest_pose_stamp_used" in bridge_cpp
     assert "candidate_should_retry_later" in bridge_cpp
     assert "EXPLICIT_TRIGGERED_RELOCALIZATION" in bridge_cpp
@@ -7035,12 +9351,29 @@ def test_phase_a2_amcl_replaces_isaac_continuous_localization_contracts():
     assert "accepted_result_hz" in bridge_cpp
     assert "on_amcl_pose" in bridge_cpp
     assert "accept_amcl_candidate" in bridge_cpp
+    assert "amcl_accept_corrections_while_moving" in bridge_cpp
+    assert "AMCL_ROBOT_MOVING_OBSERVE_ONLY" in bridge_cpp
 
     assert "service_call_timeout_sec: 10.0" in global_cfg
     assert "result_wait_timeout_sec: 20.0" in global_cfg
     assert "bridge_accept_timeout_sec: 8.0" in global_cfg
     assert "transient_stale_bridge_accept_timeout_sec: 3.0" in global_cfg
-    assert "active_deadline = shortened_deadline" in global_cpp
+    assert "localizer_input_freshness_enabled: true" in global_cfg
+    assert "localizer_input_topic: /flatscan" in global_cfg
+    assert "localizer_input_wait_timeout_sec: 1.0" in global_cfg
+    assert "localizer_input_max_age_sec: 0.5" in global_cfg
+    assert "result_allowed_pretrigger_age_sec: 1.0" in global_cfg
+    assert "active_deadline = shortened_deadline" not in global_cpp
+    assert "failure_code=FRESH_LOCALIZATION_RETRY_REQUIRED" in global_cpp
+    assert "force_accept_ignored_pretrigger_result_count" in global_cpp
+    assert "last_force_accept_ignored_reason" in global_cpp
+    assert "bridge ignored pre-force-accept stale localization_result" in global_cpp
+    assert "create_generic_subscription" in global_cpp
+    assert "wait_for_fresh_localizer_input" in global_cpp
+    assert "failure_code=LOCALIZER_INPUT_NOT_FRESH" in global_cpp
+    assert "localization_result_is_fresh_for_trigger" in global_cpp
+    assert "bridge ignoring stale triggered localization_result while waiting for" in global_cpp
+    assert "same-trigger window" in global_cpp
     assert "map_to_odom_wait_timeout_sec: 8.0" in global_cfg
     assert "bridge_status_topic: /localization/bridge_status" in global_cfg
     assert "bridge_force_accept_service: /robot_localization_bridge/force_accept_next_localization" in global_cfg
@@ -7051,10 +9384,22 @@ def test_phase_a2_amcl_replaces_isaac_continuous_localization_contracts():
     assert "<depend>tf2_ros</depend>" in global_pkg
     assert "wait_for_bridge_acceptance" in global_cpp
     assert "bridge_reject_is_transient_triggered_stale" in global_cpp
+    assert "bridge_reject_is_expected_amcl_observe_only" in global_cpp
+    assert "AMCL_ROBOT_MOVING_OBSERVE_ONLY" in global_cpp
+    assert "amcl_suppressed_after_isaac_triggered" in global_cpp
+    assert "AMCL_CORRECTION_TOO_LARGE" in global_cpp
+    assert "bridge_explicit_trigger_accept_observed" in global_cpp
+    assert "last_explicit_relocalization_sequence" in global_cpp
+    assert "bridge accepted explicit triggered relocalization" in global_cpp
+    assert global_cpp.index("bridge_explicit_trigger_accept_observed(initial, latest)") < global_cpp.index(
+        "latest.rejected_result_count > initial.rejected_result_count"
+    )
+    assert "bridge ignoring AMCL observe-only reject while waiting for fresh" in global_cpp
     assert "isaac_triggered_pose_stale_ms" in global_cpp
     assert "wait_for_map_to_odom" in global_cpp
     assert "failure_code=ISAAC_SERVICE_TIMEOUT" in global_cpp
     assert "failure_code=LOCALIZATION_RESULT_TIMEOUT" in global_cpp
+    assert "failure_code=FRESH_LOCALIZATION_RETRY_REQUIRED" in global_cpp
     assert "failure_code=BRIDGE_ACCEPT_TIMEOUT" in global_cpp
     assert "failure_code=MAP_TO_ODOM_TIMEOUT" in global_cpp
     assert "failure_code=MAP_TO_ODOM_WRONG_OWNER" in global_cpp
@@ -7121,7 +9466,7 @@ def test_phase_a1_amcl_shadow_localization_contracts():
     assert "scan_topic: /flatscan" not in amcl_cfg
     assert "map_topic: /map" in amcl_cfg
     assert "set_initial_pose: false" in amcl_cfg
-    assert "nav2_amcl::DifferentialMotionModel" in amcl_cfg
+    assert "nav2_amcl::OmniMotionModel" in amcl_cfg
 
     assert "NJRH_AMCL_LOCALIZATION_MODE:-gated" in amcl_mode
     assert "NJRH_AMCL_TF_WARMUP_SEC" in amcl_mode
@@ -7206,15 +9551,16 @@ def test_phase_a1_amcl_shadow_localization_contracts():
         assert "amcl_pose_topic: /amcl_pose" in cfg
         assert "amcl_input_enabled: false" in cfg
         assert "amcl_gate_mode: shadow" in cfg
-        assert "amcl_max_result_age_ms: 500.0" in cfg
-        assert "amcl_small_correction_translation_m: 0.30" in cfg
+        assert "amcl_max_result_age_ms: 1000.0" in cfg
+        assert "amcl_small_correction_translation_m: 0.07" in cfg
         assert "amcl_small_correction_yaw_rad: 0.20" in cfg
-        assert "amcl_medium_correction_translation_m: 0.70" in cfg
+        assert "amcl_medium_correction_translation_m: 0.15" in cfg
         assert "amcl_medium_correction_yaw_rad: 0.20" in cfg
         assert "amcl_medium_correction_consistency_count: 3" in cfg
-        assert "amcl_hard_reject_translation_m: 1.20" in cfg
-        assert "amcl_max_xy_covariance: 1.0" in cfg
-        assert "amcl_max_yaw_covariance: 0.5" in cfg
+        assert "amcl_hard_reject_translation_m: 0.30" in cfg
+        assert "amcl_hard_reject_yaw_rad: 0.8" in cfg
+        assert "amcl_max_xy_covariance: 0.15" in cfg
+        assert "amcl_max_yaw_covariance: 0.10" in cfg
         assert "amcl_seed_service: /robot_localization_bridge/seed_amcl_initial_pose" in cfg
         assert "amcl_pose_max_age_ms: 1000.0" in cfg
         assert "amcl_initial_pose_publish_repetitions: 3" in cfg
@@ -7356,7 +9702,7 @@ def test_phase_a13_amcl_scan_admission_cpu_affinity_contracts():
     assert "ros2 topic pub" not in observe
 
     assert "max_odom_tf_age_ms: 100.0" in bridge_cfg
-    assert "tf_future_stamp_offset_sec: 0.10" in bridge_cfg
+    assert "tf_future_stamp_offset_sec: 0.0" in bridge_cfg
     assert "transform_tolerance: 0.10" in nav2
     assert "global_frame: odom" in local_costmap_config_block(nav2)
     assert "global_frame: base_link" not in local_costmap_config_block(nav2)
@@ -7502,7 +9848,7 @@ def test_phase_a14_cpp_amcl_scan_admission_contracts():
     assert "scan_topic: /scan_amcl" in amcl_cfg
     assert "tf_broadcast: false" in amcl_cfg
     assert "max_odom_tf_age_ms: 100.0" in bridge_cfg
-    assert "tf_future_stamp_offset_sec: 0.10" in bridge_cfg
+    assert "tf_future_stamp_offset_sec: 0.0" in bridge_cfg
     assert "MPPIController" in nav2
     assert "SmacPlanner2D" in nav2
     assert "global_frame: odom" in local_costmap_config_block(nav2)
@@ -7699,13 +10045,17 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "--trust-change-state-response" in lifecycle_sequence
     assert "--configure-all-before-activate" in lifecycle_sequence
     assert "lifecycle sequence: configuring all managed nodes before activation" in lifecycle_sequence
+    assert "lifecycle configure complete node=" in lifecycle_sequence
+    assert "lifecycle activate complete node=" in lifecycle_sequence
     resident_lifecycle_block = runtime[
         runtime.index("activate_prestarted_nav2_lifecycle()") :
         runtime.index("ensure_navigation_layer_alive || return 1", runtime.index("activate_prestarted_nav2_lifecycle()"))
     ]
     assert "waypoint_follower" not in resident_lifecycle_block
-    assert "smoother_server" not in resident_lifecycle_block
-    assert "behavior_server" not in resident_lifecycle_block
+    assert "smoother_server" in resident_lifecycle_block
+    assert "behavior_server" in resident_lifecycle_block
+    assert resident_lifecycle_block.index("behavior_server") < resident_lifecycle_block.index("smoother_server")
+    assert resident_lifecycle_block.index("smoother_server") < resident_lifecycle_block.index("bt_navigator")
     assert resident_lifecycle_block.index("planner_server") < resident_lifecycle_block.index("controller_server")
     assert "start_amcl_status_heartbeat_if_enabled_for_navigation" in runtime
     assert "amcl_status_heartbeat_pid" in runtime
@@ -7719,6 +10069,17 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "resolve_resident_navigation_autostart_selection()" in common_runner
     assert "start_resident_navigation_autostart_if_selected()" in common_runner
     assert "wait_for_resident_navigation_autostart_if_started()" in common_runner
+    assert "COMMON_STARTUP_STAGE stage=" in common_runner
+    assert 'log_common_startup_stage "helpers_loaded"' in common_runner
+    assert 'log_common_startup_stage "local_state_ready"' in common_runner
+    assert 'log_common_startup_stage "common_services_ready"' in common_runner
+    assert 'NJRH_LOCAL_STATE_START_READY_MODE="${NJRH_COMMON_LOCAL_STATE_START_READY_MODE:-endpoint}"' in common_runner
+    resident_autostart_wait_block = common_runner[
+        common_runner.index("wait_for_resident_navigation_autostart_if_started()") :
+        common_runner.index("stop_stale_pointcloud_accel_pipeline_processes()")
+    ]
+    assert "common services will not block on navigation readiness" in resident_autostart_wait_block
+    assert "wait_for_resident_navigation_context_ready" not in resident_autostart_wait_block
     assert "NJRH_RESIDENT_NAVIGATION_EARLY_AUTOSTART:-true" in common_runner
     assert "no stale resident navigation layers found; skipping Nav2/localization/AMCL cleanup sweep" in common_runner
     assert "njrh_load_pointcloud_ingress_profile" in common_runner
@@ -7742,16 +10103,16 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert common_main_flow.index('start_canonical_helper "robot_description_static_tf_common"') < common_main_flow.index(
         'start_common_process "pointcloud_accel_pipeline"'
     )
-    assert common_main_flow.index("NJRH_RUNTIME_HEALTH_GUARD_AUTOSTART") < common_main_flow.index(
-        'start_canonical_helper \\\n  "robot_local_state_common"'
+    assert common_main_flow.index("start_robot_local_state_common_background_if_enabled") < common_main_flow.index(
+        'start_common_process "pointcloud_accel_pipeline"'
     )
-    assert common_main_flow.index("NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE") < common_main_flow.index(
-        'start_canonical_helper \\\n  "robot_local_state_common"'
+    assert common_main_flow.index("NJRH_RUNTIME_HEALTH_GUARD_AUTOSTART") < common_main_flow.index(
+        "wait_for_robot_local_state_common_background_if_started"
     )
     assert common_main_flow.index("NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE") < common_main_flow.index(
         "start_resident_navigation_autostart_if_selected"
     )
-    assert common_main_flow.index('start_canonical_helper \\\n  "robot_local_state_common"') < common_main_flow.index(
+    assert common_main_flow.index("wait_for_robot_local_state_common_background_if_started") < common_main_flow.index(
         "wait_for_runtime_health_local_state_ready"
     )
     assert "wait_for_fresh_header_topic_message" in runtime
@@ -7760,6 +10121,14 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
         common_runner.index("start_resident_navigation_autostart_if_selected()") :
         common_runner.index("wait_for_resident_navigation_autostart_if_started()")
     ]
+    assert (
+        'NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK="${NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK:-false}"'
+        in autostart_block
+    )
+    assert (
+        'NJRH_NAV2_LIFECYCLE_PARALLEL_CORE="${NJRH_NAV2_LIFECYCLE_PARALLEL_CORE:-false}"'
+        in autostart_block
+    )
     assert autostart_block.index("prepare_resident_navigation_autostart") < autostart_block.index(
         "common_require_flatscan_before_resident_autostart"
     )
@@ -7858,6 +10227,8 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "amcl_runtime_status.static_standby" in bridge_cpp
     assert "amcl_runtime_status.not_moving_no_update_ok" in bridge_cpp
     assert "amcl_runtime_status.tracking_ready && !amcl_runtime_status.correction_ready" in bridge_cpp
+    assert "amcl_runtime_waiting_seed_resolved" in bridge_cpp
+    assert "amcl_degraded_reason.clear()" in bridge_cpp
     assert "localization_degraded" in bridge_cpp
     assert "amcl_runtime_status_file" in bridge_cpp
     assert "read_amcl_runtime_status_file" in bridge_cpp
@@ -7893,13 +10264,19 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "map_topic: /map" in amcl_cfg
     assert "update_min_d: 0.05" in amcl_cfg
     assert "update_min_a: 0.05" in amcl_cfg
-    assert "robot_model_type: nav2_amcl::DifferentialMotionModel" in amcl_cfg
+    assert "robot_model_type: nav2_amcl::OmniMotionModel" in amcl_cfg
     assert "amcl_input_enabled: false" in bridge_cfg
     assert "amcl_gate_mode: shadow" in bridge_cfg
-    assert "amcl_small_correction_translation_m: 0.30" in bridge_cfg
-    assert "amcl_medium_correction_translation_m: 0.70" in bridge_cfg
+    assert "amcl_small_correction_translation_m: 0.07" in bridge_cfg
+    assert "amcl_small_correction_yaw_rad: 0.20" in bridge_cfg
+    assert "amcl_medium_correction_translation_m: 0.15" in bridge_cfg
+    assert "amcl_medium_correction_yaw_rad: 0.20" in bridge_cfg
     assert "amcl_medium_correction_consistency_count: 3" in bridge_cfg
-    assert "amcl_hard_reject_translation_m: 1.20" in bridge_cfg
+    assert "amcl_accept_corrections_while_moving: true" in bridge_cfg
+    assert "amcl_moving_linear_speed_mps: 0.02" in bridge_cfg
+    assert "amcl_moving_angular_speed_radps: 0.02" in bridge_cfg
+    assert "amcl_hard_reject_translation_m: 0.30" in bridge_cfg
+    assert "amcl_hard_reject_yaw_rad: 0.8" in bridge_cfg
     assert "amcl_scan_admission_status_topic: /amcl_scan_admission/status" in bridge_cfg
     assert "amcl_runtime_status_file: /tmp/njrh_amcl_runtime_status.env" in bridge_cfg
     assert "amcl_runtime_status_ttl_sec: 5.0" in bridge_cfg
@@ -7916,7 +10293,7 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert nomotion_probe_path.exists()
     assert observe_path.exists()
     assert "--mode disabled|shadow|gated" in verify
-    assert 'MODE="${NJRH_AMCL_LOCALIZATION_MODE:-gated}"' in verify
+    assert 'MODE="${NJRH_AMCL_LOCALIZATION_MODE:-shadow}"' in verify
     assert "--seed" in verify
     assert "--check-triggered" in verify
     assert "--check-owner" in verify
@@ -8032,6 +10409,8 @@ def test_phase_a22_amcl_readiness_stale_status_and_nomotion_race_contracts():
     assert "request_amcl_nomotion_update || return 1" not in amcl_runner
 
     assert "amcl_runtime_status_ttl_sec" in bridge_cpp
+    assert "amcl_accept_corrections_while_moving" in bridge_cpp
+    assert "amcl_robot_moving_now" in bridge_cpp
     assert "amcl_runtime_status_authoritative" in bridge_cpp
     assert "stale_file_ignored" in bridge_cpp
     assert "amcl_status_file_stale" in bridge_cpp
@@ -8060,6 +10439,9 @@ def test_phase_a22_amcl_readiness_stale_status_and_nomotion_race_contracts():
     assert "using_triggered_baseline_only" in api_cpp
 
     assert "amcl_runtime_status_ttl_sec: 5.0" in bridge_cfg
+    assert "amcl_accept_corrections_while_moving: true" in bridge_cfg
+    assert "amcl_moving_linear_speed_mps: 0.02" in bridge_cfg
+    assert "amcl_moving_angular_speed_radps: 0.02" in bridge_cfg
     assert "amcl_runtime_status_ttl_sec: 5.0" in api_cfg
     assert "max_odom_tf_age_ms: 100.0" in bridge_cfg
 
@@ -8167,7 +10549,7 @@ def test_phase_c1_nav2_controller_cpu_profile_contracts():
     assert "killall -9" not in cleanup
 
     assert "max_odom_tf_age_ms: 100.0" in bridge_cfg
-    assert "tf_future_stamp_offset_sec: 0.10" in bridge_cfg
+    assert "tf_future_stamp_offset_sec: 0.0" in bridge_cfg
     assert "transform_tolerance: 0.10" in nav2
     assert "transform_tolerance: 0.15" in local_costmap_config_block(nav2)
     assert "tf_filter_tolerance" not in nav2
@@ -8222,11 +10604,14 @@ def test_phase_d3_docking_framework_state_machine_contracts():
         "BEFORE_PREDOCK_RELOCALIZE",
         "BEFORE_PREDOCK_SETTLE",
         "NAV_TO_STAGING_NATIVE_NAV2",
+        "STAGING_NAV2_EARLY_HANDOFF",
         "STAGING_NAV2_GOAL_SUCCEEDED",
         "PREDOCK_POSE_VERIFY",
         "PREDOCK_NATIVE_GOAL_VERIFY_FAILED",
         "PREDOCK_YAW_ALIGN_RECOVERY",
         "PREDOCK_YAW_ALIGN_RECOVERY_SETTLE",
+        "PREDOCK_LATERAL_ALIGN",
+        "PREDOCK_LATERAL_ALIGN_VERIFY",
         "AFTER_PREDOCK_RELOCALIZE",
         "AFTER_PREDOCK_SETTLE",
         "GS2_DOCK_DETECT",
@@ -8234,6 +10619,7 @@ def test_phase_d3_docking_framework_state_machine_contracts():
             "PREDOCK_POSE_VERIFY_AFTER_BRIDGE_SETTLE",
             "PREDOCK_YAW_ALIGN_AFTER_BRIDGE_SETTLE",
             "PREDOCK_YAW_ALIGN_AFTER_BRIDGE_SETTLE_VERIFY",
+            "PREDOCK_LATERAL_ALIGN_AFTER_BRIDGE_SETTLE_VERIFY",
             "FINE_DOCKING_ENTRY_CHECK",
         "FINE_ALIGN",
         "RESTAGE_RETRY",
@@ -8246,7 +10632,16 @@ def test_phase_d3_docking_framework_state_machine_contracts():
         "computePredockYawError",
         "computeContactYawError",
         "normalizeYawError",
+        "predock_pose_inside_xy_handoff_window",
+        "predock_pose_allows_staging_recovery",
+        "predock_yaw_angles_met",
+        "predock_staging_target_met",
+        "predock_forward_capture_window_met",
+        "predock_lateral_capture_allowed",
         "run_predock_yaw_align",
+        "run_predock_lateral_align",
+        "predock_lateral_align_yaw_gate_met",
+        "ensure_predock_lateral_alignment",
         "evaluate_fine_docking_entry",
     ):
         assert symbol in api_cpp
@@ -8254,12 +10649,59 @@ def test_phase_d3_docking_framework_state_machine_contracts():
     assert 'predock_yaw_align_cmd_topic_ != "/cmd_vel_docking"' in api_cpp
     assert "create_publisher<geometry_msgs::msg::Twist>(predock_yaw_align_cmd_topic_" in api_cpp
     assert "actual_motion_mode_code == 2" in api_cpp
+    assert "actual motion_mode has not confirmed SPINNING=2; continuing predock yaw alignment" in api_cpp
+    assert "PREDOCK_YAW_ALIGN_MODE_SWITCHING_TIMEOUT" not in api_cpp
+    assert "docking-owned yaw/lateral recovery" in api_cpp
+    assert "retrying predock native Nav2 because current pose is outside docking recovery window" in api_cpp
+    assert 'declare_parameter<bool>("docking_predock_early_handoff_enabled", false)' in api_cpp
+    assert "docking_predock_early_handoff_enabled_ &&" in api_cpp
+    assert "predock_pose_allows_staging_recovery(predock_check)" in api_cpp
+    assert "predock yaw exceeded lateral alignment gate" in api_cpp
+    assert "predock lateral error diverged; reversing side-slip command direction once" in api_cpp
+    assert "direction_multiplier * std::copysign(command_speed, check.lateral_m)" in api_cpp
+    assert "closed-loop predock staging capture verify cycle" in api_cpp
+    assert "recapturing predock yaw in closed-loop staging cycle" in api_cpp
+    assert "closed-loop lateral capture cycle" in api_cpp
+    post_bridge_start = api_cpp.index(
+        'set_docking_job_phase(job_id, "PREDOCK_POSE_VERIFY_AFTER_BRIDGE_SETTLE")'
+    )
+    fine_entry_start = api_cpp.index(
+        'set_docking_job_phase(job_id, "FINE_DOCKING_ENTRY_CHECK")',
+        post_bridge_start,
+    )
+    post_bridge_block = api_cpp[post_bridge_start:fine_entry_start]
+    assert "ensure_predock_lateral_alignment(" not in post_bridge_block
+    assert "verifying staging lateral after bridge smoothing without second side-slip" in post_bridge_block
+    assert "post-bridge staging lateral accepted without second side-slip" in post_bridge_block
+    assert "FINE_DOCKING_REJECTED_LATERAL_TOO_LARGE" in post_bridge_block
+    assert "predock_check.lateral_abs_m > fine_docking_entry_max_lateral_m_" in post_bridge_block
+    staging_capture_block = api_cpp[
+        api_cpp.index("bool ensure_predock_lateral_alignment(") :
+        api_cpp.index("bool evaluate_fine_docking_entry", api_cpp.index("bool ensure_predock_lateral_alignment("))
+    ]
+    assert "predock_yaw_aligned = predock_yaw_angles_met(predock_check);" in staging_capture_block
+    assert "predock_yaw_aligned = predock_yaw_target_met(predock_check);" not in staging_capture_block
+    assert "bool predock_yaw_aligned = predock_yaw_angles_met(predock_check);" in api_cpp
+    assert "predock staging capture cannot fix current centerline/forward window by side-slip" in api_cpp
+    assert "forward_capture_min=" in api_cpp
+    assert "forward_capture_max=" in api_cpp
+    assert "predock staging capture exhausted closed-loop cycles" in api_cpp
+    assert "publish_predock_lateral_forced_mode(predock_lateral_align_forced_mode_)" in api_cpp
+    assert "twist.linear.y" in api_cpp
     assert "mode_controller_status_topic_" in api_cpp
     assert "docking_gs2_scan_topic_" in api_cpp
     assert "set_global_correction_paused_for_docking(job_id, true, \"docking_fine_entry\"" in api_cpp
     assert "correction_pause_reason" in api_cpp
     assert "bridge_status_has_docking_fine_pause" in api_cpp
     assert "release_stale_docking_fine_pause_if_needed" in api_cpp
+    assert "bridge_status_safe_for_fine_docking_entry" in api_cpp
+    assert "bridge_status_safe_for_goal_start(bridge, \"docking fine docking\", base_detail)" in api_cpp
+    assert "AMCL_NOT_TRACKING tolerated_for_fine_docking_after_predock_verified" in api_cpp
+    assert 'bridge.amcl_degraded_reason == "AMCL_NOT_TRACKING"' in api_cpp
+    assert "!bridge.correction_active" in api_cpp
+    assert "!bridge.amcl_correction_pending" in api_cpp
+    assert "std::fabs(bridge.remaining_translation_error_m) <= 0.02" in api_cpp
+    assert "std::fabs(bridge.remaining_yaw_error_rad) <= 0.05" in api_cpp
     assert '"pre_navigation_undock_start"' in api_cpp
     assert '"post_undock_relocalization_before_trigger"' in api_cpp
     assert "POST_UNDOCK_STALE_DOCKING_FINE_PAUSE" in api_cpp
@@ -8274,11 +10716,16 @@ def test_phase_d3_docking_framework_state_machine_contracts():
             "PREDOCK_YAW_NOT_ALIGNED_AFTER_NAV2",
             "PREDOCK_POSE_DRIFTED_AFTER_BRIDGE_SETTLE",
             "PREDOCK_YAW_NOT_ALIGNED_AFTER_BRIDGE_SETTLE",
-            "PREDOCK_YAW_NOT_ALIGNED",
+        "PREDOCK_YAW_NOT_ALIGNED",
         "PREDOCK_YAW_HARD_FAIL",
         "PREDOCK_YAW_ALIGN_TIMEOUT",
-        "PREDOCK_YAW_ALIGN_MODE_SWITCHING_TIMEOUT",
         "PREDOCK_YAW_ALIGN_NO_YAW_MOTION",
+        "PREDOCK_LATERAL_NOT_ALIGNED",
+        "PREDOCK_LATERAL_HARD_FAIL",
+        "PREDOCK_LATERAL_ALIGN_TIMEOUT",
+        "PREDOCK_LATERAL_ALIGN_NO_LATERAL_MOTION",
+        "PREDOCK_LATERAL_ALIGN_DIVERGING",
+        "PREDOCK_LATERAL_ALIGN_OWNER_CONFLICT",
         "GS2_DOCK_DETECT_TIMEOUT",
         "DOCK_FAILED_FINE_LOCALIZATION_TRANSITION_TIMEOUT",
         "FINE_DOCKING_ENTRY_CONDITION_FAILED",
@@ -8300,7 +10747,13 @@ def test_phase_d3_docking_framework_state_machine_contracts():
         "predock_yaw_verified_by_nav2",
         "reverse_yaw_offset_applied",
         "contact_frame_available",
+        "predock_forward_m",
+        "predock_lateral_m",
+        "predock_lateral_abs_m",
         "predock_yaw_aligned",
+        "predock_lateral_aligned",
+        "predock_lateral_align_attempted",
+        "predock_lateral_align_failure_code",
         "fine_bridge_settle_started",
         "fine_bridge_settle_complete",
         "fine_bridge_settle_failure_code",
@@ -8319,14 +10772,30 @@ def test_phase_d3_docking_framework_state_machine_contracts():
 
     for key in (
         "docking_framework_state_machine_enabled: true",
+        "docking_predock_early_handoff_enabled: false",
             "predock_yaw_align_enabled: true",
             "predock_yaw_align_fallback_enabled: true",
         'predock_yaw_align_cmd_topic: "/cmd_vel_docking"',
         "predock_yaw_align_require_actual_spin: true",
+        "predock_lateral_align_enabled: true",
+        "predock_lateral_align_target_m: 0.03",
+        "predock_lateral_align_max_correction_m: 0.25",
+        "predock_lateral_align_yaw_slack_rad: 0.02",
+        "predock_lateral_align_divergence_epsilon_m: 0.015",
+        "predock_lateral_align_divergence_count: 2",
+        "predock_lateral_align_auto_reverse_on_divergence: true",
+        "predock_staging_capture_max_cycles: 6",
+        "predock_forward_capture_min_m: -0.40",
+        "predock_forward_capture_max_m: 0.55",
+        'predock_lateral_align_forced_mode_topic: "/ranger_mini3/forced_mode"',
+        'predock_lateral_align_forced_mode: "side_slip"',
+        "predock_lateral_align_timeout_sec: 14.0",
+        "predock_lateral_align_speed_mps: 0.04",
         "fine_docking_entry_require_gs2_fresh: true",
         "fine_docking_entry_require_predock_yaw_aligned: true",
+        "fine_docking_entry_max_lateral_m: 0.08",
         "docking_fine_wait_for_bridge_smoothing_enabled: true",
-        "docking_fine_bridge_smoothing_wait_timeout_ms: 60000",
+        "docking_fine_bridge_smoothing_wait_timeout_ms: 5000",
         "docking_pause_global_correction_during_fine: true",
         'localization_bridge_correction_pause_service: "/robot_localization_bridge/set_correction_paused"',
         'mode_controller_status_topic: "/ranger_mini3_mode_controller/status"',
@@ -8476,10 +10945,14 @@ def test_phase_v1_navigation_docking_validation_contracts():
     ).read_text(encoding="utf-8")
 
     assert 'navigation_default_goal_completion_policy: "pose_required"' in api_cfg
+    assert 'navigation_delivery_point_goal_completion_policy: "pose_required"' in api_cfg
+    assert 'navigation_position_only_nav2_yaw_mode: "approach_heading"' in api_cfg
     assert 'predock_yaw_align_cmd_topic: "/cmd_vel_docking"' in api_cfg
+    assert "predock_lateral_align_enabled: true" in api_cfg
+    assert 'predock_lateral_align_forced_mode: "side_slip"' in api_cfg
     assert "fine_docking_entry_require_predock_yaw_aligned: true" in api_cfg
     assert "docking_fine_wait_for_bridge_smoothing_enabled: true" in api_cfg
-    assert "docking_fine_bridge_smoothing_wait_timeout_ms: 60000" in api_cfg
+    assert "docking_fine_bridge_smoothing_wait_timeout_ms: 5000" in api_cfg
     assert "docking_pause_global_correction_during_fine: true" in api_cfg
     assert "tf_broadcast: false" in amcl_cfg
     assert "global_frame: odom" in local_costmap_config_block(nav2_cfg)
@@ -8488,12 +10961,27 @@ def test_phase_v1_navigation_docking_validation_contracts():
     assert "map_to_odom_ = candidate.transform" not in bridge_cpp
 
     assert 'navigation_default_goal_completion_policy", "pose_required"' in api_cpp
+    assert 'navigation_delivery_point_goal_completion_policy", "pose_required"' in api_cpp
+    assert "resolve_nav2_goal_yaw_for_policy" in api_cpp
+    assert "nav2_goal_yaw_source" in api_cpp
     assert "goal_completion_policy=dock_staging is reserved for /api/v1/docking/start" in api_cpp
     assert 'json_bool_value(body, "wait_for_settle", false)' in api_cpp
     assert "post_relocalization_settle_requested" in api_cpp
     assert "PREDOCK_YAW_ALIGN_OWNER_CONFLICT" in api_cpp
+    assert "PREDOCK_LATERAL_ALIGN" in api_cpp
     assert "fine_docking_entry_require_predock_yaw_aligned_ && !predock_yaw_aligned" in api_cpp
+    fine_entry_block = api_cpp[
+        api_cpp.index("bool evaluate_fine_docking_entry") :
+        api_cpp.index("std::string classify_fine_docking_failure_code")
+    ]
+    assert (
+        "if (!dock_staging_handoff_ready || !post_predock_settle_complete)"
+        in fine_entry_block
+    )
+    assert "!predock_pose_verified" not in fine_entry_block
     assert "wait_for_bridge_smoothing_before_fine_docking" in api_cpp
+    assert "bridge_status_safe_for_fine_docking_entry" in api_cpp
+    assert "AMCL_NOT_TRACKING tolerated_for_fine_docking_after_predock_verified" in api_cpp
     assert "FINE_DOCKING_BRIDGE_SETTLE" in api_cpp
     assert "DOCK_FAILED_FINE_LOCALIZATION_TRANSITION_TIMEOUT" in api_cpp
 
@@ -8629,6 +11117,8 @@ def test_phase_l2_post_relocalization_settle_barrier_contracts():
 
     for code in [
         "POST_RELOCALIZATION_SETTLE_TIMEOUT",
+        "POST_RELOCALIZATION_STABLE_SAMPLE_TIMEOUT",
+        "POST_RELOCALIZATION_CORRECTION_ACTIVE",
         "POST_RELOCALIZATION_MAP_ODOM_NOT_FRESH",
         "POST_RELOCALIZATION_ODOM_BASE_NOT_FRESH",
         "POST_RELOCALIZATION_TF_CHAIN_UNSTABLE",
@@ -8710,8 +11200,8 @@ def test_phase_u1_post_undock_settle_before_pending_nav_goal_contracts():
     for cfg in (api_cfg, overlay_api_cfg):
         assert "post_undock_relocalization_settle_enabled: true" in cfg
         assert "post_undock_relocalization_settle_min_ms: 800" in cfg
-        assert "post_undock_relocalization_settle_max_ms: 3000" in cfg
-        assert "post_undock_stable_tf_samples: 5" in cfg
+        assert "post_undock_relocalization_settle_max_ms: 5000" in cfg
+        assert "post_undock_stable_tf_samples: 2" in cfg
         assert "post_undock_tf_sample_period_ms: 100" in cfg
         assert "post_undock_required_local_costmap_updates: 2" in cfg
         assert "post_undock_reject_if_new_message_filter_drop: true" in cfg
@@ -8726,6 +11216,9 @@ def test_phase_u1_post_undock_settle_before_pending_nav_goal_contracts():
     goal_start = api_cpp.index("HttpResponse handle_navigation_goal")
     goal_end = api_cpp.index("bool undock_before_navigation_if_needed", goal_start)
     goal_handler = api_cpp[goal_start:goal_end]
+    barrier_start = api_cpp.index("PostRelocalizationSettleResult wait_for_post_relocalization_settle_barrier")
+    barrier_end = api_cpp.index("RobotPoseSnapshot wait_for_current_robot_pose", barrier_start)
+    barrier_block = api_cpp[barrier_start:barrier_end]
     barrier_idx = complete_block.find("wait_for_post_relocalization_settle_barrier(")
     finish_success_idx = complete_block.find('finish_docking_job_locked(\n        true,\n        "undocked"')
     assert barrier_idx != -1
@@ -8740,9 +11233,25 @@ def test_phase_u1_post_undock_settle_before_pending_nav_goal_contracts():
     assert "post_undock_relocalization_succeeded" in wait_block
     assert "post-undock navigation readiness failed, Nav2 goal not sent" in wait_block
     assert "pending_goal_released_after_post_undock_settle = true" in wait_block
-    assert "undock_before_navigation_if_needed" in goal_handler
-    assert goal_handler.find("undock_before_navigation_if_needed") < goal_handler.find("async_send_goal(goal)")
-    assert "navigation requires post-undock localization readiness before goal start" in goal_handler
+    assert "is_post_undock" in barrier_block
+    assert "post-undock warning only: local_costmap updates below required=" in barrier_block
+    assert "post-undock warning only: local_costmap MessageFilter drop:" in barrier_block
+    assert "post-undock warning only: amcl scan admission not clean:" in barrier_block
+    assert "POST_RELOCALIZATION_CORRECTION_ACTIVE" in barrier_block
+    assert "post-undock settle warning: stable_samples=" in barrier_block
+    assert "undock_before_navigation_if_needed" not in goal_handler
+    assert "async_send_goal(goal)" not in goal_handler
+    assert "goal-start readiness will be checked in navigation background job" in goal_handler
+    assert "pre_navigation_dock_check]() {" in goal_handler
+
+    pre_send_start = api_cpp.index("bool run_navigation_goal_pre_send_sequence")
+    pre_send_end = api_cpp.index("void run_navigation_goal_job_guarded", pre_send_start)
+    pre_send_block = api_cpp[pre_send_start:pre_send_end]
+    assert "undock_before_navigation_if_needed" in pre_send_block
+    assert pre_send_block.find("undock_before_navigation_if_needed") < pre_send_block.find(
+        "wait_for_navigation_goal_start_readiness"
+    )
+    assert "navigation requires post-undock localization readiness before goal start" in pre_send_block
 
     for field in [
         "post_undock_relocalization_started",
@@ -8766,6 +11275,8 @@ def test_phase_u1_post_undock_settle_before_pending_nav_goal_contracts():
     for code in [
         "POST_UNDOCK_RELOCALIZATION_FAILED",
         "POST_UNDOCK_SETTLE_TIMEOUT",
+        "POST_UNDOCK_STABLE_SAMPLE_TIMEOUT",
+        "POST_UNDOCK_CORRECTION_ACTIVE",
         "POST_UNDOCK_MAP_ODOM_NOT_FRESH",
         "POST_UNDOCK_ODOM_BASE_NOT_FRESH",
         "POST_UNDOCK_TF_CHAIN_UNSTABLE",
@@ -8885,7 +11396,9 @@ def test_phase_r0_r2_runtime_force_accept_reduction_and_bridge_smoothing_contrac
         "active_runtime_mode",
         "safe_for_goal_start",
         "bridge_localization_degraded_blocks_goal_start",
-        "AMCL_STATIC_STANDBY_NO_CORRECTION",
+        "bridge.amcl_seeded",
+        "bridge.amcl_tracking_ready",
+        "!bridge.amcl_correction_pending",
         "AMCL correction pending before",
         "AMCL correction not ready before",
         "amcl_static_pending_is_standby",

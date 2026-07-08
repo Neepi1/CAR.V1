@@ -22,6 +22,7 @@ PAUSE_CORRECTION="true"
 CORRECTION_PAUSE_SERVICE="/robot_localization_bridge/set_correction_paused"
 YAW_TOLERANCE_DEG="2.0"
 CLOSURE_TOLERANCE_M="0.30"
+STOP_LEAD_DEG="0.0"
 MAX_EXTRA_SEC="15.0"
 
 usage() {
@@ -51,11 +52,12 @@ Options:
   --no-pause-correction   Do not call bridge correction pause service.
   --yaw-tolerance-deg DEG Final accumulated-yaw tolerance. Default: 2.0
   --closure-tolerance-m M Final XY closure tolerance. Default: 0.30
+  --stop-lead-deg DEG     Stop command lead to compensate braking/command-chain lag. Default: 0.0
   --max-extra-sec SEC     Extra timeout beyond angle/angular-speed. Default: 15.0
 
 The command path remains:
-  test script -> /cmd_vel_collision_checked -> robot_safety -> /cmd_vel_safe
-              -> ranger_mini3_mode_controller -> /cmd_vel -> ranger_base
+  test script -> /cmd_vel_collision_checked -> robot_safety -> /cmd_vel -> ranger_base
+  /cmd_vel_safe is a robot_safety diagnostic mirror.
 
 After the report is written, run:
   capture_relocalize_correction_compare.sh --latest --kind left_arc
@@ -122,6 +124,10 @@ while [[ "$#" -gt 0 ]]; do
       ;;
     --closure-tolerance-m)
       CLOSURE_TOLERANCE_M="${2:-}"
+      shift 2
+      ;;
+    --stop-lead-deg)
+      STOP_LEAD_DEG="${2:-}"
       shift 2
       ;;
     --max-extra-sec)
@@ -224,6 +230,7 @@ python3 - \
   "${CORRECTION_PAUSE_SERVICE}" \
   "${YAW_TOLERANCE_DEG}" \
   "${CLOSURE_TOLERANCE_M}" \
+  "${STOP_LEAD_DEG}" \
   "${MAX_EXTRA_SEC}" <<'PY'
 import csv
 import json
@@ -263,7 +270,8 @@ pause_correction = sys.argv[11].lower() == "true"
 correction_pause_service = sys.argv[12]
 yaw_tolerance = math.radians(abs(float(sys.argv[13])))
 closure_tolerance_m = abs(float(sys.argv[14]))
-max_extra_sec = float(sys.argv[15])
+stop_lead = math.radians(abs(float(sys.argv[15])))
+max_extra_sec = float(sys.argv[16])
 
 if radius_m <= 0.0:
     raise SystemExit("radius must be positive")
@@ -682,7 +690,7 @@ def run_segment(node: LeftArcNode, index: int, writer: csv.DictWriter) -> Segmen
             )
             next_sample += sample_period
 
-        if wheel_yaw_accum >= max(0.0, target_yaw - yaw_tolerance):
+        if wheel_yaw_accum >= max(0.0, target_yaw - stop_lead):
             break
 
         time.sleep(0.005)
@@ -872,6 +880,7 @@ def main() -> int:
                 f.write(f"- expected_final_left_m: `{expected_final_left:.3f}`\n")
                 f.write(f"- yaw_tolerance_deg: `{math.degrees(yaw_tolerance):.3f}`\n")
                 f.write(f"- closure_tolerance_m: `{closure_tolerance_m:.3f}`\n")
+                f.write(f"- stop_lead_deg: `{math.degrees(stop_lead):.3f}`\n")
                 f.write(f"- pause_correction_enable: `{pause_enable_result}`\n")
                 f.write(f"- pause_correction_disable: `{pause_disable_result}`\n")
                 if node.bridge_status:

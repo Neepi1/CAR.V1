@@ -73,13 +73,14 @@ check_static_config() {
     return
   fi
 
-  local plugin radius angle timeout rotate threshold local_frame yaw_tol
+  local plugin radius angle timeout rotate threshold disengage local_frame yaw_tol
   plugin="$(read_nav2_value "controller_server.ros__parameters.progress_checker.plugin" || true)"
   radius="$(read_nav2_value "controller_server.ros__parameters.progress_checker.required_movement_radius" || true)"
   angle="$(read_nav2_value "controller_server.ros__parameters.progress_checker.required_movement_angle" || true)"
   timeout="$(read_nav2_value "controller_server.ros__parameters.progress_checker.movement_time_allowance" || true)"
   rotate="$(read_nav2_value "controller_server.ros__parameters.FollowPath.rotate_to_goal_heading" || true)"
   threshold="$(read_nav2_value "controller_server.ros__parameters.FollowPath.angular_dist_threshold" || true)"
+  disengage="$(read_nav2_value "controller_server.ros__parameters.FollowPath.angular_disengage_threshold" || true)"
   local_frame="$(read_nav2_value "local_costmap.local_costmap.ros__parameters.global_frame" || true)"
   yaw_tol="$(read_nav2_value "controller_server.ros__parameters.goal_checker.yaw_goal_tolerance" || true)"
 
@@ -87,9 +88,9 @@ check_static_config() {
     && pass "static progress_checker.plugin=${plugin}" \
     || fail "static progress_checker.plugin=${plugin:-missing}, expected nav2_controller::PoseProgressChecker"
 
-  [[ "${radius}" == "0.10" || "${radius}" == "0.1" ]] \
+  [[ "${radius}" == "0.03" || "${radius}" == "0.030" ]] \
     && pass "static required_movement_radius=${radius}" \
-    || fail "static required_movement_radius=${radius:-missing}, expected 0.10"
+    || fail "static required_movement_radius=${radius:-missing}, expected 0.03"
 
   if [[ -n "${angle}" ]] && numeric_between "${angle}" 0.05 0.20; then
     pass "static required_movement_angle=${angle}"
@@ -99,26 +100,32 @@ check_static_config() {
 
   [[ "${timeout}" == "12.0" || "${timeout}" == "12" ]] \
     && pass "static movement_time_allowance=${timeout}" \
-    || fail "static movement_time_allowance=${timeout:-missing}, expected unchanged 12.0"
+    || fail "static movement_time_allowance=${timeout:-missing}, expected 12.0"
 
   [[ "${rotate}" == "true" ]] \
     && pass "static FollowPath.rotate_to_goal_heading=true" \
     || fail "static FollowPath.rotate_to_goal_heading=${rotate:-missing}, expected true"
 
-  if [[ -n "${threshold}" ]]; then
+  if [[ "${threshold}" == "0.45" ]]; then
     pass "static FollowPath.angular_dist_threshold=${threshold}"
   else
-    fail "missing FollowPath.angular_dist_threshold"
+    fail "static FollowPath.angular_dist_threshold=${threshold:-missing}, expected 0.45"
+  fi
+
+  if [[ "${disengage}" == "0.075" ]]; then
+    pass "static FollowPath.angular_disengage_threshold=${disengage}"
+  else
+    fail "static FollowPath.angular_disengage_threshold=${disengage:-missing}, expected 0.075"
   fi
 
   [[ "${local_frame}" == "odom" ]] \
     && pass "static local_costmap.global_frame=odom" \
     || fail "static local_costmap.global_frame=${local_frame:-missing}, expected odom"
 
-  if [[ -n "${yaw_tol}" ]] && numeric_between "${yaw_tol}" 0.10 3.14; then
+  if [[ "${yaw_tol}" == "0.05" ]]; then
     pass "static yaw_goal_tolerance=${yaw_tol}"
   else
-    fail "static yaw_goal_tolerance=${yaw_tol:-missing}, must not be made tiny"
+    fail "static yaw_goal_tolerance=${yaw_tol:-missing}, expected 0.05"
   fi
 }
 
@@ -131,7 +138,7 @@ check_pose_progress_plugin_available() {
 }
 
 check_runtime_config() {
-  local lifecycle plugin angle rotate threshold frame
+  local lifecycle plugin angle rotate threshold disengage frame
   lifecycle="$(timeout 6 ros2 lifecycle get /controller_server 2>&1 || true)"
   if [[ "${lifecycle}" == *"active [3]"* ]]; then
     pass "controller_server active"
@@ -157,9 +164,14 @@ check_runtime_config() {
     || warn "runtime FollowPath.rotate_to_goal_heading unavailable or unexpected: ${rotate}"
 
   threshold="$(param_value /controller_server FollowPath.angular_dist_threshold || true)"
-  [[ -n "${threshold}" ]] \
+  [[ "${threshold}" == "0.45" ]] \
     && pass "runtime FollowPath.angular_dist_threshold=${threshold}" \
-    || warn "runtime angular_dist_threshold unavailable"
+    || warn "runtime angular_dist_threshold unavailable or unexpected: ${threshold}"
+
+  disengage="$(param_value /controller_server FollowPath.angular_disengage_threshold || true)"
+  [[ "${disengage}" == "0.075" ]] \
+    && pass "runtime FollowPath.angular_disengage_threshold=${disengage}" \
+    || warn "runtime angular_disengage_threshold unavailable or unexpected: ${disengage}"
 
   frame="$(param_value /local_costmap/local_costmap global_frame || true)"
   [[ "${frame}" == "odom" ]] \
@@ -168,9 +180,10 @@ check_runtime_config() {
 }
 
 check_cmd_chain() {
-  local nav_info collision_info safe_info final_info
+  local nav_info collision_info api_info safe_info final_info
   nav_info="$(timeout 8 ros2 topic info -v /cmd_vel_nav 2>&1 || true)"
   collision_info="$(timeout 8 ros2 topic info -v /cmd_vel_collision_checked 2>&1 || true)"
+  api_info="$(timeout 8 ros2 topic info -v /cmd_vel_api 2>&1 || true)"
   safe_info="$(timeout 8 ros2 topic info -v /cmd_vel_safe 2>&1 || true)"
   final_info="$(timeout 8 ros2 topic info -v /cmd_vel 2>&1 || true)"
 
@@ -181,6 +194,14 @@ check_cmd_chain() {
   [[ "${collision_info}" == *"Node name: collision_monitor"* && "${collision_info}" == *"Node name: robot_safety"* ]] \
     && pass "/cmd_vel_collision_checked connects collision_monitor to robot_safety" \
     || warn "/cmd_vel_collision_checked chain not fully visible"
+
+  [[ "${collision_info}" == *"Publisher count: 1"* && "${collision_info}" == *"Node name: collision_monitor"* && "${collision_info}" != *"Node name: robot_api_server"* ]] \
+    && pass "/cmd_vel_collision_checked has collision_monitor as the single publisher" \
+    || fail "/cmd_vel_collision_checked publisher ownership is not clean"
+
+  [[ "${api_info}" == *"Node name: robot_api_server"* && "${api_info}" == *"Node name: robot_safety"* ]] \
+    && pass "/cmd_vel_api connects robot_api_server auxiliary commands to robot_safety" \
+    || warn "/cmd_vel_api chain not fully visible"
 
   [[ "${safe_info}" == *"Node name: robot_safety"* ]] \
     && pass "/cmd_vel_safe is published by robot_safety" \

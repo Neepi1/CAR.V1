@@ -119,9 +119,9 @@ print_plan() {
     echo "${PREFIX} baseline is observation-only; --apply is ignored for baseline"
   else
     echo "${PREFIX} set progress_checker.plugin=${TARGET_PLUGIN}"
-    echo "${PREFIX} set required_movement_radius=0.10"
-    echo "${PREFIX} set required_movement_angle=0.10"
-    echo "${PREFIX} keep movement_time_allowance=12.0"
+    echo "${PREFIX} set required_movement_radius=0.03"
+    echo "${PREFIX} set required_movement_angle=0.05"
+    echo "${PREFIX} set movement_time_allowance=12.0"
     echo "${PREFIX} set FollowPath.rotate_to_goal_heading=${TARGET_ROTATE}"
     echo "${PREFIX} set FollowPath.angular_dist_threshold=${TARGET_THRESHOLD}"
   fi
@@ -175,22 +175,22 @@ for line in lines:
         continue
     if in_progress and stripped and indent <= progress_indent:
         if not angle_seen:
-            out.append("      required_movement_angle: 0.10")
+            out.append("      required_movement_angle: 0.05")
         in_progress = False
     if in_progress:
         if stripped.startswith("plugin:"):
             out.append("      plugin: \"" + target_plugin + "\"")
             continue
         if stripped.startswith("required_movement_radius:"):
-            out.append("      required_movement_radius: 0.10")
+            out.append("      required_movement_radius: 0.03")
             continue
         if stripped.startswith("required_movement_angle:"):
-            out.append("      required_movement_angle: 0.10")
+            out.append("      required_movement_angle: 0.05")
             angle_seen = True
             continue
         if stripped.startswith("movement_time_allowance:"):
             if not angle_seen:
-                out.append("      required_movement_angle: 0.10")
+                out.append("      required_movement_angle: 0.05")
                 angle_seen = True
             out.append("      movement_time_allowance: 12.0")
             continue
@@ -213,7 +213,7 @@ for line in lines:
     out.append(line)
 
 if in_progress and not angle_seen:
-    out.append("      required_movement_angle: 0.10")
+    out.append("      required_movement_angle: 0.05")
 
 path.write_text("\n".join(out) + "\n", encoding="utf-8")
 PY
@@ -235,16 +235,8 @@ restart_runtime() {
     return $?
   fi
 
-  if [[ -z "${NJRH_BUILDING_ID:-}" || -z "${NJRH_FLOOR_ID:-}" ]]; then
-    echo "${PREFIX} FAIL --restart requires NJRH_NAV2_RESTART_CMD or NJRH_BUILDING_ID/NJRH_FLOOR_ID" >&2
-    return 2
-  fi
-
-  bash "${SCRIPT_DIR}/stop_floor_navigation.sh"
-  mkdir -p "${NJRH_RUNTIME_LOG_DIR}"
-  nohup bash "${SCRIPT_DIR}/run_floor_navigation.sh" "${NJRH_BUILDING_ID}" "${NJRH_FLOOR_ID}" \
-    >"${NJRH_RUNTIME_LOG_DIR}/nav2_rotation_shim_ab_restart.log" 2>&1 &
-  echo "${PREFIX} restarted resident navigation runtime pid=$! log=${NJRH_RUNTIME_LOG_DIR}/nav2_rotation_shim_ab_restart.log"
+  echo "${PREFIX} restart command: sudo systemctl restart njrh-runtime.service"
+  sudo systemctl restart njrh-runtime.service
 }
 
 print_plan
