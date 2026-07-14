@@ -2316,6 +2316,7 @@ private:
         << ",\"last_result_age_ms\":" << last_result_age_ms_
         << ",\"gate_result_age_limit_ms\":" << last_gate_result_age_limit_ms_
         << ",\"last_result_used_original_stamp\":true"
+        << ",\"has_odom\":" << (has_odom_ ? "true" : "false")
         << ",\"last_tf_lookup_stamp\":" << last_tf_lookup_stamp_sec_
         << ",\"last_odom_tf_history_lookup_ok\":" << (last_odom_tf_history_lookup_ok_ ? "true" : "false")
         << ",\"latest_odom_tf_fresh\":" << (latest_odom_tf_fresh_ ? "true" : "false")

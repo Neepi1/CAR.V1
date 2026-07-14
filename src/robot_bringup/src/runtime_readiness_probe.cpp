@@ -471,6 +471,155 @@ bool wait_for_fresh_stamped_topic(const rclcpp::Node::SharedPtr & node, const st
   return false;
 }
 
+bool wait_for_ranger_chassis(const rclcpp::Node::SharedPtr & node, double timeout_sec,
+                             double odom_max_age_sec, double odom_max_future_sec)
+{
+  constexpr const char * kRangerNode = "ranger_base_node";
+  constexpr const char * kWheelOdomTopic = "/wheel/odom";
+  constexpr const char * kMotionStateTopic = "/motion_state";
+  const auto deadline = Clock::now() + std::chrono::duration<double>(timeout_sec);
+
+  bool wheel_publisher_ready = false;
+  bool motion_publisher_ready = false;
+  bool have_odom_age = false;
+  double last_odom_age = 0.0;
+  std::atomic_bool fresh_wheel_odom_received{false};
+  std::atomic_bool motion_state_received{false};
+  std::vector<rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr> odom_subscriptions;
+  std::vector<rclcpp::GenericSubscription::SharedPtr> motion_subscriptions;
+
+  auto on_odom = [&](const nav_msgs::msg::Odometry::SharedPtr msg) {
+      const rclcpp::Time stamp(msg->header.stamp);
+      last_odom_age = (node->get_clock()->now() - stamp).seconds();
+      have_odom_age = true;
+      if (last_odom_age <= odom_max_age_sec && last_odom_age >= -odom_max_future_sec) {
+        fresh_wheel_odom_received.store(true);
+      }
+    };
+  for (const auto & qos : default_qos_profiles()) {
+    odom_subscriptions.push_back(
+      node->create_subscription<nav_msgs::msg::Odometry>(kWheelOdomTopic, qos, on_odom));
+  }
+
+  auto publisher_is_ready = [&](const char * topic) {
+      for (const auto & info : node->get_publishers_info_by_topic(topic)) {
+        if (info.node_name() == kRangerNode) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+  while (rclcpp::ok() && Clock::now() < deadline) {
+    wheel_publisher_ready = wheel_publisher_ready || publisher_is_ready(kWheelOdomTopic);
+    motion_publisher_ready = motion_publisher_ready || publisher_is_ready(kMotionStateTopic);
+
+    if (motion_subscriptions.empty()) {
+      const auto motion_type = first_topic_type(node, kMotionStateTopic);
+      if (!motion_type.empty()) {
+        for (const auto & qos : default_qos_profiles()) {
+          motion_subscriptions.push_back(node->create_generic_subscription(
+            kMotionStateTopic, motion_type, qos,
+            [&motion_state_received](std::shared_ptr<rclcpp::SerializedMessage>) {
+              motion_state_received.store(true);
+            }));
+        }
+      }
+    }
+
+    spin_slice(node);
+    if (wheel_publisher_ready && fresh_wheel_odom_received.load() && motion_publisher_ready &&
+      motion_state_received.load())
+    {
+      std::cerr << "[runtime-overlay] ranger chassis ready: publisher(" << kWheelOdomTopic
+                << ")=" << kRangerNode << " fresh_odom_age=" << last_odom_age
+                << "s publisher(" << kMotionStateTopic << ")=" << kRangerNode
+                << " motion_message=true\n";
+      return true;
+    }
+  }
+
+  std::cerr << "[runtime-overlay] timed out waiting for ranger chassis: wheel_publisher="
+            << wheel_publisher_ready << " wheel_odom_fresh=" << fresh_wheel_odom_received.load()
+            << " motion_publisher=" << motion_publisher_ready
+            << " motion_message=" << motion_state_received.load();
+  if (have_odom_age) {
+    std::cerr << " last_odom_age=" << last_odom_age << "s allowed=[-" << odom_max_future_sec
+              << "," << odom_max_age_sec << "]";
+  } else {
+    std::cerr << " last_odom_age=<none>";
+  }
+  std::cerr << "\n";
+  return false;
+}
+
+bool wait_for_imu_bias_filter(const rclcpp::Node::SharedPtr & node,
+                              const std::string & corrected_imu_topic,
+                              const std::string & bias_topic,
+                              double timeout_sec)
+{
+  constexpr const char * kBiasFilterNode = "imu_gyro_bias_filter";
+  const auto deadline = Clock::now() + std::chrono::duration<double>(timeout_sec);
+  bool corrected_publisher_ready = false;
+  bool bias_publisher_ready = false;
+  std::atomic_bool corrected_message_received{false};
+  std::atomic_bool bias_message_received{false};
+  std::vector<rclcpp::GenericSubscription::SharedPtr> corrected_subscriptions;
+  std::vector<rclcpp::GenericSubscription::SharedPtr> bias_subscriptions;
+
+  auto publisher_is_ready = [&](const std::string & topic) {
+      for (const auto & info : node->get_publishers_info_by_topic(topic)) {
+        if (info.node_name() == kBiasFilterNode) {
+          return true;
+        }
+      }
+      return false;
+    };
+  auto ensure_subscriptions = [&](const std::string & topic,
+                                  std::vector<rclcpp::GenericSubscription::SharedPtr> & subscriptions,
+                                  std::atomic_bool & received) {
+      if (!subscriptions.empty()) {
+        return;
+      }
+      const auto topic_type = first_topic_type(node, topic);
+      if (topic_type.empty()) {
+        return;
+      }
+      for (const auto & qos : default_qos_profiles()) {
+        subscriptions.push_back(node->create_generic_subscription(
+          topic, topic_type, qos,
+          [&received](std::shared_ptr<rclcpp::SerializedMessage>) { received.store(true); }));
+      }
+    };
+
+  while (rclcpp::ok() && Clock::now() < deadline) {
+    corrected_publisher_ready = corrected_publisher_ready ||
+      publisher_is_ready(corrected_imu_topic);
+    bias_publisher_ready = bias_publisher_ready || publisher_is_ready(bias_topic);
+    ensure_subscriptions(
+      corrected_imu_topic, corrected_subscriptions, corrected_message_received);
+    ensure_subscriptions(bias_topic, bias_subscriptions, bias_message_received);
+    spin_slice(node);
+
+    if (corrected_publisher_ready && corrected_message_received.load() &&
+      bias_publisher_ready && bias_message_received.load())
+    {
+      std::cerr << "[runtime-overlay] IMU bias filter ready: publisher("
+                << corrected_imu_topic << ")=" << kBiasFilterNode
+                << " corrected_message=true publisher(" << bias_topic << ")="
+                << kBiasFilterNode << " bias_message=true\n";
+      return true;
+    }
+  }
+
+  std::cerr << "[runtime-overlay] timed out waiting for IMU bias filter: corrected_publisher="
+            << corrected_publisher_ready
+            << " corrected_message=" << corrected_message_received.load()
+            << " bias_publisher=" << bias_publisher_ready
+            << " bias_message=" << bias_message_received.load() << "\n";
+  return false;
+}
+
 bool wait_for_tf(const rclcpp::Node::SharedPtr & node, const std::string & target,
                  const std::string & source, double timeout_sec)
 {
@@ -812,6 +961,108 @@ bool wait_for_map_topic_matches_yaml(const rclcpp::Node::SharedPtr & node,
   return false;
 }
 
+template<typename DurationT>
+double remaining_timeout_sec(const std::chrono::time_point<Clock, DurationT> & deadline)
+{
+  return std::max(0.1, std::chrono::duration<double>(deadline - Clock::now()).count());
+}
+
+bool wait_for_bridge_odom_status(const rclcpp::Node::SharedPtr & node, double timeout_sec)
+{
+  const auto deadline = Clock::now() + std::chrono::duration<double>(timeout_sec);
+  std::atomic_bool has_odom{false};
+  std::atomic_bool status_received{false};
+  std::string last_status;
+  std::vector<rclcpp::Subscription<std_msgs::msg::String>::SharedPtr> subscriptions;
+  auto on_status = [&](const std_msgs::msg::String::SharedPtr msg) {
+      status_received.store(true);
+      last_status = msg->data;
+      if (msg->data.find("\"has_odom\":true") != std::string::npos) {
+        has_odom.store(true);
+      }
+    };
+  for (const auto & qos : default_qos_profiles()) {
+    subscriptions.push_back(
+      node->create_subscription<std_msgs::msg::String>(
+        "/localization/bridge_status", qos, on_status));
+  }
+
+  while (rclcpp::ok() && Clock::now() < deadline && !has_odom.load()) {
+    spin_slice(node);
+  }
+  if (has_odom.load()) {
+    std::cerr << "[runtime-overlay] localization bridge odom ready: has_odom=true\n";
+    return true;
+  }
+  std::cerr << "[runtime-overlay] timed out waiting for localization bridge odom: status_received="
+            << status_received.load() << " has_odom=false";
+  if (status_received.load()) {
+    std::cerr << " last_status_size=" << last_status.size();
+  }
+  std::cerr << "\n";
+  return false;
+}
+
+bool wait_for_localization_prestart(const rclcpp::Node::SharedPtr & node, double timeout_sec)
+{
+  const auto deadline = Clock::now() + std::chrono::duration<double>(timeout_sec);
+  if (!wait_for_service(
+      node, "/trigger_grid_search_localization", remaining_timeout_sec(deadline)))
+  {
+    return false;
+  }
+  if (!wait_for_bridge_odom_status(node, remaining_timeout_sec(deadline))) {
+    return false;
+  }
+  std::cerr << "[runtime-overlay] localization prestart ready: isaac_service=true bridge_odom=true\n";
+  return true;
+}
+
+bool wait_for_localization_stack(const rclcpp::Node::SharedPtr & node,
+                                 const std::string & map_yaml,
+                                 const std::string & flatscan_topic,
+                                 double timeout_sec)
+{
+  const auto deadline = Clock::now() + std::chrono::duration<double>(timeout_sec);
+  if (!wait_for_service(
+      node, "/global_localization/trigger", remaining_timeout_sec(deadline)))
+  {
+    return false;
+  }
+  if (!wait_for_service(
+      node, "/trigger_grid_search_localization", remaining_timeout_sec(deadline)))
+  {
+    return false;
+  }
+  if (!wait_for_map_topic_matches_yaml(node, map_yaml, remaining_timeout_sec(deadline))) {
+    return false;
+  }
+  if (!wait_for_publisher_from_node(
+      node, flatscan_topic, "laser_scan_to_flatscan", remaining_timeout_sec(deadline)))
+  {
+    return false;
+  }
+  std::cerr << "[runtime-overlay] localization stack ready: services=true map=" << map_yaml
+            << " flatscan_publisher=laser_scan_to_flatscan topic=" << flatscan_topic << "\n";
+  return true;
+}
+
+bool wait_for_global_costmap(const rclcpp::Node::SharedPtr & node,
+                             double lifecycle_timeout_sec,
+                             double publisher_timeout_sec)
+{
+  if (!wait_for_lifecycle_active(
+      node, "/global_costmap/global_costmap", lifecycle_timeout_sec))
+  {
+    return false;
+  }
+  if (!wait_for_topic_publisher(node, "/global_costmap/costmap", publisher_timeout_sec)) {
+    return false;
+  }
+  std::cerr << "[runtime-overlay] global costmap ready: lifecycle=active publisher=true\n";
+  return true;
+}
+
 [[noreturn]] void exit_probe(int code)
 {
   std::cout.flush();
@@ -834,13 +1085,18 @@ void print_usage()
     << "  publisher-from-node <topic> <node_name> <timeout_sec>\n"
     << "  topic <topic> <timeout_sec>\n"
     << "  fresh-header-topic <topic> <timeout_sec> <max_age_sec> <max_future_sec>\n"
+    << "  ranger-chassis <timeout_sec> <odom_max_age_sec> <odom_max_future_sec>\n"
+    << "  imu-bias-filter <corrected_imu_topic> <bias_topic> <timeout_sec>\n"
     << "  tf <target_frame> <source_frame> <timeout_sec>\n"
     << "  fresh-tf <target_frame> <source_frame> <timeout_sec> <max_age_sec>\n"
     << "  transformable-scan <timeout_sec> <required_good>\n"
     << "  local-state-endpoint <timeout_sec> <mode>\n"
     << "  lifecycle-active <node_name> <timeout_sec>\n"
     << "  occupancy-grid <topic> <timeout_sec> <min_width> <min_height>\n"
-    << "  map-topic-matches-yaml <map_yaml> <timeout_sec>\n";
+    << "  map-topic-matches-yaml <map_yaml> <timeout_sec>\n"
+    << "  localization-prestart <timeout_sec>\n"
+    << "  localization-stack <map_yaml> <flatscan_topic> <timeout_sec>\n"
+    << "  global-costmap <lifecycle_timeout_sec> <publisher_timeout_sec>\n";
 }
 
 }  // namespace
@@ -873,6 +1129,14 @@ int main(int argc, char ** argv)
       ok = wait_for_fresh_stamped_topic(
         node, argv[2], parse_double(argv[3], "timeout_sec"),
         parse_double(argv[4], "max_age_sec"), parse_double(argv[5], "max_future_sec"));
+    } else if (command == "ranger-chassis" && argc == 5) {
+      ok = wait_for_ranger_chassis(
+        node, parse_double(argv[2], "timeout_sec"),
+        parse_double(argv[3], "odom_max_age_sec"),
+        parse_double(argv[4], "odom_max_future_sec"));
+    } else if (command == "imu-bias-filter" && argc == 5) {
+      ok = wait_for_imu_bias_filter(
+        node, argv[2], argv[3], parse_double(argv[4], "timeout_sec"));
     } else if (command == "tf" && argc == 5) {
       ok = wait_for_tf(node, argv[2], argv[3], parse_double(argv[4], "timeout_sec"));
     } else if (command == "fresh-tf" && argc == 6) {
@@ -898,6 +1162,15 @@ int main(int argc, char ** argv)
     } else if (command == "map-topic-matches-yaml" && argc == 4) {
       ok = wait_for_map_topic_matches_yaml(node, argv[2], parse_double(argv[3],
         "timeout_sec"));
+    } else if (command == "localization-prestart" && argc == 3) {
+      ok = wait_for_localization_prestart(node, parse_double(argv[2], "timeout_sec"));
+    } else if (command == "localization-stack" && argc == 5) {
+      ok = wait_for_localization_stack(
+        node, argv[2], argv[3], parse_double(argv[4], "timeout_sec"));
+    } else if (command == "global-costmap" && argc == 4) {
+      ok = wait_for_global_costmap(
+        node, parse_double(argv[2], "lifecycle_timeout_sec"),
+        parse_double(argv[3], "publisher_timeout_sec"));
     } else {
       print_usage();
       exit_probe(2);

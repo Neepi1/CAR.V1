@@ -47,7 +47,7 @@ LOCALIZER_FLATSCAN_TOPIC="${NJRH_ISAAC_LOCALIZER_FLATSCAN_TOPIC:-/flatscan}"
 export NJRH_LOCALIZATION_MAP_EXTERNAL_LIFECYCLE_BRINGUP="${LOCALIZATION_MAP_EXTERNAL_LIFECYCLE_BRINGUP}"
 
 if [[ -n "${NJRH_FLOOR_ID:-}" || -n "${NAV2_FLOOR_ID:-}" ]]; then
-  resolve_floor_assets "${NJRH_BUILDING_ID:-${NAV2_BUILDING_ID:-building_1}}" "${NJRH_FLOOR_ID:-${NAV2_FLOOR_ID:-}}"
+  resolve_floor_assets_if_needed "${NJRH_BUILDING_ID:-${NAV2_BUILDING_ID:-building_1}}" "${NJRH_FLOOR_ID:-${NAV2_FLOOR_ID:-}}"
 fi
 
 NAV2_MAP_YAML="${NAV2_MAP_YAML:-}"
@@ -244,7 +244,11 @@ start_map_server_lifecycle_with_nav2_util() {
   }
 
   local node_timeout="${NJRH_LOCALIZATION_MAP_LIFECYCLE_NODE_TIMEOUT_SEC:-30}"
-  local sequence_args=(--per-node-timeout-sec "${node_timeout}")
+  local change_state_response_timeout="${NJRH_NAV2_LIFECYCLE_CHANGE_STATE_RESPONSE_TIMEOUT_SEC:-5}"
+  local sequence_args=(
+    --per-node-timeout-sec "${node_timeout}"
+    --change-state-response-timeout-sec "${change_state_response_timeout}"
+  )
   if [[ "${NJRH_LOCALIZATION_MAP_LIFECYCLE_TRUST_CHANGE_STATE_RESPONSE:-true}" == "true" ]]; then
     sequence_args+=(--trust-change-state-response)
   fi
@@ -298,23 +302,76 @@ flatscan_publisher_ready_for_localization() {
   wait_for_topic_publisher_from_node "${LOCALIZER_FLATSCAN_TOPIC}" "laser_scan_to_flatscan" "$1"
 }
 
-ensure_pointcloud_accel_pipeline_for_localization() {
+flatscan_supervisor_status_ready_for_localization() (
+  local status_file="${NJRH_FLATSCAN_HELPER_STATUS_FILE:-${NJRH_RUNTIME_LOG_DIR}/flatscan_helper_status.env}"
+  local max_age_sec="${NJRH_LOCALIZATION_FLATSCAN_STATUS_MAX_AGE_SEC:-30}"
+  local file_epoch=0
+  local now_epoch=0
+
+  [[ -r "${status_file}" ]] || return 1
+  FLATSCAN_HELPER_HEALTH_STATE=""
+  FLATSCAN_HELPER_PID=""
+  # shellcheck disable=SC1090
+  source "${status_file}" 2>/dev/null || return 1
+  [[ "${FLATSCAN_HELPER_HEALTH_STATE:-}" == "healthy" ]] || return 1
+  [[ -n "${FLATSCAN_HELPER_PID:-}" ]] || return 1
+  kill -0 "${FLATSCAN_HELPER_PID}" 2>/dev/null || return 1
+  file_epoch="$(stat -c %Y "${status_file}" 2>/dev/null || printf '0')"
+  now_epoch="$(date +%s)"
+  (( file_epoch > 0 && now_epoch - file_epoch <= max_age_sec ))
+)
+
+require_common_pointcloud_for_localization() {
   [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" != "legacy" ]] || return 0
-  if pointcloud_accel_pipeline_runtime_running; then
-    if flatscan_publisher_ready_for_localization "${LOCALIZATION_FLATSCAN_READY_TIMEOUT}"; then
-      echo "[runtime-overlay] pointcloud accel pipeline already running with ${LOCALIZER_FLATSCAN_TOPIC} publisher for localization profile=${NJRH_POINTCLOUD_ACCEL_PROFILE}" >&2
-      return 0
-    fi
-    echo "[runtime-overlay] pointcloud accel pipeline is running but ${LOCALIZER_FLATSCAN_TOPIC} publisher is missing; restarting profile=${NJRH_POINTCLOUD_ACCEL_PROFILE}" >&2
-    bash "${SCRIPT_DIR}/set_pointcloud_accel_profile.sh" --profile "${NJRH_POINTCLOUD_ACCEL_PROFILE}" --restart >&2
-    flatscan_publisher_ready_for_localization "${LOCALIZATION_FLATSCAN_READY_TIMEOUT}"
-    return $?
+  if ! pointcloud_accel_pipeline_runtime_running; then
+    echo "[runtime-overlay] common-owned pointcloud accel pipeline is not running; localization will not start or restart it" >&2
+    return 1
   fi
-  echo "[runtime-overlay] starting pointcloud accel pipeline for localization profile=${NJRH_POINTCLOUD_ACCEL_PROFILE}" >&2
-  start_overlay_helper "pointcloud_accel_pipeline_localization" env \
-    NJRH_FORCE_RESTART_DRIVER="${NJRH_POINTCLOUD_ACCEL_FORCE_RESTART_DRIVER:-false}" \
-    bash "${SCRIPT_DIR}/run_pointcloud_accel_pipeline.sh"
-  flatscan_publisher_ready_for_localization "${LOCALIZATION_FLATSCAN_READY_TIMEOUT}"
+  if flatscan_supervisor_status_ready_for_localization; then
+    echo "[runtime-overlay] common-owned pointcloud accel pipeline is healthy from flatscan_helper_status.env" >&2
+    return 0
+  fi
+  if flatscan_publisher_ready_for_localization "${NJRH_LOCALIZATION_COMMON_FLATSCAN_WAIT_SEC:-20}"; then
+    echo "[runtime-overlay] common-owned pointcloud accel pipeline has ${LOCALIZER_FLATSCAN_TOPIC} publisher" >&2
+    return 0
+  fi
+  echo "[runtime-overlay] common-owned pointcloud accel pipeline did not provide ${LOCALIZER_FLATSCAN_TOPIC}; localization will not restart it" >&2
+  return 1
+}
+
+require_common_ranger_chassis_for_localization() {
+  local timeout_sec="${NJRH_LOCALIZATION_RANGER_LIVENESS_WAIT_SEC:-3}"
+  local process_pattern=""
+  process_pattern="$(canonical_helper_process_pattern "ranger_chassis")" || return 1
+  if ! canonical_process_running "${process_pattern}"; then
+    echo "[runtime-overlay] common-owned Ranger chassis process is not running; localization will not start or restart it" >&2
+    return 1
+  fi
+  if runtime_health_check "local_state_ready"; then
+    echo "[runtime-overlay] common runtime health confirms the Ranger-to-local-state chain" >&2
+    return 0
+  fi
+  echo "[runtime-overlay] common runtime health is unavailable; falling back to a bounded Ranger odom probe" >&2
+  if ranger_chassis_liveness_ready "${timeout_sec}"; then
+    echo "[runtime-overlay] common-owned Ranger chassis is live for localization" >&2
+    return 0
+  fi
+  echo "[runtime-overlay] common-owned Ranger chassis is not live; localization will not start or restart it" >&2
+  return 1
+}
+
+require_common_static_tf_for_localization() {
+  local helper_pattern=""
+  helper_pattern="$(canonical_helper_process_pattern "robot_description_static_tf_common")" || return 1
+  if ! canonical_process_running "${helper_pattern}"; then
+    echo "[runtime-overlay] common-owned static TF publisher is not running; localization will not start or restart it" >&2
+    return 1
+  fi
+  if ! wait_for_tf_edge "base_link" "lidar_level_link" "${NJRH_LOCALIZATION_STATIC_TF_WAIT_SEC:-5}"; then
+    echo "[runtime-overlay] common-owned base_link -> lidar_level_link TF is unavailable" >&2
+    return 1
+  fi
+  echo "[runtime-overlay] common-owned static TF publisher is ready for localization" >&2
 }
 
 if [[ -n "${NAV2_LOCALIZER_PARAMS}" ]]; then
@@ -369,9 +426,9 @@ ensure_resident_local_state_for_localization() {
   echo "[runtime-overlay] resident local_state ${NAV_LOCAL_STATE_MODE} process exists for occupancy localization; startup odom/TF probes are disabled" >&2
 }
 
-start_canonical_helper "ranger_chassis_localization" bash "${SCRIPT_DIR}/run_ranger_chassis.sh"
-start_canonical_helper "robot_description_static_tf_localization" bash "${SCRIPT_DIR}/run_robot_description.sh"
-ensure_pointcloud_accel_pipeline_for_localization
+require_common_ranger_chassis_for_localization || exit 1
+require_common_static_tf_for_localization || exit 1
+require_common_pointcloud_for_localization || exit 1
 ensure_localization_pointcloud_ready
 if [[ "${NAV_LOCAL_STATE_MODE}" == "fastlio" ]]; then
   ensure_resident_fastlio_for_local_state || exit 1

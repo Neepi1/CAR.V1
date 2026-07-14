@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-unset NJRH_COMMON_ENV_SETUP_DONE
+unset NJRH_COMMON_ENV_SETUP_DONE NJRH_COMMON_ENV_PARENT_READY
 source "${SCRIPT_DIR}/common_env.sh"
 source "${SCRIPT_DIR}/cpu_affinity.sh"
 source "${SCRIPT_DIR}/pointcloud_accel_profile.sh"
@@ -17,9 +17,14 @@ FLATSCAN_HELPER_REQUIRED="${NJRH_FLATSCAN_HELPER_REQUIRED:-true}"
 FLATSCAN_HELPER_RESTART="${NJRH_FLATSCAN_HELPER_RESTART:-true}"
 FLATSCAN_HELPER_MAX_RESTARTS="${NJRH_FLATSCAN_HELPER_MAX_RESTARTS:-5}"
 FLATSCAN_HELPER_RESTART_BACKOFF_SEC="${NJRH_FLATSCAN_HELPER_RESTART_BACKOFF_SEC:-1.0}"
+FLATSCAN_HELPER_MISSING_CONFIRMATIONS="${NJRH_FLATSCAN_HELPER_MISSING_CONFIRMATIONS:-3}"
+FLATSCAN_HELPER_RESTART_COOLDOWN_SEC="${NJRH_FLATSCAN_HELPER_RESTART_COOLDOWN_SEC:-60}"
+FLATSCAN_HELPER_HEALTHY_RESET_SEC="${NJRH_FLATSCAN_HELPER_HEALTHY_RESET_SEC:-60}"
+FLATSCAN_GRAPH_PROBE_TIMEOUT_SEC="${NJRH_FLATSCAN_GRAPH_PROBE_TIMEOUT_SEC:-4}"
+FLATSCAN_MESSAGE_CONFIRM_TIMEOUT_SEC="${NJRH_FLATSCAN_MESSAGE_CONFIRM_TIMEOUT_SEC:-10}"
 FLATSCAN_WAIT_SEC="${NJRH_FLATSCAN_WAIT_SEC:-30}"
 FLATSCAN_MIN_HZ="${NJRH_FLATSCAN_MIN_HZ:-5.0}"
-FLATSCAN_SUPERVISE_PERIOD_SEC="${NJRH_FLATSCAN_SUPERVISE_PERIOD_SEC:-5.0}"
+FLATSCAN_SUPERVISE_PERIOD_SEC="${NJRH_FLATSCAN_SUPERVISE_PERIOD_SEC:-10.0}"
 FLATSCAN_STATUS_FILE="${NJRH_FLATSCAN_HELPER_STATUS_FILE:-${NJRH_RUNTIME_LOG_DIR}/flatscan_helper_status.env}"
 
 driver_pid=""
@@ -27,6 +32,10 @@ local_perception_pid=""
 flatscan_pid=""
 flatscan_helper_mode="none"
 flatscan_helper_restart_count=0
+flatscan_helper_graph_miss_count=0
+flatscan_helper_health_state="starting"
+flatscan_helper_healthy_since_epoch=0
+flatscan_helper_restart_cooldown_until_epoch=0
 
 truthy() {
   case "${1:-}" in
@@ -76,6 +85,11 @@ write_flatscan_helper_status() {
     printf 'FLATSCAN_HELPER_MODE=%q\n' "${flatscan_helper_mode}"
     printf 'FLATSCAN_HELPER_PID=%q\n' "${flatscan_pid}"
     printf 'FLATSCAN_HELPER_RESTART_COUNT=%q\n' "${flatscan_helper_restart_count}"
+    printf 'FLATSCAN_HELPER_GRAPH_MISS_COUNT=%q\n' "${flatscan_helper_graph_miss_count}"
+    printf 'FLATSCAN_HELPER_HEALTH_STATE=%q\n' "${flatscan_helper_health_state}"
+    printf 'FLATSCAN_HELPER_HEALTHY_SINCE_EPOCH=%q\n' "${flatscan_helper_healthy_since_epoch}"
+    printf 'FLATSCAN_HELPER_RESTART_COOLDOWN_UNTIL_EPOCH=%q\n' "${flatscan_helper_restart_cooldown_until_epoch}"
+    printf 'FLATSCAN_HELPER_MISSING_CONFIRMATIONS=%q\n' "${FLATSCAN_HELPER_MISSING_CONFIRMATIONS}"
     printf 'FLATSCAN_HELPER_REQUIRED=%q\n' "${FLATSCAN_HELPER_REQUIRED}"
     printf 'FLATSCAN_HELPER_RESTART=%q\n' "${FLATSCAN_HELPER_RESTART}"
     printf 'FLATSCAN_HELPER_UPDATED_AT=%q\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -84,8 +98,10 @@ write_flatscan_helper_status() {
 
 topic_publisher_count() {
   local topic="$1"
-  timeout 4 ros2 topic info -v "${topic}" 2>/dev/null \
-    | awk -F: '/Publisher count/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}'
+  local output
+  output="$(timeout --kill-after=1 "${FLATSCAN_GRAPH_PROBE_TIMEOUT_SEC}" \
+    ros2 topic info -v "${topic}" 2>/dev/null || true)"
+  awk -F: '/Publisher count/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' <<<"${output}"
 }
 
 scan_publisher_exists() {
@@ -103,7 +119,8 @@ flatscan_publisher_exists() {
 flatscan_hz_ok() {
   local output
   local hz
-  output="$(timeout 10 ros2 topic hz /flatscan --window 3 2>/dev/null || true)"
+  output="$(timeout --kill-after=1 "${FLATSCAN_MESSAGE_CONFIRM_TIMEOUT_SEC}" \
+    ros2 topic hz /flatscan --window 3 2>/dev/null || true)"
   hz="$(awk '/average rate:/ {value=$3} END {if (value != "") print value}' <<<"${output}")"
   if [[ -z "${hz}" ]]; then
     echo "[pointcloud-accel] FAIL /flatscan publisher exists but hz could not be measured" >&2
@@ -114,6 +131,42 @@ flatscan_hz_ok() {
     return 0
   fi
   echo "[pointcloud-accel] FAIL /flatscan hz=${hz} below min=${FLATSCAN_MIN_HZ}" >&2
+  return 1
+}
+
+note_flatscan_healthy() {
+  local now
+  local healthy_elapsed
+  now="$(date +%s)"
+  flatscan_helper_graph_miss_count=0
+  flatscan_helper_health_state="healthy"
+  if [[ "${flatscan_helper_healthy_since_epoch}" -eq 0 ]]; then
+    flatscan_helper_healthy_since_epoch="${now}"
+  fi
+  healthy_elapsed=$((now - flatscan_helper_healthy_since_epoch))
+  if [[ "${flatscan_helper_restart_count}" -gt 0 ]] && \
+      [[ "${healthy_elapsed}" -ge "${FLATSCAN_HELPER_HEALTHY_RESET_SEC}" ]]; then
+    echo "[pointcloud-accel] /flatscan stable health reset restart budget after ${healthy_elapsed}s" >&2
+    flatscan_helper_restart_count=0
+    flatscan_helper_restart_cooldown_until_epoch=0
+  fi
+  write_flatscan_helper_status
+}
+
+note_flatscan_graph_miss() {
+  flatscan_helper_graph_miss_count=$((flatscan_helper_graph_miss_count + 1))
+  flatscan_helper_health_state="graph_suspect"
+  flatscan_helper_healthy_since_epoch=0
+  write_flatscan_helper_status
+  echo "[pointcloud-accel] WARN /flatscan graph probe miss ${flatscan_helper_graph_miss_count}/${FLATSCAN_HELPER_MISSING_CONFIRMATIONS}; no restart before confirmation" >&2
+}
+
+confirm_flatscan_stream_after_graph_misses() {
+  if flatscan_hz_ok; then
+    echo "[pointcloud-accel] /flatscan graph misses confirmed but /flatscan messages are flowing; keeping helper pid=${flatscan_pid}" >&2
+    note_flatscan_healthy
+    return 0
+  fi
   return 1
 }
 
@@ -171,6 +224,9 @@ start_flatscan_helper() {
     --ros-args --params-file "${FLATSCAN_PARAMS}" \
     -r scan:=/scan -r flatscan:=/flatscan
   flatscan_helper_mode="standalone"
+  flatscan_helper_graph_miss_count=0
+  flatscan_helper_health_state="starting"
+  flatscan_helper_healthy_since_epoch=0
   write_flatscan_helper_status
 }
 
@@ -198,19 +254,60 @@ wait_for_flatscan_ready() {
   flatscan_hz_ok
 }
 
-restart_flatscan_helper_or_fail() {
+restart_flatscan_helper_if_allowed() {
   local reason="$1"
-  flatscan_helper_restart_count=$((flatscan_helper_restart_count + 1))
-  write_flatscan_helper_status
-  if ! truthy "${FLATSCAN_HELPER_RESTART}" || [[ "${flatscan_helper_restart_count}" -gt "${FLATSCAN_HELPER_MAX_RESTARTS}" ]]; then
-    echo "[pointcloud-accel] FAIL ${reason}; restart=${FLATSCAN_HELPER_RESTART} count=${flatscan_helper_restart_count} max=${FLATSCAN_HELPER_MAX_RESTARTS}" >&2
-    return 1
+  local now
+  now="$(date +%s)"
+
+  if ! truthy "${FLATSCAN_HELPER_RESTART}"; then
+    flatscan_helper_health_state="restart_disabled"
+    write_flatscan_helper_status
+    echo "[pointcloud-accel] FAIL ${reason}; helper restart disabled, keeping supervisor and /scan owner alive" >&2
+    return 0
   fi
+
+  if [[ "${flatscan_helper_restart_cooldown_until_epoch}" -gt "${now}" ]]; then
+    flatscan_helper_health_state="restart_cooldown"
+    write_flatscan_helper_status
+    echo "[pointcloud-accel] WARN ${reason}; restart cooldown active until ${flatscan_helper_restart_cooldown_until_epoch}, keeping supervisor alive" >&2
+    return 0
+  fi
+
+  if [[ "${flatscan_helper_restart_cooldown_until_epoch}" -ne 0 ]]; then
+    echo "[pointcloud-accel] /flatscan restart cooldown expired; opening a new bounded restart window" >&2
+    flatscan_helper_restart_count=0
+    flatscan_helper_restart_cooldown_until_epoch=0
+  fi
+
+  if [[ "${flatscan_helper_restart_count}" -ge "${FLATSCAN_HELPER_MAX_RESTARTS}" ]]; then
+    flatscan_helper_restart_cooldown_until_epoch=$((now + FLATSCAN_HELPER_RESTART_COOLDOWN_SEC))
+    flatscan_helper_health_state="restart_cooldown"
+    write_flatscan_helper_status
+    echo "[pointcloud-accel] WARN ${reason}; restart budget exhausted; keeping supervisor alive and cooling down for ${FLATSCAN_HELPER_RESTART_COOLDOWN_SEC}s" >&2
+    return 0
+  fi
+
+  flatscan_helper_restart_count=$((flatscan_helper_restart_count + 1))
+  flatscan_helper_graph_miss_count=0
+  flatscan_helper_health_state="restarting"
+  flatscan_helper_healthy_since_epoch=0
+  write_flatscan_helper_status
   echo "[pointcloud-accel] WARN ${reason}; restarting laser_scan_to_flatscan count=${flatscan_helper_restart_count}/${FLATSCAN_HELPER_MAX_RESTARTS}" >&2
   stop_flatscan_helper || true
   sleep "${FLATSCAN_HELPER_RESTART_BACKOFF_SEC}"
-  start_flatscan_helper || return 1
-  wait_for_flatscan_ready || return 1
+  if ! start_flatscan_helper; then
+    flatscan_helper_health_state="restart_start_failed"
+    write_flatscan_helper_status
+    echo "[pointcloud-accel] FAIL helper restart could not start; supervisor remains active for retry" >&2
+    return 0
+  fi
+  if ! wait_for_flatscan_ready; then
+    flatscan_helper_health_state="restart_unverified"
+    write_flatscan_helper_status
+    echo "[pointcloud-accel] WARN helper restart did not pass readiness yet; keeping process and supervisor active for recheck" >&2
+    return 0
+  fi
+  note_flatscan_healthy
 }
 
 supervise_flatscan_helper() {
@@ -223,17 +320,27 @@ supervise_flatscan_helper() {
     case "${flatscan_helper_mode}" in
       standalone)
         if ! flatscan_helper_running; then
-          if scan_publisher_exists; then
-            restart_flatscan_helper_or_fail "laser_scan_to_flatscan exited" || return 1
-          else
-            echo "[pointcloud-accel] WARN laser_scan_to_flatscan is not running but /scan publisher is not ready; waiting before helper restart" >&2
-          fi
+          flatscan_helper_graph_miss_count=0
+          flatscan_helper_health_state="process_missing"
+          flatscan_helper_healthy_since_epoch=0
+          write_flatscan_helper_status
+          restart_flatscan_helper_if_allowed "laser_scan_to_flatscan exited"
         elif ! flatscan_publisher_exists; then
-          if scan_publisher_exists; then
-            restart_flatscan_helper_or_fail "CASE_FLATSCAN_HELPER_DEAD: standalone /scan exists but /flatscan publisher is missing while laser_scan_to_flatscan pid=${flatscan_pid} is still alive" || return 1
-          else
-            echo "[pointcloud-accel] WARN standalone scan chain temporarily lacks /flatscan while /scan publisher is not ready; keeping laser_scan_to_flatscan pid=${flatscan_pid} alive and retrying" >&2
+          note_flatscan_graph_miss
+          if [[ "${flatscan_helper_graph_miss_count}" -ge "${FLATSCAN_HELPER_MISSING_CONFIRMATIONS}" ]]; then
+            if confirm_flatscan_stream_after_graph_misses; then
+              :
+            elif scan_publisher_exists; then
+              restart_flatscan_helper_if_allowed "CASE_FLATSCAN_HELPER_DEAD: standalone /scan exists but /flatscan publisher is missing while laser_scan_to_flatscan pid=${flatscan_pid} is still alive"
+            else
+              flatscan_helper_graph_miss_count=0
+              flatscan_helper_health_state="upstream_scan_suspect"
+              write_flatscan_helper_status
+              echo "[pointcloud-accel] WARN standalone scan chain temporarily lacks /flatscan while /scan publisher is not ready; keeping laser_scan_to_flatscan pid=${flatscan_pid} alive and retrying" >&2
+            fi
           fi
+        else
+          note_flatscan_healthy
         fi
         ;;
     esac
@@ -310,4 +417,5 @@ case "${PROFILE}" in
 esac
 
 wait_for_flatscan_ready
+note_flatscan_healthy
 supervise_flatscan_helper

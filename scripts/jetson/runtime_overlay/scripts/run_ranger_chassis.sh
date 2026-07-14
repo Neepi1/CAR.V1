@@ -17,37 +17,47 @@ ROBOT_MODEL="${ROBOT_MODEL:-ranger_mini_v3}"
 # base-frame contract.
 RANGER_SPINNING_BASE_TO_CENTER_X="${RANGER_SPINNING_BASE_TO_CENTER_X:-0.0}"
 RANGER_SPINNING_BASE_TO_CENTER_Y="${RANGER_SPINNING_BASE_TO_CENTER_Y:-0.0}"
-# Field-calibrated SPINNING wheel odom yaw scale from 2026-07-07
-# wheel-vs-IMU spin sweep at 0.60 rad/s, +/-30..360 deg, 5 rounds. The scale
-# corrects wheel yaw integration at the source before Nav2 consumes local odom.
+# Positive SPINNING yaw scale came from the JT128 IMU sweep. The negative scale
+# was finalized by a correction-frozen two-point A/B that bracketed 0.977672
+# and 1.0, then repeated successfully at 0.986. Both scales correct wheel yaw
+# integration at the source before Nav2 consumes local odom.
 RANGER_SPINNING_YAW_SCALE_POSITIVE="${RANGER_SPINNING_YAW_SCALE_POSITIVE:-0.976386}"
-RANGER_SPINNING_YAW_SCALE_NEGATIVE="${RANGER_SPINNING_YAW_SCALE_NEGATIVE:-0.977672}"
+RANGER_SPINNING_YAW_SCALE_NEGATIVE="${RANGER_SPINNING_YAW_SCALE_NEGATIVE:-0.986000}"
 # Keep zero-speed commands in SPINNING until the feedback yaw rate and mode
 # transition have settled. This separates spin braking from the later
 # SPINNING -> DUAL_ACKERMAN mode exit and prevents the first following drive
 # segment from inheriting the chassis stop tail.
 RANGER_SPINNING_ZERO_CMD_HOLD_ENABLED="${RANGER_SPINNING_ZERO_CMD_HOLD_ENABLED:-true}"
 RANGER_SPINNING_ZERO_CMD_HOLD_WZ_THRESHOLD_RADPS="${RANGER_SPINNING_ZERO_CMD_HOLD_WZ_THRESHOLD_RADPS:-0.030}"
+# The chassis core owns all mode transitions. It holds zero, waits for physical
+# stop, sends the mode request, and releases the latest command only after the
+# firmware reports the requested mode with mode_changing=0.
+RANGER_MODE_SWITCH_HANDSHAKE_ENABLED="${RANGER_MODE_SWITCH_HANDSHAKE_ENABLED:-true}"
+RANGER_MODE_SWITCH_RETRY_PERIOD_SEC="${RANGER_MODE_SWITCH_RETRY_PERIOD_SEC:-0.10}"
+RANGER_MODE_SWITCH_TIMEOUT_SEC="${RANGER_MODE_SWITCH_TIMEOUT_SEC:-2.0}"
+RANGER_MODE_SWITCH_STABLE_DURATION_SEC="${RANGER_MODE_SWITCH_STABLE_DURATION_SEC:-0.15}"
+RANGER_MODE_SWITCH_STOP_LINEAR_THRESHOLD_MPS="${RANGER_MODE_SWITCH_STOP_LINEAR_THRESHOLD_MPS:-0.02}"
+RANGER_MODE_SWITCH_STOP_ANGULAR_THRESHOLD_RADPS="${RANGER_MODE_SWITCH_STOP_ANGULAR_THRESHOLD_RADPS:-0.03}"
+RANGER_MODE_STATUS_TOPIC="${RANGER_MODE_STATUS_TOPIC:-/ranger_base/status}"
+RANGER_LEGACY_MODE_STATUS_TOPIC="${RANGER_LEGACY_MODE_STATUS_TOPIC:-/ranger_mini3_mode_controller/status}"
 RANGER_DUAL_ACKERMANN_ODOM_USE_FEEDBACK_TWIST="${RANGER_DUAL_ACKERMANN_ODOM_USE_FEEDBACK_TWIST:-true}"
-# Odom-only navigation redlines on 2026-07-05 showed /wheel/odom ahead of
-# post-goal relocalized base_link mainly during near-straight and terminal
-# slow DUAL_ACKERMAN motion. Apply this to near-straight odometry only so
-# Ackermann arc curvature remains on the official feedback model.
-RANGER_DUAL_ACKERMANN_LINEAR_ODOM_SCALE="${RANGER_DUAL_ACKERMANN_LINEAR_ODOM_SCALE:-0.960}"
+# The 2026-07-13 calibration2/calibration3 shadow-mode round trip kept
+# map->odom fixed and accepted no AMCL corrections. Physical endpoint offsets
+# produced independent forward/reverse scale fits of 0.99095 and 0.99110, so
+# use the rounded common value. Yaw and lateral residuals remain separate.
+RANGER_DUAL_ACKERMANN_LINEAR_ODOM_SCALE="${RANGER_DUAL_ACKERMANN_LINEAR_ODOM_SCALE:-0.991}"
 RANGER_DUAL_ACKERMANN_LINEAR_ODOM_SCALE_MAX_ABS_YAW_RATE="${RANGER_DUAL_ACKERMANN_LINEAR_ODOM_SCALE_MAX_ABS_YAW_RATE:-0.060}"
-# Field-calibrated DUAL_ACKERMAN yaw feedback scale for high-speed
-# near-straight micro-corrections. 2026-07-06 two-leg audits showed the
-# chassis feedback angular velocity under-integrates yaw when |wz| is small,
-# while larger Ackermann arcs already match the IMU, so only near-straight
-# odometry yaw is scaled.
+# Sign-specific near-straight DUAL_ACKERMAN scales fitted from the 2026-07-13
+# correction-frozen six-leg replay. Positive feedback yaw accumulated 41.044
+# deg while the projected LiDAR IMU accumulated 42.733 deg; negative feedback
+# yaw accumulated -77.930 deg while the IMU accumulated -76.180 deg.
 RANGER_DUAL_ACKERMANN_YAW_SCALE_MAX_ABS_YAW_RATE="${RANGER_DUAL_ACKERMANN_YAW_SCALE_MAX_ABS_YAW_RATE:-0.060}"
-RANGER_DUAL_ACKERMANN_NEAR_STRAIGHT_YAW_SCALE_POSITIVE="${RANGER_DUAL_ACKERMANN_NEAR_STRAIGHT_YAW_SCALE_POSITIVE:-1.120}"
-RANGER_DUAL_ACKERMANN_NEAR_STRAIGHT_YAW_SCALE_NEGATIVE="${RANGER_DUAL_ACKERMANN_NEAR_STRAIGHT_YAW_SCALE_NEGATIVE:-1.120}"
-# Field-calibrated straight-drive yaw drift term. This covers the remaining
-# case where feedback yaw rate is nearly zero but the robot still accumulates a
-# small clockwise heading drift at speed. Units are radian yaw per meter driven.
+RANGER_DUAL_ACKERMANN_NEAR_STRAIGHT_YAW_SCALE_POSITIVE="${RANGER_DUAL_ACKERMANN_NEAR_STRAIGHT_YAW_SCALE_POSITIVE:-1.041151}"
+RANGER_DUAL_ACKERMANN_NEAR_STRAIGHT_YAW_SCALE_NEGATIVE="${RANGER_DUAL_ACKERMANN_NEAR_STRAIGHT_YAW_SCALE_NEGATIVE:-0.977549}"
+# Units are radian yaw per meter driven. Keep the bias neutral unless a
+# sign-consistent residual is reproduced independently of localization.
 RANGER_DUAL_ACKERMANN_YAW_BIAS_MAX_ABS_YAW_RATE="${RANGER_DUAL_ACKERMANN_YAW_BIAS_MAX_ABS_YAW_RATE:-0.030}"
-RANGER_DUAL_ACKERMANN_NEAR_STRAIGHT_YAW_BIAS_PER_METER="${RANGER_DUAL_ACKERMANN_NEAR_STRAIGHT_YAW_BIAS_PER_METER:--0.0041}"
+RANGER_DUAL_ACKERMANN_NEAR_STRAIGHT_YAW_BIAS_PER_METER="${RANGER_DUAL_ACKERMANN_NEAR_STRAIGHT_YAW_BIAS_PER_METER:-0.0}"
 LOCK_DIR="/tmp/njrh_ranger_chassis_${CAN_IFACE}.lock"
 REAL_NODE_PATTERN="/ranger_base/lib/ranger_base/ranger_base_node.*port_name:=${CAN_IFACE}"
 WRAPPER_PATTERN="ros2 run ranger_base ranger_base_node.*port_name:=${CAN_IFACE}"
@@ -119,6 +129,14 @@ njrh_run_affined ranger_base_node ros2 run ranger_base ranger_base_node \
   -p "spinning_yaw_scale_negative:=${RANGER_SPINNING_YAW_SCALE_NEGATIVE}" \
   -p "spinning_zero_cmd_hold_enabled:=${RANGER_SPINNING_ZERO_CMD_HOLD_ENABLED}" \
   -p "spinning_zero_cmd_hold_wz_threshold_radps:=${RANGER_SPINNING_ZERO_CMD_HOLD_WZ_THRESHOLD_RADPS}" \
+  -p "mode_switch_handshake_enabled:=${RANGER_MODE_SWITCH_HANDSHAKE_ENABLED}" \
+  -p "mode_switch_retry_period_sec:=${RANGER_MODE_SWITCH_RETRY_PERIOD_SEC}" \
+  -p "mode_switch_timeout_sec:=${RANGER_MODE_SWITCH_TIMEOUT_SEC}" \
+  -p "mode_switch_stable_duration_sec:=${RANGER_MODE_SWITCH_STABLE_DURATION_SEC}" \
+  -p "mode_switch_stop_linear_threshold_mps:=${RANGER_MODE_SWITCH_STOP_LINEAR_THRESHOLD_MPS}" \
+  -p "mode_switch_stop_angular_threshold_radps:=${RANGER_MODE_SWITCH_STOP_ANGULAR_THRESHOLD_RADPS}" \
+  -p "mode_status_topic:=${RANGER_MODE_STATUS_TOPIC}" \
+  -p "legacy_mode_status_topic:=${RANGER_LEGACY_MODE_STATUS_TOPIC}" \
   -r /tf:=/tf_ranger_internal \
   -r /tf_static:=/tf_static_ranger_internal &
 chassis_pid=$!

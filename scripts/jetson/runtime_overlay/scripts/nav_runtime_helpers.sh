@@ -15,17 +15,11 @@ force_restart_nav_helpers_enabled() {
   [[ "${NJRH_FORCE_RESTART_NAV_HELPERS:-false}" == "true" ]]
 }
 
-forget_overlay_helper_pid() {
-  local pid_to_forget="$1"
-  local kept_pids=()
-  local helper_pid
-  for helper_pid in "${helper_pids[@]:-}"; do
-    [[ -n "${helper_pid}" ]] || continue
-    if [[ "${helper_pid}" != "${pid_to_forget}" ]]; then
-      kept_pids+=("${helper_pid}")
-    fi
-  done
-  helper_pids=("${kept_pids[@]}")
+localization_generation_owned_helper() {
+  case "$1" in
+    global_localization*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 helper_process_pattern() {
@@ -42,9 +36,6 @@ helper_process_pattern() {
       ;;
     global_localization*)
       printf '%s\n' "robot_global_localization/global_localization_node|/install/robot_global_localization/lib/robot_global_localization/global_localization_node"
-      ;;
-    ranger_mini3_mode_controller*)
-      printf '%s\n' "ranger_mini3_mode_controller/mode_controller_node|/install/ranger_mini3_mode_controller/lib/ranger_mini3_mode_controller/mode_controller_node"
       ;;
     *)
       return 1
@@ -82,10 +73,6 @@ cleanup_stale_overlay_helper() {
     global_localization*)
       [[ -n "${helper_pattern}" ]] && kill_overlay_pattern "${helper_pattern}"
       kill_overlay_pattern "${NJRH_OVERLAY_ROOT}/scripts/run_global_localization.sh"
-      ;;
-    ranger_mini3_mode_controller*)
-      [[ -n "${helper_pattern}" ]] && kill_overlay_pattern "${helper_pattern}"
-      kill_overlay_pattern "${NJRH_OVERLAY_ROOT}/scripts/run_ranger_mini3_mode_controller.sh"
       ;;
     *)
       [[ -n "${helper_pattern}" ]] && kill_overlay_pattern "${helper_pattern}"
@@ -179,11 +166,6 @@ stop_existing_overlay_nav_helpers() {
   kill_overlay_pattern "${NJRH_OVERLAY_ROOT}/scripts/run_floor_manager.sh"
   kill_overlay_pattern "/install/robot_floor_manager/lib/robot_floor_manager/floor_manager_node"
   kill_overlay_pattern "robot_floor_manager/floor_manager_node"
-  kill_overlay_pattern "${NJRH_OVERLAY_ROOT}/scripts/run_ranger_mini3_mode_controller.sh"
-  kill_overlay_pattern "ranger_mini3_mode_controller/mode_controller_node.py"
-  kill_overlay_pattern "python3 .*mode_controller_node.py"
-  kill_overlay_pattern "/install/ranger_mini3_mode_controller/lib/ranger_mini3_mode_controller/mode_controller_node"
-  kill_overlay_pattern "ranger_mini3_mode_controller/mode_controller_node"
 }
 
 start_overlay_helper() {
@@ -198,7 +180,11 @@ start_overlay_helper() {
   local helper_log="${NJRH_RUNTIME_LOG_DIR}/${helper_name}.log"
   local helper_pattern=""
   if helper_pattern="$(helper_process_pattern "${helper_name}")"; then
-    if reuse_common_services_enabled && helper_process_running "${helper_pattern}"; then
+    if localization_generation_owned_helper "${helper_name}" \
+      && helper_process_running "${helper_pattern}"; then
+      echo "[runtime-overlay] replacing stale ${helper_name}; starting a fresh localization generation" >&2
+      cleanup_stale_overlay_helper "${helper_name}" "${helper_pattern}"
+    elif reuse_common_services_enabled && helper_process_running "${helper_pattern}"; then
       if helper_ready "${helper_name}"; then
         echo "[runtime-overlay] reusing existing ${helper_name}; pattern=${helper_pattern}" >&2
         return 0
@@ -216,16 +202,6 @@ start_overlay_helper() {
     echo "[runtime-overlay] helper failed to stay alive: ${helper_name}. Check ${helper_log}" >&2
     return 1
   fi
-  case "${helper_name}" in
-    global_localization*)
-      # The resident navigation stack needs /global_localization/trigger after
-      # initial startup for explicit relocalization and post-test truth checks.
-      # Keep the wrapper alive independently from the occupancy-localization
-      # launch script; full runtime stop still removes it by process pattern.
-      disown "${helper_pid}" 2>/dev/null || true
-      forget_overlay_helper_pid "${helper_pid}"
-      ;;
-  esac
   echo "[runtime-overlay] helper ready: ${helper_name} (pid=${helper_pid})" >&2
 }
 

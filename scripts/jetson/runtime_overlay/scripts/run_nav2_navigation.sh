@@ -140,6 +140,7 @@ start_navigation_lifecycle_with_nav2_util() {
 start_navigation_lifecycle_with_repo_sequence() {
   local timeout_sec="${NJRH_NAV2_LIFECYCLE_BRINGUP_TIMEOUT_SEC:-180}"
   local node_timeout="${NJRH_NAV2_LIFECYCLE_NODE_TIMEOUT_SEC:-60}"
+  local change_state_response_timeout="${NJRH_NAV2_LIFECYCLE_CHANGE_STATE_RESPONSE_TIMEOUT_SEC:-5}"
   local kill_after="${NJRH_NAV2_LIFECYCLE_BRINGUP_KILL_AFTER_SEC:-5}"
   local core_nodes=(
     planner_server
@@ -153,7 +154,10 @@ start_navigation_lifecycle_with_repo_sequence() {
   local background_nodes=(
     waypoint_follower
   )
-  local sequence_args=(--per-node-timeout-sec "${node_timeout}")
+  local sequence_args=(
+    --per-node-timeout-sec "${node_timeout}"
+    --change-state-response-timeout-sec "${change_state_response_timeout}"
+  )
   if [[ "${NJRH_NAV2_LIFECYCLE_TRUST_CHANGE_STATE_RESPONSE:-true}" == "true" ]]; then
     sequence_args+=(--trust-change-state-response)
   fi
@@ -184,7 +188,7 @@ start_navigation_lifecycle_with_repo_sequence() {
 }
 
 if [[ -n "${NJRH_FLOOR_ID:-}" || -n "${NAV2_FLOOR_ID:-}" ]]; then
-  resolve_floor_assets "${NJRH_BUILDING_ID:-${NAV2_BUILDING_ID:-building_1}}" "${NJRH_FLOOR_ID:-${NAV2_FLOOR_ID:-}}"
+  resolve_floor_assets_if_needed "${NJRH_BUILDING_ID:-${NAV2_BUILDING_ID:-building_1}}" "${NJRH_FLOOR_ID:-${NAV2_FLOOR_ID:-}}"
 fi
 
 [[ -f "${LAUNCH_FILE}" ]] || {
@@ -204,6 +208,7 @@ if standard_nav_stack_ready; then
   done
 fi
 
+clear_nav2_lifecycle_ready_status
 stop_existing_overlay_nav_helpers
 rm -f "${NJRH_NAV2_HOLD_READY_FILE}" 2>/dev/null || true
 if [[ "${NJRH_SKIP_PRESTART_NAV2_STOP:-false}" != "true" ]]; then
@@ -457,7 +462,6 @@ ensure_resident_overlay_helper_process() {
 
 ensure_resident_overlay_helper_process "floor_manager" "floor_manager" bash "${SCRIPT_DIR}/run_floor_manager.sh"
 ensure_resident_overlay_helper_process "robot_safety" "robot_safety" bash "${SCRIPT_DIR}/run_robot_safety.sh"
-ensure_resident_overlay_helper_process "ranger_mini3_mode_controller" "ranger_mini3_mode_controller" bash "${SCRIPT_DIR}/run_ranger_mini3_mode_controller.sh"
 echo "[runtime-overlay] local_perception helper disabled; local costmap/collision_monitor consume /scan for standard marking+clearing" >&2
 
 ros2 launch "${LAUNCH_FILE}" \
@@ -479,8 +483,10 @@ wait_for_controller_server_affinity || exit 1
 if nav2_external_lifecycle_bringup_enabled && ! nav2_lifecycle_hold_enabled; then
   if [[ "${NJRH_NAV2_USE_REPO_LIFECYCLE_SEQUENCE:-true}" == "true" ]]; then
     start_navigation_lifecycle_with_repo_sequence || exit 1
+    write_nav2_lifecycle_ready_status "$$" "nav2_wrapper_repo_sequence"
   else
     start_navigation_lifecycle_with_nav2_util || exit 1
+    write_nav2_lifecycle_ready_status "$$" "nav2_wrapper_nav2_util"
   fi
 elif nav2_lifecycle_hold_enabled; then
   write_nav2_hold_ready_status

@@ -95,76 +95,57 @@ finally:
 PY
 }
 
+nav2_lifecycle_ready_status_file() {
+  printf '%s\n' "${NJRH_NAV2_LIFECYCLE_READY_STATUS_FILE:-/tmp/njrh_nav2_lifecycle_ready.env}"
+}
+
+clear_nav2_lifecycle_ready_status() {
+  rm -f "$(nav2_lifecycle_ready_status_file)" 2>/dev/null || true
+}
+
+write_nav2_lifecycle_ready_status() {
+  local owner_pid="$1"
+  local source_label="${2:-unknown}"
+  local status_file
+  local tmp_file
+  status_file="$(nav2_lifecycle_ready_status_file)"
+  tmp_file="${status_file}.$$"
+  {
+    printf 'NAV2_LIFECYCLE_READY=true\n'
+    printf 'NAV2_LIFECYCLE_READY_STAMP_SEC=%q\n' "$(date +%s)"
+    printf 'NAV2_LIFECYCLE_READY_OWNER_PID=%q\n' "${owner_pid}"
+    printf 'NAV2_LIFECYCLE_READY_SOURCE=%q\n' "${source_label}"
+  } >"${tmp_file}"
+  mv -f "${tmp_file}" "${status_file}"
+}
+
+nav2_lifecycle_ready_status_matches() (
+  local status_file
+  local now_sec
+  local age_sec
+  local max_age_sec="${NJRH_NAV2_LIFECYCLE_READY_STATUS_MAX_AGE_SEC:-600}"
+  status_file="$(nav2_lifecycle_ready_status_file)"
+  [[ -r "${status_file}" ]] || return 1
+  NAV2_LIFECYCLE_READY=""
+  NAV2_LIFECYCLE_READY_STAMP_SEC=""
+  NAV2_LIFECYCLE_READY_OWNER_PID=""
+  NAV2_LIFECYCLE_READY_SOURCE=""
+  # shellcheck disable=SC1090
+  source "${status_file}" 2>/dev/null || return 1
+  [[ "${NAV2_LIFECYCLE_READY:-false}" == "true" ]] || return 1
+  [[ "${NAV2_LIFECYCLE_READY_OWNER_PID:-}" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "${NAV2_LIFECYCLE_READY_OWNER_PID}" 2>/dev/null || return 1
+  now_sec="$(date +%s)"
+  age_sec=$((now_sec - ${NAV2_LIFECYCLE_READY_STAMP_SEC:-0}))
+  (( age_sec >= 0 && age_sec <= max_age_sec ))
+)
+
 nav2_lifecycle_manager_reported_active() {
-  local log_files=(
-    "${NJRH_NAVIGATION_RESUME_LOG_FILE:-/tmp/njrh_navigation_resume.log}"
-    "${NJRH_RUNTIME_LOG_DIR:-}/resident_navigation_runtime.log"
-    "${NJRH_RUNTIME_LOG_DIR:-}/nav2_navigation.log"
-  )
-  local log_file
-  for log_file in "${log_files[@]}"; do
-    [[ -n "${log_file}" && -f "${log_file}" ]] || continue
-    if python3 - "${log_file}" <<'PY'
-import sys
-
-path = sys.argv[1]
-try:
-    with open(path, "r", encoding="utf-8", errors="replace") as file:
-        lines = file.readlines()
-except OSError:
-    raise SystemExit(1)
-
-start_index = 0
-for index, line in enumerate(lines):
-    if "STARTUP_STAGE stage=nav2_layer_started" in line:
-        start_index = index
-
-for line in lines[start_index:]:
-    if "lifecycle_manager_navigation" in line and "Managed nodes are active" in line:
-        raise SystemExit(0)
-raise SystemExit(1)
-PY
-    then
-      return 0
-    fi
-  done
-  return 1
+  nav2_lifecycle_ready_status_matches
 }
 
 nav2_point_navigation_core_reported_active() {
-  local log_files=(
-    "${NJRH_NAVIGATION_RESUME_LOG_FILE:-/tmp/njrh_navigation_resume.log}"
-    "${NJRH_RUNTIME_LOG_DIR:-}/resident_navigation_runtime.log"
-    "${NJRH_RUNTIME_LOG_DIR:-}/nav2_navigation.log"
-  )
-  local log_file
-  for log_file in "${log_files[@]}"; do
-    [[ -n "${log_file}" && -f "${log_file}" ]] || continue
-    if python3 - "${log_file}" <<'PY'
-import sys
-
-path = sys.argv[1]
-try:
-    with open(path, "r", encoding="utf-8", errors="replace") as file:
-        lines = file.readlines()
-except OSError:
-    raise SystemExit(1)
-
-start_index = 0
-for index, line in enumerate(lines):
-    if "STARTUP_STAGE stage=nav2_layer_started" in line:
-        start_index = index
-
-for line in lines[start_index:]:
-    if "point-navigation core nodes are active" in line:
-        raise SystemExit(0)
-raise SystemExit(1)
-PY
-    then
-      return 0
-    fi
-  done
-  return 1
+  nav2_lifecycle_ready_status_matches
 }
 
 nav2_critical_processes_running() {

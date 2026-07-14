@@ -36,10 +36,15 @@ robot_safety:
     spin_to_drive_linear_epsilon_mps: 0.03
     spin_to_drive_odom_max_age_sec: 0.20
     mode_exit_guard_enabled: true
-    mode_controller_status_topic: /ranger_mini3_mode_controller/status
+    mode_controller_status_topic: /ranger_base/status
     mode_exit_guard_probe_speed_mps: 0.06
     mode_exit_guard_timeout_sec: 1.0
     mode_exit_guard_status_max_age_sec: 0.5
+    allow_reverse: false
+    reverse_enable_topic: /ranger_mini3/allow_reverse
+    docking_reverse_enable_topic: /ranger_mini3/docking_allow_reverse
+    teleop_reverse_enable_topic: /ranger_mini3/teleop_allow_reverse
+    reverse_enable_timeout_sec: 0.75
     final_cmd_lateral_deadband_mps: 0.001
     allow_api_lateral_cmd: true
     api_lateral_max_mps: 0.10

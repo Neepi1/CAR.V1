@@ -63,6 +63,7 @@ container_env=(
   "-e" "NJRH_NAV2_LIFECYCLE_PARALLEL_CORE=${NJRH_NAV2_LIFECYCLE_PARALLEL_CORE:-false}"
   "-e" "NJRH_NAV2_LIFECYCLE_PARALLEL_BT=${NJRH_NAV2_LIFECYCLE_PARALLEL_BT:-true}"
   "-e" "NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK=${NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK:-false}"
+  "-e" "NJRH_NAV2_HELD_PRESTART_WAIT_FOR_LOCALIZER_SERVICE=${NJRH_NAV2_HELD_PRESTART_WAIT_FOR_LOCALIZER_SERVICE:-true}"
   "-e" "NJRH_COMMON_LOCAL_STATE_START_READY_MODE=${NJRH_COMMON_LOCAL_STATE_START_READY_MODE:-endpoint}"
   "-e" "NJRH_COMMON_LOCAL_STATE_BACKGROUND_START=${NJRH_COMMON_LOCAL_STATE_BACKGROUND_START:-true}"
   "-e" "NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE=${NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE:-false}"
@@ -90,6 +91,24 @@ container_env=(
   "-e" "HOME=${RUNTIME_HOME}"
 )
 
+clear_runtime_status_files() {
+  rm -f \
+    /tmp/njrh_runtime_map_context.json \
+    /tmp/njrh_runtime_health.json \
+    /tmp/njrh_amcl_runtime_status.env \
+    /tmp/njrh_nav2_launch_hold_ready.env \
+    /tmp/njrh_nav2_lifecycle_ready.env \
+    2>/dev/null || true
+}
+
+container_runtime_processes_present() {
+  local process_table
+  if ! process_table="$(docker top "${CONTAINER_NAME}" -eo pid,args 2>/dev/null)"; then
+    return 2
+  fi
+  grep -Eq "run_common_services[.]sh|run_driver[.]sh|run_pointcloud_accel_pipeline[.]sh|laser_scan_to_flatscan|ranger_base_node|hesai_ros_driver_node|runtime_health_guard[.]py|robot_localization/ekf_node|run_navigation_runtime_services[.]sh|run_occupancy_grid_localization[.]sh|standard_navigation[.]launch[.]py|occupancy_localization_stack[.]launch[.]py|global_localization_node|localization_bridge_node|robot_api_server_node|__node:=controller_server|__node:=planner_server|__node:=map_server" <<<"${process_table}"
+}
+
 prepare_container_permissions() {
   local mode="${NJRH_PREPARE_RUNTIME_PERMISSIONS_MODE:-once}"
   local marker="${NJRH_RUNTIME_PERMISSIONS_MARKER:-${WORKSPACE_CONTAINER}/.njrh_runtime_permissions_ready}"
@@ -111,7 +130,7 @@ prepare_container_permissions() {
     return 0
   fi
 
-  docker exec -u root "${CONTAINER_NAME}" /bin/bash -lc "
+  docker exec -u root "${CONTAINER_NAME}" /bin/bash -c "
     set -e
     mkdir -p \
       '${WORKSPACE_CONTAINER}/maps_release' \
@@ -144,71 +163,23 @@ prepare_container_permissions() {
 }
 
 stop_container_common_processes() {
+  local process_state=0
   if ! docker ps --format '{{.Names}}' | grep -Fx "${CONTAINER_NAME}" >/dev/null 2>&1; then
+    clear_runtime_status_files
     return 0
   fi
-  docker exec "${CONTAINER_NAME}" /bin/bash -lc '
-    set +e
-    pids_by_pattern() {
-      local pattern="$1"
-      ps -eo pid=,args= \
-        | awk -v pattern="${pattern}" '"'"'
-          $0 ~ pattern &&
-          $0 !~ /awk -v pattern/ &&
-          $0 !~ /pids_by_pattern/ &&
-          $0 !~ /stop_exact_process_set/ &&
-          $0 !~ /common_pattern=/ &&
-          $0 !~ /node_pattern=/ &&
-          $0 !~ /docker exec/ &&
-          $0 !~ /njrh_systemd_runtime\.sh/ &&
-          $0 !~ /ros2_cli_pattern=/ {print $1}
-        '"'"'
-    }
-    wait_pids_gone() {
-      local timeout_sec="$1"
-      shift || true
-      local pids=("$@")
-      local deadline=$((SECONDS + timeout_sec))
-      local pid
-      while (( SECONDS < deadline )); do
-        local alive=0
-        for pid in "${pids[@]}"; do
-          [[ -n "${pid}" && -d "/proc/${pid}" ]] && alive=1
-        done
-        [[ "${alive}" -eq 0 ]] && return 0
-        sleep 0.2
-      done
-      return 1
-    }
-    stop_exact_process_set() {
-      local label="$1"
-      local pattern="$2"
-      mapfile -t pids < <(pids_by_pattern "${pattern}")
-      [[ "${#pids[@]}" -gt 0 ]] || return 0
-      echo "[njrh-systemd] stopping ${label} pids=${pids[*]}" >&2
-      kill -INT "${pids[@]}" 2>/dev/null || true
-      wait_pids_gone 2 "${pids[@]}" && return 0
-      mapfile -t pids < <(pids_by_pattern "${pattern}")
-      [[ "${#pids[@]}" -gt 0 ]] || return 0
-      kill -TERM "${pids[@]}" 2>/dev/null || true
-      wait_pids_gone 3 "${pids[@]}" && return 0
-      mapfile -t pids < <(pids_by_pattern "${pattern}")
-      [[ "${#pids[@]}" -gt 0 ]] || return 0
-      echo "[njrh-systemd] killing exact stale ${label} pids=${pids[*]}" >&2
-      kill -KILL "${pids[@]}" 2>/dev/null || true
-    }
-    common_pattern="run_common_services.sh"
-    node_pattern="hesai_ros_driver_node|pointcloud_axis_remap|imu_axis_remap|ranger_base_node|robot_description_static_tf_node|robot_eai_gs2/gs2_driver_node|gs2_driver_node --ros-args|ros2 launch robot_eai_gs2 gs2.launch.py|ekf_node --ros-args.*__node:=robot_local_state|robot_localization/ekf_node|robot_local_perception/local_perception_node|robot_floor_manager/floor_manager_node|robot_safety/robot_safety_node|ranger_mini3_mode_controller/mode_controller_node|robot_docking_manager/docking_manager_node|docking_manager_node --ros-args|run_robot_api_server_supervised.sh|robot_api_server/robot_api_server_node|robot_api_server_node --ros-args|run_navigation_runtime_services.sh|nav2_lifecycle_sequence.py|call_global_localization_trigger.py|run_nav2_navigation.sh|run_occupancy_grid_localization.sh|standard_navigation.launch.py|occupancy_localization_stack.launch.py|occupancy_grid_localizer_container|occupancy_grid_localizer|robot_localization_bridge/localization_bridge_node|localization_bridge_node --ros-args|amcl --ros-args|nav2_amcl|amcl_scan_admission|__node:=map_server|__node:=controller_server|__node:=planner_server|__node:=bt_navigator|__node:=behavior_server|__node:=velocity_smoother|__node:=collision_monitor|__node:=lifecycle_manager_navigation|__node:=lifecycle_manager_costmap_filters"
-    ros2_cli_pattern="/opt/ros/humble/bin/ros2 (lifecycle get|topic echo|topic hz|topic info|node info|service call /amcl/(change_state|get_state))|ros2 (lifecycle get|topic echo|topic hz|topic info|node info|service call /amcl/(change_state|get_state))"
-    stop_exact_process_set "stale ros2 diagnostics cli" "${ros2_cli_pattern}"
-    stop_exact_process_set "common services" "${common_pattern}"
-    stop_exact_process_set "runtime nodes" "${node_pattern}"
-    rm -f \
-      /tmp/njrh_runtime_map_context.json \
-      /tmp/njrh_amcl_runtime_status.env \
-      /tmp/njrh_nav2_launch_hold_ready.env \
-      2>/dev/null || true
-  ' || true
+  container_runtime_processes_present || process_state=$?
+  if [[ "${process_state}" -eq 1 ]]; then
+    echo "[njrh-systemd] no stale runtime processes found; skipping container cleanup sweep" >&2
+    clear_runtime_status_files
+    return 0
+  fi
+  if [[ "${process_state}" -eq 2 ]]; then
+    echo "[njrh-systemd] container process table unavailable; running conservative cleanup sweep" >&2
+  fi
+  docker exec "${CONTAINER_NAME}" /bin/bash \
+    "${OVERLAY_CONTAINER}/scripts/stop_runtime_processes.sh" || true
+  clear_runtime_status_files
 }
 
 cd "${WORKSPACE_HOST}"
@@ -227,7 +198,7 @@ case "${ACTION}" in
 
     echo "[njrh-systemd] GS2 serial port resolved to ${GS2_SERIAL_PORT}" >&2
     exec docker exec -u "${RUNTIME_USER}" --workdir "${OVERLAY_CONTAINER}" "${container_env[@]}" "${CONTAINER_NAME}" \
-      /bin/bash -lc "cd '${OVERLAY_CONTAINER}' && exec bash scripts/run_common_services.sh"
+      /bin/bash -c "cd '${OVERLAY_CONTAINER}' && exec bash scripts/run_common_services.sh"
     ;;
   stop)
     stop_container_common_processes

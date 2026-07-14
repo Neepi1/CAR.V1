@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+startup_epoch_sec="$(date +%s)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/commercial_runtime_helpers.sh"
 source "${SCRIPT_DIR}/floor_asset_helpers.sh"
@@ -22,7 +23,7 @@ export NJRH_LOCALIZATION_MAP_EXTERNAL_LIFECYCLE_BRINGUP="${NJRH_LOCALIZATION_MAP
   exit 2
 }
 
-resolve_floor_assets "${building_id}" "${floor_id}"
+resolve_floor_assets_if_needed "${building_id}" "${floor_id}"
 
 localization_pid=""
 navigation_pid=""
@@ -38,7 +39,6 @@ exit_code=0
 runtime_ready=0
 cleanup_started=0
 localization_ready_failure_reason=""
-startup_epoch_sec="$(date +%s)"
 
 stale_amcl_heartbeat_pids() {
   ps -eo pid=,args= |
@@ -1082,6 +1082,23 @@ ensure_localization_stack_ready_for_navigation() {
   local flatscan_repair_timeout="${NJRH_INITIAL_LOCALIZATION_FLATSCAN_REPAIR_WAIT_SEC:-20}"
   local publisher_timeout="${NJRH_INITIAL_LOCALIZATION_RESULT_PUBLISHER_WAIT_SEC:-45}"
   local require_result_publisher="${NJRH_INITIAL_LOCALIZATION_REQUIRE_RESULT_PUBLISHER:-false}"
+  local stack_timeout="${NJRH_INITIAL_LOCALIZATION_STACK_WAIT_SEC:-45}"
+
+  if runtime_readiness_probe localization-stack \
+    "${NAV2_MAP_YAML}" "/flatscan" "${stack_timeout}"; then
+    echo "[runtime-overlay] localization stack passed the single-participant startup gate" >&2
+    if env_flag_true "${require_result_publisher}"; then
+      if ! wait_for_topic_publisher "/localization_result" "${publisher_timeout}"; then
+        set_localization_ready_failure "LOCALIZATION_RESULT_PUBLISHER_MISSING" "/localization_result publisher not ready within ${publisher_timeout}s"
+        return 1
+      fi
+    else
+      echo "[runtime-overlay] skipping /localization_result publisher pre-gate; trigger wrapper verifies result, bridge acceptance, and map->odom" >&2
+    fi
+    echo "[runtime-overlay] localization stack ready for initial relocalization" >&2
+    return 0
+  fi
+  echo "[runtime-overlay] falling back to detailed localization readiness diagnostics and FlatScan repair" >&2
 
   if ! wait_for_ros_service "/global_localization/trigger" "${service_timeout}"; then
     set_localization_ready_failure "GLOBAL_LOCALIZATION_TRIGGER_SERVICE_MISSING" "/global_localization/trigger not ready within ${service_timeout}s"
@@ -1146,6 +1163,7 @@ start_resident_navigation_layer() {
     return 0
   fi
   echo "[runtime-overlay] ${verb} resident Nav2 layer for ${NJRH_BUILDING_ID}/${NJRH_FLOOR_ID}" >&2
+  clear_nav2_lifecycle_ready_status
   rm -f "${NJRH_NAV2_HOLD_READY_FILE:-/tmp/njrh_nav2_launch_hold_ready.env}" 2>/dev/null || true
   NJRH_BUILDING_ID="${NJRH_BUILDING_ID}" \
   NJRH_FLOOR_ID="${NJRH_FLOOR_ID}" \
@@ -1161,8 +1179,12 @@ run_nav2_lifecycle_sequence() {
   shift || true
   local nodes=("$@")
   local node_timeout="${NJRH_NAV2_LIFECYCLE_NODE_TIMEOUT_SEC:-60}"
+  local change_state_response_timeout="${NJRH_NAV2_LIFECYCLE_CHANGE_STATE_RESPONSE_TIMEOUT_SEC:-5}"
   local kill_after="${NJRH_NAV2_LIFECYCLE_BRINGUP_KILL_AFTER_SEC:-5}"
-  local sequence_args=(--per-node-timeout-sec "${node_timeout}")
+  local sequence_args=(
+    --per-node-timeout-sec "${node_timeout}"
+    --change-state-response-timeout-sec "${change_state_response_timeout}"
+  )
   echo "[runtime-overlay] Nav2 lifecycle startup method=repo_sequence nodes=${nodes[*]}" >&2
   if [[ "${NJRH_NAV2_LIFECYCLE_TRUST_CHANGE_STATE_RESPONSE:-true}" == "true" ]]; then
     sequence_args+=(--trust-change-state-response)
@@ -1215,8 +1237,12 @@ run_nav2_lifecycle_sequence_until_active() {
   shift || true
   local nodes=("$@")
   local node_timeout="${NJRH_NAV2_LIFECYCLE_NODE_TIMEOUT_SEC:-60}"
+  local change_state_response_timeout="${NJRH_NAV2_LIFECYCLE_CHANGE_STATE_RESPONSE_TIMEOUT_SEC:-5}"
   local kill_after="${NJRH_NAV2_LIFECYCLE_BRINGUP_KILL_AFTER_SEC:-5}"
-  local sequence_args=(--per-node-timeout-sec "${node_timeout}")
+  local sequence_args=(
+    --per-node-timeout-sec "${node_timeout}"
+    --change-state-response-timeout-sec "${change_state_response_timeout}"
+  )
   local rc=1
 
   if [[ "${NJRH_NAV2_LIFECYCLE_TRUST_CHANGE_STATE_RESPONSE:-true}" == "true" ]]; then
@@ -1264,8 +1290,11 @@ run_nav2_lifecycle_sequence_until_active() {
 activate_prestarted_nav2_lifecycle() {
   [[ "${nav2_prestarted}" -eq 1 ]] || return 0
   if [[ "${nav2_lifecycle_background_started}" -eq 1 ]]; then
-    wait_for_prestarted_nav2_lifecycle_background
-    return $?
+    if wait_for_prestarted_nav2_lifecycle_background; then
+      write_nav2_lifecycle_ready_status "${navigation_pid}" "resident_background_sequence"
+      return 0
+    fi
+    return 1
   fi
   local timeout_sec="${NJRH_NAV2_LIFECYCLE_BRINGUP_TIMEOUT_SEC:-180}"
   local nodes=(
@@ -1284,6 +1313,7 @@ activate_prestarted_nav2_lifecycle() {
       echo "[runtime-overlay] prestarted Nav2 lifecycle sequence failed or timed out" >&2
       return 1
     }
+  write_nav2_lifecycle_ready_status "${navigation_pid}" "resident_foreground_sequence"
   echo "[runtime-overlay] lifecycle_manager_navigation external lifecycle sequence: Managed nodes are active" >&2
 }
 
@@ -1512,6 +1542,19 @@ ensure_common_local_state_ready_for_navigation_start || {
 log_startup_stage "common_local_state_ready"
 
 if [[ -z "${navigation_pid}" ]] && env_flag_true "${NJRH_NAV2_HELD_PRESTART_AFTER_LOCAL_STATE:-true}"; then
+  if env_flag_true "${NJRH_NAV2_HELD_PRESTART_WAIT_FOR_LOCALIZER_SERVICE:-true}"; then
+    localizer_prestart_service_timeout="${NJRH_NAV2_HELD_PRESTART_LOCALIZER_SERVICE_WAIT_SEC:-45}"
+    echo "[runtime-overlay] prioritizing localization startup until Isaac service and bridge odom are ready before held Nav2 prestart" >&2
+    ensure_localization_layer_alive || exit 1
+    if ! runtime_readiness_probe localization-prestart "${localizer_prestart_service_timeout}"; then
+      set_localization_ready_failure \
+        "LOCALIZATION_PRESTART_NOT_READY" \
+        "Isaac service or localization bridge odom not ready before held Nav2 prestart within ${localizer_prestart_service_timeout}s"
+      write_runtime_map_context "failed" "false" "${localization_ready_failure_reason}"
+      exit 1
+    fi
+    log_startup_stage "localizer_service_ready_for_nav2_prestart"
+  fi
   start_resident_navigation_layer "true" "nav2_layer_prestarted_held" "prestarting held"
   nav2_prestarted=1
   sleep "${NJRH_NAV2_PRESTART_SETTLE_SEC:-0.1}"

@@ -1,0 +1,49 @@
+/**:
+  ros__parameters:
+    frequency: 50.0
+    sensor_timeout: 0.15
+    two_d_mode: true
+    transform_time_offset: 0.0
+    transform_timeout: 0.0
+    print_diagnostics: true
+    debug: false
+    publish_tf: true
+    publish_acceleration: false
+    reset_on_time_jump: true
+
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_link
+    world_frame: odom
+
+    # IMU yaw-rate is the high-confidence dynamic heading source. Do not fuse
+    # chassis-integrated absolute yaw: recorded-spin replay showed it pulls the
+    # settled estimate back to wheel yaw and erases the IMU correction. Wheel
+    # yaw-rate remains a deliberately soft fallback so an IMU outage cannot
+    # leave the EKF predicting its last non-zero yaw-rate.
+    odom0: /wheel/odom_ekf
+    odom0_config: [true, true, false,
+                   false, false, false,
+                   true, false, false,
+                   false, false, true,
+                   false, false, false]
+    odom0_queue_size: 10
+    odom0_nodelay: true
+    odom0_differential: false
+    odom0_relative: false
+
+    imu0: /lidar_imu_bias_corrected
+    imu0_config: [false, false, false,
+                  false, false, false,
+                  false, false, false,
+                  false, false, true,
+                  false, false, false]
+    imu0_queue_size: 10
+    imu0_nodelay: true
+    imu0_differential: false
+    imu0_relative: false
+    imu0_remove_gravitational_acceleration: true
+
+    # Do not use a sub-1-sigma Mahalanobis gate here. It can reject the real
+    # 0.6rad/s -> 0 stop measurement and make the EKF predict stale yaw-rate.
+    use_control: false

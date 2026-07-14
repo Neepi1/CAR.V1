@@ -382,13 +382,9 @@ inline sensor_msgs::msg::PointCloud2 SourceDriver::ToRosMsg(const LidarDecodedFr
 {
   sensor_msgs::msg::PointCloud2 ros_msg;
   uint32_t points_number = (frame.fParam.IsMultiFrameFrequency() == 0) ? frame.points_num : frame.multi_points_num;
-  uint32_t packet_number = (frame.fParam.IsMultiFrameFrequency() == 0) ? frame.packet_num : frame.multi_packet_num;
   LidarPointXYZIRT *pPoints = (frame.fParam.IsMultiFrameFrequency() == 0) ? frame.points : frame.multi_points;
-  int frame_index = (frame.fParam.IsMultiFrameFrequency() == 0) ? frame.frame_index : frame.multi_frame_index;
   double frame_start_timestamp = (frame.fParam.IsMultiFrameFrequency() == 0) ? frame.frame_start_timestamp : frame.multi_frame_start_timestamp;
-  double frame_end_timestamp = (frame.fParam.IsMultiFrameFrequency() == 0) ? frame.frame_end_timestamp : frame.multi_frame_end_timestamp;
   const double normalized_frame_start_timestamp = NormalizeHeaderTimestamp(frame_start_timestamp);
-  const char *prefix = (frame.fParam.IsMultiFrameFrequency() == 0) ? "raw" : "multi";
   // Use 32-byte PointXYZIRT layout (aligned) for consumers that expect it (e.g. NVBlox).
   // x,y,z,pad (16 bytes) + intensity (4) + ring (2) + pad (2) + timestamp (8) = 32 bytes
   int fields = 8;
@@ -452,9 +448,8 @@ inline sensor_msgs::msg::PointCloud2 SourceDriver::ToRosMsg(const LidarDecodedFr
     ++iter_ring_;
     ++iter_timestamp_;
   }
-  // printf("HesaiLidar Runing Status [standby mode:%u]  |  [speed:%u]\n", frame.work_mode, frame.spin_speed);
-  printf("%s frame:%d points:%u packet:%d start time:%lf end time:%lf\n", prefix, frame_index, points_number, packet_number, frame_start_timestamp, frame_end_timestamp) ;
-  std::cout.flush();
+  // Per-frame stdout logging can generate gigabytes of runtime logs and is not
+  // part of the pointcloud data path. Keep frame timing in explicit probes.
   ros_msg.header.stamp = ToBuiltinTime(normalized_frame_start_timestamp);
   ros_msg.header.frame_id = frame_id_;
   return ros_msg;

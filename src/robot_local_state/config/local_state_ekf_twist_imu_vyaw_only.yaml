@@ -9,27 +9,27 @@ robot_local_state:
     debug: false
     publish_tf: true
     publish_acceleration: false
+    reset_on_time_jump: true
 
     map_frame: map
     odom_frame: odom
     base_link_frame: base_link
     world_frame: odom
 
-    # Diagnostic drift-reduction profile: do not fuse chassis-integrated wheel
-    # x/y/yaw pose or wheel yaw-rate. EKF x/y is propagated from wheel forward
-    # speed, while corrected JT128 IMU gyro is the only yaw-rate measurement.
+    # Do not combine chassis-integrated wheel pose with an independent IMU
+    # heading model. Integrate planar translation from the measured body twist;
+    # corrected JT128 IMU gyro is the only yaw-rate measurement.
+    # Keeping wheel vy is required for Ranger Mini3 side-slip motion.
     odom0: /wheel/odom_ekf
     odom0_config: [false, false, false,
                    false, false, false,
-                   true, false, false,
+                   true, true, false,
                    false, false, false,
                    false, false, false]
-    odom0_queue_size: 20
+    odom0_queue_size: 10
     odom0_nodelay: true
     odom0_differential: false
     odom0_relative: false
-    odom0_pose_rejection_threshold: 5.0
-    odom0_twist_rejection_threshold: 1.5
 
     imu0: /lidar_imu_bias_corrected
     imu0_config: [false, false, false,
@@ -37,12 +37,14 @@ robot_local_state:
                   false, false, false,
                   false, false, true,
                   false, false, false]
-    imu0_queue_size: 100
+    imu0_queue_size: 10
     imu0_nodelay: true
     imu0_differential: false
     imu0_relative: false
     imu0_remove_gravitational_acceleration: true
-    imu0_pose_rejection_threshold: 0.8
-    imu0_twist_rejection_threshold: 0.8
+
+    # A sub-1-sigma Mahalanobis gate can reject the real 0.6rad/s -> 0 stop
+    # update and leave the EKF predicting stale yaw-rate. The bias filter owns
+    # stationary qualification; the EKF must consume the resulting zero rate.
 
     use_control: false

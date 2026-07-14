@@ -86,13 +86,24 @@ def get_state(node, node_name: str, deadline: float) -> int:
     return int(response.current_state.id)
 
 
-def change_state(node, node_name: str, transition_id: int, transition_name: str, deadline: float) -> None:
+def change_state(
+    node,
+    node_name: str,
+    transition_id: int,
+    transition_name: str,
+    deadline: float,
+    response_timeout_sec: float,
+) -> None:
     client = node.create_client(ChangeState, f"{node_name}/change_state")
     if not wait_for_service(client, node_name, f"{node_name}/change_state", deadline):
         raise TimeoutError(f"change_state service unavailable for {node_name}")
     request = ChangeState.Request()
     request.transition.id = transition_id
-    response = call_service(node, client, request, node_name, transition_name, deadline)
+    response_deadline = min(
+        deadline,
+        time.monotonic() + max(0.2, response_timeout_sec),
+    )
+    response = call_service(node, client, request, node_name, transition_name, response_deadline)
     if not bool(response.success):
         raise RuntimeError(f"{transition_name} rejected for {node_name}")
 
@@ -113,6 +124,7 @@ def configure_node(
     node,
     node_name: str,
     per_node_timeout_sec: float,
+    change_state_response_timeout_sec: float,
     trust_change_state_response: bool,
 ) -> None:
     def deadline() -> float:
@@ -121,7 +133,14 @@ def configure_node(
     if trust_change_state_response:
         try:
             log(f"lifecycle configure node={node_name}")
-            change_state(node, node_name, Transition.TRANSITION_CONFIGURE, "configure", deadline())
+            change_state(
+                node,
+                node_name,
+                Transition.TRANSITION_CONFIGURE,
+                "configure",
+                deadline(),
+                change_state_response_timeout_sec,
+            )
             return
         except Exception as exc:  # noqa: BLE001 - fall back to state inspection below.
             warn(f"lifecycle configure direct transition did not complete node={node_name}: {exc}; checking state")
@@ -132,12 +151,25 @@ def configure_node(
         return
     if current == State.PRIMARY_STATE_UNCONFIGURED:
         log(f"lifecycle configure node={node_name}")
-        change_state(node, node_name, Transition.TRANSITION_CONFIGURE, "configure", deadline())
-        if trust_change_state_response:
-            return
+        try:
+            change_state(
+                node,
+                node_name,
+                Transition.TRANSITION_CONFIGURE,
+                "configure",
+                deadline(),
+                change_state_response_timeout_sec,
+            )
+            if trust_change_state_response:
+                return
+        except TimeoutError as exc:
+            warn(f"lifecycle configure response lost node={node_name}: {exc}; confirming state")
         wait_for_state(node, node_name, State.PRIMARY_STATE_INACTIVE, deadline())
         return
     if current == State.PRIMARY_STATE_INACTIVE:
+        return
+    if current == State.TRANSITION_STATE_CONFIGURING:
+        wait_for_state(node, node_name, State.PRIMARY_STATE_INACTIVE, deadline())
         return
     current = get_state(node, node_name, deadline())
     if current not in (State.PRIMARY_STATE_ACTIVE, State.PRIMARY_STATE_INACTIVE):
@@ -148,6 +180,7 @@ def activate_node(
     node,
     node_name: str,
     per_node_timeout_sec: float,
+    change_state_response_timeout_sec: float,
     trust_change_state_response: bool,
 ) -> None:
     def deadline() -> float:
@@ -156,7 +189,14 @@ def activate_node(
     if trust_change_state_response:
         try:
             log(f"lifecycle activate node={node_name}")
-            change_state(node, node_name, Transition.TRANSITION_ACTIVATE, "activate", deadline())
+            change_state(
+                node,
+                node_name,
+                Transition.TRANSITION_ACTIVATE,
+                "activate",
+                deadline(),
+                change_state_response_timeout_sec,
+            )
             return
         except Exception as exc:  # noqa: BLE001 - fall back to state inspection below.
             warn(f"lifecycle activate direct transition did not complete node={node_name}: {exc}; checking state")
@@ -166,9 +206,22 @@ def activate_node(
         return
     if current == State.PRIMARY_STATE_INACTIVE:
         log(f"lifecycle activate node={node_name}")
-        change_state(node, node_name, Transition.TRANSITION_ACTIVATE, "activate", deadline())
-        if trust_change_state_response:
-            return
+        try:
+            change_state(
+                node,
+                node_name,
+                Transition.TRANSITION_ACTIVATE,
+                "activate",
+                deadline(),
+                change_state_response_timeout_sec,
+            )
+            if trust_change_state_response:
+                return
+        except TimeoutError as exc:
+            warn(f"lifecycle activate response lost node={node_name}: {exc}; confirming state")
+        wait_for_state(node, node_name, State.PRIMARY_STATE_ACTIVE, deadline())
+        return
+    if current == State.TRANSITION_STATE_ACTIVATING:
         wait_for_state(node, node_name, State.PRIMARY_STATE_ACTIVE, deadline())
         return
     current = get_state(node, node_name, deadline())
@@ -180,19 +233,38 @@ def bringup_node(
     node,
     node_name: str,
     per_node_timeout_sec: float,
+    change_state_response_timeout_sec: float,
     trust_change_state_response: bool,
 ) -> None:
     start = time.monotonic()
-    configure_node(node, node_name, per_node_timeout_sec, trust_change_state_response)
+    configure_node(
+        node,
+        node_name,
+        per_node_timeout_sec,
+        change_state_response_timeout_sec,
+        trust_change_state_response,
+    )
     log(f"lifecycle configure complete node={node_name} elapsed_sec={time.monotonic() - start:.3f}")
     start = time.monotonic()
-    activate_node(node, node_name, per_node_timeout_sec, trust_change_state_response)
+    activate_node(
+        node,
+        node_name,
+        per_node_timeout_sec,
+        change_state_response_timeout_sec,
+        trust_change_state_response,
+    )
     log(f"lifecycle activate complete node={node_name} elapsed_sec={time.monotonic() - start:.3f}")
 
 
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--per-node-timeout-sec", type=float, default=float(os.environ.get("NJRH_NAV2_LIFECYCLE_NODE_TIMEOUT_SEC", "60")))
+    parser.add_argument(
+        "--change-state-response-timeout-sec",
+        type=float,
+        default=float(os.environ.get("NJRH_NAV2_LIFECYCLE_CHANGE_STATE_RESPONSE_TIMEOUT_SEC", "5.0")),
+        help="Short wait for a ChangeState response before confirming the actual lifecycle state.",
+    )
     parser.add_argument(
         "--configure-all-before-activate",
         action="store_true",
@@ -223,6 +295,7 @@ def main(argv: Iterable[str]) -> int:
                     node,
                     node_name,
                     args.per_node_timeout_sec,
+                    args.change_state_response_timeout_sec,
                     args.trust_change_state_response,
                 )
             for node_name in nodes:
@@ -230,6 +303,7 @@ def main(argv: Iterable[str]) -> int:
                     node,
                     node_name,
                     args.per_node_timeout_sec,
+                    args.change_state_response_timeout_sec,
                     args.trust_change_state_response,
                 )
         else:
@@ -238,6 +312,7 @@ def main(argv: Iterable[str]) -> int:
                     node,
                     node_name,
                     args.per_node_timeout_sec,
+                    args.change_state_response_timeout_sec,
                     args.trust_change_state_response,
                 )
         log("lifecycle sequence: managed nodes are active")

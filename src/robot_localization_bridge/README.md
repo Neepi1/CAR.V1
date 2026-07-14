@@ -2,6 +2,11 @@
 
 Bridge that synthesizes the only canonical `map -> odom` transform.
 
+The Jetson field profile defaults to `NJRH_AMCL_LOCALIZATION_MODE=gated`, so
+bounded AMCL corrections remain active during navigation. Apply profile changes
+with a full `njrh-runtime.service` restart; do not restart AMCL or this bridge
+independently from the navigation chain.
+
 ## Parameters
 
 - `publish_tf`: defaults to `true`

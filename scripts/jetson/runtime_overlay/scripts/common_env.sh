@@ -1,9 +1,20 @@
 #!/usr/bin/env bash
+
+if [[ "${NJRH_COMMON_ENV_LOADED:-}" == "1" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 set -euo pipefail
 umask 0002
+common_env_parent_ready="${NJRH_COMMON_ENV_PARENT_READY:-0}"
 
-export USER="$(id -un)"
-export HOME="$(getent passwd "$(id -u)" | cut -d: -f6)"
+if [[ "${common_env_parent_ready}" != "1" ]]; then
+  export USER="$(id -un)"
+  export HOME="$(getent passwd "$(id -u)" | cut -d: -f6)"
+else
+  export USER="${USER:-root}"
+  export HOME="${HOME:-/root}"
+fi
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
 export FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}"
 
@@ -88,7 +99,9 @@ XML
   export NJRH_FASTDDS_ALLOWED_ADDRESSES="${addresses[*]}"
 }
 
-configure_fastdds_interface_whitelist
+if [[ "${common_env_parent_ready}" != "1" ]]; then
+  configure_fastdds_interface_whitelist
+fi
 
 OVERLAY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT_ROOT="${NJRH_PROJECT_ROOT:-/workspaces/njrh-v3/workspace1}"
@@ -111,19 +124,19 @@ export NJRH_WAYPOINTS_DIR="${NJRH_WAYPOINTS_DIR:-${OVERLAY_ROOT}/waypoints}"
 export NJRH_RUNTIME_LOG_DIR="${NJRH_RUNTIME_LOG_DIR:-${OVERLAY_ROOT}/web_dashboard/runtime_logs}"
 
 LOCAL_STATE_EKF_PROFILE_FILE="${NJRH_LOCAL_STATE_EKF_PROFILE_FILE:-${OVERLAY_ROOT}/config/local_state_ekf_profile.env}"
-if [[ -f "${LOCAL_STATE_EKF_PROFILE_FILE}" ]]; then
+if [[ "${common_env_parent_ready}" != "1" && -f "${LOCAL_STATE_EKF_PROFILE_FILE}" ]]; then
   # shellcheck source=../config/local_state_ekf_profile.env
   source "${LOCAL_STATE_EKF_PROFILE_FILE}"
 fi
 
 ISAAC_LOCALIZATION_MODE_FILE="${NJRH_ISAAC_LOCALIZATION_MODE_FILE:-${OVERLAY_ROOT}/config/isaac_localization_mode.env}"
-if [[ -f "${ISAAC_LOCALIZATION_MODE_FILE}" ]]; then
+if [[ "${common_env_parent_ready}" != "1" && -f "${ISAAC_LOCALIZATION_MODE_FILE}" ]]; then
   # shellcheck source=../config/isaac_localization_mode.env
   source "${ISAAC_LOCALIZATION_MODE_FILE}"
 fi
 
 AMCL_LOCALIZATION_PROFILE_FILE="${NJRH_AMCL_LOCALIZATION_PROFILE_FILE:-${OVERLAY_ROOT}/config/amcl_localization_profile.env}"
-if [[ -f "${AMCL_LOCALIZATION_PROFILE_FILE}" ]]; then
+if [[ "${common_env_parent_ready}" != "1" && -f "${AMCL_LOCALIZATION_PROFILE_FILE}" ]]; then
   # shellcheck source=../config/amcl_localization_profile.env
   source "${AMCL_LOCALIZATION_PROFILE_FILE}"
 fi
@@ -135,7 +148,8 @@ project_overlay_missing() {
   esac
 }
 
-if [[ "${NJRH_COMMON_ENV_SETUP_DONE:-}" != "1" ]] || project_overlay_missing; then
+if [[ "${common_env_parent_ready}" != "1" ]] && \
+  { [[ "${NJRH_COMMON_ENV_SETUP_DONE:-}" != "1" ]] || project_overlay_missing; }; then
   set +u
   source /opt/ros/humble/setup.bash
   if [[ -f "${UPSTREAM_WS}/install/local_setup.bash" ]]; then
@@ -160,12 +174,14 @@ if [[ "${NJRH_COMMON_ENV_SETUP_DONE:-}" != "1" ]] || project_overlay_missing; th
   export NJRH_COMMON_ENV_SETUP_DONE=1
 fi
 
-mkdir -p \
-  "${NJRH_RUNTIME_LOG_DIR}" \
-  "${NJRH_MAPS_DIR}" \
-  "${NJRH_MAPS3D_DIR}" \
-  "${NJRH_RELEASE_ASSETS_DIR}" \
-  "${NJRH_WAYPOINTS_DIR}"
+if [[ "${common_env_parent_ready}" != "1" ]]; then
+  mkdir -p \
+    "${NJRH_RUNTIME_LOG_DIR}" \
+    "${NJRH_MAPS_DIR}" \
+    "${NJRH_MAPS3D_DIR}" \
+    "${NJRH_RELEASE_ASSETS_DIR}" \
+    "${NJRH_WAYPOINTS_DIR}"
+fi
 
 require_upstream_script() {
   local script_name="$1"
@@ -209,6 +225,12 @@ runtime_readiness_probe_output_reports_success() {
     fresh-header-topic)
       [[ "${output}" == *"[runtime-overlay] fresh stamped topic ready:"* ]]
       ;;
+    ranger-chassis)
+      [[ "${output}" == *"[runtime-overlay] ranger chassis ready:"* ]]
+      ;;
+    imu-bias-filter)
+      [[ "${output}" == *"[runtime-overlay] IMU bias filter ready:"* ]]
+      ;;
     tf)
       [[ "${output}" == *"[runtime-overlay] TF ready:"* ]]
       ;;
@@ -230,6 +252,15 @@ runtime_readiness_probe_output_reports_success() {
     map-topic-matches-yaml)
       [[ "${output}" == *"[runtime-overlay] /map matches requested map yaml:"* ]]
       ;;
+    localization-stack)
+      [[ "${output}" == *"[runtime-overlay] localization stack ready:"* ]]
+      ;;
+    global-costmap)
+      [[ "${output}" == *"[runtime-overlay] global costmap ready:"* ]]
+      ;;
+    localization-prestart)
+      [[ "${output}" == *"[runtime-overlay] localization prestart ready:"* ]]
+      ;;
     *)
       return 1
       ;;
@@ -247,11 +278,17 @@ runtime_readiness_probe() {
       service|node|topic-publisher|topic|fresh-header-topic|lifecycle-active|occupancy-grid|map-topic-matches-yaml)
         requested_timeout="${3:-}"
         ;;
-      publisher-from-node|tf|fresh-tf)
+      publisher-from-node|tf|fresh-tf|imu-bias-filter|localization-stack)
         requested_timeout="${4:-}"
         ;;
-      transformable-scan|local-state-endpoint)
+      transformable-scan|local-state-endpoint|ranger-chassis|localization-prestart)
         requested_timeout="${2:-}"
+        ;;
+      global-costmap)
+        requested_timeout="$(awk \
+          -v lifecycle_timeout="${2:-0}" \
+          -v publisher_timeout="${3:-0}" \
+          'BEGIN {printf "%.3f", lifecycle_timeout + publisher_timeout}')"
         ;;
       *)
         requested_timeout="30"
@@ -292,3 +329,28 @@ PY
   fi
   return "${rc}"
 }
+
+rotate_runtime_log() {
+  local log_file="$1"
+  local retain_bytes="${2:-${NJRH_RUNTIME_LOG_RETAIN_BYTES:-33554432}}"
+  local previous_file="${log_file}.previous"
+  local tmp_file="${previous_file}.$$"
+  local size_bytes=0
+
+  [[ "${NJRH_RUNTIME_LOG_ROTATE_ENABLED:-true}" == "true" ]] || return 0
+  [[ -e "${log_file}" ]] || return 0
+  size_bytes="$(stat -c %s "${log_file}" 2>/dev/null || printf '0')"
+  rm -f "${previous_file}" "${tmp_file}"
+  if (( size_bytes > retain_bytes )); then
+    tail -c "${retain_bytes}" "${log_file}" >"${tmp_file}"
+    mv -f "${tmp_file}" "${previous_file}"
+    : >"${log_file}"
+  else
+    mv -f "${log_file}" "${previous_file}"
+  fi
+}
+
+# Function definitions stay shell-local, while children in the same systemd
+# generation inherit the already-resolved ROS/DDS/profile environment.
+export NJRH_COMMON_ENV_PARENT_READY=1
+NJRH_COMMON_ENV_LOADED=1

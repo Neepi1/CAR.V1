@@ -128,6 +128,16 @@ fi
 EKF_PROFILE="${LOCAL_STATE_EKF_PROFILE:-${NJRH_LOCAL_STATE_EKF_PROFILE:-wheel_only}}"
 DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf.yaml"
 case "${EKF_PROFILE}" in
+  wheel_spin_imu|spin_imu)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf_wheel_spin_imu.yaml"
+    DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf_spin_imu.yaml"
+    EKF_USES_IMU=true
+    ;;
+  wheel_imu_primary_vyaw|imu_primary_vyaw)
+    DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf_wheel_imu_primary_vyaw.yaml"
+    DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf_imu_primary.yaml"
+    EKF_USES_IMU=true
+    ;;
   wheel_pose_imu_vyaw|pose_imu_vyaw)
     DEFAULT_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_ekf_wheel_pose_imu_vyaw.yaml"
     EKF_USES_IMU=true
@@ -260,7 +270,7 @@ case "${EKF_PROFILE}" in
     EKF_USES_IMU=false
     ;;
   *)
-    echo "[runtime-overlay] invalid LOCAL_STATE_EKF_PROFILE=${EKF_PROFILE}; expected wheel_imu, wheel_pose_imu_vyaw, wheel_imu_pose_soft_yaw_015, wheel_imu_twist_soft_yaw_012, wheel_imu_twist_soft_yaw_010, wheel_imu_twist_soft_yaw_015, wheel_imu_yaw_offset_m061, wheel_imu_xy_shear_p062, wheel_imu_xy_lateral_m061, wheel_imu_xy_lateral_m040, wheel_imu_xy_lateral_m050, wheel_imu_xy_lateral_m085, wheel_imu_xy_lateral_m120, wheel_imu_xy_lateral_soft_yaw_016, wheel_imu_xy_lateral_yaw_p979_n1011, wheel_imu_soft_yaw_018, wheel_imu_soft_yaw_016, wheel_imu_soft_yaw_015, wheel_imu_soft_yaw_014, wheel_imu_soft_yaw_010, wheel_imu_soft_yaw, wheel_xy_imu_vyaw, wheel_xy_imu_yaw, wheel_xy_diff_yaw_imu, twist_imu, twist_imu_vyaw_only, twist_wheel_yaw_imu, or wheel_only" >&2
+    echo "[runtime-overlay] invalid LOCAL_STATE_EKF_PROFILE=${EKF_PROFILE}; expected wheel_spin_imu, wheel_imu_primary_vyaw, wheel_imu, wheel_pose_imu_vyaw, wheel_imu_pose_soft_yaw_015, wheel_imu_twist_soft_yaw_012, wheel_imu_twist_soft_yaw_010, wheel_imu_twist_soft_yaw_015, wheel_imu_yaw_offset_m061, wheel_imu_xy_shear_p062, wheel_imu_xy_lateral_m061, wheel_imu_xy_lateral_m040, wheel_imu_xy_lateral_m050, wheel_imu_xy_lateral_m085, wheel_imu_xy_lateral_m120, wheel_imu_xy_lateral_soft_yaw_016, wheel_imu_xy_lateral_yaw_p979_n1011, wheel_imu_soft_yaw_018, wheel_imu_soft_yaw_016, wheel_imu_soft_yaw_015, wheel_imu_soft_yaw_014, wheel_imu_soft_yaw_010, wheel_imu_soft_yaw, wheel_xy_imu_vyaw, wheel_xy_imu_yaw, wheel_xy_diff_yaw_imu, twist_imu, twist_imu_vyaw_only, twist_wheel_yaw_imu, or wheel_only" >&2
     exit 1
     ;;
 esac
@@ -378,22 +388,9 @@ if [[ "${LOCAL_STATE_IMU_BIAS_FILTER_ENABLED}" == "true" ]]; then
     CORRECTED_IMU_TOPIC="${LOCAL_STATE_CORRECTED_IMU_TOPIC:-/lidar_imu_bias_corrected}"
     IMU_BIAS_TOPIC="${LOCAL_STATE_IMU_BIAS_TOPIC:-/local_state/imu_bias}"
     IMU_BIAS_READY_TIMEOUT_SEC="${LOCAL_STATE_IMU_BIAS_FILTER_READY_TIMEOUT_SEC:-8}"
-    runtime_readiness_probe publisher-from-node \
-      "${CORRECTED_IMU_TOPIC}" imu_gyro_bias_filter "${IMU_BIAS_READY_TIMEOUT_SEC}" || {
-        echo "[runtime-overlay] IMU gyro bias filter missing publisher on ${CORRECTED_IMU_TOPIC}" >&2
-        exit 1
-      }
-    runtime_readiness_probe topic "${CORRECTED_IMU_TOPIC}" "${IMU_BIAS_READY_TIMEOUT_SEC}" || {
-      echo "[runtime-overlay] IMU gyro bias filter did not publish samples on ${CORRECTED_IMU_TOPIC}" >&2
-      exit 1
-    }
-    runtime_readiness_probe publisher-from-node \
-      "${IMU_BIAS_TOPIC}" imu_gyro_bias_filter "${IMU_BIAS_READY_TIMEOUT_SEC}" || {
-        echo "[runtime-overlay] IMU gyro bias filter missing publisher on ${IMU_BIAS_TOPIC}" >&2
-        exit 1
-      }
-    runtime_readiness_probe topic "${IMU_BIAS_TOPIC}" "${IMU_BIAS_READY_TIMEOUT_SEC}" || {
-      echo "[runtime-overlay] IMU gyro bias filter did not publish samples on ${IMU_BIAS_TOPIC}" >&2
+    runtime_readiness_probe imu-bias-filter \
+      "${CORRECTED_IMU_TOPIC}" "${IMU_BIAS_TOPIC}" "${IMU_BIAS_READY_TIMEOUT_SEC}" || {
+      echo "[runtime-overlay] IMU gyro bias filter outputs did not become ready" >&2
       exit 1
     }
   fi

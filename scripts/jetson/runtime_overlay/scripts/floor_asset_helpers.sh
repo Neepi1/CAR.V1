@@ -36,6 +36,33 @@ validate_floor_assets() {
   fi
 }
 
+floor_asset_context_ready_for() {
+  local building_id="${1:-${NJRH_BUILDING_ID:-building_1}}"
+  local floor_id="${2:-${NJRH_FLOOR_ID:-}}"
+
+  [[ "${NJRH_FLOOR_ASSET_CONTEXT_READY:-}" == "1" ]] || return 1
+  [[ -n "${floor_id}" ]] || return 1
+  [[ "${NJRH_BUILDING_ID:-}" == "${building_id}" ]] || return 1
+  [[ "${NJRH_FLOOR_ID:-}" == "${floor_id}" ]] || return 1
+  [[ "${NJRH_MAP_CONTEXT_BUILDING_ID:-}" == "${building_id}" ]] || return 1
+  [[ "${NJRH_MAP_CONTEXT_FLOOR_ID:-}" == "${floor_id}" ]] || return 1
+  [[ -n "${NJRH_CURRENT_FLOOR_ROOT:-}" && -d "${NJRH_CURRENT_FLOOR_ROOT}" ]] || return 1
+  [[ -n "${NAV2_MAP_YAML:-}" && -f "${NAV2_MAP_YAML}" ]] || return 1
+  [[ -n "${NAV2_LOCALIZER_MAP_YAML:-}" && -f "${NAV2_LOCALIZER_MAP_YAML}" ]] || return 1
+  [[ -n "${NAV2_LOCALIZER_MAP_PNG:-}" && -f "${NAV2_LOCALIZER_MAP_PNG}" ]] || return 1
+  [[ -n "${NJRH_FLOOR_POSES_YAML:-}" && -f "${NJRH_FLOOR_POSES_YAML}" ]] || return 1
+}
+
+resolve_floor_assets_if_needed() {
+  local building_id="${1:-${NJRH_BUILDING_ID:-building_1}}"
+  local floor_id="${2:-${NJRH_FLOOR_ID:-}}"
+  if floor_asset_context_ready_for "${building_id}" "${floor_id}"; then
+    echo "[runtime-overlay] reusing resolved floor asset context ${building_id}/${floor_id} root=${NJRH_CURRENT_FLOOR_ROOT}" >&2
+    return 0
+  fi
+  resolve_floor_assets "${building_id}" "${floor_id}"
+}
+
 resolve_floor_assets() {
   local building_id="${1:-${NJRH_BUILDING_ID:-building_1}}"
   local floor_id="${2:-${NJRH_FLOOR_ID:-}}"
@@ -69,30 +96,20 @@ resolve_floor_assets() {
   local nav_map_name=""
   local nav_map_id=""
   if [[ -f "${asset_report}" ]]; then
-    nav_map_name="$(python3 - "${asset_report}" <<'PY'
+    IFS=$'\t' read -r nav_map_name nav_map_id < <(python3 - "${asset_report}" <<'PY'
 import json
 import sys
 
 try:
     with open(sys.argv[1], "r", encoding="utf-8") as stream:
         data = json.load(stream)
-    print(str(data.get("map_name") or data.get("display_name") or ""))
+    name = str(data.get("map_name") or data.get("display_name") or "").replace("\t", " ")
+    map_id = str(data.get("map_id") or "").replace("\t", " ")
+    print(f"{name}\t{map_id}")
 except Exception:
-    print("")
+    print("\t")
 PY
-)"
-    nav_map_id="$(python3 - "${asset_report}" <<'PY'
-import json
-import sys
-
-try:
-    with open(sys.argv[1], "r", encoding="utf-8") as stream:
-        data = json.load(stream)
-    print(str(data.get("map_id") or ""))
-except Exception:
-    print("")
-PY
-)"
+)
   fi
   export NJRH_NAV_MAP_NAME="${nav_map_name}"
   export NJRH_NAV_MAP_ID="${nav_map_id}"
@@ -100,6 +117,7 @@ PY
   export NJRH_MAP_DISPLAY_NAME="${nav_map_name:-${NJRH_MAP_DISPLAY_NAME:-}}"
   export NJRH_MAP_CONTEXT_BUILDING_ID="${building_id}"
   export NJRH_MAP_CONTEXT_FLOOR_ID="${floor_id}"
+  export NJRH_FLOOR_ASSET_CONTEXT_READY=1
 
   printf '[runtime-overlay] selected floor %s/%s\n' "${building_id}" "${floor_id}" >&2
   printf '[runtime-overlay] selected floor asset root=%s\n' "${runtime_root}" >&2

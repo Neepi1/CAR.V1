@@ -1,7 +1,7 @@
 # Ranger Spin Settle Handoff
 
 Date: 2026-07-04
-Updated: 2026-07-08
+Updated: 2026-07-14
 
 ## Scope
 
@@ -80,6 +80,47 @@ delivery-spin-only samples was rejected: valid two-point navigation still
 required `15cm` to `18cm` relocalization corrections and yaw residual worsened
 on the return leg. This is an odom integration calibration, not a command-speed
 change.
+
+## 2026-07-14 Spin-IMU Incident And Correction
+
+A commanded 180-degree spin followed by a long straight test was invalidated
+after the robot entered an unsafe trajectory. The primary spin overshoot was in
+the test harness, not an IMU scale jump:
+
+- both motion scripts used subscription depth 50 and called one
+  `rclpy.spin_once()` per control iteration while consuming seven active topics;
+- when the script decided to stop at `177.765deg`, an independent recorder was
+  already at `216.897deg`, equivalent to about 1.14 seconds of stale feedback at
+  0.6 rad/s;
+- the settled spin IMU delta was `3.9252rad`, or `224.90deg`, showing that the
+  IMU observed the physical overspin rather than creating it.
+
+The spin-aware wheel preprocessor also applied corrected yaw and corrected x/y
+with different transforms. It previously used constant additive x/y offsets
+after changing yaw. That violates the rigid-pose contract. It now anchors a
+single transform at spin settle:
+
+```text
+p_corrected = R(yaw_offset) * p_wheel + translation
+yaw_corrected = yaw_wheel + yaw_offset
+```
+
+Regression evidence:
+
+- the new public-interface GTest fails on the old implementation and passes on
+  the SE(2) implementation;
+- historical replay at 13.6559 seconds reduces the false corrected lateral
+  displacement from `2.091115m` to `0.0000002m`;
+- an isolated ROS domain test with high-rate multi-topic traffic completed a
+  simulated 180-degree spin at `180.122deg`; wheel feedback age was 16.97ms max
+  and 9.91ms P95;
+- both motion scripts now use depth-1 latest samples, a continuously running
+  executor, and a default 0.20-second hard feedback-age limit. Stale feedback
+  causes a zero command and failed test rather than continued motion.
+
+These are software and replay gates only. The corrected profile still requires
+low-speed `+30/-30deg` field validation in a clear area before any larger-angle
+or spin-then-straight test.
 
 ## Rollback
 

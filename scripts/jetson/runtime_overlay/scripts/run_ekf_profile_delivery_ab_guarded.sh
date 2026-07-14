@@ -26,7 +26,7 @@ GOAL_COMPLETION_POLICY="pose_required"
 OUTPUT_ROOT="${PROJECT_ROOT}/reports/ekf_profile_delivery_ab_guarded"
 APPLY="false"
 PREFLIGHT_ONLY="false"
-RESTORE_PROFILE="wheel_only"
+RESTORE_PROFILE="wheel_imu"
 LOCAL_STATE_READY_TIMEOUT_SEC="20"
 RELOCALIZE_TIMEOUT_SEC="60"
 RELOCALIZE_SETTLE_TIMEOUT_SEC="20"
@@ -45,7 +45,7 @@ With --apply, the script:
   1. restarts the full resident navigation runtime with the requested EKF profile;
   2. runs one explicit pre-A/B relocalization capture;
   3. runs target-a <-> target-b through the guarded API/Nav2 path;
-  4. always restores the field-default wheel_pose_imu_vyaw profile through a full
+  4. always restores the field-default wheel_imu profile through a full
      navigation runtime restart and relocalizes again.
 
 Options:
@@ -212,7 +212,7 @@ OUTPUT_ROOT="${OUTPUT_ROOT/#\~/${HOME}}"
 
 validate_profile() {
   case "$1" in
-    wheel_imu|wheel_pose_imu_vyaw|pose_imu_vyaw|wheel_imu_pose_soft_yaw_015|pose_soft_yaw_015|\
+    wheel_imu_primary_vyaw|imu_primary_vyaw|wheel_imu|wheel_pose_imu_vyaw|pose_imu_vyaw|wheel_imu_pose_soft_yaw_015|pose_soft_yaw_015|\
     wheel_imu_twist_soft_yaw_012|twist_soft_yaw_012|wheel_imu_twist_soft_yaw_010|twist_soft_yaw_010|wheel_imu_twist_soft_yaw_015|twist_soft_yaw_015|wheel_imu_soft_yaw_018|soft_yaw_018|\
     wheel_imu_soft_yaw_016|soft_yaw_016|\
     wheel_imu_soft_yaw_014|soft_yaw_014|wheel_imu_soft_yaw_010|soft_yaw_010|wheel_imu_soft_yaw_015|soft_yaw_015|\

@@ -40,8 +40,6 @@ controller_server
   -> collision_monitor
   -> /cmd_vel_collision_checked
   -> robot_safety
-  -> /cmd_vel_safe
-  -> ranger_mini3_mode_controller
   -> /cmd_vel
   -> ranger_base_node
 ```
@@ -52,8 +50,8 @@ Near-field docking uses a separate pre-safety input so Nav2 collision-monitor ze
 robot_docking_manager
   -> /cmd_vel_docking
   -> robot_safety
-  -> /cmd_vel_safe
-  -> ranger_mini3_mode_controller
   -> /cmd_vel
   -> ranger_base_node
 ```
+
+`robot_safety` also mirrors the final command to `/cmd_vel_safe` for read-only diagnostics.

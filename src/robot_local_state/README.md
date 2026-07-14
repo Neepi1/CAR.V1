@@ -3,19 +3,64 @@
 Local odometry wrapper and the only canonical owner of `odom -> base_link`.
 
 Production runtime currently defaults to
-`LOCAL_STATE_MODE=ekf LOCAL_STATE_EKF_PROFILE=wheel_only`. In that mode a
-small odom preprocessor republishes Ranger `/wheel/odom` as `/wheel/odom_ekf`
-with sane covariance floors, then `robot_localization` publishes
-`/local_state/odometry` while owning the only `odom -> base_link` TF without IMU
-fusion. This is the field-safe baseline for chassis-odom isolation and direct
-wheel-vs-IMU yaw-scale calibration.
+`LOCAL_STATE_MODE=ekf LOCAL_STATE_EKF_PROFILE=wheel_spin_imu`. In that mode the
+odom preprocessor keeps Ranger `/wheel/odom` unchanged and publishes a
+mode-aware `/wheel/odom_ekf`: wheel pose remains authoritative outside actual
+Ranger `SPINNING` mode, while corrected JT128 IMU yaw-rate integrates only the
+spin interval. The spin interval begins on `/motion_state.motion_mode=2`, keeps
+spin x/y fixed, includes the physical tail after the final zero command, and
+ends after IMU yaw-rate is below `0.02rad/s` for `0.30s`. The resulting yaw and
+position correction is preserved as one rigid SE(2) transform when normal
+wheel odom resumes. A yaw correction is therefore applied to subsequent wheel
+x/y increments around the settled spin anchor; x/y are not maintained as
+independent additive offsets.
+Stale or missing IMU data causes a bounded fallback to raw wheel odom rather
+than an unbounded IMU heading.
+
+`robot_localization` fuses corrected wheel `x/y/yaw/vx` and corrected IMU
+yaw-rate, but does not fuse wheel yaw-rate a second time. It publishes
+`/local_state/odometry` and remains the only owner of `odom -> base_link`.
+FAST-LIO2 and raw `/lidar_imu` are unchanged. `wheel_imu` remains the immediate
+rollback profile.
+
+The earlier `+180/-180deg` acceptance is invalid. A 2026-07-14 incident showed
+that the motion-test scripts could accumulate depth-50 subscription queues
+while processing only one callback per control iteration. During the failed
+180-degree test the script saw `177.765deg` while an independent recorder was
+already at `216.897deg`; settled IMU integration reached `224.90deg`. The same
+incident exposed an invalid yaw-only pose correction: historical replay at
+13.656 seconds changed from a false `2.091115m` corrected lateral displacement
+to `0.0000002m` after applying the SE(2) fix. Hardware acceptance must be rerun
+with the depth-1, background-executor, stale-feedback-fail-closed test scripts.
 
 Experimental drift-reduction profiles remain available for controlled A/B
 tests. `LOCAL_STATE_EKF_PROFILE=wheel_pose_imu_vyaw` remains available for
 controlled fusion diagnostics and keeps wheel x/y/yaw pose
 and wheel forward speed, but removes wheel yaw-rate so corrected JT128 IMU gyro
-is the only EKF yaw-rate input. `LOCAL_STATE_EKF_PROFILE=wheel_imu_pose_soft_yaw_015` keeps the default
-EKF fusion fields, but starts the wheel odom preprocessor with a softer wheel
+is the only EKF yaw-rate input.
+
+`LOCAL_STATE_EKF_PROFILE=wheel_imu_primary_vyaw` is the guarded replacement
+candidate for the rejected IMU-only-yaw-rate profile. Corrected IMU yaw-rate is
+the dominant dynamic input. Wheel x/y pose and forward speed remain fused, and
+high-covariance wheel yaw-rate remains only as a bounded outage fallback;
+chassis-integrated absolute wheel yaw is deliberately excluded because replay
+showed it erases the IMU correction after a spin. The corrected IMU relay publishes
+only new samples, validates the original source-stamp ordering, and restamps
+the EKF-only derivative at local receipt time because canonical JT128 stamps
+currently trail system time by a variable 0.68-2.86 seconds. It does not use
+the old `0.8` Mahalanobis rejection gate. This profile is diagnostic-only after
+the failed repeatability gate recorded in
+`docs/phase_ranger_imu_primary_local_ekf.md`.
+
+The IMU-primary profile passed live positive/negative spin shadow tests and a production
+two-point field run on 2026-07-10. Spin estimates matched corrected IMU within
+`0.05deg`; the two navigation legs finished within `5.60cm/0.61deg` and
+`5.49cm/0.30deg`, but a repeated return leg later diverged by about `44.2deg`
+between local and wheel yaw and degraded to `35.6cm/13.2deg`. The runtime was
+therefore rolled back and remains diagnostic-only.
+
+`LOCAL_STATE_EKF_PROFILE=wheel_imu_pose_soft_yaw_015` keeps the default EKF
+fusion fields, but starts the wheel odom preprocessor with a softer wheel
 yaw-pose covariance floor while leaving wheel yaw-rate at the stable default.
 `LOCAL_STATE_EKF_PROFILE=wheel_imu_twist_soft_yaw_012` keeps the same default
 fusion fields and wheel yaw-pose covariance, but softens only wheel yaw-rate to
@@ -95,10 +140,10 @@ x/y from wheel forward speed. It is a narrower diagnostic for cases where yaw
 is acceptable but post-relocalization truth shows lateral XY drift.
 
 `LOCAL_STATE_EKF_PROFILE=wheel_only` uses `local_state_ekf_wheel_only.yaml`,
-starts the wheel odom preprocessor, skips the IMU gyro-bias filter, and runs
+starts the wheel odom preprocessor, skips EKF IMU fusion, and runs
 `robot_localization` from `/wheel/odom_ekf` only. It preserves
 `/local_state/odometry` and the single canonical `odom -> base_link` TF owner
-for temporary chassis-odom isolation. The Jetson runtime default lives in
+for rollback and temporary chassis-odom isolation. The Jetson runtime default lives in
 `scripts/jetson/runtime_overlay/config/local_state_ekf_profile.env`.
 
 The raw `/lidar_imu` stream remains high-rate for JT128 and FAST-LIO2 mapping.
@@ -133,9 +178,15 @@ that odom as `/local_state/odometry` and remains the only canonical owner of
 - FAST-LIO diagnostic input: `/fastlio/base_odometry`
 - FAST-LIO local-state config: `local_state_fastlio.yaml`
 - EKF output topic: `/local_state/odometry` via `/odometry/filtered` remap
-- Production EKF config: `local_state_ekf.yaml`, selected by
-  `LOCAL_STATE_EKF_PROFILE=wheel_imu`, uses planar wheel `x`, `y`, `yaw`, `vx`,
-  and `vyaw` plus corrected IMU `vyaw`
+- Production spin-aware EKF config: `local_state_ekf_wheel_spin_imu.yaml`,
+  selected by `LOCAL_STATE_EKF_PROFILE=wheel_spin_imu`, uses corrected wheel
+  `x`, `y`, `yaw`, and `vx` plus corrected IMU `vyaw`; wheel `vyaw` is excluded
+  to avoid applying the same spin feedback twice. The paired preprocessor
+  config is `local_state_wheel_odom_ekf_spin_imu.yaml`.
+- Previous bounded wheel+IMU EKF config: `local_state_ekf.yaml`, selected by
+  `LOCAL_STATE_EKF_PROFILE=wheel_imu`, remains the immediate rollback profile
+  and uses planar wheel `x`, `y`, `yaw`, `vx`, and `vyaw` plus corrected IMU
+  `vyaw`.
 - Wheel-pose+IMU-yaw-rate experimental EKF profile:
   `LOCAL_STATE_EKF_PROFILE=wheel_pose_imu_vyaw`, uses
   `local_state_ekf_wheel_pose_imu_vyaw.yaml` to fuse wheel `x`, `y`, `yaw`, and
@@ -316,6 +367,8 @@ that odom as `/local_state/odometry` and remains the only canonical owner of
   hang cannot leave a process alive after its ROS endpoints have disappeared.
 - To run the wheel-pose+IMU EKF default explicitly, set
   `LOCAL_STATE_MODE=ekf LOCAL_STATE_EKF_PROFILE=wheel_imu`
+- To run the guarded IMU-primary yaw-rate candidate, set
+  `LOCAL_STATE_MODE=ekf LOCAL_STATE_EKF_PROFILE=wheel_imu_primary_vyaw`
 - To run wheel pose with IMU-only yaw-rate, set
   `LOCAL_STATE_MODE=ekf LOCAL_STATE_EKF_PROFILE=wheel_pose_imu_vyaw`
 - To run the default EKF with softer wheel yaw-pose covariance only, set
@@ -336,8 +389,8 @@ that odom as `/local_state/odometry` and remains the only canonical owner of
   `LOCAL_STATE_MODE=ekf LOCAL_STATE_EKF_PROFILE=wheel_imu_soft_yaw`
 - To run the default EKF with moderate soft-yaw covariance, set
   `LOCAL_STATE_MODE=ekf LOCAL_STATE_EKF_PROFILE=wheel_imu_soft_yaw_015`
-- To run the wheel-yaw-anchored plus IMU-yaw-rate EKF field default explicitly,
-  set `LOCAL_STATE_MODE=ekf LOCAL_STATE_EKF_PROFILE=wheel_pose_imu_vyaw`
+- To run the field default explicitly, set
+  `LOCAL_STATE_MODE=ekf LOCAL_STATE_EKF_PROFILE=wheel_imu`
 - To run the conservative wheel-x/y+IMU-yaw EKF experiment, set
   `LOCAL_STATE_MODE=ekf LOCAL_STATE_EKF_PROFILE=wheel_xy_imu_yaw`
 - To run the experimental wheel-twist+IMU EKF, set

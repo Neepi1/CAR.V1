@@ -133,12 +133,9 @@ wait_for_global_costmap_static() {
   local timeout_sec="${1:-35}"
   local min_cells="${2:-101}"
   if [[ "${NJRH_GLOBAL_COSTMAP_FULL_MESSAGE_GATE:-false}" != "true" ]]; then
-    runtime_readiness_probe lifecycle-active "/global_costmap/global_costmap" "${timeout_sec}" || {
-      echo "[runtime-overlay] global costmap lifecycle was not active in time" >&2
-      return 1
-    }
-    runtime_readiness_probe topic-publisher "/global_costmap/costmap" "${NJRH_GLOBAL_COSTMAP_PUBLISHER_READY_TIMEOUT_SEC:-15}" || {
-      echo "[runtime-overlay] global costmap publisher was not ready in time" >&2
+    runtime_readiness_probe global-costmap \
+      "${timeout_sec}" "${NJRH_GLOBAL_COSTMAP_PUBLISHER_READY_TIMEOUT_SEC:-15}" || {
+      echo "[runtime-overlay] global costmap lifecycle or publisher was not ready in time" >&2
       return 1
     }
     echo "[runtime-overlay] global costmap lifecycle and costmap publisher are ready; full OccupancyGrid message gate is deferred" >&2

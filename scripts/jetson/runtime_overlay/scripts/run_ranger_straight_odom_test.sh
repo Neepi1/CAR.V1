@@ -21,6 +21,7 @@ PAUSE_CORRECTION="true"
 CORRECTION_PAUSE_SERVICE="/robot_localization_bridge/set_correction_paused"
 DISTANCE_TOLERANCE_M="0.03"
 MAX_EXTRA_SEC="12.0"
+FEEDBACK_MAX_AGE_SEC="0.20"
 
 usage() {
   cat <<'EOF'
@@ -46,6 +47,7 @@ Options:
   --no-pause-correction   Do not call bridge correction pause service.
   --distance-tolerance-m M Stop tolerance recorded in summary. Default: 0.03
   --max-extra-sec SEC     Extra timeout beyond abs(distance)/speed. Default: 12.0
+  --feedback-max-age-sec SEC Abort if wheel odom is older than this. Default: 0.20
 
 Signed distances are supported for diagnostics. Reverse motion may be rejected
 unless the current runtime profile explicitly permits reverse.
@@ -118,6 +120,10 @@ while [[ "$#" -gt 0 ]]; do
       MAX_EXTRA_SEC="${2:-}"
       shift 2
       ;;
+    --feedback-max-age-sec)
+      FEEDBACK_MAX_AGE_SEC="${2:-}"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -157,6 +163,7 @@ mkdir -p "${OUT_DIR}"
   echo "- local_odom_topic: ${LOCAL_ODOM_TOPIC}"
   echo "- pause_correction: ${PAUSE_CORRECTION}"
   echo "- correction_pause_service: ${CORRECTION_PAUSE_SERVICE}"
+  echo "- feedback_max_age_sec: ${FEEDBACK_MAX_AGE_SEC}"
   echo "- rmw: ${RMW_IMPLEMENTATION:-}"
   echo
   echo "## ROS Nodes"
@@ -206,12 +213,14 @@ python3 - \
   "${PAUSE_CORRECTION}" \
   "${CORRECTION_PAUSE_SERVICE}" \
   "${DISTANCE_TOLERANCE_M}" \
-  "${MAX_EXTRA_SEC}" <<'PY'
+  "${MAX_EXTRA_SEC}" \
+  "${FEEDBACK_MAX_AGE_SEC}" <<'PY'
 import csv
 import json
 import math
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -219,6 +228,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import rclpy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
@@ -238,6 +248,7 @@ pause_correction = sys.argv[10].lower() == "true"
 correction_pause_service = sys.argv[11]
 distance_tolerance_m = abs(float(sys.argv[12]))
 max_extra_sec = float(sys.argv[13])
+feedback_max_age_sec = float(sys.argv[14])
 
 if linear_speed <= 0.0:
     raise SystemExit("linear speed must be positive")
@@ -245,6 +256,8 @@ if repeat < 1:
     raise SystemExit("repeat must be >= 1")
 if sample_hz <= 0.0:
     raise SystemExit("sample_hz must be positive")
+if feedback_max_age_sec <= 0.0:
+    raise SystemExit("feedback_max_age_sec must be positive")
 
 distances_m = [float(x.strip()) for x in distances_m_text.split(",") if x.strip()]
 if not distances_m:
@@ -325,8 +338,8 @@ class SegmentResult:
 class StraightNode(Node):
     def __init__(self) -> None:
         super().__init__("ranger_straight_odom_test")
-        qos = QoSProfile(depth=50)
-        telemetry_qos = QoSProfile(depth=50)
+        qos = QoSProfile(depth=1)
+        telemetry_qos = QoSProfile(depth=1)
         telemetry_qos.reliability = ReliabilityPolicy.BEST_EFFORT
         self.cmd_pub = self.create_publisher(Twist, cmd_topic, qos)
         self.pause_client = self.create_client(SetBool, correction_pause_service)
@@ -337,6 +350,7 @@ class StraightNode(Node):
         self.safety_status = ""
         self.mode_status = ""
         self.bridge_status = ""
+        self.wheel_odom_received_at: Optional[float] = None
         self.create_subscription(Odometry, odom_topic, self._wheel_cb, telemetry_qos)
         self.create_subscription(Odometry, local_odom_topic, self._local_cb, telemetry_qos)
         self.create_subscription(Twist, "/cmd_vel_safe", self._cmd_safe_cb, telemetry_qos)
@@ -347,6 +361,7 @@ class StraightNode(Node):
 
     def _wheel_cb(self, msg: Odometry) -> None:
         self.wheel_odom = msg
+        self.wheel_odom_received_at = time.monotonic()
 
     def _local_cb(self, msg: Odometry) -> None:
         self.local_odom = msg
@@ -369,22 +384,31 @@ class StraightNode(Node):
     def spin_some(self, duration: float) -> None:
         deadline = time.monotonic() + duration
         while time.monotonic() < deadline and rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=0.02)
+            time.sleep(0.01)
+
+    def wheel_odom_age_sec(self, now: Optional[float] = None) -> float:
+        if self.wheel_odom_received_at is None:
+            return math.inf
+        current = time.monotonic() if now is None else now
+        return max(0.0, current - self.wheel_odom_received_at)
+
+    def wheel_odom_is_fresh(self, now: Optional[float] = None) -> bool:
+        return self.wheel_odom is not None and self.wheel_odom_age_sec(now) <= feedback_max_age_sec
 
     def wait_for_odom(self, timeout_sec: float = 5.0) -> bool:
         deadline = time.monotonic() + timeout_sec
         while time.monotonic() < deadline and rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=0.05)
-            if self.wheel_odom is not None:
+            if self.wheel_odom_is_fresh():
                 return True
+            time.sleep(0.01)
         return False
 
     def wait_for_local_odom(self, timeout_sec: float = 3.0) -> bool:
         deadline = time.monotonic() + timeout_sec
         while time.monotonic() < deadline and rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=0.05)
             if self.local_odom is not None:
                 return True
+            time.sleep(0.01)
         return False
 
     def set_correction_pause(self, paused: bool) -> str:
@@ -395,7 +419,9 @@ class StraightNode(Node):
         req = SetBool.Request()
         req.data = paused
         future = self.pause_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=4.0)
+        deadline = time.monotonic() + 4.0
+        while not future.done() and time.monotonic() < deadline and rclpy.ok():
+            time.sleep(0.01)
         if not future.done():
             return "timeout"
         result = future.result()
@@ -410,7 +436,6 @@ class StraightNode(Node):
         end = time.monotonic() + duration
         while time.monotonic() < end and rclpy.ok():
             self.publish_cmd(0.0)
-            rclpy.spin_once(self, timeout_sec=0.02)
             time.sleep(0.03)
 
 
@@ -451,8 +476,9 @@ def run_segment(node: StraightNode, index: int, target_m: float, writer: csv.Dic
     commanded_vx = direction * linear_speed
     timeout_sec = target_abs / linear_speed + max_extra_sec
 
-    if node.wheel_odom is None:
-        return SegmentResult(index, target_m, False, "missing_initial_wheel_odom", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, None, None, None, None, None, 0.0, 0.0, node.safety_status, node.mode_status)
+    if not node.wheel_odom_is_fresh():
+        reason = "missing_initial_wheel_odom" if node.wheel_odom is None else "stale_initial_wheel_odom"
+        return SegmentResult(index, target_m, False, reason, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, None, None, None, None, None, 0.0, 0.0, node.safety_status, node.mode_status)
 
     start_wheel = odom_pose(node.wheel_odom)
     start_local = pose_or_none(node.local_odom)
@@ -480,8 +506,13 @@ def run_segment(node: StraightNode, index: int, target_m: float, writer: csv.Dic
             reason = "timeout"
             break
 
+        wheel_odom_age = node.wheel_odom_age_sec(now)
+        if wheel_odom_age > feedback_max_age_sec:
+            ok = False
+            reason = f"wheel_odom_stale_age_{wheel_odom_age:.3f}s"
+            break
+
         node.publish_cmd(commanded_vx)
-        rclpy.spin_once(node, timeout_sec=0.01)
 
         if node.wheel_odom is not None:
             wheel_pose = odom_pose(node.wheel_odom)
@@ -519,6 +550,7 @@ def run_segment(node: StraightNode, index: int, target_m: float, writer: csv.Dic
                 "wheel_lateral_m": f"{wheel_lateral:.6f}",
                 "wheel_distance_m": f"{wheel_distance:.6f}",
                 "wheel_yaw_delta_rad": f"{wheel_yaw_delta:.6f}",
+                "wheel_odom_receive_age_sec": f"{wheel_odom_age:.6f}",
                 "wheel_twist_vx": fmt_optional(wheel_twist[0]),
                 "wheel_twist_wz": fmt_optional(wheel_twist[2]),
                 "local_x": "" if local_pose is None else f"{local_pose[0]:.6f}",
@@ -548,7 +580,6 @@ def run_segment(node: StraightNode, index: int, target_m: float, writer: csv.Dic
     settle_until = time.monotonic() + settle_sec
     while time.monotonic() < settle_until and rclpy.ok():
         node.publish_cmd(0.0)
-        rclpy.spin_once(node, timeout_sec=0.02)
         time.sleep(0.03)
 
     end_wheel = odom_pose(node.wheel_odom) if node.wheel_odom is not None else start_wheel
@@ -592,6 +623,14 @@ def run_segment(node: StraightNode, index: int, target_m: float, writer: csv.Dic
 def main() -> int:
     rclpy.init(args=None)
     node = StraightNode()
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+    executor_thread = threading.Thread(
+        target=executor.spin,
+        name="ranger_straight_test_callbacks",
+        daemon=True,
+    )
+    executor_thread.start()
     results: List[SegmentResult] = []
     pause_enable_result = "not_called"
     pause_disable_result = "not_called"
@@ -616,6 +655,7 @@ def main() -> int:
                 "wheel_lateral_m",
                 "wheel_distance_m",
                 "wheel_yaw_delta_rad",
+                "wheel_odom_receive_age_sec",
                 "wheel_twist_vx",
                 "wheel_twist_wz",
                 "local_x",
@@ -673,6 +713,7 @@ def main() -> int:
                 f.write(f"- repeat: `{repeat}`\n")
                 f.write(f"- cmd_topic: `{cmd_topic}`\n")
                 f.write(f"- odom_topic: `{odom_topic}`\n")
+                f.write(f"- feedback_max_age_sec: `{feedback_max_age_sec:.3f}`\n")
                 f.write(f"- distance_tolerance_m: `{distance_tolerance_m:.3f}`\n")
                 f.write(f"- pause_correction_enable: `{pause_enable_result}`\n")
                 f.write(f"- pause_correction_disable: `{pause_disable_result}`\n")
@@ -707,6 +748,8 @@ def main() -> int:
                     f.write(results[-1].mode_status)
                     f.write("\n```\n")
         finally:
+            executor.shutdown(timeout_sec=2.0)
+            executor_thread.join(timeout=2.0)
             node.destroy_node()
             if rclpy.ok():
                 rclpy.shutdown()

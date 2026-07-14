@@ -14,17 +14,27 @@ imu_gyro_bias_filter:
     require_fresh_cmd_vel: false
     odom_timeout_sec: 0.5
     cmd_vel_timeout_sec: 0.5
-    stationary_required_sec: 1.0
-    odom_linear_threshold_mps: 0.01
-    odom_angular_threshold_radps: 0.01
-    cmd_linear_threshold_mps: 0.01
-    cmd_angular_threshold_radps: 0.01
-    max_bias_sample_abs_radps: 0.05
-    accumulator_alpha: 0.02
+    stationary_required_sec: 2.0
+    command_motion_holdoff_sec: 1.0
+    odom_linear_threshold_mps: 0.003
+    odom_angular_threshold_radps: 0.003
+    cmd_linear_threshold_mps: 0.001
+    cmd_angular_threshold_radps: 0.001
+    max_bias_sample_abs_radps: 0.03
+    accumulator_alpha: 0.002
     zero_output_when_stationary: true
     corrected_output_rate_hz: 100.0
     bias_publish_rate_hz: 10.0
     corrected_output_latest_on_timer: true
-    corrected_output_preserve_source_stamp: true
+    # Canonical JT128 stamps currently trail system time by a variable
+    # 0.7-2.9s. Keep /lidar_imu untouched, but stamp this EKF-only derivative
+    # at receipt so robot_localization does not process a seconds-old sample.
+    corrected_output_preserve_source_stamp: false
     corrected_output_max_source_age_sec: 0.20
+    corrected_output_publish_only_new_sample: true
+    corrected_output_require_monotonic_stamp: true
+    # This branch is EKF-only. FAST-LIO2 continues to consume untouched
+    # /lidar_imu, whose covariance and timestamps are not changed here.
+    override_output_angular_velocity_z_covariance: true
+    output_angular_velocity_z_covariance: 0.0025
     bias_publish_preserve_source_stamp: true

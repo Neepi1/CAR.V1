@@ -21,7 +21,6 @@ apply_pattern robot_api_server "robot_api_server_node"
 apply_pattern ranger_base_node "ranger_base_node"
 apply_pattern robot_safety "robot_safety_node"
 apply_pattern velocity_smoother "velocity_smoother"
-apply_pattern ranger_mini3_mode_controller "mode_controller_node"
 apply_pattern docking_manager "docking_manager_node"
 
 apply_pattern robot_local_state "ekf_node.*__node:=robot_local_state|local_state_node"

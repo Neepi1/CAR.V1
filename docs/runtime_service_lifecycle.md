@@ -16,18 +16,16 @@ Common services should stay up during daily operation:
 - `robot_eai_gs2` GS2 near-field docking lidar driver (`/dock/gs2_scan`, `/dock/gs2_points`)
 - `robot_local_state` canonical local odom owner (`LOCAL_STATE_MODE=ekf LOCAL_STATE_EKF_PROFILE=wheel_only` by default: `/wheel/odom_ekf` -> EKF -> `/local_state/odometry`; `/lidar_imu_bias_corrected` remains resident for safety-side spin-tail detection, not EKF fusion; FAST-LIO local-state remains an explicit diagnostic/mapping-aligned mode)
 - `robot_safety`
-- `ranger_mini3_mode_controller`
+- project-maintained `ranger_base` chassis core
 - `robot_floor_manager`
 - `robot_api_server`
 
-`ranger_mini3_mode_controller` remains resident after `robot_safety`, but it is
-now official-passthrough-only. It preserves normal `/cmd_vel_safe` Twist values
-for official AgileX `ranger_base_node` interpretation, while still protecting
-timeout/startup/park zero behavior, reverse permits for docking and teleop,
-normal-navigation lateral rejection, desired/actual `motion_mode` diagnostics,
-and status publication. The legacy custom Ackermann shaping path and its A/B
-profile switch have been removed so stale `mode_controller_profile=custom`
-settings cannot reintroduce the wrong model.
+`ranger_base` is the only Ranger mode and CAN owner. It consumes the final
+post-safety `/cmd_vel`, holds zero during mode transitions, and releases motion
+only after firmware feedback confirms the requested mode with
+`mode_changing=0`. `/ranger_base/status` replaces the former shadow-controller
+status. `/cmd_vel_safe` remains a diagnostic mirror and is not a second control
+path.
 
 `robot_api_server` is supervised inside the common-service layer. If the API process exits, `run_robot_api_server_supervised.sh` restarts it after a short delay. Before each restart, the supervisor clears stale orphan API processes so only one `robot_api_server_node` can own port `8080` and the fixed HTTP worker pool. `njrh_container.sh start-runtime` and `start-common` now also require `GET /api/v1/status` on port `8080` to become healthy before reporting common services as ready. That host-side HTTP wait defaults to `NJRH_ROBOT_API_READY_TIMEOUT_SEC=120` with `NJRH_ROBOT_API_READY_POLL_SEC=1`; it does not create ROS readiness participants. The API process uses a fixed HTTP worker pool controlled by `max_http_connections` and returns `503` when overloaded instead of creating unbounded detached request threads.
 
@@ -39,8 +37,14 @@ one final readiness recheck before treating the helper as failed. A real helper
 failure is stopped with bounded `SIGINT`, then `SIGTERM`, then a scoped kill of
 that helper process tree. The common-service wrapper must not block forever in
 `wait` on a helper that ignored `SIGINT`, because that prevents `robot_safety`,
-the Ranger mode controller, docking manager, and `robot_api_server` from
+the Ranger chassis core, docking manager, and `robot_api_server` from
 starting.
+
+Cold-start readiness does not create one DDS participant per Ranger or IMU
+condition. One Ranger probe preserves the `/wheel/odom` owner/freshness and
+`/motion_state` owner/message checks; one IMU-bias probe preserves the corrected
+IMU and bias publisher/message checks. This changes discovery overhead only,
+not the admission conditions.
 
 The API server treats `/tf` as a process-level localization input, not as page-scoped telemetry. It creates the `/tf` subscription once at startup and keeps it resident so high-rate `/api/v1/robot/pose` polling cannot repeatedly add and remove reliable Fast DDS endpoints on `/tf`; that endpoint churn can backpressure `robot_localization_bridge` while the bridge process still appears alive.
 
@@ -52,7 +56,9 @@ independent 50 Hz publisher callback group is the only code path that broadcasts
 callbacks, and correction logging off the transform broadcast path. The bridge
 status topic exposes `map_odom_publish_loop_hz`,
 `map_odom_publish_gap_ms`, accepted/published state sequence, pause/frozen
-state, and `publisher_decoupled_from_correction=true`. The API
+state, `has_odom`, and `publisher_decoupled_from_correction=true`. Held Nav2
+preload requires both the Isaac grid-search service and `has_odom=true`, so cold
+Nav2 discovery/load cannot race the bridge's first canonical odom sample. The API
 post-relocalization settle barrier refuses to release the next Nav2 goal or GS2
 fine-docking stage until that publisher heartbeat is stable, the accepted state
 has been published, `odom -> base_link` is fresh, local costmap has updated, and
@@ -208,18 +214,25 @@ FAST-LIO2 mapping input.
 
 Phase 1.15 treats `/flatscan` as a supervised localization-startup dependency,
 not just a side effect of the scan chain. In `ipc_worker`, the accel core owns
-`/scan`, while a bounded-restart standalone `laser_scan_to_flatscan`
-compatibility helper owns `/flatscan`. Helper state is written to
-`flatscan_helper_status.env` for `verify_pointcloud_accel_profile.sh` and
-`run_pointcloud_accel_ab.sh`. If `/scan` has a publisher but `/flatscan` does
-not, diagnostics report `CASE_FLATSCAN_HELPER_DEAD`. This does not add topics or
+`/scan`, while a standalone `laser_scan_to_flatscan` compatibility helper owns
+`/flatscan`. Helper state is written to `flatscan_helper_status.env` for
+`verify_pointcloud_accel_profile.sh` and `run_pointcloud_accel_ab.sh`. A helper
+process exit is strong evidence and permits an immediate bounded restart. A
+missing publisher from the short Fast DDS graph probe is only suspicion: the
+supervisor requires three consecutive misses and then checks the actual
+`/flatscan` message rate before replacing a live helper. The restart limit is a
+cooldown window rather than a terminal budget; exhausting it keeps the
+supervisor and `/scan` owner alive, and 60 seconds of stable helper health resets
+the budget. The status file exposes health state, consecutive graph misses, and
+cooldown expiry. If `/scan` has a publisher but `/flatscan` is confirmed absent,
+diagnostics report `CASE_FLATSCAN_HELPER_DEAD`. This does not add topics or
 change PointCloud2 QoS, DDS/RMW, timestamp policy, FAST-LIO2, EKF, App API, or
 Nav2 controller/planner behavior.
 Navigation stop and localization cleanup must preserve the common
 `laser_scan_to_flatscan` helper. If an older manual mode transition or field
 diagnostic still leaves `/scan` alive but `/flatscan` missing, resident
-navigation startup restarts the current pointcloud accel profile once and waits
-for `/flatscan` again before reporting `FLATSCAN_MISSING`. Common startup does
+navigation startup reports `FLATSCAN_MISSING` without starting or restarting
+the pointcloud profile. Common startup does
 not duplicate that `/flatscan` gate by default; use
 `NJRH_COMMON_REQUIRE_FLATSCAN_BEFORE_RESIDENT_AUTOSTART=true` only when isolating
 the pointcloud helper before resident navigation is allowed to start.
@@ -227,6 +240,23 @@ Non-legacy common runtime startup also treats duplicate
 `run_pointcloud_accel_pipeline.sh` or `laser_scan_to_flatscan` processes as
 stale ownership and stops that pointcloud profile with targeted SIGINT/SIGTERM
 before starting one replacement chain.
+
+Phase S4 makes this ownership rule symmetric for all common dependencies.
+`run_common_services.sh` is the only owner of Ranger, static sensor TF, and the
+pointcloud pipeline. `run_occupancy_grid_localization.sh` checks process
+liveness, fresh wheel odom, static TF, and the supervised FlatScan status, but
+it cannot kill or replace those processes. A genuine dependency failure exits
+the resident startup and leaves full-chain recovery to `njrh-runtime.service`.
+This prevents a transient Fast DDS graph miss from moving chassis ownership
+under the localization child process.
+
+Startup control state is no longer inferred by repeatedly loading cumulative
+runtime logs. Nav2 lifecycle completion writes
+`/tmp/njrh_nav2_lifecycle_ready.env` atomically with the live owner PID and a
+timestamp; readiness still requires the critical Nav2 processes and falls back
+to direct lifecycle service checks. Common process logs keep one bounded 32 MiB
+previous-run tail. The vendor Hesai overlay no longer prints one timing line per
+pointcloud frame; explicit diagnostics remain responsible for frame timing.
 
 The local-state startup gate requires a fresh `odom -> base_link` TF before
 common services continue to safety, mode control, API, and resident navigation.
@@ -335,7 +365,7 @@ Nav2 preflight is process-first. `run_nav2_navigation.sh` starts or reuses floor
 
 The occupancy localization mode may start or reuse localization-specific services such as `robot_localization_bridge` and `robot_global_localization`, but it does not own FAST-LIO2 or canonical local-state. It consumes `/lidar_points` for stationary Isaac relocalization and checks only that the resident local-state process for the selected mode exists before launching the localization stack; FAST-LIO2 is required only for explicit `NJRH_NAV_LOCAL_STATE_MODE=fastlio`. On localization or Nav2 startup failure the mode script cleans the localization stack and overlay helpers only; `robot_local_state` remains a common/canonical service. This prevents Nav2 from staying active while `/local_state/odometry` and `/tf` publishers disappear during a stop/resume race.
 
-Navigation resume gives the localization layer a short settle window (`NJRH_NAV_LOCALIZATION_START_SETTLE_SEC`, default 0.1 seconds), then runs a bounded deterministic startup chain before Nav2 is allowed to become ready. The critical path does not start resident AMCL before the first map correction. Instead, the chain waits for `/global_localization/trigger`, Isaac `/trigger_grid_search_localization`, explicitly drives `/map_server` to active for the selected floor asset, requires the selected `/map` to be observable, requires the `laser_scan_to_flatscan` publisher on `/flatscan`, sends one `/global_localization/trigger`, then requires bridge-accepted localization and live `map -> odom`. The `/localization_result` publisher pre-gate is optional through `NJRH_INITIAL_LOCALIZATION_REQUIRE_RESULT_PUBLISHER=true`; it is not the default because the wrapper service already waits for the actual result and bridge acceptance. `/flatscan` is `isaac_ros_pointcloud_interfaces/msg/FlatScan`, not `sensor_msgs/msg/LaserScan`; `/scan` is the LaserScan intermediate. The FlatScan gate checks publisher ownership rather than consuming a generic FlatScan message because the standard ROS CLI/generic probe path is unreliable for this Isaac interface on the Jetson runtime. If this gate fails, `run_navigation_runtime_services.sh` now records the specific reason `FLATSCAN_MISSING` and logs `/scan` publisher presence, the `laser_scan_to_flatscan` process state, the active pointcloud accel profile, and the verify/restart command. Other admission failures are split into `GLOBAL_LOCALIZATION_TRIGGER_SERVICE_MISSING`, `GRID_SEARCH_LOCALIZATION_SERVICE_MISSING`, `MAP_SERVER_NOT_ACTIVE`, `MAP_TOPIC_MISSING`, and `LOCALIZATION_RESULT_PUBLISHER_MISSING` only when that optional result-publisher gate is explicitly enabled. This is the required localization sequence, not a high-frequency Python/rclpy graph watchdog.
+Navigation resume gives the localization layer a short settle window (`NJRH_NAV_LOCALIZATION_START_SETTLE_SEC`, default 0.1 seconds), then runs a bounded deterministic startup chain before Nav2 is allowed to become ready. The critical path does not start resident AMCL before the first map correction. Instead, one localization-stack probe waits for `/global_localization/trigger`, Isaac `/trigger_grid_search_localization`, the selected `/map`, and the `laser_scan_to_flatscan` publisher on `/flatscan`; map-server lifecycle activation remains explicit. The wrapper then requires two consecutive post-arm FlatScan samples with at least 115 degrees FOV, sends one `/global_localization/trigger`, and requires bridge-accepted localization plus live `map -> odom`. The `/localization_result` publisher pre-gate is optional through `NJRH_INITIAL_LOCALIZATION_REQUIRE_RESULT_PUBLISHER=true`; it is not the default because the wrapper service already waits for the actual result and bridge acceptance. `/flatscan` is `isaac_ros_pointcloud_interfaces/msg/FlatScan`, not `sensor_msgs/msg/LaserScan`; `/scan` is the LaserScan intermediate. The FlatScan gate checks publisher ownership rather than consuming a generic FlatScan message because the standard ROS CLI/generic probe path is unreliable for this Isaac interface on the Jetson runtime. If this gate fails, `run_navigation_runtime_services.sh` now records the specific reason `FLATSCAN_MISSING` and logs `/scan` publisher presence, the `laser_scan_to_flatscan` process state, the active pointcloud accel profile, and the verify/restart command. Other admission failures are split into `GLOBAL_LOCALIZATION_TRIGGER_SERVICE_MISSING`, `GRID_SEARCH_LOCALIZATION_SERVICE_MISSING`, `MAP_SERVER_NOT_ACTIVE`, `MAP_TOPIC_MISSING`, and `LOCALIZATION_RESULT_PUBLISHER_MISSING` only when that optional result-publisher gate is explicitly enabled. This is the required localization sequence, not a high-frequency Python/rclpy graph watchdog.
 
 The local costmap `MessageFilter` drops observed on `/scan` are separate from
 `/flatscan` startup admission. They require a producer/TF timing audit and must
@@ -343,13 +373,18 @@ not be hidden by restamping or mixed into the flatscan lifecycle fix.
 
 Standard Nav2 startup separates filter lifecycle from core navigation lifecycle. `lifecycle_manager_costmap_filters` owns only the keepout/speed mask map servers and filter-info servers. The production resident cold-start path first prepares localization, triggers the bridge-owned `map -> odom` baseline, and only then launches Nav2. `NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION=true` remains available only as an A/B optimization switch. After the trigger result is accepted and bridge-owned `map -> odom` is live, resident runtime starts the core lifecycle nodes through Nav2's lifecycle helper with a bounded runtime timeout. The default keeps deterministic TF ordering without changing Nav2 controller/planner plugins, TF tolerances, pointcloud QoS, FAST-LIO2, Ranger odom, or EKF policy.
 
+Global-costmap readiness uses one bounded participant to require both lifecycle
+active state and a live `/global_costmap/costmap` publisher. A full large
+OccupancyGrid message wait remains diagnostic-only; it is not required for the
+ready context.
+
 The occupancy localization startup no longer waits on `/lidar_points` from shell. It launches the localization stack and leaves pointcloud freshness to explicit diagnostics, Isaac/localizer logs, and API goal admission. This prevents a manual navigation stop or short common-service recovery window from causing the resident navigation runtime to exit before Isaac localization and Nav2 are even launched.
 
 Mode services are allowed to start and stop when switching between navigation and mapping:
 
 - Navigation: Isaac localization stack, `robot_localization_bridge`, Nav2, velocity smoother, collision monitor.
 - Mapping: mapping-owned FAST-LIO2, optional PGO, slam_toolbox 2D mapping, scan slicing helpers.
-- Docking: `robot_docking_manager` is a common resident service, started by `run_common_services.sh` after `robot_safety` and `ranger_mini3_mode_controller`. It stays idle until `/docking/start` or `/docking/undock` is called, keeping `/docking/start`, `/docking/stop`, and `/docking/undock` discoverable before API return-to-dock jobs reach the fine-docking handoff.
+- Docking: `robot_docking_manager` is a common resident service, started by `run_common_services.sh` after `ranger_base` and `robot_safety`. It stays idle until `/docking/start` or `/docking/undock` is called, keeping `/docking/start`, `/docking/stop`, and `/docking/undock` discoverable before API return-to-dock jobs reach the fine-docking handoff.
 - Current field-default mapping: `run_projected_map.sh` starts FAST-LIO2 only for the active live mapping session, then feeds `slam_toolbox` 2D mapping. PGO remains optional formal mapping work.
 
 The field runtime now has a selected-floor resident navigation entrypoint. It is

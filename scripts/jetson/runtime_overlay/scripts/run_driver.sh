@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # run_driver may be spawned by a long-lived parent runtime script. Refresh the
 # ROS overlay here so component containers see newly installed packages.
-unset NJRH_COMMON_ENV_SETUP_DONE
+unset NJRH_COMMON_ENV_SETUP_DONE NJRH_COMMON_ENV_PARENT_READY
 source "${SCRIPT_DIR}/common_env.sh"
 source "${SCRIPT_DIR}/cpu_affinity.sh"
 source "${SCRIPT_DIR}/local_perception_profile.sh"

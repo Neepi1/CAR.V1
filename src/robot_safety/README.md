@@ -7,7 +7,7 @@ Final command arbitration point before the chassis bridge.
 - normal navigation/App command input: `/cmd_vel_collision_checked`
 - docking command input: `/cmd_vel_docking`
 - final chassis command output: `/cmd_vel`
-- safe command mirror: `/cmd_vel_safe`
+- safe command mirror: `/cmd_vel_safe` (diagnostic only)
 - estop input: `/safety/estop`
 - optional localization gate: `/localization/health`
 - state output: `/safety/status`
@@ -15,7 +15,7 @@ Final command arbitration point before the chassis bridge.
 
 ## Arbitration Policy
 
-`robot_safety` is the only package allowed to publish the post-arbitration chassis command on `/cmd_vel`. `/cmd_vel_safe` is a mirror for diagnostics and the Ranger Mini 3 mode-controller shadow observer. Docking commands use a separate `/cmd_vel_docking` input so Nav2 `collision_monitor` zero commands on `/cmd_vel_collision_checked` cannot overwrite near-field docking or undocking commands.
+`robot_safety` is the only package allowed to publish the post-arbitration chassis command on `/cmd_vel`. `/cmd_vel_safe` is a read-only diagnostics mirror. Docking commands use a separate `/cmd_vel_docking` input so Nav2 `collision_monitor` zero commands on `/cmd_vel_collision_checked` cannot overwrite near-field docking or undocking commands.
 
 Command topics are treated as latest-only control streams, not durable command queues. The node creates the normal, API, docking, final, and mirror Twist endpoints with `KEEP_LAST(1)` QoS by default so old nonzero velocity samples cannot be drained after a newer stop command. A near-zero command from the active command owner is also stop-dominant: `robot_safety` immediately publishes zero, keeps a short zero burst window, and rejects late nonzero samples during that window. This prevents spin/drive/arc commands from continuing only because an upstream queue or source-priority cache still contains older velocity samples.
 
@@ -31,9 +31,9 @@ When a fresh `/cmd_vel_docking` message exists, normal `/cmd_vel_collision_check
 
 After a pure yaw command, `robot_safety` can hold the first following linear command at zero until the spin tail has settled. The gate checks `/wheel/odom.twist.twist.angular.z` and, by default, `/lidar_imu_bias_corrected.angular_velocity.z` because the Ranger wheel twist can report zero before the physical body yaw-rate has actually stopped. `/local_state/odometry` remains an optional diagnostic gate only; production release is based on raw wheel odom plus the corrected 100 Hz IMU tail detector. The local-state runtime must keep `imu_gyro_bias_filter_node` resident even when the EKF profile is wheel-only; otherwise this gate can only fail open after its timeout. This handles Ranger Mini 3 spin stop tail: upstream Nav2/API may have already published zero yaw, while the chassis is still rotating for a short interval. The gate is intentionally placed in `robot_safety` because this package is the final command arbitration point before `/cmd_vel`; it does not change Nav2, AMCL, or the chassis SDK motion model.
 
-After docking or lateral capture, the Ranger SDK can keep reporting `MOTION_MODE_PARALLEL` while all command topics are already zero. The official SDK only switches back to `MOTION_MODE_DUAL_ACKERMAN` when it receives a nonzero dual-Ackermann-style Twist. `robot_safety` therefore has a mode-exit guard for normal/API drive commands: if the mode-controller status reports an actual lateral mode and the next command intends dual-Ackermann drive, it first emits a bounded low-speed `linear.x` probe with `linear.y=0` and `angular.z=0`, then releases the original command after the actual mode returns to dual Ackermann. Docking commands are exempt so fine docking can still intentionally use side-slip.
+After docking or lateral capture, the Ranger chassis can keep reporting `MOTION_MODE_PARALLEL` while all command topics are already zero. `robot_safety` observes `/ranger_base/status` for its outer mode-exit guard. The authoritative transition is now inside `ranger_base`: any probe or requested drive is held at zero until the firmware confirms DUAL_ACKERMAN, so a safety-layer probe cannot leak physical motion during mode change. Docking commands are exempt from the outer guard so fine docking can intentionally request lateral motion; the chassis core still performs the same confirmed transition.
 
-API terminal pose recovery may also need a small side-slip command after Nav2 reaches a normal goal but final pose verification still sees a lateral residual. When `allow_api_lateral_cmd=true`, `robot_safety` passes bounded `/cmd_vel_api.linear.y` through the same final arbitration path, clamps it with `api_lateral_max_mps`, and still relies on the Ranger mode controller forced-mode contract before the chassis accepts lateral motion. Normal Nav2 commands remain lateral-zeroed.
+API terminal pose recovery may also need a small side-slip command after Nav2 reaches a normal goal but final pose verification still sees a lateral residual. When `allow_api_lateral_cmd=true`, `robot_safety` passes bounded `/cmd_vel_api.linear.y` through the same final arbitration path and clamps it with `api_lateral_max_mps`; `ranger_base` derives and confirms the required lateral chassis mode from that Twist. Normal Nav2 commands remain lateral-zeroed.
 
 For push-in spring charging docks, controlled undocking must be a continuous low-speed motion through the charger switch travel. `robot_safety` stores the last fresh `/cmd_vel_docking` command and republishes it from the safety timer while the docking-priority window is active, so watchdog/status refreshes do not insert zero commands between valid undock updates.
 
@@ -82,10 +82,15 @@ When any blocking state is active, the node publishes a zero twist and latches t
 - `spin_to_drive_linear_epsilon_mps`: linear command threshold used to distinguish pure spin from drive
 - `spin_to_drive_odom_max_age_sec`: maximum accepted age of the odom yaw-rate sample
 - `mode_exit_guard_enabled`: guard normal/API drive commands from starting at full speed while the chassis still reports a lateral motion mode
-- `mode_controller_status_topic`: status source containing actual Ranger motion mode, default `/ranger_mini3_mode_controller/status`
+- `mode_controller_status_topic`: compatibility parameter naming the actual Ranger mode status source, default `/ranger_base/status`
 - `mode_exit_guard_probe_speed_mps`: bounded dual-Ackermann probe speed used to switch out of lateral mode, default `0.06`
 - `mode_exit_guard_timeout_sec`: maximum probe duration before holding zero instead of passing the original command, default `1.0`
 - `mode_exit_guard_status_max_age_sec`: maximum accepted age of the mode-controller status sample, default `0.5`
+- `allow_reverse`: globally allow reverse when explicitly enabled, default `false`
+- `reverse_enable_topic`: bounded normal/API reverse permit, default `/ranger_mini3/allow_reverse`
+- `docking_reverse_enable_topic`: controlled-undock reverse permit, default `/ranger_mini3/docking_allow_reverse`
+- `teleop_reverse_enable_topic`: mapping-teleop reverse permit, default `/ranger_mini3/teleop_allow_reverse`
+- `reverse_enable_timeout_sec`: freshness window for each reverse permit, default `0.75`
 - `allow_api_lateral_cmd`: allow bounded `/cmd_vel_api.linear.y` for API-owned terminal pose recovery, default `false`
 - `api_lateral_max_mps`: absolute clamp for API lateral speed before final publication, default `0.10`
 

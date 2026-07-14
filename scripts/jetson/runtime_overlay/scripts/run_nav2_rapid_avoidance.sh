@@ -35,7 +35,6 @@ trap on_signal INT TERM
 
 echo "[runtime-overlay] local_perception rapid helper disabled; rapid avoidance consumes /scan through Nav2 standard layers" >&2
 start_overlay_helper "robot_safety_rapid" bash "${SCRIPT_DIR}/run_robot_safety.sh"
-start_overlay_helper "ranger_mini3_mode_controller_rapid" bash "${SCRIPT_DIR}/run_ranger_mini3_mode_controller.sh"
 
 bash "$(require_upstream_script run_nav2_rapid_avoidance.sh)" &
 nav_pid=$!

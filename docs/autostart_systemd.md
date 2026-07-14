@@ -48,6 +48,18 @@ blocked by default because a transient owner can exit before resident navigation
 is ready and then clean up Nav2/localization children. `stop_floor_navigation.sh`
 is a broad debug cleanup script, not the product restart path.
 
+The production systemd path uses non-login `bash -c` for preparation and the
+foreground common-service owner inside an already-running container. Startup
+readiness groups related Ranger, IMU, localization, and costmap checks into
+bounded C++ probes; grouping reduces Fast DDS discovery churn but preserves the
+individual publisher, freshness, lifecycle, and message requirements.
+
+On the 2026-07-10 final build, three complete service restarts reached confirmed
+navigation ready in `66.055 s`, `59.321 s`, and `69.676 s`; resident-navigation
+times were `43 s`, `43 s`, and `52 s`. See
+[`phase_s4_boot_to_navigation_critical_path.md`](phase_s4_boot_to_navigation_critical_path.md)
+for the startup contract and formal five-run acceptance procedure.
+
 Environment is stored in:
 
 ```text
@@ -70,7 +82,6 @@ The boot service starts common infrastructure first:
 - `local_perception_node`
 - `floor_manager_node`
 - `robot_safety_node`
-- `mode_controller_node` from `ranger_mini3_mode_controller`
 - `docking_manager_node` from `robot_docking_manager`, exposing resident `/docking/start`, `/docking/stop`, and `/docking/undock`
 - `robot_api_server_node`
 
@@ -81,12 +92,13 @@ it starts the resident localization/Nav2 runtime for that last manually selected
 map. If no valid last map exists, the robot remains in `NO_MAP` with common
 services alive.
 
-Startup keeps `NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE=false` so
-resident Nav2/localization is not launched before the canonical local-state
-owner exists. `NJRH_COMMON_LOCAL_STATE_BACKGROUND_START=false` is also the
-production default: starting `robot_local_state_common` in parallel with sensor
-initialization is kept only as an explicit A/B knob because field restarts showed
-it can fail local-state readiness and trigger a service restart.
+Startup keeps `NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE=false`.
+MapServer/Isaac loading starts only after canonical local-state admission;
+field A/B showed earlier loading can starve TF/DDS discovery even when odometry
+messages are already fresh. `NJRH_COMMON_LOCAL_STATE_BACKGROUND_START=true`
+still starts local state alongside pointcloud/GS2 helpers, with a bounded final
+readiness recheck instead of a full service restart when cold startup finishes
+just after the first window.
 
 It does not start:
 

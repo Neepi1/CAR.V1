@@ -1,0 +1,44 @@
+/**:
+  ros__parameters:
+    mock_mode: false
+    publish_tf: false
+    output_topic: /wheel/odom_ekf
+    input_odom_topic: /wheel/odom
+    input_base_frame: base_link
+    input_imu_topic: /lidar_imu_bias_corrected
+    input_motion_state_topic: /motion_state
+    input_cmd_vel_topic: /cmd_vel
+    odom_frame: odom
+    base_frame: base_link
+    odom_yaw_offset_rad: 0.0
+    rotate_odom_position_with_yaw_offset: false
+    anchor_pose_to_first_sample: true
+    apply_pose_covariance_floor: true
+    pose_covariance_floor_x: 0.05
+    pose_covariance_floor_y: 0.05
+    pose_covariance_floor_yaw: 0.08
+    apply_twist_covariance_floor: true
+    twist_covariance_floor_vx: 0.02
+    twist_covariance_floor_vy: 0.50
+    twist_covariance_floor_vyaw: 0.08
+    publish_rate_hz: 50.0
+    publish_on_callback: false
+    republish_latest: true
+    republish_latest_max_age_sec: 0.5
+
+    spin_yaw_correction_enabled: true
+    spin_motion_mode: 2
+    spin_command_start_threshold_radps: 0.05
+    spin_command_zero_linear_threshold_mps: 0.02
+    spin_command_zero_angular_threshold_radps: 0.02
+    spin_imu_motion_threshold_radps: 0.03
+    spin_imu_stop_threshold_radps: 0.02
+    spin_imu_stop_stable_sec: 0.30
+    spin_imu_timeout_sec: 0.20
+    spin_imu_max_integration_dt_sec: 0.05
+    spin_settle_timeout_sec: 2.0
+    spin_freeze_xy_while_spinning: true
+    spin_freeze_xy_max_command_linear_mps: 0.03
+    spin_replace_twist_with_imu: false
+    spin_yaw_status_topic: /local_state/spin_yaw_correction_status
+    spin_yaw_status_rate_hz: 5.0

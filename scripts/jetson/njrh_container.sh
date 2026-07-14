@@ -187,12 +187,66 @@ run_container() {
     /bin/bash -lc "trap 'exit 0' TERM INT; while sleep 3600; do :; done"
 }
 
+prepare_running_container_runtime_once() {
+  local host_gs2="${NJRH_GS2_HOST_DEVICE:-/dev/gs2}"
+  local host_target=""
+  local target_name=""
+  local major_dec=""
+  local minor_dec=""
+
+  if [[ -e "${host_gs2}" ]]; then
+    host_target="$(readlink -f "${host_gs2}")"
+  elif compgen -G "/dev/serial/by-id/*CP2102*" >/dev/null; then
+    host_target="$(readlink -f /dev/serial/by-id/*CP2102* | head -n 1)"
+  fi
+  if [[ -n "${host_target}" && -e "${host_target}" ]]; then
+    local major_hex minor_hex
+    target_name="$(basename "${host_target}")"
+    read -r major_hex minor_hex < <(stat -c '%t %T' "${host_target}")
+    major_dec="$((16#${major_hex}))"
+    minor_dec="$((16#${minor_hex}))"
+  fi
+
+  docker exec -u root \
+    -e "NJRH_RUNTIME_USER_CHECK=${RUNTIME_USER}" \
+    -e "NJRH_GS2_TARGET_NAME=${target_name}" \
+    -e "NJRH_GS2_TARGET_MAJOR=${major_dec}" \
+    -e "NJRH_GS2_TARGET_MINOR=${minor_dec}" \
+    "${CONTAINER_NAME}" /bin/bash -c '
+      set -e
+      id "${NJRH_RUNTIME_USER_CHECK}" >/dev/null
+      mkdir -p /tmp/isaac_ros_nitros/graphs
+      chown root:root /tmp/isaac_ros_nitros /tmp/isaac_ros_nitros/graphs
+      chmod 1777 /tmp/isaac_ros_nitros /tmp/isaac_ros_nitros/graphs
+      if [[ -n "${NJRH_GS2_TARGET_NAME}" ]]; then
+        if [[ ! -e "/dev/${NJRH_GS2_TARGET_NAME}" ]]; then
+          mknod -m 666 "/dev/${NJRH_GS2_TARGET_NAME}" c \
+            "${NJRH_GS2_TARGET_MAJOR}" "${NJRH_GS2_TARGET_MINOR}"
+        fi
+        chmod 666 "/dev/${NJRH_GS2_TARGET_NAME}" || true
+        ln -sf "/dev/${NJRH_GS2_TARGET_NAME}" /dev/gs2
+        mkdir -p /dev/serial/by-id
+        ln -sf "../../${NJRH_GS2_TARGET_NAME}" \
+          /dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0
+      fi
+    ' >/dev/null 2>&1
+}
+
+wait_for_and_prepare_running_container() {
+  local attempt
+  for attempt in $(seq 1 20); do
+    if prepare_running_container_runtime_once; then
+      return 0
+    fi
+    sleep 1
+  done
+  die "container did not become ready for consolidated runtime setup: ${CONTAINER_NAME}"
+}
+
 start_container() {
   if container_running; then
     RUNTIME_IMAGE_NAME="$(docker inspect --format '{{.Config.Image}}' "$CONTAINER_NAME")"
-    wait_for_container_ready
-    prepare_nitros_tmp
-    ensure_gs2_device_in_container
+    wait_for_and_prepare_running_container
     echo "[njrh-container] container already running: $CONTAINER_NAME"
     return
   fi
@@ -203,9 +257,7 @@ start_container() {
     docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   fi
   run_container
-  wait_for_container_ready
-  prepare_nitros_tmp
-  ensure_gs2_device_in_container
+  wait_for_and_prepare_running_container
   echo "[njrh-container] container started: $CONTAINER_NAME"
 }
 

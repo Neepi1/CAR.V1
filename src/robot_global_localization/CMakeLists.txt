@@ -3,6 +3,7 @@ project(robot_global_localization)
 
 find_package(ament_cmake REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(isaac_ros_pointcloud_interfaces REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(robot_interfaces REQUIRED)
 find_package(std_msgs REQUIRED)
@@ -15,6 +16,7 @@ add_executable(global_localization_node
 target_compile_features(global_localization_node PUBLIC cxx_std_17)
 ament_target_dependencies(global_localization_node
   geometry_msgs
+  isaac_ros_pointcloud_interfaces
   rclcpp
   robot_interfaces
   std_msgs

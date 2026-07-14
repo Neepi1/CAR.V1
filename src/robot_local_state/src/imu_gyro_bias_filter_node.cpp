@@ -22,6 +22,8 @@
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
 
+#include "robot_local_state/stationary_gate.hpp"
+
 namespace
 {
 bool is_finite(const double value)
@@ -123,6 +125,8 @@ public:
     odom_timeout_sec_ = declare_parameter<double>("odom_timeout_sec", 0.5);
     cmd_vel_timeout_sec_ = declare_parameter<double>("cmd_vel_timeout_sec", 0.5);
     stationary_required_sec_ = declare_parameter<double>("stationary_required_sec", 1.0);
+    command_motion_holdoff_sec_ =
+      std::max(0.0, declare_parameter<double>("command_motion_holdoff_sec", 1.0));
     odom_linear_threshold_mps_ = declare_parameter<double>("odom_linear_threshold_mps", 0.01);
     odom_angular_threshold_radps_ = declare_parameter<double>("odom_angular_threshold_radps", 0.01);
     cmd_linear_threshold_mps_ = declare_parameter<double>("cmd_linear_threshold_mps", 0.01);
@@ -140,8 +144,26 @@ public:
       declare_parameter<bool>("corrected_output_preserve_source_stamp", true);
     corrected_output_max_source_age_sec_ =
       std::max(0.0, declare_parameter<double>("corrected_output_max_source_age_sec", 0.20));
+    corrected_output_publish_only_new_sample_ =
+      declare_parameter<bool>("corrected_output_publish_only_new_sample", true);
+    corrected_output_require_monotonic_stamp_ =
+      declare_parameter<bool>("corrected_output_require_monotonic_stamp", true);
+    override_output_angular_velocity_z_covariance_ =
+      declare_parameter<bool>("override_output_angular_velocity_z_covariance", false);
+    output_angular_velocity_z_covariance_ = std::max(
+      1.0e-9,
+      declare_parameter<double>("output_angular_velocity_z_covariance", 0.0025));
     bias_publish_preserve_source_stamp_ =
       declare_parameter<bool>("bias_publish_preserve_source_stamp", true);
+
+    stationary_gate_ = std::make_unique<robot_local_state::StationaryGate>(
+      use_odom_stationary_,
+      use_cmd_vel_stationary_,
+      odom_timeout_sec_,
+      cmd_vel_timeout_sec_,
+      stationary_required_sec_,
+      command_motion_holdoff_sec_,
+      require_fresh_cmd_vel_);
 
     if (transform_output_to_target_frame_) {
       if (output_target_frame_.empty()) {
@@ -154,7 +176,7 @@ public:
 
     corrected_imu_pub_ = create_publisher<sensor_msgs::msg::Imu>(
       output_imu_topic_,
-      rclcpp::SensorDataQoS().keep_last(100));
+      rclcpp::SensorDataQoS().keep_last(1));
     bias_pub_ = create_publisher<geometry_msgs::msg::Vector3Stamped>(bias_topic_, rclcpp::QoS(10));
 
     if (use_odom_stationary_) {
@@ -208,40 +230,9 @@ private:
            std::abs(msg.angular_velocity.z) <= max_bias_sample_abs_radps_;
   }
 
-  bool is_fresh(const bool valid, const double stamp_sec, const double timeout_sec, const double now_sec) const
-  {
-    return valid && timeout_sec >= 0.0 && (now_sec - stamp_sec) <= timeout_sec;
-  }
-
-  bool stationary_candidate(const double now_sec) const
-  {
-    bool candidate = true;
-    if (use_odom_stationary_) {
-      const bool odom_fresh = is_fresh(has_odom_, last_odom_sec_, odom_timeout_sec_, now_sec);
-      candidate = candidate && odom_fresh && last_odom_is_stationary_;
-    }
-    if (use_cmd_vel_stationary_) {
-      const bool cmd_fresh = is_fresh(has_cmd_vel_, last_cmd_vel_sec_, cmd_vel_timeout_sec_, now_sec);
-      if (cmd_fresh) {
-        candidate = candidate && last_cmd_vel_is_stationary_;
-      } else if (require_fresh_cmd_vel_) {
-        candidate = false;
-      }
-    }
-    return candidate;
-  }
-
   bool stationary_confirmed(const double now_sec)
   {
-    if (!stationary_candidate(now_sec)) {
-      stationary_since_sec_ = 0.0;
-      return false;
-    }
-    if (stationary_since_sec_ <= 0.0) {
-      stationary_since_sec_ = now_sec;
-      return stationary_required_sec_ <= 0.0;
-    }
-    return (now_sec - stationary_since_sec_) >= stationary_required_sec_;
+    return stationary_gate_->confirmed(now_sec);
   }
 
   void update_bias(const sensor_msgs::msg::Imu & msg)
@@ -284,6 +275,7 @@ private:
   void publish_corrected_imu(const sensor_msgs::msg::Imu & msg)
   {
     corrected_imu_pub_->publish(msg);
+    last_published_corrected_generation_ = latest_corrected_generation_;
     ++output_corrected_count_;
     ++output_corrected_window_count_;
   }
@@ -298,6 +290,13 @@ private:
   void maybe_publish_corrected_direct(const double now_sec)
   {
     if (!latest_corrected_imu_) {
+      return;
+    }
+    if (
+      corrected_output_publish_only_new_sample_ &&
+      latest_corrected_generation_ == last_published_corrected_generation_)
+    {
+      ++duplicate_corrected_skip_count_;
       return;
     }
     const double min_period_sec = 1.0 / corrected_output_rate_hz_;
@@ -332,7 +331,8 @@ private:
       get_logger(),
       "IMU bias filter rates input=%.1fHz corrected_out=%.1fHz bias_out=%.1fHz "
       "totals input=%" PRIu64 " corrected=%" PRIu64 " bias=%" PRIu64 " stale_skips=%" PRIu64
-      " transform_failures=%" PRIu64,
+      " duplicate_skips=%" PRIu64 " nonmonotonic_skips=%" PRIu64
+      " source_time_resets=%" PRIu64 " transform_failures=%" PRIu64,
       input_hz,
       corrected_hz,
       bias_hz,
@@ -340,6 +340,9 @@ private:
       output_corrected_count_,
       output_bias_count_,
       stale_corrected_skip_count_,
+      duplicate_corrected_skip_count_,
+      nonmonotonic_input_skip_count_,
+      source_time_reset_count_,
       output_transform_failure_count_);
     rate_window_start_sec_ = now_sec;
     input_imu_window_count_ = 0;
@@ -351,6 +354,14 @@ private:
   {
     const double now_sec = now().seconds();
     if (!latest_corrected_imu_) {
+      maybe_report_rates(now_sec);
+      return;
+    }
+    if (
+      corrected_output_publish_only_new_sample_ &&
+      latest_corrected_generation_ == last_published_corrected_generation_)
+    {
+      ++duplicate_corrected_skip_count_;
       maybe_report_rates(now_sec);
       return;
     }
@@ -375,18 +386,22 @@ private:
 
   void on_odom(const nav_msgs::msg::Odometry::SharedPtr msg)
   {
-    last_odom_sec_ = now().seconds();
-    last_odom_is_stationary_ =
-      twist_is_zero(msg->twist.twist, odom_linear_threshold_mps_, odom_angular_threshold_radps_);
-    has_odom_ = true;
+    const double now_sec = now().seconds();
+    stationary_gate_->observe_odom(
+      now_sec,
+      !use_odom_stationary_ ||
+      twist_is_zero(
+        msg->twist.twist,
+        odom_linear_threshold_mps_,
+        odom_angular_threshold_radps_));
   }
 
   void on_cmd_vel(const geometry_msgs::msg::Twist::SharedPtr msg)
   {
-    last_cmd_vel_sec_ = now().seconds();
-    last_cmd_vel_is_stationary_ =
-      twist_is_zero(*msg, cmd_linear_threshold_mps_, cmd_angular_threshold_radps_);
-    has_cmd_vel_ = true;
+    stationary_gate_->observe_command(
+      now().seconds(),
+      !use_cmd_vel_stationary_ ||
+      twist_is_zero(*msg, cmd_linear_threshold_mps_, cmd_angular_threshold_radps_));
   }
 
   void on_imu(const sensor_msgs::msg::Imu::SharedPtr msg)
@@ -394,6 +409,20 @@ private:
     const double now_sec = now().seconds();
     ++input_imu_count_;
     ++input_imu_window_count_;
+
+    const double source_stamp_sec = stamp_seconds(msg->header.stamp);
+    if (corrected_output_require_monotonic_stamp_ && source_stamp_sec > 0.0) {
+      if (last_input_source_stamp_sec_ > 0.0 && source_stamp_sec <= last_input_source_stamp_sec_) {
+        if ((last_input_source_stamp_sec_ - source_stamp_sec) > 1.0) {
+          ++source_time_reset_count_;
+        } else {
+          ++nonmonotonic_input_skip_count_;
+          maybe_report_rates(now_sec);
+          return;
+        }
+      }
+      last_input_source_stamp_sec_ = source_stamp_sec;
+    }
 
     sensor_msgs::msg::Imu corrected = *msg;
     const bool stationary = stationary_confirmed(now_sec);
@@ -417,7 +446,9 @@ private:
       maybe_report_rates(now_sec);
       return;
     }
+    apply_output_angular_velocity_covariance(corrected);
     latest_corrected_imu_ = corrected;
+    ++latest_corrected_generation_;
     latest_imu_receive_sec_ = now_sec;
     latest_bias_msg_ = make_bias_msg(*msg);
 
@@ -474,6 +505,21 @@ private:
     }
   }
 
+  void apply_output_angular_velocity_covariance(sensor_msgs::msg::Imu & corrected) const
+  {
+    if (!override_output_angular_velocity_z_covariance_) {
+      return;
+    }
+
+    // The EKF only consumes body yaw-rate. Clear rotated cross terms so the
+    // overridden Z variance remains a valid diagonal measurement covariance.
+    corrected.angular_velocity_covariance[2] = 0.0;
+    corrected.angular_velocity_covariance[5] = 0.0;
+    corrected.angular_velocity_covariance[6] = 0.0;
+    corrected.angular_velocity_covariance[7] = 0.0;
+    corrected.angular_velocity_covariance[8] = output_angular_velocity_z_covariance_;
+  }
+
   std::string imu_topic_;
   std::string odom_topic_;
   std::string cmd_vel_topic_;
@@ -489,6 +535,7 @@ private:
   double odom_timeout_sec_{0.5};
   double cmd_vel_timeout_sec_{0.5};
   double stationary_required_sec_{1.0};
+  double command_motion_holdoff_sec_{1.0};
   double odom_linear_threshold_mps_{0.01};
   double odom_angular_threshold_radps_{0.01};
   double cmd_linear_threshold_mps_{0.01};
@@ -501,21 +548,22 @@ private:
   bool corrected_output_latest_on_timer_{true};
   bool corrected_output_preserve_source_stamp_{true};
   double corrected_output_max_source_age_sec_{0.20};
+  bool corrected_output_publish_only_new_sample_{true};
+  bool corrected_output_require_monotonic_stamp_{true};
+  bool override_output_angular_velocity_z_covariance_{false};
+  double output_angular_velocity_z_covariance_{0.0025};
   bool bias_publish_preserve_source_stamp_{true};
 
-  bool has_odom_{false};
-  bool has_cmd_vel_{false};
-  bool last_odom_is_stationary_{false};
-  bool last_cmd_vel_is_stationary_{false};
-  double last_odom_sec_{0.0};
-  double last_cmd_vel_sec_{0.0};
-  double stationary_since_sec_{0.0};
+  std::unique_ptr<robot_local_state::StationaryGate> stationary_gate_;
   bool bias_initialized_{false};
   geometry_msgs::msg::Vector3 bias_;
   std::optional<sensor_msgs::msg::Imu> latest_corrected_imu_;
   std::optional<geometry_msgs::msg::Vector3Stamped> latest_bias_msg_;
+  double last_input_source_stamp_sec_{0.0};
   double latest_imu_receive_sec_{0.0};
   double last_corrected_publish_sec_{0.0};
+  std::uint64_t latest_corrected_generation_{0};
+  std::uint64_t last_published_corrected_generation_{0};
   double rate_window_start_sec_{0.0};
   double rate_report_period_sec_{10.0};
   std::uint64_t input_imu_count_{0};
@@ -525,6 +573,9 @@ private:
   std::uint64_t output_corrected_window_count_{0};
   std::uint64_t output_bias_window_count_{0};
   std::uint64_t stale_corrected_skip_count_{0};
+  std::uint64_t duplicate_corrected_skip_count_{0};
+  std::uint64_t nonmonotonic_input_skip_count_{0};
+  std::uint64_t source_time_reset_count_{0};
   std::uint64_t output_transform_failure_count_{0};
 
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;

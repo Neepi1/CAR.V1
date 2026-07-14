@@ -238,10 +238,8 @@ ranger_chassis_runtime_ready() {
   local timeout_sec="${1:-${RANGER_CHASSIS_READY_TIMEOUT_SEC:-4}}"
   local odom_max_age_sec="${2:-${RANGER_CHASSIS_ODOM_MAX_AGE_SEC:-1.0}}"
   local odom_max_future_sec="${3:-${RANGER_CHASSIS_ODOM_MAX_FUTURE_SEC:-0.25}}"
-  wait_for_topic_publisher_from_node "/wheel/odom" "ranger_base_node" "${timeout_sec}" &&
-    wait_for_fresh_header_topic_message "/wheel/odom" "${timeout_sec}" "${odom_max_age_sec}" "${odom_max_future_sec}" &&
-    wait_for_topic_publisher_from_node "/motion_state" "ranger_base_node" "${timeout_sec}" &&
-    wait_for_topic_message "/motion_state" "${timeout_sec}"
+  runtime_readiness_probe ranger-chassis "${timeout_sec}" \
+    "${odom_max_age_sec}" "${odom_max_future_sec}"
 }
 
 ranger_chassis_liveness_ready() {
@@ -305,6 +303,20 @@ canonical_helper_start_ready() {
       # A just-started helper only has to stay alive. Topic/TF/service checks
       # are diagnostics, not startup gates.
       return 0
+      ;;
+  esac
+}
+
+canonical_helper_final_recheck() {
+  local helper_name="$1"
+  case "${helper_name}" in
+    local_state*|robot_local_state*)
+      LOCAL_STATE_PROCESS_START_TIMEOUT_SEC="${LOCAL_STATE_READY_RECHECK_TIMEOUT_SEC:-12}" \
+      LOCAL_STATE_START_READY_TIMEOUT_SEC="${LOCAL_STATE_READY_RECHECK_TIMEOUT_SEC:-12}" \
+        canonical_helper_start_ready "${helper_name}"
+      ;;
+    *)
+      canonical_helper_ready "${helper_name}"
       ;;
   esac
 }
@@ -397,7 +409,7 @@ start_canonical_helper() {
     return 1
   fi
   if ! canonical_helper_start_ready "${helper_name}"; then
-    if LOCAL_STATE_REUSE_READY_TIMEOUT_SEC="${LOCAL_STATE_READY_RECHECK_TIMEOUT_SEC:-12}" canonical_helper_ready "${helper_name}"; then
+    if canonical_helper_final_recheck "${helper_name}"; then
       echo "[runtime-overlay] helper became ready during final recheck: ${helper_name}" >&2
       disown "${helper_pid}" 2>/dev/null || true
       forget_canonical_helper_pid "${helper_pid}"

@@ -26,7 +26,7 @@ container common-service layer and kept alive during normal operation:
 | Service | Owner | Production role |
 | --- | --- | --- |
 | JT128 driver and canonical remap | `robot_hesai_jt128` / runtime overlay | Sensor ingress |
-| Ranger chassis driver | `robot_chassis_bridge` / Ranger driver wrapper | Wheel odom and command sink |
+| Ranger chassis core | project-maintained `ranger_base` under the `robot_chassis_bridge` boundary | Wheel odom, confirmed mode transitions, and the only CAN command sink |
 | Static robot TF | `robot_description` | Sensor extrinsics |
 | FAST-LIO2 runtime | `robot_fastlio_mapping` wrapper | Resident mapping/diagnostic frontend; optional explicit FAST-LIO local-state source |
 | Local state | `robot_local_state` | Only `odom->base_link` publisher, default wheel-only EKF with corrected IMU kept resident for safety-side spin-tail detection |
@@ -34,7 +34,6 @@ container common-service layer and kept alive during normal operation:
 | Localization bridge | `robot_localization_bridge` | Only `map->odom` publisher |
 | Local perception | `robot_local_perception` | `/perception/obstacle_points` and clearing cloud |
 | Safety arbiter | `robot_safety` | Final command gate |
-| Ranger mode controller | `ranger_mini3_mode_controller` | Chassis-mode adaptation |
 | Floor manager | `robot_floor_manager` | Atomic floor asset switching |
 | Map server | Nav2 `map_server` | Continuously running lifecycle node, map loaded by service |
 | Nav2 stack | Nav2 lifecycle nodes | Resident navigation capability, not always executing a task |
@@ -132,8 +131,8 @@ App
   -> velocity_smoother
   -> collision_monitor
   -> robot_safety
-  -> ranger_mini3_mode_controller
-  -> chassis
+  -> ranger_base
+  -> pinned UGV SDK / chassis
 ```
 
 ## Mapping Contract
@@ -211,7 +210,7 @@ window. It does not report startup failure solely because a shell probe missed
 `map->odom`, `odom->base_link`, `/global_costmap/costmap`,
 `/perception/obstacle_points`, `/safety/status`, or Nav2 lifecycle state.
 FAST-LIO2, `fastlio_odom_bridge`, `robot_local_state`, `robot_safety`, and the
-Ranger mode controller are common resident services. Lower-level localization
+Ranger chassis core are common resident services. Lower-level localization
 and Nav2 scripts may start missing helper processes, but they must not kill or
 repair canonical odom owners as part of navigation startup.
 

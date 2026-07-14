@@ -9,6 +9,7 @@ robot_local_state:
     debug: false
     publish_tf: true
     publish_acceleration: false
+    reset_on_time_jump: true
 
     map_frame: map
     odom_frame: odom
@@ -42,7 +43,4 @@ robot_local_state:
     imu0_differential: false
     imu0_relative: false
     imu0_remove_gravitational_acceleration: true
-    imu0_pose_rejection_threshold: 0.8
-    imu0_twist_rejection_threshold: 0.8
-
     use_control: false

@@ -38,6 +38,12 @@ enum class CommandSource
   DOCKING,
 };
 
+struct ReversePermit
+{
+  bool enabled{false};
+  rclcpp::Time stamp{0, 0, RCL_ROS_TIME};
+};
+
 const char * to_string(const SafetyState state)
 {
   switch (state) {
@@ -177,13 +183,22 @@ public:
       std::max(0.02, declare_parameter<double>("spin_to_drive_imu_max_age_sec", 0.10));
     mode_exit_guard_enabled_ = declare_parameter<bool>("mode_exit_guard_enabled", true);
     mode_controller_status_topic_ =
-      declare_parameter<std::string>("mode_controller_status_topic", "/ranger_mini3_mode_controller/status");
+      declare_parameter<std::string>("mode_controller_status_topic", "/ranger_base/status");
     mode_exit_guard_probe_speed_mps_ =
       std::max(0.0, declare_parameter<double>("mode_exit_guard_probe_speed_mps", 0.06));
     mode_exit_guard_timeout_sec_ =
       std::max(0.0, declare_parameter<double>("mode_exit_guard_timeout_sec", 1.0));
     mode_exit_guard_status_max_age_sec_ =
       std::max(0.05, declare_parameter<double>("mode_exit_guard_status_max_age_sec", 0.5));
+    allow_reverse_ = declare_parameter<bool>("allow_reverse", false);
+    reverse_enable_topic_ =
+      declare_parameter<std::string>("reverse_enable_topic", "/ranger_mini3/allow_reverse");
+    docking_reverse_enable_topic_ = declare_parameter<std::string>(
+      "docking_reverse_enable_topic", "/ranger_mini3/docking_allow_reverse");
+    teleop_reverse_enable_topic_ = declare_parameter<std::string>(
+      "teleop_reverse_enable_topic", "/ranger_mini3/teleop_allow_reverse");
+    reverse_enable_timeout_sec_ =
+      std::max(0.05, declare_parameter<double>("reverse_enable_timeout_sec", 0.75));
     final_cmd_lateral_deadband_mps_ =
       std::max(0.0, declare_parameter<double>("final_cmd_lateral_deadband_mps", 0.001));
     allow_api_lateral_cmd_ = declare_parameter<bool>("allow_api_lateral_cmd", false);
@@ -301,6 +316,27 @@ public:
         mode_controller_status_topic_,
         rclcpp::QoS(10),
         std::bind(&RobotSafetyNode::on_mode_controller_status, this, std::placeholders::_1));
+    }
+    if (!reverse_enable_topic_.empty()) {
+      reverse_enable_sub_ = create_subscription<std_msgs::msg::Bool>(
+        reverse_enable_topic_, rclcpp::QoS(10),
+        [this](const std_msgs::msg::Bool::SharedPtr msg) {
+          update_reverse_permit(legacy_reverse_permit_, msg->data);
+        });
+    }
+    if (!docking_reverse_enable_topic_.empty()) {
+      docking_reverse_enable_sub_ = create_subscription<std_msgs::msg::Bool>(
+        docking_reverse_enable_topic_, rclcpp::QoS(10),
+        [this](const std_msgs::msg::Bool::SharedPtr msg) {
+          update_reverse_permit(docking_reverse_permit_, msg->data);
+        });
+    }
+    if (!teleop_reverse_enable_topic_.empty()) {
+      teleop_reverse_enable_sub_ = create_subscription<std_msgs::msg::Bool>(
+        teleop_reverse_enable_topic_, rclcpp::QoS(10),
+        [this](const std_msgs::msg::Bool::SharedPtr msg) {
+          update_reverse_permit(teleop_reverse_permit_, msg->data);
+        });
     }
 
     timer_ = create_wall_timer(
@@ -618,6 +654,33 @@ private:
     latest_actual_motion_mode_time_ = now();
   }
 
+  void update_reverse_permit(ReversePermit & permit, const bool enabled)
+  {
+    permit.enabled = enabled;
+    permit.stamp = now();
+  }
+
+  bool reverse_permit_fresh(const ReversePermit & permit) const
+  {
+    return permit.enabled && permit.stamp.nanoseconds() > 0 &&
+           (now() - permit.stamp).seconds() <= reverse_enable_timeout_sec_;
+  }
+
+  bool reverse_allowed(const CommandSource source) const
+  {
+    if (allow_reverse_) {
+      return true;
+    }
+    if (source == CommandSource::DOCKING) {
+      return reverse_permit_fresh(docking_reverse_permit_);
+    }
+    if (source == CommandSource::API) {
+      return reverse_permit_fresh(legacy_reverse_permit_) ||
+             reverse_permit_fresh(teleop_reverse_permit_);
+    }
+    return reverse_permit_fresh(legacy_reverse_permit_);
+  }
+
   void on_spin_to_drive_odom(const nav_msgs::msg::Odometry::SharedPtr msg)
   {
     const double wz = msg->twist.twist.angular.z;
@@ -770,6 +833,9 @@ private:
     const CommandSource source) const
   {
     auto sanitized = cmd;
+    if (sanitized.linear.x < 0.0 && !reverse_allowed(source)) {
+      sanitized.linear.x = 0.0;
+    }
     const bool allow_lateral =
       source == CommandSource::DOCKING ||
       (source == CommandSource::API && allow_api_lateral_cmd_);
@@ -1100,10 +1166,15 @@ private:
   double spin_to_drive_local_odom_max_age_sec_{0.20};
   double spin_to_drive_imu_max_age_sec_{0.10};
   bool mode_exit_guard_enabled_{true};
-  std::string mode_controller_status_topic_{"/ranger_mini3_mode_controller/status"};
+  std::string mode_controller_status_topic_{"/ranger_base/status"};
   double mode_exit_guard_probe_speed_mps_{0.06};
   double mode_exit_guard_timeout_sec_{1.0};
   double mode_exit_guard_status_max_age_sec_{0.5};
+  bool allow_reverse_{false};
+  std::string reverse_enable_topic_{"/ranger_mini3/allow_reverse"};
+  std::string docking_reverse_enable_topic_{"/ranger_mini3/docking_allow_reverse"};
+  std::string teleop_reverse_enable_topic_{"/ranger_mini3/teleop_allow_reverse"};
+  double reverse_enable_timeout_sec_{0.75};
   double final_cmd_lateral_deadband_mps_{0.001};
   bool allow_api_lateral_cmd_{false};
   double api_lateral_max_mps_{0.10};
@@ -1137,6 +1208,9 @@ private:
   rclcpp::Time spin_to_drive_imu_stable_since_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time mode_exit_guard_started_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time latest_actual_motion_mode_time_{0, 0, RCL_ROS_TIME};
+  ReversePermit legacy_reverse_permit_;
+  ReversePermit docking_reverse_permit_;
+  ReversePermit teleop_reverse_permit_;
   rclcpp::Time zero_cmd_priority_until_time_{0, 0, RCL_ROS_TIME};
   double latest_spin_to_drive_wz_radps_{0.0};
   double latest_spin_to_drive_local_wz_radps_{0.0};
@@ -1168,6 +1242,9 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr spin_to_drive_local_odom_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr spin_to_drive_imu_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr mode_controller_status_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr reverse_enable_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr docking_reverse_enable_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr teleop_reverse_enable_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 

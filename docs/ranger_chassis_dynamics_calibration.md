@@ -50,6 +50,18 @@ Files:
 - `metrics.json`: machine-readable metrics
 - `summary.md`: human-readable result table
 
+The stop-latency probe waits for fresh `/wheel/odom`, the command publisher's
+`robot_safety` subscription, and a zero command observed on both
+`/cmd_vel_safe` and `/cmd_vel` before it starts the motion clock. The default
+discovery timeout is 10 seconds and can be changed with
+`--discovery-timeout-sec`. A readiness timeout refuses to move the chassis.
+The report separates yaw accumulated before the stop request from yaw tail
+accumulated after the stop request. Odom, local-state, motion-state, and
+corrected-IMU subscriptions are latest-only, while an independent executor
+keeps callbacks current during command publication. The report records wheel
+message age and compares wheel yaw tail with integrated
+`/lidar_imu_bias_corrected` yaw tail.
+
 ## Standard Low/Mid-Speed Test
 
 Run only in a clear area with E-stop available:
@@ -230,22 +242,211 @@ stop-instant wheel/IMU agreement before separately tuning stop-tail
 compensation. The intermediate `0.965` positive / `0.961` negative AB and the
 `0.991` positive AB were rejected for positive spin because they increased the
 stop-instant wheel/IMU error; negative `0.966` reduced the stop-instant error
-to below `1deg` in single-sample verification. A
-follow-up attempt to raise the negative default to `0.985`
-based on delivery-spin-only samples was rejected: valid two-point navigation
-still required `15cm` to `18cm` relocalization corrections and yaw residual
-worsened on the return leg.
+to below `1deg` in single-sample verification. An older attempt near `0.985`
+was inconclusive because online corrections and
+stale relocalization results were mixed into the comparison. The 2026-07-10
+bounded A/B froze bridge corrections and bracketed the same two-point route at
+`0.977672` and `1.0`. The fitted and repeated field value is `0.986000`.
 
 The temporary attempt to raise near-straight linear odom scale from `0.960` to
 `0.970` was rejected by field data: the `delivery_512355` correction worsened
 to about 15.0 cm total and lateral error grew to about 12.4 cm. The production
-overlay therefore keeps neutral SPINNING yaw scaling for the wheel odom source,
-because navigation heading is now owned by the local-state EKF using corrected
-IMU yaw-rate:
+overlay keeps the validated sign-specific SPINNING scales while wheel pose/yaw
+remains the long-term EKF anchor and corrected IMU supplies dynamic yaw-rate:
 
 ```yaml
 spinning_yaw_scale_positive: 0.976386
-spinning_yaw_scale_negative: 0.977672
+spinning_yaw_scale_negative: 0.986000
 dual_ackermann_linear_odom_scale: 0.960
 dual_ackermann_linear_odom_scale_max_abs_yaw_rate: 0.060
 ```
+
+## 2026-07-13 Dual Ackermann Near-Straight Yaw A/B
+
+A correction-frozen two-point audit separated the wheel/IMU yaw residual from
+online AMCL corrections. `/wheel/odom` and `/local_state/odometry` remained
+aligned, and the initial SPINNING residual was below one degree. The later
+near-straight custom corrections were larger than the measured full-leg
+wheel/IMU residual and had the wrong net effect:
+
+- previous near-straight scale: `1.120` for both signs
+- previous fixed bias: `-0.0041 rad/m`
+- predicted residual with those two corrections removed: about `+0.09deg` on
+  the return leg and `+0.43deg` on the outbound leg
+
+The first field A/B kept the feedback twist, near-straight linear scale, and
+sign-specific SPINNING scales unchanged, while restoring only these yaw terms
+to neutral:
+
+```yaml
+dual_ackermann_near_straight_yaw_scale_positive: 1.000
+dual_ackermann_near_straight_yaw_scale_negative: 1.000
+dual_ackermann_near_straight_yaw_bias_per_meter: 0.0
+```
+
+Three correction-frozen round trips were then run between `delivery_512355`
+and `delivery_675235`. The six legs kept `/wheel/odom` and
+`/local_state/odometry` within `0.014mm`, but the median explicit
+relocalization correction was still `13.95cm / 1.12deg`. The median full-leg
+wheel/IMU yaw residual was `-1.41deg`, so the all-neutral candidate did not
+pass the `10cm / 0.5deg` acceptance target.
+
+Replaying only DUAL_ACKERMAN intervals with `0.003 <= |wz| <= 0.060rad/s`
+separated the feedback signs:
+
+| feedback sign | intervals | wheel yaw | projected IMU yaw | fitted scale |
+|---|---:|---:|---:|---:|
+| positive | 129 | `41.044deg` | `42.733deg` | `1.041151` |
+| negative | 206 | `-77.930deg` | `-76.180deg` | `0.977549` |
+
+The next single-model A/B therefore uses those sign-specific scales while the
+per-meter bias remains neutral and the SPINNING scales remain unchanged:
+
+```yaml
+dual_ackermann_near_straight_yaw_scale_positive: 1.041151
+dual_ackermann_near_straight_yaw_scale_negative: 0.977549
+dual_ackermann_near_straight_yaw_bias_per_meter: 0.0
+```
+
+The second three-round-trip validation retained those fitted scales. Compared
+with the all-neutral baseline:
+
+| metric across six legs | neutral | sign-specific fit |
+|---|---:|---:|
+| median odom closure | `7.30cm` | `6.80cm` |
+| median absolute wheel/IMU yaw residual | `1.41deg` | `0.48deg` |
+| median explicit map->odom correction | `13.95cm` | `10.31cm` |
+| median absolute correction yaw | `1.12deg` | `0.54deg` |
+| maximum correction translation | `27.72cm` | `14.57cm` |
+
+The fitted model materially improves both directions without changing the
+linear or SPINNING scales. It remains just outside the strict `10cm / 0.5deg`
+all-leg target. The post-relocalization scan-map search itself still requested
+`2.5cm` to `12.5cm` offsets, so this dataset does not support another odom
+parameter step below that truth-source floor. Keep the fitted values until a
+surveyed pose or independent motion-capture reference is available.
+
+## 2026-07-13 Physical Marker Linear Scale
+
+Two physical floor markers, `calibration2` and `calibration3`, provide a
+`13.9557m` surveyed map baseline. With the near-straight linear scale at
+`0.960`, the wheel displacement under-reported the measured longitudinal
+travel by about `37.9cm` in one direction and `27.8cm` in the reverse
+direction. This rejects `0.960` independently of Isaac or AMCL endpoint
+corrections.
+
+The final A/B used AMCL `shadow` mode. Across both legs, `map->odom` remained
+unchanged, AMCL generated `297` candidates, and the bridge accepted zero AMCL
+corrections. Ground-marker endpoint offsets and raw wheel displacement gave:
+
+| leg | physical displacement | wheel displacement | fitted scale |
+|---|---:|---:|---:|
+| calibration3 to calibration2 | `13.6625m` | `13.7873m` | `0.99095` |
+| calibration2 to calibration3 | `13.7921m` | `13.9159m` | `0.99110` |
+
+The two independently fitted values differ by only `0.00015`. The runtime uses
+their rounded common value:
+
+```yaml
+dual_ackermann_linear_odom_scale: 0.991
+dual_ackermann_linear_odom_scale_max_abs_yaw_rate: 0.060
+```
+
+The post-apply validation retained AMCL shadow mode and accepted no AMCL
+corrections. Its independent physical-marker comparison was:
+
+| leg | physical displacement | scaled wheel displacement | distance residual |
+|---|---:|---:|---:|
+| calibration3 to calibration2 | `13.9149m` | `13.9056m` | `-9mm` (`-0.067%`) |
+| calibration2 to calibration3 | `13.9507m` | `13.9203m` | `-30mm` (`-0.218%`) |
+
+Both directions are below the `1%` wheel-distance target. The measurements are
+manual ground-marker offsets, so the small residual does not justify another
+parameter step or extra decimal place.
+
+This decision changes only near-straight linear integration. The same round
+trip still exposed a physical lateral closure mismatch: the robot closed about
+`4cm` forward and `18.5cm` right of its measured start, while wheel odom closed
+about `1.2cm` forward and `10.0cm` right. Sign-specific yaw calibration,
+SPINNING calibration, and Ackermann arc feedback therefore remain separate
+work. AMCL gating and the local-state profile are unchanged by the linear
+scale.
+
+## 2026-07-14 Spin Error Split by Callback Receipt Time
+
+`record_cmd_vel_stop_latency.sh` now records event-level callback receipt times
+for the command chain, wheel/local odometry, corrected IMU, raw IMU, and Ranger
+motion state. The primary split is the first final `/cmd_vel` zero callback
+after a nonzero command. Raw IMU three-axis norm defines physical motion onset
+and sustained stop, while corrected IMU `base_link` yaw-rate is the yaw
+reference.
+
+The `+180deg` and `-180deg` tests at `0.6rad/s` showed:
+
+| metric | positive | negative |
+|---|---:|---:|
+| zero publish to final `/cmd_vel` receipt | `1.90ms` | `5.33ms` |
+| wheel motion onset lead over IMU | `0.410s` | `0.267s` |
+| wheel - IMU before zero | `+11.709deg` | `-9.864deg` |
+| wheel - IMU after zero | `+0.449deg` | `+0.345deg` |
+| wheel - IMU total | `+12.158deg` | `-9.519deg` |
+
+The physical tail was `4.2-4.7deg`, but wheel odometry recorded it within
+`0.45deg`. The dominant mismatch therefore forms during SPINNING startup before
+the zero command, not in the stop-command transport or an unobserved tail.
+Stable wheel and IMU yaw rates agreed within about `1.1%`, so changing one
+global yaw scale would distort steady motion while hiding a transition error.
+
+The complete report and event CSV files are under
+`reports/ranger_spin_receive_time_split/`.
+
+## 2026-07-14 Mode-Aware Spin Yaw Correction
+
+The receipt-time split rejects a global yaw-scale or fixed-angle patch. The
+steady wheel and IMU rates agree, and the physical stop tail is already visible
+in wheel odom. The actionable defect is the false wheel-yaw interval created
+while Ranger reports `SPINNING` before the chassis body starts rotating.
+
+Production now uses `LOCAL_STATE_EKF_PROFILE=wheel_spin_imu`:
+
+1. Preserve upstream `/wheel/odom` unchanged for diagnostics and rollback.
+2. On actual `/motion_state.motion_mode=2`, anchor the last corrected wheel
+   x/y/yaw and start integrating `/lidar_imu_bias_corrected.angular_velocity.z`.
+3. Keep x/y fixed for a pure spin and continue IMU integration after the final
+   zero command until yaw-rate stays below `0.02rad/s` for `0.30s`.
+4. Preserve the resulting x/y/yaw offsets when wheel odom resumes, so the
+   published pose is continuous rather than jumping at the mode boundary.
+5. Fall back to raw wheel odom if IMU age exceeds `0.20s`; force bounded spin
+   completion after `2.0s` of zero command if the stop detector cannot settle.
+6. Feed corrected wheel `x/y/yaw/vx` and corrected IMU yaw-rate to the EKF.
+   Wheel yaw-rate is excluded from this profile to avoid duplicate dynamic yaw
+   inputs.
+
+This changes neither Ranger SDK output nor FAST-LIO2 inputs. TF ownership also
+stays unchanged: `robot_local_state` remains the only `odom -> base_link`
+publisher. Rollback is one profile change to `wheel_imu`, followed by a full
+`njrh-runtime.service` restart.
+
+Validation results:
+
+| test | corrected result | fallback/gap |
+|---|---:|---:|
+| shadow `+180deg @ 0.6rad/s` | corrected - IMU `+0.030deg` | `0 / 0` |
+| shadow `-180deg @ 0.6rad/s` | corrected - IMU `+0.018deg` | `0 / 0` |
+| production `+90deg @ 0.6rad/s` | local - IMU `+0.114deg`, x/y drift `0.16mm` | `0 / 0` |
+| production `-90deg @ 0.6rad/s` | local - IMU `-0.019deg`, x/y drift below sample resolution | `0 / 0` |
+| `delivery_675235 -> delivery_512355` | `5.00cm / 0.22deg`, AMCL accepted `0` | no navigation failure |
+| `delivery_512355 -> delivery_675235` | `4.78cm / 0.55deg`, AMCL accepted `0` | no navigation failure |
+
+After the production spin and navigation runs, the status counters were
+`completed=6`, `imu_fallback=0`, `imu_gap=0`, and `forced_settle=1`. The forced
+settle is the bounded `2.0s` zero-command completion path, not an IMU outage;
+retain this counter in longer repeatability tests rather than silently treating
+it as an ordinary settle.
+
+The two navigation reports are
+`/tmp/spin_imu_to_512_20260714_01/summary.md` and
+`/tmp/spin_imu_return_675_20260714_01/summary.md` on the Jetson container.
+AMCL remained in shadow mode. Its maximum candidates (`0.407m` and `0.933m`)
+were not accepted and must be diagnosed as scan-map/localization candidates,
+not attributed to this local odom correction.

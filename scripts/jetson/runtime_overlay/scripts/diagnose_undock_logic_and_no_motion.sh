@@ -182,7 +182,7 @@ paths = {
     "nav2_overlay": root / "scripts/jetson/runtime_overlay/config/nav2.yaml",
     "docking_cpp": root / "src/robot_docking_manager/src/docking_manager_node.cpp",
     "safety_cpp": root / "src/robot_safety/src/robot_safety_node.cpp",
-    "mode_cpp": root / "src/ranger_mini3_mode_controller/src/mode_controller_node.cpp",
+    "mode_cpp": root / "src/ranger_base/src/ranger_messenger.cpp",
 }
 
 def text(name):

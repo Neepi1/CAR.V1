@@ -148,9 +148,10 @@ Common startup no longer blocks resident navigation autostart on a duplicate
 `NJRH_COMMON_REQUIRE_FLATSCAN_BEFORE_RESIDENT_AUTOSTART=true` only for strict
 field isolation. The resident localization gate remains the authoritative
 publisher-owner confirmation
-(`NJRH_INITIAL_LOCALIZATION_FLATSCAN_WAIT_SEC=20` by default) and uses the same
-repair path for up to `NJRH_INITIAL_LOCALIZATION_FLATSCAN_REPAIR_WAIT_SEC=60`;
-it still does not trigger global localization until `/flatscan` is observable.
+(`NJRH_INITIAL_LOCALIZATION_FLATSCAN_WAIT_SEC=20` by default). Phase S4 makes
+that gate consumer-only: it trusts a fresh healthy supervisor status or waits
+for the publisher, but never starts or restarts the common pointcloud owner. It
+still does not trigger global localization until `/flatscan` is observable.
 Common startup treats `robot_local_state` direct readiness as the hard local
 state gate: the helper must expose the endpoint and fresh `odom -> base_link`.
 `runtime_health_guard` starts before `robot_local_state` so its ROS graph and TF
@@ -304,9 +305,11 @@ window is bounded (`NJRH_GLOBAL_LOCALIZATION_TRIGGER_CALL_TIMEOUT`, default
 `isaac_triggered_pose_stale_ms` with `gate_mode=triggered` are treated as
 transient old Isaac results: the wrapper refuses the stale pose, shortens the
 active bridge-accept deadline to
-`transient_stale_bridge_accept_timeout_sec` (3 seconds by default), and lets the
-resident runtime re-trigger Isaac for a fresh result instead of waiting for the
-full normal bridge timeout. Other bridge rejections remain terminal. Common
+`transient_stale_bridge_accept_timeout_sec` (8 seconds by default). A result
+stamped before force-accept was armed is also ignored without ending the
+request; the wrapper keeps the same trigger armed for the following fresh
+result. Only expiry of that same-trigger window lets the resident runtime
+re-trigger Isaac. Other bridge rejections remain terminal. Common
 startup also removes stale diagnostics plus exact AMCL lifecycle
 `ros2 service call /amcl/(change_state|get_state)` clients before resident
 navigation starts, so one-shot CLI clients cannot survive into the next boot and

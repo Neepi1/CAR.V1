@@ -138,7 +138,7 @@ robot_api_server:
     docking_fine_bridge_smoothing_zero_cmd_during_wait: true
     docking_pause_global_correction_during_fine: true
     localization_bridge_correction_pause_service: "/robot_localization_bridge/set_correction_paused"
-    mode_controller_status_topic: "/ranger_mini3_mode_controller/status"
+    mode_controller_status_topic: "/ranger_base/status"
     mapping_2d_live_map_topic: "/map"
     mapping_2d_live_map_max_age_sec: 3.0
     scan_topic: "/scan"
@@ -248,13 +248,22 @@ robot_api_server:
     post_nav2_final_verify_reverse_enable_topic: "/ranger_mini3/allow_reverse"
     post_nav2_final_verify_terminal_lateral_correction_enabled: true
     post_nav2_final_verify_terminal_lateral_target_m: 0.03
-    post_nav2_final_verify_terminal_lateral_trigger_m: 0.07
+    post_nav2_final_verify_terminal_lateral_trigger_m: 0.04
     post_nav2_final_verify_terminal_lateral_max_xy_m: 0.30
     post_nav2_final_verify_terminal_lateral_max_forward_m: 0.12
-    post_nav2_final_verify_terminal_lateral_speed_mps: 0.08
+    post_nav2_final_verify_terminal_lateral_speed_mps: 0.04
     post_nav2_final_verify_terminal_lateral_kp: 0.8
     post_nav2_final_verify_terminal_lateral_timeout_sec: 8.0
     post_nav2_final_verify_terminal_lateral_command_sign: 1.0
+    post_nav2_final_verify_terminal_settle_enabled: true
+    post_nav2_final_verify_terminal_settle_linear_speed_threshold_mps: 0.01
+    post_nav2_final_verify_terminal_settle_angular_speed_threshold_radps: 0.02
+    post_nav2_final_verify_terminal_settle_stable_duration_sec: 0.30
+    post_nav2_final_verify_terminal_settle_timeout_sec: 2.50
+    post_nav2_final_verify_terminal_settle_odom_max_age_sec: 0.20
+    post_nav2_final_verify_terminal_settle_require_dual_ackermann_mode: true
+    post_nav2_final_verify_terminal_settle_mode_status_max_age_sec: 0.50
+    post_nav2_final_verify_terminal_settle_max_recheck_count: 1
     navigation_near_goal_stalled_handoff_enabled: true
     navigation_near_goal_stalled_handoff_distance_m: 0.30
     navigation_near_goal_stalled_handoff_min_wait_sec: 3.0

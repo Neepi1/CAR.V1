@@ -21,6 +21,7 @@ PAUSE_CORRECTION="true"
 CORRECTION_PAUSE_SERVICE="/robot_localization_bridge/set_correction_paused"
 ANGLE_TOLERANCE_DEG="1.0"
 MAX_EXTRA_SEC="8.0"
+FEEDBACK_MAX_AGE_SEC="0.20"
 
 usage() {
   cat <<'EOF'
@@ -44,6 +45,7 @@ Options:
   --no-pause-correction   Do not call bridge correction pause service.
   --angle-tolerance-deg N Stop tolerance. Default: 1.0
   --max-extra-sec SEC     Extra timeout beyond target/speed. Default: 8.0
+  --feedback-max-age-sec SEC Abort if wheel odom is older than this. Default: 0.20
 
 The command path remains:
   test script -> /cmd_vel_collision_checked -> robot_safety -> /cmd_vel -> ranger_base
@@ -109,6 +111,10 @@ while [[ "$#" -gt 0 ]]; do
       MAX_EXTRA_SEC="${2:-}"
       shift 2
       ;;
+    --feedback-max-age-sec)
+      FEEDBACK_MAX_AGE_SEC="${2:-}"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -148,6 +154,7 @@ mkdir -p "${OUT_DIR}"
   echo "- local_odom_topic: ${LOCAL_ODOM_TOPIC}"
   echo "- pause_correction: ${PAUSE_CORRECTION}"
   echo "- correction_pause_service: ${CORRECTION_PAUSE_SERVICE}"
+  echo "- feedback_max_age_sec: ${FEEDBACK_MAX_AGE_SEC}"
   echo "- rmw: ${RMW_IMPLEMENTATION:-}"
   echo
   echo "## ROS Nodes"
@@ -195,12 +202,14 @@ python3 - \
   "${PAUSE_CORRECTION}" \
   "${CORRECTION_PAUSE_SERVICE}" \
   "${ANGLE_TOLERANCE_DEG}" \
-  "${MAX_EXTRA_SEC}" <<'PY'
+  "${MAX_EXTRA_SEC}" \
+  "${FEEDBACK_MAX_AGE_SEC}" <<'PY'
 import csv
 import json
 import math
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -208,6 +217,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import rclpy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
@@ -227,6 +237,7 @@ pause_correction = sys.argv[10].lower() == "true"
 correction_pause_service = sys.argv[11]
 angle_tolerance = math.radians(abs(float(sys.argv[12])))
 max_extra_sec = float(sys.argv[13])
+feedback_max_age_sec = float(sys.argv[14])
 
 if angular_speed <= 0.0:
     raise SystemExit("angular speed must be positive")
@@ -234,6 +245,8 @@ if repeat < 1:
     raise SystemExit("repeat must be >= 1")
 if sample_hz <= 0.0:
     raise SystemExit("sample_hz must be positive")
+if feedback_max_age_sec <= 0.0:
+    raise SystemExit("feedback_max_age_sec must be positive")
 
 angles_deg = [float(x.strip()) for x in angles_deg_text.split(",") if x.strip()]
 if not angles_deg:
@@ -282,8 +295,8 @@ class SegmentResult:
 class SpinNode(Node):
     def __init__(self) -> None:
         super().__init__("ranger_spin_odom_test")
-        qos = QoSProfile(depth=50)
-        telemetry_qos = QoSProfile(depth=50)
+        qos = QoSProfile(depth=1)
+        telemetry_qos = QoSProfile(depth=1)
         telemetry_qos.reliability = ReliabilityPolicy.BEST_EFFORT
         self.cmd_pub = self.create_publisher(Twist, cmd_topic, qos)
         self.pause_client = self.create_client(SetBool, correction_pause_service)
@@ -294,6 +307,7 @@ class SpinNode(Node):
         self.safety_status = ""
         self.mode_status = ""
         self.bridge_status = ""
+        self.wheel_odom_received_at: Optional[float] = None
         self.create_subscription(Odometry, odom_topic, self._wheel_cb, telemetry_qos)
         self.create_subscription(Odometry, local_odom_topic, self._local_cb, telemetry_qos)
         self.create_subscription(Twist, "/cmd_vel_safe", self._cmd_safe_cb, telemetry_qos)
@@ -304,6 +318,7 @@ class SpinNode(Node):
 
     def _wheel_cb(self, msg: Odometry) -> None:
         self.wheel_odom = msg
+        self.wheel_odom_received_at = time.monotonic()
 
     def _local_cb(self, msg: Odometry) -> None:
         self.local_odom = msg
@@ -325,15 +340,24 @@ class SpinNode(Node):
 
     def spin_some(self, duration: float) -> None:
         deadline = time.monotonic() + duration
-        while time.monotonic() < deadline:
-            rclpy.spin_once(self, timeout_sec=0.02)
+        while time.monotonic() < deadline and rclpy.ok():
+            time.sleep(0.01)
+
+    def wheel_odom_age_sec(self, now: Optional[float] = None) -> float:
+        if self.wheel_odom_received_at is None:
+            return math.inf
+        current = time.monotonic() if now is None else now
+        return max(0.0, current - self.wheel_odom_received_at)
+
+    def wheel_odom_is_fresh(self, now: Optional[float] = None) -> bool:
+        return self.wheel_odom is not None and self.wheel_odom_age_sec(now) <= feedback_max_age_sec
 
     def wait_for_odom(self, timeout_sec: float = 5.0) -> bool:
         deadline = time.monotonic() + timeout_sec
         while time.monotonic() < deadline and rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=0.05)
-            if self.wheel_odom is not None:
+            if self.wheel_odom_is_fresh():
                 return True
+            time.sleep(0.01)
         return False
 
     def set_correction_pause(self, paused: bool) -> str:
@@ -344,7 +368,9 @@ class SpinNode(Node):
         req = SetBool.Request()
         req.data = paused
         future = self.pause_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=4.0)
+        deadline = time.monotonic() + 4.0
+        while not future.done() and time.monotonic() < deadline and rclpy.ok():
+            time.sleep(0.01)
         if not future.done():
             return "timeout"
         result = future.result()
@@ -359,7 +385,6 @@ class SpinNode(Node):
         end = time.monotonic() + duration
         while time.monotonic() < end and rclpy.ok():
             self.publish_cmd(0.0)
-            rclpy.spin_once(self, timeout_sec=0.02)
             time.sleep(0.03)
 
 
@@ -399,8 +424,9 @@ def run_segment(node: SpinNode, index: int, target_deg: float, writer: csv.DictW
     commanded_wz = direction * angular_speed
     timeout_sec = target_abs / angular_speed + max_extra_sec
 
-    if node.wheel_odom is None:
-        return SegmentResult(index, target_deg, False, "missing_initial_wheel_odom", 0.0, 0.0, None, 0.0, None, 0.0, 0.0, node.safety_status, node.mode_status)
+    if not node.wheel_odom_is_fresh():
+        reason = "missing_initial_wheel_odom" if node.wheel_odom is None else "stale_initial_wheel_odom"
+        return SegmentResult(index, target_deg, False, reason, 0.0, 0.0, None, 0.0, None, 0.0, 0.0, node.safety_status, node.mode_status)
 
     start_wheel = odom_pose(node.wheel_odom)
     start_local = pose_or_none(node.local_odom)
@@ -425,8 +451,13 @@ def run_segment(node: SpinNode, index: int, target_deg: float, writer: csv.DictW
             reason = "timeout"
             break
 
+        wheel_odom_age = node.wheel_odom_age_sec(now)
+        if wheel_odom_age > feedback_max_age_sec:
+            ok = False
+            reason = f"wheel_odom_stale_age_{wheel_odom_age:.3f}s"
+            break
+
         node.publish_cmd(commanded_wz)
-        rclpy.spin_once(node, timeout_sec=0.01)
 
         if node.wheel_odom is not None:
             wheel_pose = odom_pose(node.wheel_odom)
@@ -464,6 +495,7 @@ def run_segment(node: SpinNode, index: int, target_deg: float, writer: csv.DictW
                 "wheel_y": f"{wheel_pose[1]:.6f}",
                 "wheel_yaw": f"{wheel_pose[2]:.6f}",
                 "wheel_yaw_accum": f"{wheel_yaw_accum:.6f}",
+                "wheel_odom_receive_age_sec": f"{wheel_odom_age:.6f}",
                 "local_x": "" if local_pose is None else f"{local_pose[0]:.6f}",
                 "local_y": "" if local_pose is None else f"{local_pose[1]:.6f}",
                 "local_yaw": "" if local_pose is None else f"{local_pose[2]:.6f}",
@@ -486,7 +518,6 @@ def run_segment(node: SpinNode, index: int, target_deg: float, writer: csv.DictW
     settle_until = time.monotonic() + settle_sec
     while time.monotonic() < settle_until and rclpy.ok():
         node.publish_cmd(0.0)
-        rclpy.spin_once(node, timeout_sec=0.02)
         time.sleep(0.03)
 
     end_wheel = odom_pose(node.wheel_odom) if node.wheel_odom is not None else start_wheel
@@ -522,6 +553,14 @@ def run_segment(node: SpinNode, index: int, target_deg: float, writer: csv.DictW
 def main() -> int:
     rclpy.init(args=None)
     node = SpinNode()
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+    executor_thread = threading.Thread(
+        target=executor.spin,
+        name="ranger_spin_test_callbacks",
+        daemon=True,
+    )
+    executor_thread.start()
     results: List[SegmentResult] = []
     pause_enable_result = "not_called"
     pause_disable_result = "not_called"
@@ -542,6 +581,7 @@ def main() -> int:
                 "wheel_y",
                 "wheel_yaw",
                 "wheel_yaw_accum",
+                "wheel_odom_receive_age_sec",
                 "local_x",
                 "local_y",
                 "local_yaw",
@@ -591,6 +631,7 @@ def main() -> int:
                 f.write(f"- repeat: `{repeat}`\n")
                 f.write(f"- cmd_topic: `{cmd_topic}`\n")
                 f.write(f"- odom_topic: `{odom_topic}`\n")
+                f.write(f"- feedback_max_age_sec: `{feedback_max_age_sec:.3f}`\n")
                 f.write(f"- pause_correction_enable: `{pause_enable_result}`\n")
                 f.write(f"- pause_correction_disable: `{pause_disable_result}`\n")
                 if bridge_status:
@@ -620,6 +661,8 @@ def main() -> int:
                     f.write(results[-1].mode_status)
                     f.write("\n```\n")
         finally:
+            executor.shutdown(timeout_sec=2.0)
+            executor_thread.join(timeout=2.0)
             node.destroy_node()
             if rclpy.ok():
                 rclpy.shutdown()

@@ -13,6 +13,7 @@ log_common_startup_stage() {
 log_common_startup_stage "script_start"
 source "${SCRIPT_DIR}/canonical_tf_helpers.sh"
 source "${SCRIPT_DIR}/nav_runtime_helpers.sh"
+source "${SCRIPT_DIR}/floor_asset_helpers.sh"
 source "${SCRIPT_DIR}/cpu_affinity.sh"
 source "${SCRIPT_DIR}/pointcloud_accel_profile.sh"
 log_common_startup_stage "helpers_loaded"
@@ -99,6 +100,7 @@ start_common_process() {
   fi
 
   mkdir -p "${NJRH_RUNTIME_LOG_DIR}"
+  rotate_runtime_log "${log_file}"
   echo "[runtime-overlay] starting ${name}" >&2
   "$@" >>"${log_file}" 2>&1 &
   local pid=$!
@@ -447,6 +449,9 @@ start_resident_navigation_autostart_if_selected() {
   [[ "${resident_navigation_autostart_started}" -eq 0 ]] || return 0
   resolve_resident_navigation_autostart_selection
   [[ -n "${autostart_floor_id}" ]] || return 0
+  resolve_floor_assets_if_needed "${autostart_building_id}" "${autostart_floor_id}"
+  autostart_map_id="${NJRH_NAV_MAP_ID:-${autostart_map_id}}"
+  autostart_display_name="${NJRH_NAV_MAP_NAME:-${autostart_display_name}}"
 
   prepare_resident_navigation_autostart
   if common_require_flatscan_before_resident_autostart; then
@@ -621,12 +626,15 @@ fastlio_pid_is_mapping_owned() {
 }
 
 stop_non_mapping_fastlio_runtime_processes() {
+  local pattern="ros2 run fast_lio fastlio_mapping|fast_lio/lib/fast_lio/fastlio_mapping|fast_lio/fastlio_mapping|fastlio_mapping --ros-args|laser_mapping"
+  local candidates=()
   local pids=()
-  local proc pid
-  for proc in /proc/[0-9]*; do
-    [[ -r "${proc}/cmdline" ]] || continue
-    pid="${proc##*/}"
-    tr '\0' ' ' <"${proc}/cmdline" | grep -Eq "ros2 run fast_lio fastlio_mapping|fast_lio/lib/fast_lio/fastlio_mapping|fast_lio/fastlio_mapping|fastlio_mapping --ros-args|laser_mapping" || continue
+  local cmdline pid
+  mapfile -t candidates < <(pgrep -f "${pattern}" 2>/dev/null || true)
+  for pid in "${candidates[@]}"; do
+    [[ -r "/proc/${pid}/cmdline" ]] || continue
+    cmdline="$(tr '\0' ' ' <"/proc/${pid}/cmdline")"
+    grep -Eq "${pattern}" <<<"${cmdline}" || continue
     fastlio_pid_is_mapping_owned "${pid}" && continue
     pids+=("${pid}")
   done
@@ -831,8 +839,7 @@ start_overlay_helper "floor_manager_common" bash "${SCRIPT_DIR}/run_floor_manage
 log_common_startup_stage "floor_manager_ready"
 start_overlay_helper "robot_safety_common" bash "${SCRIPT_DIR}/run_robot_safety.sh"
 log_common_startup_stage "robot_safety_ready"
-start_overlay_helper "ranger_mini3_mode_controller_common" bash "${SCRIPT_DIR}/run_ranger_mini3_mode_controller.sh"
-log_common_startup_stage "mode_controller_ready"
+log_common_startup_stage "ranger_chassis_core_ready"
 if [[ "${NJRH_DOCKING_MANAGER_AUTOSTART:-true}" == "true" ]]; then
   start_common_process "docking_manager" "robot_docking_manager/docking_manager_node|docking_manager_node --ros-args|run_docking_manager.sh" \
     bash "${SCRIPT_DIR}/run_docking_manager.sh"
