@@ -10,6 +10,9 @@ Final command arbitration point before the chassis bridge.
 - safe command mirror: `/cmd_vel_safe` (diagnostic only)
 - estop input: `/safety/estop`
 - optional localization gate: `/localization/health`
+- owner-scoped motion hold service: `/safety/set_motion_hold`
+- execution lease service: `/safety/set_execution_lease`
+- motion interlock state: `/safety/motion_interlock_state`
 - state output: `/safety/status`
 - motion-allowed output: `/safety/motion_allowed`
 
@@ -22,10 +25,16 @@ Command topics are treated as latest-only control streams, not durable command q
 The current arbitration order is:
 
 1. `ESTOP_ACTIVE`
-2. `LOCALIZATION_INVALID` when `require_localization_health=true`
-3. `COMMAND_STALE` when upstream control stops refreshing commands inside the watchdog window
-4. `DOCKED_CONTACT_BLOCK` when normal motion is requested while docked or charging
-5. `OK`
+2. `MISSION_MOTION_HOLD` while one or more owner-scoped holds exist
+3. `EXECUTION_LEASE_MISSING` after an execution session has engaged and its lease is absent or expired
+4. `EXECUTION_MODE_INVALID` when the matching special-mode lease is absent,
+   stale, expired, or owned by another mission
+5. `EXECUTION_SOURCE_BLOCKED` when API or docking velocity attempts to preempt
+   a healthy elevator execution session
+6. `LOCALIZATION_INVALID` when `require_localization_health=true`
+7. `DOCKED_CONTACT_BLOCK` when normal motion is requested while docked or charging
+8. `COMMAND_STALE` when upstream control stops refreshing commands inside the watchdog window
+9. `OK`
 
 When a fresh `/cmd_vel_docking` message exists, normal `/cmd_vel_collision_checked` messages are ignored for `docking_cmd_priority_timeout_sec`. This keeps App zero bursts and Nav2/collision-monitor zero output from interleaving with controlled docking motion.
 
@@ -33,17 +42,165 @@ After a pure yaw command, `robot_safety` can hold the first following linear com
 
 After docking or lateral capture, the Ranger chassis can keep reporting `MOTION_MODE_PARALLEL` while all command topics are already zero. `robot_safety` observes `/ranger_base/status` for its outer mode-exit guard. The authoritative transition is now inside `ranger_base`: any probe or requested drive is held at zero until the firmware confirms DUAL_ACKERMAN, so a safety-layer probe cannot leak physical motion during mode change. Docking commands are exempt from the outer guard so fine docking can intentionally request lateral motion; the chassis core still performs the same confirmed transition.
 
-API terminal pose recovery may also need a small side-slip command after Nav2 reaches a normal goal but final pose verification still sees a lateral residual. When `allow_api_lateral_cmd=true`, `robot_safety` passes bounded `/cmd_vel_api.linear.y` through the same final arbitration path and clamps it with `api_lateral_max_mps`; `ranger_base` derives and confirms the required lateral chassis mode from that Twist. Normal Nav2 commands remain lateral-zeroed.
+Terminal pose recovery may need a small side-slip command after Ackermann MPPI reaches a lateral-dominant residual. API fallback remains bounded by `allow_api_lateral_cmd` and `api_lateral_max_mps`. The controller-native path is fail-closed: normal Nav2 `linear.y` remains zero unless `GoalScopedRotationShimController` publishes a fresh `/ranger_mini3/nav_terminal_lateral_enable` lease, and the accepted command is clamped by `normal_navigation_lateral_max_mps`. `ranger_base` derives and confirms the required lateral chassis mode from the final Twist.
 
 For push-in spring charging docks, controlled undocking must be a continuous low-speed motion through the charger switch travel. `robot_safety` stores the last fresh `/cmd_vel_docking` command and republishes it from the safety timer while the docking-priority window is active, so watchdog/status refreshes do not insert zero commands between valid undock updates.
 
-When `block_normal_motion_when_docked=true`, BMS contact, `/docking/status` docked/charging, or the persistent dock-contact latch blocks normal `/cmd_vel_collision_checked` output and publishes zero with `/safety/status=DOCKED_CONTACT_BLOCK`. A latch is treated as stale safety memory when fresh BMS says no contact and there is no current docked/charging status, so an old latch cannot permanently block navigation after a clean no-contact state is visible. `allow_docking_cmd_when_docked=true` preserves `/cmd_vel_docking` so the controlled docking/undocking owner can still move. The watchdog timer evaluates a fresh docking command in docking context, so the dock/contact interlock does not insert zero commands between valid `/cmd_vel_docking` updates.
+When `block_normal_motion_when_docked=true`, BMS contact, `/docking/status` docked/charging, or the persistent dock-contact latch blocks normal `/cmd_vel_collision_checked` output and publishes zero with `/safety/status=DOCKED_CONTACT_BLOCK`. A latch is treated as stale safety memory when fresh BMS says no contact and there is no current docked/charging status, so an old latch cannot permanently block navigation after a clean no-contact state is visible. `allow_docking_cmd_when_docked=true` keeps the docking channel available, but it no longer means that every docking Twist is legal after electrical contact. With `bms_docking_interlock_enabled=true`, the first fresh BMS contact immediately clears the cached docking command and publishes zero. That electrical-contact event is latched inside the final arbiter, so forward, lateral, and angular docking commands remain hard-blocked even if BMS messages later become stale or another publisher continues sending them. Only an exact zero or a pure negative-X command with a fresh controlled-undock reverse permit is accepted. The latch is released only after that explicit reverse session ends and fresh BMS feedback confirms no contact.
 
 When any blocking state is active, the node publishes a zero twist and latches the current safety state on `/safety/status`.
+
+## P6 Mission And Elevator Motion Interlock
+
+The P6 interlock cross-checks the operating-mode control plane without allowing
+that plane to publish velocity. A `DOORWAY` or `ELEVATOR_RIDE` mode does not
+authorize motion by itself; only the final arbiter can pass a command to
+`/cmd_vel`.
+
+### Owner-scoped motion hold
+
+`SetMotionHold` identifies a hold by the exact `(owner, transaction_id)` tuple.
+Acquire additionally requires a non-empty reason.
+
+- Holds from different transactions compose. Motion remains blocked until every
+  hold has been released by its exact owner and transaction.
+- An anonymous client or another owner cannot release a hold.
+- Repeating the same acquire is idempotent; changing its reason updates the
+  existing record.
+- A hold has no TTL. It remains active for the lifetime of the safety process
+  until exact release. Restart is not a release protocol: startup still
+  publishes zero, and recovery must reconstruct and validate mission state
+  before any new motion.
+- A hold dominates an otherwise healthy execution lease.
+
+The elevator failure order is always: acquire or confirm the hold, request
+cancel of the one active Nav2 goal, wait for the action terminal state, then
+verify fresh wheel/local odometry is settled. Destroying an FSM or returning a
+failed action result must not release the hold.
+
+### Execution lease and failure lock
+
+Normal navigation behavior is unchanged while no P6 execution session is
+engaged. Once `SetExecutionLease(OP_SET)` opens a session, the exact
+`owner + mission_id + transaction_id + lease_id` must renew it before the
+steady-clock TTL expires.
+
+- Configured lease duration is bounded by `min_execution_lease_sec` and
+  `max_execution_lease_sec`.
+- Renewal is accepted only for the exact active tuple.
+- An unrelated lease cannot take over an active session.
+- Expiry retires the lease but deliberately leaves the session engaged.
+  Consequently the arbiter remains in `EXECUTION_LEASE_MISSING` and continues
+  publishing zero. It does not silently return to ordinary motion.
+- Only the configured `execution_recovery_owner` may acquire a recovery lease
+  for an expired, failure-locked session.
+- Exact release closes a healthy or recovered session. Retired lease IDs cannot
+  be reused.
+- A healthy session only permits the normal Nav2/collision-monitor source.
+  `/cmd_vel_api` and `/cmd_vel_docking` are blocked for the whole session.
+- `ELEVATOR_WAIT`, `ELEVATOR_RIDE`, `DOORWAY`, and `RECOVERY` require a fresh
+  `/robot_mode/state` lease with the same owner and mission as the execution
+  session. Safety uses the earlier of heartbeat timeout and advertised mode
+  lease expiry; mode fallback to `NORMAL` or a lost heartbeat stops motion.
+
+Execution TTL and reverse/lateral permit freshness are evaluated with
+`std::chrono::steady_clock`, so ROS time pause or rollback cannot extend
+physical motion authority. Any accepted interlock transition clears cached
+API/docking commands, reverse/lateral permits, and starts a stop-dominant zero
+window; an old command or permit cannot be replayed simply because a hold was
+released.
+
+Safety-stop publication is callback-synchronous, not deferred to
+`publish_rate_hz`. A motion-hold or execution-lease service decision publishes
+zero immediately whenever the interlock changed, and also whenever the final
+combined snapshot is blocked even if the pure decision itself was unchanged.
+An operating-mode state change follows the same rule: it clears cached
+commands/permits and publishes zero in the mode subscription callback; an
+unchanged but blocked mode snapshot also publishes zero. The timer remains the
+watchdog and refresh path, not the first stop path.
+
+`MotionInterlockState.motion_blocked` remains the low-level hold/execution-TTL
+arbiter state. `interlock_effective_motion_blocked` additionally includes the
+mode contract for the normal Nav2 source, while `normal_source_only` exposes
+source restriction. `/safety/motion_allowed` remains authoritative for the
+combined estop, localization, dock, watchdog, and interlock decision.
+
+The owner strings coordinate components; they are not authentication. Without
+SROS 2, deployment access control must not treat them as security identities.
+
+### Isolated validation
+
+The pure arbiter regression is
+`test/test_motion_interlock_arbiter.cpp`. It covers composed holds, exact-owner
+release, hold precedence, TTL expiry, failure lock, exact renewal/release,
+conflicting leases, recovery ownership, and no-mutation rejection paths.
+
+The only recommended command for the isolated ROS graph smoke is:
+
+```bash
+bash /workspaces/njrh-v3/workspace1/src/robot_safety/test/run_isolated_interlock_smoke.sh
+```
+
+Do not invoke `isolated_interlock_smoke.py` directly. The wrapper fixes
+`ROS_DOMAIN_ID=181`, sets `allow_reverse=true`, and starts a dedicated safety
+node with normal, API, docking, output, mirror, operating-mode, and all reverse
+or lateral permit topics under `/p6_test/*`. It deliberately lowers
+`publish_rate_hz` to `1.0`: after synchronizing with the slow timer, the smoke
+acquires an execution lease and requires finite zero output from the service
+callback before the next one-second timer tick. It must still run with no live
+runtime container, chassis bridge, or `/cmd_vel` connection. Its `EXIT` trap
+terminates and waits for the isolated node and removes the temporary log on
+success, failure, or interruption.
+
+The smoke test proves limited synthetic facts: hold/release behavior,
+execution-lease expiry, API-source blocking during a healthy session,
+normal-Nav2-source passage, owner/mission mismatch blocking, and advertised
+mode-lease expiry taking effect before the heartbeat timeout. With global
+reverse deliberately enabled, it also proves docking reverse cannot bypass the
+docking-specific permit. Non-finite Twist commands injected independently on
+the normal, API, and docking sources must all produce finite zero output. This
+is not a hardware stop-distance test and is not currently registered as an
+automatic launch test.
+
+`robot_elevator_manager/test/test_nonmoving_cross_floor_scenario.cpp` also
+composes this pure interlock with the mission, elevator, floor-transition,
+mode, and correction-pause cores. It verifies the successful synthetic path
+finishes with no hold or execution session. That GTest uses no ROS node, Twist
+publisher, chassis connection, real Nav2 goal, or hardware motion.
+
+### Real hardware release gate
+
+Do not enable real elevator motion merely because the interfaces, unit tests,
+or isolated smoke test pass. Hardware release additionally requires:
+
+1. one and only one production `robot_safety` instance and `/cmd_vel` publisher;
+2. verified hold-to-final-zero propagation through
+   `velocity_smoother -> collision_monitor -> robot_safety -> ranger_base`;
+3. measured stop latency and stopping distance at the elevator speed limits;
+4. process-kill and heartbeat-loss tests while a Nav2 goal is active;
+5. proof that hold release does not replay cached nonzero API, docking, or Nav2
+   commands;
+6. restart recovery that cancels orphan goals and reacquires hold before any
+   motion;
+7. door-closing, stale observation, arm-not-stowed, localization-transition,
+   and footprint-straddling fault injection;
+8. an empty, stationary elevator acceptance before loaded or public operation.
+
+Until the floor/elevator/mission ROS adapters, real floor assets, and the
+arm/vision evidence sources are integrated, these interlocks are infrastructure
+only and do not authorize a real elevator entry or exit.
 
 ## Parameters
 
 - `watchdog_timeout_sec`: stop the robot when upstream control stalls
+- `min_execution_lease_sec`: minimum accepted P6 execution TTL, default `0.20`
+- `max_execution_lease_sec`: maximum accepted P6 execution TTL, default `5.0`
+- `execution_recovery_owner`: only owner allowed to recover an expired execution session, default `robot_mission_manager`
+- `motion_hold_service`: owner-scoped hold endpoint, default `/safety/set_motion_hold`
+- `execution_lease_service`: execution heartbeat endpoint, default `/safety/set_execution_lease`
+- `motion_interlock_state_topic`: transient-local interlock diagnostics, default `/safety/motion_interlock_state`
+- `execution_mode_state_topic`: operating-mode heartbeat cross-checked during special sessions, default `/robot_mode/state`
+- `execution_mode_state_timeout_sec`: maximum mode-heartbeat age; advertised lease expiry may stop earlier, default `0.75`
 - `cmd_vel_qos_depth`: Twist command stream QoS depth, default `1` for latest-only velocity control
 - `zero_cmd_priority_enabled`: make near-zero Twist commands immediately stop-dominant for the active command owner
 - `zero_cmd_priority_epsilon`: absolute per-axis Twist threshold treated as a zero command
@@ -62,6 +219,8 @@ When any blocking state is active, the node publishes a zero twist and latches t
 - `docking_status_topic`: docking status input for docked/charging evidence
 - `docking_contact_latch_file`: persistent explicit dock-contact state shared with API/docking manager
 - `allow_docking_cmd_when_docked`: keep controlled `/cmd_vel_docking` motion available while normal motion is blocked
+- `bms_docking_interlock_enabled`: on fresh BMS contact, immediately zero and latch rejection of subsequent forward/lateral/angular docking commands until confirmed undock
+- `bms_docking_interlock_allow_reverse_undock`: while the BMS interlock is latched, allow only pure negative-X docking motion with a fresh docking reverse permit
 - `spin_to_drive_settle_enabled`: hold linear drive briefly after pure spin until actual wheel odom yaw rate is settled
 - `spin_to_drive_odom_topic`: odom topic used for the actual yaw-rate settle check, default `/wheel/odom`
 - `spin_to_drive_wz_threshold_radps`: actual yaw-rate threshold treated as stopped, default `0.02`
@@ -86,11 +245,15 @@ When any blocking state is active, the node publishes a zero twist and latches t
 - `mode_exit_guard_probe_speed_mps`: bounded dual-Ackermann probe speed used to switch out of lateral mode, default `0.06`
 - `mode_exit_guard_timeout_sec`: maximum probe duration before holding zero instead of passing the original command, default `1.0`
 - `mode_exit_guard_status_max_age_sec`: maximum accepted age of the mode-controller status sample, default `0.5`
-- `allow_reverse`: globally allow reverse when explicitly enabled, default `false`
+- `allow_reverse`: legacy/global shortcut for reverse outside an active execution session and outside the `DOCKING` source, default `false`; it never replaces the docking-specific permit
 - `reverse_enable_topic`: bounded normal/API reverse permit, default `/ranger_mini3/allow_reverse`
 - `docking_reverse_enable_topic`: controlled-undock reverse permit, default `/ranger_mini3/docking_allow_reverse`
 - `teleop_reverse_enable_topic`: mapping-teleop reverse permit, default `/ranger_mini3/teleop_allow_reverse`
-- `reverse_enable_timeout_sec`: freshness window for each reverse permit, default `0.75`
+- `nav_terminal_reverse_enable_topic`: controller-native terminal reverse permit, default `/ranger_mini3/nav_terminal_reverse_enable`
+- `nav_terminal_lateral_enable_topic`: controller-native terminal side-slip permit, default `/ranger_mini3/nav_terminal_lateral_enable`
+- `reverse_enable_timeout_sec`: steady-clock freshness window for each reverse or lateral permit, default `0.75`
+- `normal_navigation_reverse_max_mps`: absolute clamp for permitted terminal reverse, default `0.08`
+- `normal_navigation_lateral_max_mps`: absolute clamp for permitted terminal side-slip, default `0.05`
 - `allow_api_lateral_cmd`: allow bounded `/cmd_vel_api.linear.y` for API-owned terminal pose recovery, default `false`
 - `api_lateral_max_mps`: absolute clamp for API lateral speed before final publication, default `0.10`
 
@@ -98,5 +261,6 @@ When any blocking state is active, the node publishes a zero twist and latches t
 
 - This package does not own planners, controllers, or collision monitoring. It only arbitrates the final command.
 - The docking command hold is not a bypass: the held command is still published only by `robot_safety`, only while the docking command is fresh. Ordinary Nav2 reverse is limited to low-speed MPPI terminal correction and does not own docking/undocking motion.
+- `allow_reverse=true` cannot authorize `DOCKING` reverse. Docking always requires a fresh `/ranger_mini3/docking_allow_reverse` permit; while an execution session is engaged, reverse is restricted to the normal Nav2 source with its fresh terminal-reverse permit.
 - Jetson runtime executes the compiled C++ node directly and fails fast if the binary is missing; the Python fallback path has been removed.
 - `/cmd_vel_safe` is a diagnostic mirror when the runtime publishes the final command on `/cmd_vel`; the effective chassis command remains owned by `robot_safety`.

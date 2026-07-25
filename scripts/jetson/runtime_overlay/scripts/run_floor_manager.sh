@@ -7,7 +7,7 @@ source "${SCRIPT_DIR}/common_env.sh"
 NODE_BIN="${NJRH_PROJECT_ROOT}/install/robot_floor_manager/lib/robot_floor_manager/floor_manager_node"
 [[ -x "${NODE_BIN}" ]] || {
   echo "[runtime-overlay] robot_floor_manager binary missing: ${NODE_BIN}" >&2
-  echo "[runtime-overlay] build it with: colcon build --packages-select robot_interfaces robot_floor_manager" >&2
+  echo "[runtime-overlay] build it with: colcon build --packages-select robot_map_asset_identity robot_interfaces robot_floor_manager" >&2
   exit 1
 }
 

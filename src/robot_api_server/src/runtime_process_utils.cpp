@@ -4,8 +4,11 @@
 #include <cerrno>
 #include <csignal>
 #include <cctype>
+#include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <limits>
+#include <system_error>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -17,6 +20,25 @@ namespace robot_api_server
 {
 
 namespace fs = std::filesystem;
+
+namespace
+{
+
+std::string read_proc_file(const pid_t pid, const char * filename)
+{
+  try {
+    std::ifstream file(fs::path("/proc") / std::to_string(pid) / filename, std::ios::binary);
+    if (!file) {
+      return {};
+    }
+    return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+  } catch (const std::ios_base::failure &) {
+    // A process can disappear between opening and reading its procfs entry.
+    return {};
+  }
+}
+
+}  // namespace
 
 void set_close_on_exec(const int fd)
 {
@@ -64,37 +86,52 @@ bool is_pid_directory(const fs::path & path)
 
 std::string read_proc_cmdline(const pid_t pid)
 {
-  std::ifstream file(fs::path("/proc") / std::to_string(pid) / "cmdline", std::ios::binary);
-  if (!file) {
-    return {};
-  }
-  std::string cmdline((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+  std::string cmdline = read_proc_file(pid, "cmdline");
   std::replace(cmdline.begin(), cmdline.end(), '\0', ' ');
   return trim(cmdline);
 }
 
 std::string read_proc_environ(const pid_t pid)
 {
-  std::ifstream file(fs::path("/proc") / std::to_string(pid) / "environ", std::ios::binary);
-  if (!file) {
-    return {};
-  }
-  std::string environ((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+  std::string environ = read_proc_file(pid, "environ");
   std::replace(environ.begin(), environ.end(), '\0', '\n');
   return environ;
 }
 
+std::vector<pid_t> list_proc_pids()
+{
+  std::vector<pid_t> pids;
+  std::error_code iterator_error;
+  fs::directory_iterator iterator(
+    fs::path("/proc"), fs::directory_options::skip_permission_denied, iterator_error);
+  const fs::directory_iterator end;
+  while (!iterator_error && iterator != end) {
+    const fs::path path = iterator->path();
+    std::error_code type_error;
+    if (iterator->is_directory(type_error) && !type_error && is_pid_directory(path)) {
+      const std::string name = path.filename().string();
+      char * parse_end = nullptr;
+      errno = 0;
+      const long parsed = std::strtol(name.c_str(), &parse_end, 10);
+      if (
+        errno == 0 && parse_end != name.c_str() && *parse_end == '\0' && parsed > 0 &&
+        parsed <= static_cast<long>(std::numeric_limits<pid_t>::max()))
+      {
+        pids.push_back(static_cast<pid_t>(parsed));
+      }
+    }
+    iterator.increment(iterator_error);
+  }
+  return pids;
+}
+
 bool process_group_has_live_process(const pid_t pgid)
 {
-  if (pgid <= 0 || !fs::exists("/proc")) {
+  if (pgid <= 0) {
     return false;
   }
   const pid_t self_pid = ::getpid();
-  for (const auto & entry : fs::directory_iterator("/proc")) {
-    if (!entry.is_directory() || !is_pid_directory(entry.path())) {
-      continue;
-    }
-    const pid_t pid = static_cast<pid_t>(std::stol(entry.path().filename().string()));
+  for (const pid_t pid : list_proc_pids()) {
     if (pid <= 1 || pid == self_pid) {
       continue;
     }

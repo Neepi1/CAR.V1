@@ -77,7 +77,7 @@ The boot service starts common infrastructure first:
 - `imu_axis_remap_node`
 - `ranger_base_node`
 - `robot_description_static_tf_node`
-- `gs2_driver_node` from `robot_eai_gs2`, publishing `/dock/gs2_scan` and `/dock/gs2_points` in `gs2_link`
+- Orbbec 336L depth driver plus `orbbec_depth_dock_node`, publishing `/dock/target_observation`; GS2 is not started in the product profile
 - `robot_localization/ekf_node` as `robot_local_state`, fusing `/wheel/odom` with system-time `/lidar_imu`
 - `local_perception_node`
 - `floor_manager_node`
@@ -121,4 +121,4 @@ Docking-manager autostart can be disabled only for controlled bench diagnostics:
 NJRH_DOCKING_MANAGER_AUTOSTART=false
 ```
 
-For GS2 startup, `njrh-runtime.service` resolves the host `/dev/gs2` symlink before entering the container and exports the real tty path as `NJRH_GS2_SERIAL_PORT`. This prevents the container from accidentally using an unrelated `/dev/ttyUSB*` device after USB re-enumeration.
+`/etc/njrh/runtime.env` persists `NJRH_DOCKING_SENSOR_BACKEND=orbbec_336l` and `NJRH_GS2_AUTOSTART=false`. The systemd runner explicitly passes both values into the container. For an explicit GS2 rollback, it resolves the host `/dev/gs2` symlink and exports the real tty path as `NJRH_GS2_SERIAL_PORT`; otherwise it does not resolve or start GS2.

@@ -1,0 +1,10 @@
+<library path="ranger_mini3_lattice_planner">
+  <class
+    name="robot_nav_config::RangerMini3LatticePlanner"
+    type="robot_nav_config::RangerMini3LatticePlanner"
+    base_class_type="nav2_core::GlobalPlanner">
+    <description>
+      SmacPlannerLattice with a footprint-checked straight-corridor policy for Ranger Mini3.
+    </description>
+  </class>
+</library>

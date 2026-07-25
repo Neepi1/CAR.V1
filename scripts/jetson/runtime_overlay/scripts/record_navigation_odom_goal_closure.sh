@@ -26,6 +26,7 @@ IMU_BIAS_SEC=1.0
 BASE_FRAME="base_link"
 PROJECT_IMU_TO_BASE=true
 TF_WAIT_SEC=2.0
+ASSERT_STRAIGHTNESS=false
 PREFIX="[nav-odom-goal]"
 
 usage() {
@@ -66,6 +67,7 @@ Options:
   --base-frame FRAME            Frame used to project IMU angular velocity. Default: base_link.
   --no-project-imu-to-base      Use raw IMU angular_velocity.z instead of projected base-frame z.
   --tf-wait-sec N               TF wait for IMU projection. Default: 2.0.
+  --assert-straightness         Return nonzero when the captured cruise path is wavy.
   --no-stop-when-terminal       Keep recording until duration even after terminal state.
   -h, --help                    Show this help.
 EOF
@@ -140,6 +142,10 @@ while [[ $# -gt 0 ]]; do
     --tf-wait-sec)
       TF_WAIT_SEC="${2:-}"
       shift 2
+      ;;
+    --assert-straightness)
+      ASSERT_STRAIGHTNESS=true
+      shift
       ;;
     --no-stop-when-terminal)
       STOP_WHEN_TERMINAL=false
@@ -222,6 +228,7 @@ fi
   echo "base_frame=${BASE_FRAME}"
   echo "project_imu_to_base=${PROJECT_IMU_TO_BASE}"
   echo "tf_wait_sec=${TF_WAIT_SEC}"
+  echo "assert_straightness=${ASSERT_STRAIGHTNESS}"
   echo "workspace_root=${WORKSPACE_ROOT}"
   echo "publishes_velocity=false"
   echo "calls_relocalization=false"
@@ -260,7 +267,7 @@ from pathlib import Path
 import rclpy
 from action_msgs.msg import GoalStatusArray
 from geometry_msgs.msg import Twist
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path as NavPath
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -568,6 +575,48 @@ def classify_phase(row):
     return "mixed"
 
 
+def path_shape_metrics(msg):
+    points = [
+        (float(pose.pose.position.x), float(pose.pose.position.y))
+        for pose in msg.poses
+    ]
+    if len(points) < 2:
+        return {
+            "pose_count": len(points),
+            "path_length_m": 0.0,
+            "chord_m": 0.0,
+            "length_ratio": None,
+            "max_cross_track_m": None,
+        }
+    path_length = sum(
+        math.hypot(cur[0] - prev[0], cur[1] - prev[1])
+        for prev, cur in zip(points, points[1:])
+    )
+    start_x, start_y = points[0]
+    end_x, end_y = points[-1]
+    chord_dx = end_x - start_x
+    chord_dy = end_y - start_y
+    chord = math.hypot(chord_dx, chord_dy)
+    if chord <= 1.0e-6:
+        max_cross_track = None
+        length_ratio = None
+    else:
+        ux = chord_dx / chord
+        uy = chord_dy / chord
+        max_cross_track = max(
+            abs((x - start_x) * uy - (y - start_y) * ux)
+            for x, y in points
+        )
+        length_ratio = path_length / chord
+    return {
+        "pose_count": len(points),
+        "path_length_m": path_length,
+        "chord_m": chord,
+        "length_ratio": length_ratio,
+        "max_cross_track_m": max_cross_track,
+    }
+
+
 class Probe(Node):
     def __init__(self):
         super().__init__("record_navigation_odom_goal_closure")
@@ -602,6 +651,8 @@ class Probe(Node):
         self.imu_wz_base = None
         self.imu_wz_bias_corrected = None
         self.imu_max_abs_wz_bias_corrected = 0.0
+        self.path_metrics = {}
+        self.path_snapshots = {}
 
         qos = QoSProfile(depth=80)
         be = QoSProfile(depth=120, history=HistoryPolicy.KEEP_LAST)
@@ -633,6 +684,21 @@ class Probe(Node):
             self.create_subscription(MotionState, "/motion_state", self.on_motion_state, qos)
         if SystemState is not None:
             self.create_subscription(SystemState, "/system_state", self.on_system_state, qos)
+        for topic in (
+            "/unsmoothed_plan",
+            "/plan",
+            "/plan_smoothed",
+            "/received_global_plan",
+            "/transformed_global_plan",
+        ):
+            self.path_metrics[topic] = {
+                "count": 0,
+                "max_cross_track_m": None,
+                "max_length_ratio": None,
+                "latest": None,
+            }
+            self.create_subscription(
+                NavPath, topic, lambda msg, t=topic: self.on_path(t, msg), qos)
 
     def rel(self):
         return time.time() - self.start_wall
@@ -731,6 +797,32 @@ class Probe(Node):
 
     def on_system_state(self, msg):
         self.latest_system_state = msg
+
+    def on_path(self, topic, msg):
+        metrics = path_shape_metrics(msg)
+        stats = self.path_metrics[topic]
+        stats["count"] += 1
+        stats["latest"] = metrics
+        cross_track = metrics.get("max_cross_track_m")
+        if cross_track is not None:
+            previous = stats.get("max_cross_track_m")
+            stats["max_cross_track_m"] = (
+                cross_track if previous is None else max(previous, cross_track)
+            )
+        length_ratio = metrics.get("length_ratio")
+        if length_ratio is not None:
+            previous = stats.get("max_length_ratio")
+            stats["max_length_ratio"] = (
+                length_ratio if previous is None else max(previous, length_ratio)
+            )
+        points = [
+            [float(pose.pose.position.x), float(pose.pose.position.y)]
+            for pose in msg.poses
+        ]
+        snapshots = self.path_snapshots.setdefault(topic, {})
+        if "first" not in snapshots:
+            snapshots["first"] = points
+        snapshots["latest"] = points
 
     def current_tf_pose(self, target, source):
         try:
@@ -1159,6 +1251,14 @@ try:
             break
 
     write_csv(output_dir / "samples.csv", rows, fields)
+    (output_dir / "path_metrics.json").write_text(
+        json.dumps(node.path_metrics, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (output_dir / "path_snapshots.json").write_text(
+        json.dumps(node.path_snapshots, separators=(",", ":"), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     (output_dir / "api_state_samples.jsonl").write_text(
         "".join(json.dumps(sample, ensure_ascii=False, sort_keys=True) + "\n" for sample in api_samples),
         encoding="utf-8",
@@ -1250,6 +1350,7 @@ try:
             "amcl_gate_mode": last_bridge.get("amcl_gate_mode"),
             "amcl_shadow_mode": last_bridge.get("amcl_shadow_mode"),
         },
+        "path_metrics": node.path_metrics,
         "segments": segments,
     }
     (output_dir / "summary.json").write_text(
@@ -1357,6 +1458,8 @@ try:
         "- `samples.csv`",
         "- `segments.csv`",
         "- `api_state_samples.jsonl`",
+        "- `path_metrics.json`",
+        "- `path_snapshots.json`",
         "- `summary.json`",
     ])
     (output_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1370,8 +1473,18 @@ PY
 
 rc=$?
 if [[ "${rc}" -eq 0 ]]; then
+  analysis_args=(--report-dir "${OUTPUT_DIR}")
+  if [[ "${ASSERT_STRAIGHTNESS}" == "true" ]]; then
+    analysis_args+=(--assert-pass)
+  fi
+  python3 "${SCRIPT_DIR}/analyze_navigation_straightness.py" "${analysis_args[@]}"
+  analysis_rc=$?
   echo "${PREFIX} summary ${OUTPUT_DIR}/summary.md"
+  echo "${PREFIX} straightness ${OUTPUT_DIR}/straightness.md"
   echo "${PREFIX} complete: ${OUTPUT_DIR}"
+  if [[ "${analysis_rc}" -ne 0 ]]; then
+    exit "${analysis_rc}"
+  fi
 else
   echo "${PREFIX} FAIL capture exited with rc=${rc}" >&2
 fi

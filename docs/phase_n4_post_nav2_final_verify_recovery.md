@@ -45,16 +45,28 @@ Retry policy:
 
 - `post_nav2_final_verify_max_retry_count: 3`
 - post-retry XY acceptance slack: `0.02m`
-- XY retry range: `0.06m..0.35m`
+- terminal recovery range: `0.06m..0.40m`, owned by the single
+  `navigation_terminal_recovery_max_distance_m` parameter for same-goal retry,
+  failed-Nav2 recovery, and direct terminal correction
 - yaw retry: enabled for `pose_required`
 - retry target: the same Nav2 goal, including the original target yaw
 - API velocity correction: enabled only for bounded final yaw/terminal XY correction
-- terminal XY correction: enabled when yaw is already within `0.05rad`, XY is within `0.30m`, and the forward error is within `0.12m`; the correction uses the terminal lateral configuration and side-slip forced mode, but it is axis-staged. While lateral error is above `0.03m`, it publishes only `linear.y` with the field-validated positive command sign. Only after lateral is inside target does it publish a pure `linear.x` forward/backward correction. This avoids the Ranger Mini3 official driver's mixed x/y parallel-mode behavior, which can move the robot away from the target near the goal. Side-slip direction still reverses at most once if the lateral error diverges, then exits to retry/degraded instead of pushing indefinitely.
+- terminal pose correction is enabled for a pose-required goal when XY is within `0.40m` and the forward error is within `0.15m`; it is axis-staged as yaw, lateral, then forward/reverse. While lateral error is above `0.03m`, it publishes only `linear.y` with the field-validated positive command sign. Only after lateral is inside target does it publish a pure `linear.x` forward/backward correction. This avoids the Ranger Mini3 official driver's mixed x/y parallel-mode behavior, which can move the robot away from the target near the goal. Side-slip direction still reverses at most once if the lateral error diverges, then exits to retry/degraded instead of pushing indefinitely. The `20s` timeout is a maximum budget for the largest admitted residual; the loop exits immediately after the strict `0.06m` / `0.05rad` pose gate and physical-stop check pass.
+- every nonzero terminal translation is checked against a fresh `/local_costmap/costmap` corridor before publication. A stale map, stale `odom -> base_link`, unknown cell, or cost at/above `50` stops the API correction; the command still goes through `/cmd_vel_api -> robot_safety`.
 - terminal XY correction is checked before the yaw-only salvage wait. If the robot is already within the terminal lateral gate, the API goes directly to bounded axis-staged correction instead of waiting up to the final-yaw timeout for a yaw-only candidate that can never solve the remaining XY error.
-- near-goal stalled handoff: enabled by `navigation_near_goal_stalled_handoff_enabled`; when Nav2 is still executing within `0.30m` of the target for at least `3s` and has not improved by `0.02m` over `1.5s`, the API cancels only that Nav2 goal and enters the same final verification/correction path; this does not loosen the `0.06m` commercial acceptance gate
-- near-goal yaw-first recovery does not wait through the generic final-pose salvage loop when the robot is already inside the `0.35m` recovery window but outside the yaw-only XY gate. This avoids an 8s idle gap seen on the `delivery_230891 -> delivery_987692` route before the API can either align yaw or retry the same Nav2 goal.
+- the legacy API near-goal stalled handoff is disabled in production with
+  `navigation_near_goal_stalled_handoff_enabled=false`. Near-goal ownership now
+  remains inside the same `FollowPath` action: the controller-native handoff
+  admits a target only inside the canonical `0.40m` envelope, with body-frame
+  forward residual within `0.15m` and either lateral-dominant residual or
+  Ackermann-hairpin path evidence. It serializes yaw, side-slip,
+  forward/reverse, and stop settle through the normal Nav2 safety chain. API
+  correction remains available only after a true Nav2 abort; neither path
+  loosens the `0.06m` / `0.05rad` commercial acceptance gate.
+- near-goal yaw-first recovery does not wait through the generic final-pose salvage loop when the robot is already inside the `0.40m` recovery window but outside the yaw-only XY gate. This avoids an idle gap before the API can either align yaw, perform bounded axis-staged correction, or retry the same Nav2 goal.
 - ordinary API final yaw uses a conservative `0.60rad/s` cap, matching the Nav2 RotationShim cap. Field data showed a `2.39rad` residual yaw could time out at `0.35rad/s` with only about `0.053rad` remaining, forcing an extra same-goal retry. The API yaw loop now stops at `navigation_final_yaw_align_success_tolerance_rad=0.045`, while commercial verification remains `0.05rad`, so normal pose jitter after the zero command does not turn a good final yaw into `degraded`.
-- reverse is not globally enabled; ordinary MPPI/Nav2 only has a bounded low-speed terminal reverse envelope (`vx_min=-0.08`) guarded by `PreferForwardCritic`, while `/ranger_mini3/allow_reverse` is retained as a bounded final-verify permit path for future/dedicated recovery commands
+- reverse is not globally enabled. MPPI retains `vx_min=-0.08`, but `robot_api_server` grants `/ranger_mini3/allow_reverse` only while the active target is within `0.30m`; it refreshes the lease every `0.20s`, keeps it through a `0.35m` exit hysteresis, and clears it on result, cancel, timeout, handoff, stale pose, or scope exit. This applies to ordinary navigation, same-goal final retry, yaw-drift reposition, and pre-dock Nav2.
+- `robot_safety` independently enforces `normal_navigation_reverse_max_mps=0.08`. A normal reverse command without a fresh permit is rejected as a complete Twist, not by clearing only `linear.x`; this preserves the MPPI curvature contract and prevents a forbidden reverse Ackermann arc from becoming a tiny pure-spin request. Docking and teleop continue to use their separate permit channels.
 
 If the retry succeeds and final verification passes, `task_complete=true`. If
 the retry is exhausted and the remaining XY error is within the small
@@ -125,10 +137,29 @@ Field validation:
   `delivery_230891` completed in `13.78s` at `0.056584m` / `0.002038rad`,
   `/cmd_vel_api` had `mixed_xy=0` in both runs, and neither run entered
   `final_pose_salvage_waiting`.
+- On 2026-07-22, three consecutive
+  `dock_20260624T233520Z_bda53ad2_predock <-> delivery_512355` round trips
+  completed through the normal API path after one full runtime restart. The six
+  final XY errors were `0.0306`, `0.0543`, `0.0250`, `0.0373`, `0.0253`, and
+  `0.0536m`; all final yaw errors were below `0.0356rad`. Goal 5 entered the
+  canonical recovery envelope with `0.3662m` initial lateral residual, which
+  the former independent `0.35m` retry gate would have rejected. The guarded
+  axis-staged correction completed in `11.05s` at `0.0253m`. All six Nav2
+  actions still reached final verification through a non-success result, so
+  these runs validate terminal recovery continuity only; they do not prove
+  native Nav2 terminal convergence.
+- After the stalled-handoff eligibility was tied to the same canonical recovery
+  envelope, two additional round trips completed at `0.0313`, `0.0536`,
+  `0.0419`, and `0.0217m`; their yaw errors were `0.0326`, `0.0330`, `0.0102`,
+  and `0.0318rad`. The captured terminal lateral residuals included `0.1483m`
+  and `0.1960m`. Nav2 itself aborted before the `1.5s` proactive handoff timer
+  matured in these samples, after which the same guarded recovery path reached
+  the unchanged commercial gate. This validates removal of the unreachable
+  policy boundary, not native Nav2 success or activation of the timer itself.
 
 This phase does not change Nav2 planner/controller plugins, progress checker,
 TF tolerances, `max_odom_tf_age_ms`, AMCL/Isaac/bridge correction policy,
 pointcloud QoS/DDS, FAST-LIO2, Ranger odom, EKF, or the `robot_safety` speed
-chain. Ordinary MPPI/Nav2 reverse is limited to low-speed terminal correction
-and remains forward-biased by `PreferForwardCritic`; docking/teleop reverse
-continues to use explicit permit paths instead of the normal MPPI sampler.
+chain ownership. Ordinary MPPI/Nav2 reverse is leased only in the terminal
+window, capped at `0.08m/s`, and remains forward-biased by `PreferForwardCritic`;
+docking/teleop reverse continues to use separate explicit permit paths.

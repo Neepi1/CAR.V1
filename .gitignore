@@ -30,7 +30,20 @@ log/
 /tmp_*
 /_tmp_*
 /.tmp_*/
+/.codex_tmp*
+/tmp/
 *.log
+
+# Root-level field transfer bundles and sampled diagnostics
+/*.tar
+/*.tar.gz
+/*.tgz
+/*.csv
+/*.jsonl
+/api_after_*.json
+/api_pose_poll_*.json
+/spin_tail_*.csv
+/0.01
 
 # ROS bag and sensor/map products that should be archived outside Git
 *.bag

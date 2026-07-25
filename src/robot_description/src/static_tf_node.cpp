@@ -17,6 +17,8 @@
 namespace
 {
 
+constexpr double kHalfPi = 1.57079632679489661923;
+
 std::string trim(const std::string & input)
 {
   const auto begin = input.find_first_not_of(" \t\r\n");
@@ -143,6 +145,7 @@ private:
     const auto gs2_frame = config.count("gs2_frame") ? require_string(config, "gs2_frame") : "gs2_link";
     const auto charge_contact_frame =
       config.count("charge_contact_frame") ? require_string(config, "charge_contact_frame") : "charge_contact_link";
+    const bool docking_camera_configured = config.count("docking_camera_x") > 0U;
 
     const double lidar_x = require_double(config, "lidar_x");
     const double lidar_y = require_double(config, "lidar_y");
@@ -204,6 +207,34 @@ private:
         require_double(config, "charge_contact_roll"),
         require_double(config, "charge_contact_pitch"),
         require_double(config, "charge_contact_yaw")));
+    }
+    if (docking_camera_configured) {
+      const auto camera_frame = config.count("docking_camera_frame") ?
+        require_string(config, "docking_camera_frame") : "camera336l_link";
+      const auto camera_depth_optical_frame = config.count("docking_camera_depth_optical_frame") ?
+        require_string(config, "docking_camera_depth_optical_frame") :
+        "camera336l_depth_optical_frame";
+      transforms.push_back(make_transform(
+        stamp,
+        base_frame,
+        camera_frame,
+        require_double(config, "docking_camera_x"),
+        require_double(config, "docking_camera_y"),
+        require_double(config, "docking_camera_z"),
+        require_double(config, "docking_camera_roll"),
+        require_double(config, "docking_camera_pitch"),
+        require_double(config, "docking_camera_yaw")));
+      // REP-103 camera optical convention: +Z forward, +X right, +Y down.
+      transforms.push_back(make_transform(
+        stamp,
+        camera_frame,
+        camera_depth_optical_frame,
+        0.0,
+        0.0,
+        0.0,
+        -kHalfPi,
+        0.0,
+        -kHalfPi));
     }
     return transforms;
   }

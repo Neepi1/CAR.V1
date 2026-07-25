@@ -1,0 +1,27 @@
+ARG BASE_IMAGE=njrh-car:latest
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-c"]
+
+COPY scripts/jetson/vendor/orbbec/*.deb /tmp/njrh-orbbec/
+
+# The validated njrh-car base already contains every declared dependency. Use
+# dpkg directly so adding the camera cannot upgrade Nav2 or any unrelated ROS
+# package through a refreshed APT snapshot.
+RUN dpkg -i \
+    /tmp/njrh-orbbec/ros-humble-diagnostic-updater_*.deb \
+    /tmp/njrh-orbbec/ros-humble-orbbec-camera-msgs_*.deb \
+    /tmp/njrh-orbbec/ros-humble-orbbec-description_*.deb \
+    /tmp/njrh-orbbec/ros-humble-orbbec-camera_*.deb \
+ && test -f /opt/ros/humble/lib/liborbbec_camera.so \
+ && source /opt/ros/humble/setup.bash \
+ && ! ldd /opt/ros/humble/lib/liborbbec_camera.so | grep -q "not found" \
+ && dpkg-query -W \
+    ros-humble-diagnostic-updater \
+    ros-humble-orbbec-camera \
+    ros-humble-orbbec-camera-msgs \
+    ros-humble-orbbec-description \
+    > /etc/njrh-orbbec-packages.txt \
+ && rm -rf /tmp/njrh-orbbec
+
+LABEL njrh.runtime.orbbec="gemini336l-2.8.6"

@@ -9,6 +9,7 @@ find_package(std_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ArmState.msg"
   "msg/CorrectionPauseState.msg"
+  "msg/DockTargetObservation.msg"
   "msg/ElevatorObservation.msg"
   "msg/FloorSwitchStatus.msg"
   "msg/HealthStatus.msg"

@@ -159,6 +159,10 @@ private:
     std::uint64_t accepted_result_count{0U};
     std::uint64_t rejected_result_count{0U};
     std::uint64_t last_explicit_relocalization_sequence{0U};
+    std::uint64_t last_explicit_map_odom_target_sequence{0U};
+    std::uint64_t current_sequence{0U};
+    std::uint64_t target_sequence{0U};
+    std::uint64_t amcl_post_isaac_refined_sequence{0U};
     bool has_map_to_odom{false};
     bool safe_for_goal_start{false};
     bool correction_active{false};
@@ -173,6 +177,8 @@ private:
     std::string last_reject_reason;
     std::string last_force_accept_ignored_reason;
     std::string last_explicit_relocalization_source;
+    std::string current_source;
+    std::string target_source;
     std::string raw;
   };
 
@@ -282,6 +288,7 @@ private:
         initial_bridge,
         trigger_started_sec,
         bridge_accept_timeout_sec,
+        force_accept_armed,
         bridge_detail))
     {
       response->accepted = false;
@@ -387,6 +394,12 @@ private:
       json_uint_value(msg->data, "force_accept_ignored_pretrigger_result_count", 0U);
     snapshot.last_explicit_relocalization_sequence =
       json_uint_value(msg->data, "last_explicit_relocalization_sequence", 0U);
+    snapshot.last_explicit_map_odom_target_sequence =
+      json_uint_value(msg->data, "last_explicit_map_odom_target_sequence", 0U);
+    snapshot.current_sequence = json_uint_value(msg->data, "current_sequence", 0U);
+    snapshot.target_sequence = json_uint_value(msg->data, "target_sequence", 0U);
+    snapshot.amcl_post_isaac_refined_sequence =
+      json_uint_value(msg->data, "amcl_post_isaac_refined_sequence", 0U);
     snapshot.has_map_to_odom = json_bool_value(msg->data, "has_map_to_odom", false);
     snapshot.safe_for_goal_start = json_bool_value(msg->data, "safe_for_goal_start", false);
     snapshot.correction_active = json_bool_value(msg->data, "correction_active", false);
@@ -403,6 +416,8 @@ private:
       json_string_value(msg->data, "last_force_accept_ignored_reason");
     snapshot.last_explicit_relocalization_source =
       json_string_value(msg->data, "last_explicit_relocalization_source");
+    snapshot.current_source = json_string_value(msg->data, "current_source");
+    snapshot.target_source = json_string_value(msg->data, "target_source");
 
     std::lock_guard<std::mutex> lock(state_mutex_);
     bridge_status_ = snapshot;
@@ -818,10 +833,33 @@ private:
     return false;
   }
 
+  bool bridge_explicit_relocalization_target_settled(
+    const BridgeStatusSnapshot & latest) const
+  {
+    if (
+      latest.last_explicit_map_odom_target_sequence == 0U ||
+      latest.current_sequence != latest.target_sequence ||
+      latest.current_sequence < latest.last_explicit_map_odom_target_sequence)
+    {
+      return false;
+    }
+    const bool isaac_target_completed =
+      latest.current_sequence == latest.last_explicit_map_odom_target_sequence &&
+      latest.current_source == "isaac_triggered" &&
+      latest.target_source == "isaac_triggered";
+    const bool valid_amcl_refine_completed =
+      latest.amcl_post_isaac_refined_sequence ==
+      latest.last_explicit_relocalization_sequence &&
+      latest.current_source == "amcl_gated" &&
+      latest.target_source == "amcl_gated";
+    return isaac_target_completed || valid_amcl_refine_completed;
+  }
+
   bool wait_for_bridge_acceptance(
     const BridgeStatusSnapshot & initial,
     const double trigger_started_sec,
     const double timeout_sec,
+    const bool explicit_accept_required,
     std::string & detail)
   {
     auto active_deadline = steady_deadline(timeout_sec);
@@ -839,7 +877,12 @@ private:
           bridge_explicit_trigger_accept_observed(initial, latest) &&
           latest.has_map_to_odom)
         {
-          if (map_to_odom_ready(latest))
+          if (
+            map_to_odom_ready(latest) &&
+            latest.safe_for_goal_start &&
+            !latest.correction_active &&
+            latest.current_sequence == latest.target_sequence &&
+            bridge_explicit_relocalization_target_settled(latest))
           {
             detail = "bridge accepted explicit triggered relocalization"
                      " gate_mode=" + latest.gate_mode +
@@ -855,16 +898,26 @@ private:
                      " remaining_translation_error_m=" +
                      std::to_string(latest.remaining_translation_error_m) +
                      " remaining_yaw_error_rad=" +
-                     std::to_string(latest.remaining_yaw_error_rad);
+                     std::to_string(latest.remaining_yaw_error_rad) +
+                     " current_sequence=" + std::to_string(latest.current_sequence) +
+                     " target_sequence=" + std::to_string(latest.target_sequence) +
+                     " current_source=" + latest.current_source +
+                     " target_source=" + latest.target_source;
             return true;
           }
           saw_nonfresh_bridge_accept = true;
-          detail = "bridge accepted explicit triggered relocalization but map->odom is not fresh yet"
+          detail = "bridge accepted explicit triggered relocalization but map->odom target is not settled yet"
                    " owner=" + latest.owner +
                    " age_ms=" + std::to_string(latest.map_to_odom_age_ms) +
                    " publish_gap_ms=" + std::to_string(latest.map_odom_publish_gap_ms) +
                    " explicit_sequence=" +
                    std::to_string(latest.last_explicit_relocalization_sequence) +
+                   " safe_for_goal_start=" + bool_string(latest.safe_for_goal_start) +
+                   " correction_active=" + bool_string(latest.correction_active) +
+                   " current_sequence=" + std::to_string(latest.current_sequence) +
+                   " target_sequence=" + std::to_string(latest.target_sequence) +
+                   " current_source=" + latest.current_source +
+                   " target_source=" + latest.target_source +
                    " last_reject_reason=" + latest.last_reject_reason;
         }
         if (
@@ -905,10 +958,15 @@ private:
           return false;
         }
         if (
+          !explicit_accept_required &&
           latest.accepted_result_count > initial.accepted_result_count &&
           latest.has_map_to_odom)
         {
-          if (map_to_odom_ready(latest))
+          if (
+            map_to_odom_ready(latest) &&
+            latest.safe_for_goal_start &&
+            !latest.correction_active &&
+            latest.current_sequence == latest.target_sequence)
           {
             detail = "bridge accepted result gate_mode=" + latest.gate_mode +
                      " accept_reason=" + latest.last_accept_reason +
@@ -926,7 +984,7 @@ private:
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     detail = saw_nonfresh_bridge_accept ?
-      "failure_code=BRIDGE_ACCEPT_TIMEOUT bridge accepted a result but map->odom did not become fresh" :
+      "failure_code=BRIDGE_ACCEPT_TIMEOUT bridge accepted a result but map->odom target did not settle" :
       "failure_code=BRIDGE_ACCEPT_TIMEOUT bridge did not accept localization_result";
     if (latest.available) {
       detail += " last_reject_reason=" + latest.last_reject_reason;
@@ -948,6 +1006,7 @@ private:
     return (
       reason.find("AMCL_ROBOT_MOVING_OBSERVE_ONLY") != std::string::npos ||
       reason.find("amcl_suppressed_after_isaac_triggered") != std::string::npos ||
+      reason.find("AMCL_POST_ISAAC_REFINE_") != std::string::npos ||
       reason.find("AMCL_CORRECTION_TOO_LARGE") != std::string::npos) &&
       reason.find("amcl") != std::string::npos;
   }

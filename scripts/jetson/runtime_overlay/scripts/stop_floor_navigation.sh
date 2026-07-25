@@ -6,15 +6,28 @@ source "${SCRIPT_DIR}/common_env.sh"
 
 publish_zero_topic() {
   local topic="$1"
-  timeout "${NJRH_NAV_STOP_ZERO_TIMEOUT_SEC:-0.25s}" \
+  timeout --kill-after="${NJRH_NAV_STOP_ZERO_KILL_AFTER_SEC:-0.25s}" \
+    "${NJRH_NAV_STOP_ZERO_TIMEOUT_SEC:-0.25s}" \
     ros2 topic pub --once "${topic}" geometry_msgs/msg/Twist '{}' >/dev/null 2>&1 || true
 }
 
 publish_zero() {
-  publish_zero_topic /cmd_vel_collision_checked
-  publish_zero_topic /cmd_vel_nav
-  publish_zero_topic /cmd_vel_nav_raw
-  publish_zero_topic /cmd_vel_docking
+  local topics=(
+    /cmd_vel_collision_checked
+    /cmd_vel_nav
+    /cmd_vel_nav_raw
+    /cmd_vel_docking
+  )
+  local pids=()
+  local topic
+  for topic in "${topics[@]}"; do
+    publish_zero_topic "${topic}" &
+    pids+=("$!")
+  done
+  local pid
+  for pid in "${pids[@]}"; do
+    wait "${pid}" || true
+  done
 }
 
 clear_runtime_map_context() {
@@ -131,10 +144,12 @@ wait_until_clear() {
 
 kill_navigation_patterns() {
   local signal="$1"
-  local pattern
-  for pattern in "${patterns[@]}"; do
-    pkill "-${signal}" -f "${pattern}" 2>/dev/null || true
-  done
+  local pids=()
+  mapfile -t pids < <(matching_navigation_processes | awk '{print $1}')
+  if (( ${#pids[@]} == 0 )); then
+    return 0
+  fi
+  kill "-${signal}" "${pids[@]}" 2>/dev/null || true
 }
 
 stop_amcl_bounded() {
@@ -149,6 +164,17 @@ stop_amcl_bounded() {
     local status=$?
     echo "[runtime-overlay] AMCL stop did not complete within ${timeout_sec} status=${status}; continuing after Nav2 process cleanup" >&2
   fi
+}
+
+final_navigation_cleanup() {
+  local grace_sec="${NJRH_NAV_STOP_FINAL_GRACE_SEC:-2}"
+  local kill_wait_sec="${NJRH_NAV_STOP_FINAL_KILL_WAIT_SEC:-2}"
+  if wait_until_clear "${grace_sec}"; then
+    return 0
+  fi
+  echo "[runtime-overlay] navigation owner cleanup still settling; killing remaining exact process ids" >&2
+  kill_navigation_patterns KILL
+  wait_until_clear "${kill_wait_sec}" || true
 }
 
 echo "[runtime-overlay] stop floor navigation requested" >&2
@@ -169,6 +195,7 @@ kill_navigation_patterns KILL
 wait_until_clear "${NJRH_NAV_STOP_KILL_WAIT_SEC:-1}" || true
 publish_zero
 stop_amcl_bounded
+final_navigation_cleanup
 clear_runtime_map_context
 
 lingering="$(matching_navigation_processes)"

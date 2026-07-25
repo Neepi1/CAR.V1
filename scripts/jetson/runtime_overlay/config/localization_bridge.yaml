@@ -32,6 +32,12 @@ robot_localization_bridge:
     status_topic: /localization/bridge_status
     force_accept_service: /robot_localization_bridge/force_accept_next_localization
     correction_pause_service: /robot_localization_bridge/set_correction_paused
+    correction_pause_lease_service: /robot_localization_bridge/set_correction_pause_lease
+    correction_pause_state_topic: /localization/correction_pause_state
+    floor_health_topic: /localization/floor_health
+    begin_floor_transition_service: /robot_localization_bridge/begin_floor_transition
+    floor_transition_pause_owner: robot_floor_manager
+    live_floor_transition_service_enabled: false
     two_d_mode: true
     # Legacy compatibility knob. Phase A2 removed Isaac continuous localization;
     # any non-triggered value is ignored by the bridge.
@@ -69,6 +75,12 @@ robot_localization_bridge:
     amcl_post_isaac_refine_agreement_translation_m: 0.08
     amcl_post_isaac_refine_agreement_yaw_rad: 0.08
     amcl_post_isaac_refine_require_stationary: true
+    amcl_post_isaac_refine_min_delay_sec: 0.25
+    amcl_post_isaac_refine_min_pose_stamp_delta_sec: 0.0
+    amcl_post_isaac_refine_request_nomotion_update: true
+    amcl_post_isaac_refine_nomotion_update_service: /request_nomotion_update
+    amcl_post_isaac_refine_nomotion_request_period_sec: 0.5
+    amcl_post_isaac_refine_nomotion_max_requests: 4
     amcl_initial_pose_topic: /initialpose
     amcl_initial_pose_seed_enabled: true
     amcl_initial_pose_xy_covariance: 0.01

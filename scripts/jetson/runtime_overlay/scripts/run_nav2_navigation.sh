@@ -14,8 +14,50 @@ export NJRH_NAV2_LAUNCH_NONCRITICAL_NODES="${NJRH_NAV2_LAUNCH_NONCRITICAL_NODES:
 export NAV2_PARAMS_FILE="${NAV2_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/nav2.yaml}"
 export NJRH_NAV2_HOLD_READY_FILE="${NJRH_NAV2_HOLD_READY_FILE:-/tmp/njrh_nav2_launch_hold_ready.env}"
 LAUNCH_FILE="${NJRH_PROJECT_ROOT}/src/robot_bringup/launch/standard_navigation.launch.py"
+planner_profile="${NJRH_NAV2_PLANNER_PROFILE:-smac2d}"
+planner_profile_root="${NJRH_PROJECT_ROOT}/src/robot_nav_config/config/planner_profiles"
+ranger_lattice_root="${NJRH_PROJECT_ROOT}/src/robot_nav_config/lattice"
+ranger_lattice_name="ranger_mini3_ackermann_0p05m_0p81m_16"
+nav_bt_root="${NJRH_PROJECT_ROOT}/install/robot_nav_config/share/robot_nav_config/behavior_trees"
+planner_profile_file="${NJRH_NAV2_PLANNER_PROFILE_FILE:-}"
+ranger_lattice_file="${NJRH_RANGER_LATTICE_FILE:-${ranger_lattice_root}/${ranger_lattice_name}.json}"
+nav_to_pose_bt_xml="${NJRH_NAV2_BT_XML:-}"
 map_server_ready_timeout_sec="${NJRH_NAV_MAP_SERVER_READY_TIMEOUT:-75}"
 global_costmap_ready_timeout_sec="${NJRH_NAV_GLOBAL_COSTMAP_READY_TIMEOUT:-90}"
+
+case "${planner_profile}" in
+  smac2d)
+    planner_profile_file="${planner_profile_file:-${planner_profile_root}/preserve_base.yaml}"
+    nav_to_pose_bt_xml="${nav_to_pose_bt_xml:-${nav_bt_root}/navigate_to_pose.xml}"
+    ;;
+  ranger_lattice)
+    planner_profile_file="${planner_profile_file:-${planner_profile_root}/ranger_mini3_lattice.yaml}"
+    nav_to_pose_bt_xml="${nav_to_pose_bt_xml:-${nav_bt_root}/navigate_to_pose_ranger_lattice.xml}"
+    lattice_validator="${NJRH_PROJECT_ROOT}/src/robot_nav_config/tools/validate_ranger_mini3_lattice.py"
+    [[ -f "${lattice_validator}" ]] || {
+      echo "[runtime-overlay] missing Ranger lattice validator: ${lattice_validator}" >&2
+      exit 1
+    }
+    python3 "${lattice_validator}" \
+      --config "${ranger_lattice_root}/${ranger_lattice_name}.config.json" \
+      --lattice "${ranger_lattice_file}" \
+      --manifest "${ranger_lattice_root}/${ranger_lattice_name}.manifest.json"
+    ;;
+  *)
+    echo "[runtime-overlay] unsupported NJRH_NAV2_PLANNER_PROFILE=${planner_profile}; expected smac2d or ranger_lattice" >&2
+    exit 1
+    ;;
+esac
+
+[[ -f "${planner_profile_file}" ]] || {
+  echo "[runtime-overlay] missing Nav2 planner profile: ${planner_profile_file}" >&2
+  exit 1
+}
+[[ -f "${nav_to_pose_bt_xml}" ]] || {
+  echo "[runtime-overlay] missing Nav2 behavior tree for profile ${planner_profile}: ${nav_to_pose_bt_xml}" >&2
+  exit 1
+}
+echo "[runtime-overlay] planner_profile=${planner_profile} profile_file=${planner_profile_file} nav_to_pose_bt=${nav_to_pose_bt_xml}" >&2
 
 controller_server_pids() {
   ps -eo pid=,args= | awk '
@@ -338,7 +380,10 @@ PY
 }
 
 disable_neutral_costmap_filters_if_needed() {
-  [[ "${NJRH_NAV2_DISABLE_NEUTRAL_COSTMAP_FILTERS:-true}" == "true" ]] || return 0
+  # Keep neutral filter servers and plugins resident by default. A neutral mask
+  # is the valid empty keepout layer, and residency is required to hot-load the
+  # first App-authored keepout line without restarting Nav2.
+  [[ "${NJRH_NAV2_DISABLE_NEUTRAL_COSTMAP_FILTERS:-false}" == "true" ]] || return 0
   [[ -n "${NAV2_KEEP_OUT_MASK_YAML:-}" && -f "${NAV2_KEEP_OUT_MASK_YAML}" ]] || return 0
 
   if ! costmap_filter_mask_is_neutral "${NAV2_KEEP_OUT_MASK_YAML}"; then
@@ -469,6 +514,9 @@ ros2 launch "${LAUNCH_FILE}" \
   autostart:=true \
   navigation_lifecycle_autostart:="${navigation_lifecycle_autostart}" \
   params_file:="${NAV2_PARAMS_FILE}" \
+  planner_profile_file:="${planner_profile_file}" \
+  ranger_lattice_filepath:="${ranger_lattice_file}" \
+  nav_to_pose_bt_xml:="${nav_to_pose_bt_xml}" \
   keepout_mask_yaml:="${NAV2_KEEP_OUT_MASK_YAML}" \
   speed_mask_yaml:="${NAV2_SPEED_MASK_YAML}" \
   log_level:="${NJRH_NAV2_LOG_LEVEL:-warn}" &

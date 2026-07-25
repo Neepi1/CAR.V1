@@ -316,6 +316,24 @@ def pose_delta(
     }
 
 
+def compose_pose(
+    parent_child: Optional[Dict[str, float]],
+    child_object: Optional[Dict[str, float]],
+) -> Optional[Dict[str, float]]:
+    if parent_child is None or child_object is None:
+        return None
+    c = math.cos(parent_child["yaw_rad"])
+    s = math.sin(parent_child["yaw_rad"])
+    yaw = norm_angle(parent_child["yaw_rad"] + child_object["yaw_rad"])
+    return {
+        "x": parent_child["x"] + c * child_object["x"] - s * child_object["y"],
+        "y": parent_child["y"] + s * child_object["x"] + c * child_object["y"],
+        "z": parent_child.get("z", 0.0) + child_object.get("z", 0.0),
+        "yaw_rad": yaw,
+        "yaw_deg": math.degrees(yaw),
+    }
+
+
 def odom_to_dict(msg: Optional[Odometry]) -> Optional[Dict[str, Any]]:
     if msg is None:
         return None
@@ -485,6 +503,19 @@ def odom_pose(snapshot: Dict[str, Any], key: str) -> Optional[Dict[str, float]]:
     return pose if isinstance(pose, dict) else None
 
 
+def resolved_map_base(snapshot: Dict[str, Any]) -> Tuple[Optional[Dict[str, float]], str]:
+    direct = tf_pose(snapshot, "map_base_link")
+    if direct is not None:
+        return direct, "direct_tf"
+    composed = compose_pose(
+        tf_pose(snapshot, "map_odom"),
+        tf_pose(snapshot, "odom_base_link"),
+    )
+    if composed is not None:
+        return composed, "composed_map_odom_x_odom_base_link"
+    return None, "unavailable"
+
+
 def main() -> int:
     rclpy.init(args=None)
     node = CaptureNode()
@@ -519,7 +550,9 @@ def main() -> int:
 
         after = node.snapshot("after")
 
-        map_base_delta = pose_delta(tf_pose(before, "map_base_link"), tf_pose(after, "map_base_link"))
+        before_map_base, before_map_base_source = resolved_map_base(before)
+        after_map_base, after_map_base_source = resolved_map_base(after)
+        map_base_delta = pose_delta(before_map_base, after_map_base)
         map_odom_delta = pose_delta(tf_pose(before, "map_odom"), tf_pose(after, "map_odom"))
         odom_base_delta = pose_delta(tf_pose(before, "odom_base_link"), tf_pose(after, "odom_base_link"))
         wheel_delta = pose_delta(odom_pose(before, "wheel_odom"), odom_pose(after, "wheel_odom"))
@@ -530,6 +563,8 @@ def main() -> int:
             "time_utc": now_iso(),
             "reason": reason,
             "trigger": trigger,
+            "map_base_link_before_source": before_map_base_source,
+            "map_base_link_after_source": after_map_base_source,
             "map_base_link_delta": map_base_delta,
             "map_odom_delta": map_odom_delta,
             "odom_base_link_delta": odom_base_delta,
@@ -545,6 +580,10 @@ def main() -> int:
                 "last_accepted_correction_yaw_rad": after_status.get("last_accepted_correction_yaw_rad"),
                 "last_candidate_correction_translation_m": after_status.get("last_candidate_correction_translation_m"),
                 "last_candidate_correction_yaw_rad": after_status.get("last_candidate_correction_yaw_rad"),
+                "last_candidate_map_odom_parameter_translation_m": after_status.get("last_candidate_map_odom_parameter_translation_m"),
+                "last_candidate_map_odom_parameter_yaw_rad": after_status.get("last_candidate_map_odom_parameter_yaw_rad"),
+                "last_accepted_map_odom_parameter_translation_m": after_status.get("last_accepted_map_odom_parameter_translation_m"),
+                "last_accepted_map_odom_parameter_yaw_rad": after_status.get("last_accepted_map_odom_parameter_yaw_rad"),
                 "current_source": after_status.get("current_source"),
                 "has_map_to_odom": after_status.get("has_map_to_odom"),
                 "correction_paused": after_status.get("correction_paused"),
@@ -580,16 +619,22 @@ def main() -> int:
             f.write(f"- reason: `{reason}`\n")
             f.write(f"- trigger_accepted: `{str(trigger.get('accepted')).lower()}`\n")
             f.write(f"- trigger_message: `{trigger.get('message', '')}`\n")
-            f.write(f"- bridge_last_correction_delta_translation_m: `{metrics['bridge'].get('last_correction_delta_translation_m')}`\n")
-            f.write(f"- bridge_last_correction_delta_yaw_rad: `{metrics['bridge'].get('last_correction_delta_yaw_rad')}`\n")
+            f.write(f"- robot_pose_correction_translation_m: `{(map_base_delta or {}).get('translation_m')}`\n")
+            f.write(f"- robot_pose_correction_yaw_deg: `{(map_base_delta or {}).get('dyaw_deg')}`\n")
+            f.write(f"- map_base_link_before_source: `{before_map_base_source}`\n")
+            f.write(f"- map_base_link_after_source: `{after_map_base_source}`\n")
+            f.write(f"- bridge_last_base_correction_translation_m: `{metrics['bridge'].get('last_correction_delta_translation_m')}`\n")
+            f.write(f"- bridge_last_base_correction_yaw_rad: `{metrics['bridge'].get('last_correction_delta_yaw_rad')}`\n")
+            f.write(f"- bridge_last_map_odom_parameter_translation_m: `{metrics['bridge'].get('last_accepted_map_odom_parameter_translation_m')}`\n")
+            f.write(f"- bridge_last_map_odom_parameter_yaw_rad: `{metrics['bridge'].get('last_accepted_map_odom_parameter_yaw_rad')}`\n")
             f.write(f"- bridge_safe_for_goal_start: `{metrics['bridge'].get('safe_for_goal_start')}`\n")
             f.write(f"- bridge_correction_paused: `{metrics['bridge'].get('correction_paused')}`\n")
             f.write("\n")
-            f.write("Positive `forward_m_in_before_frame` means the accepted relocalization moved `map->base_link` forward along the robot heading captured before relocalization. Positive `left_m_in_before_frame` means it moved left in the same start frame.\n\n")
+            f.write("Positive `forward_m_in_before_frame` means the accepted relocalization moved `map->base_link` forward along the robot heading captured before relocalization. Positive `left_m_in_before_frame` means it moved left in the same start frame. The `map->odom` row is a transform-parameter delta and is not robot travel; yaw compensation is amplified there by distance from the odom origin.\n\n")
             f.write("| delta source | dx_map_m | dy_map_m | translation_m | dyaw_deg | forward_m_in_before_frame | left_m_in_before_frame |\n")
             f.write("|---|---:|---:|---:|---:|---:|---:|\n")
-            f.write("| map->base_link | " + md_delta(map_base_delta).lstrip("| "))
-            f.write("| map->odom | " + md_delta(map_odom_delta).lstrip("| "))
+            f.write("| robot pose: map->base_link | " + md_delta(map_base_delta).lstrip("| "))
+            f.write("| TF parameter only: map->odom | " + md_delta(map_odom_delta).lstrip("| "))
             f.write("| odom->base_link | " + md_delta(odom_base_delta).lstrip("| "))
             f.write("| /wheel/odom pose | " + md_delta(wheel_delta).lstrip("| "))
             f.write("| /local_state/odometry pose | " + md_delta(local_delta).lstrip("| "))

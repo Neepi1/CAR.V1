@@ -6,6 +6,7 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 
 find_package(ament_cmake REQUIRED)
+find_package(action_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(lifecycle_msgs REQUIRED)
 find_package(nav2_msgs REQUIRED)
@@ -67,6 +68,7 @@ add_executable(robot_api_server_node
   src/docking_job_model.cpp
   src/docking_status_utils.cpp
   src/floor_asset_resolver.cpp
+  src/floor_runtime_interlock.cpp
   src/localization_result_model.cpp
   src/map_asset_writer.cpp
   src/map_catalog.cpp
@@ -87,9 +89,11 @@ target_include_directories(robot_api_server_node PRIVATE include)
 target_link_libraries(
   robot_api_server_node
   robot_api_server_keepout
+  robot_api_server_elevator_config
 )
 ament_target_dependencies(
   robot_api_server_node
+  action_msgs
   geometry_msgs
   lifecycle_msgs
   nav2_msgs
@@ -124,6 +128,7 @@ install(DIRECTORY config launch
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
   ament_add_gtest(
     test_floor_runtime_interlock
@@ -166,6 +171,39 @@ if(BUILD_TESTING)
   target_link_libraries(
     test_elevator_configuration_module
     robot_api_server_elevator_config
+  )
+
+  add_test(
+    NAME keepout_http_smoke
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/keepout_http_smoke.py
+      --node $<TARGET_FILE:robot_api_server_node>
+      --port 18081
+  )
+  set_tests_properties(keepout_http_smoke PROPERTIES RUN_SERIAL TRUE TIMEOUT 45)
+
+  add_test(
+    NAME floor_runtime_http_smoke
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/floor_runtime_http_smoke.py
+      --node $<TARGET_FILE:robot_api_server_node>
+      --port 18082
+  )
+  set_tests_properties(floor_runtime_http_smoke PROPERTIES RUN_SERIAL TRUE TIMEOUT 45)
+
+  add_test(
+    NAME elevator_configuration_http_smoke
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/elevator_configuration_http_smoke.py
+      --node $<TARGET_FILE:robot_api_server_node>
+      --port 18083
+  )
+  set_tests_properties(
+    elevator_configuration_http_smoke
+    PROPERTIES RUN_SERIAL TRUE TIMEOUT 60
   )
 endif()
 

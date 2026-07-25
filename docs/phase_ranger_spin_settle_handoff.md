@@ -1,7 +1,7 @@
 # Ranger Spin Settle Handoff
 
 Date: 2026-07-04
-Updated: 2026-07-14
+Updated: 2026-07-20
 
 ## Scope
 
@@ -32,6 +32,34 @@ This is therefore not a Nav2, AMCL, or robot_safety FIFO delay. It is the Ranger
 - `robot_api_server` waits for actual `/wheel/odom` yaw-rate settle after API-owned final yaw and predock yaw alignment, then re-reads pose before declaring success.
 - Runtime overlay config mirrors the source config for Jetson deployment.
 - `verify_nav2_progress_checker_config.sh` now expects the updated RotationShim thresholds.
+
+## 2026-07-20 Predock Terminal Spin Stall
+
+A return-to-dock run reached the pre-dock terminal rotation but Nav2 aborted
+with `controller_server: Failed to make progress` after 12 seconds. The API
+then completed a second yaw correction, which appeared as a pause followed by
+a state change and another spin. Evidence from that run:
+
+- Nav2 exited with about `0.054744rad` (`3.14deg`) yaw error remaining.
+- The API proportional fallback reduced it to `0.029033rad` (`1.66deg`) in
+  `1.042s` with a maximum command of `0.20rad/s`.
+- Humble Nav2 `1.1.19` still requests the full `0.60rad/s` terminal spin near
+  the goal; it lacks the angular stopping envelope now present upstream.
+
+`GoalScopedRotationShimController` now limits only terminal, XY-in-tolerance
+pure-yaw commands with the upstream formula
+`sqrt(2 * max_angular_accel * abs(remaining_yaw))`. At the observed residual
+and `max_angular_accel=1.2rad/s^2`, the command is reduced from `0.60rad/s` to
+`0.362rad/s`. `closed_loop=true` keeps the acceleration clamp tied to measured
+odom yaw rate. MPPI, startup heading thresholds, Ranger SDK mode control, and
+the API docking controller are unchanged.
+
+Rollback is one parameter:
+
+```yaml
+FollowPath:
+  terminal_rotation_braking_enabled: false
+```
 
 Runtime knobs:
 
@@ -144,3 +172,30 @@ diagnostics where spin-to-drive safety is explicitly not under test.
 - Ordinary navigation from `delivery_512355` to `delivery_675235` with AMCL in shadow/observe mode.
 - Spin then straight test at the current production spin speed.
 - Return-to-dock predock yaw alignment check, focusing on whether residual spin tail causes lateral drift.
+
+## Lightweight Predock Spin Capture
+
+Use `record_predock_spin_command_chain_light.sh` when the chassis enters
+SPINNING near the predock pose but does not physically rotate. The recorder is
+read-only and uses one ROS process. It captures the four command boundaries
+(`/cmd_vel_nav_raw`, `/cmd_vel_nav`, `/cmd_vel_collision_checked`, `/cmd_vel`),
+Ranger mode feedback from the standard-string `/ranger_base/status`, wheel/local
+odom yaw rate, and corrected LiDAR IMU yaw rate. It does not depend on the
+`ranger_msgs` Python package, subscribe to pointcloud/scan, start rosbag, or
+poll the API.
+
+Each SPINNING interval is classified in `summary.md` as one of:
+
+- no sustained raw Nav2 spin command after mode switching;
+- command lost at velocity smoother, collision monitor, or robot safety;
+- final command reached Ranger but produced no physical IMU rotation;
+- command and physical rotation both present.
+
+The default report directory is a unique path directly under `/tmp`, avoiding
+workspace and shared `/tmp/njrh_reports` ownership problems. `Ctrl+C` finalizes
+the report instead of leaving recorder processes running. Wait for the script's
+`READY` line before triggering return-to-dock. It waits for first messages from
+wheel odom, local odom, corrected IMU, and Ranger status, then allows another
+0.5 seconds for endpoint discovery so the first short command pulse is not
+hidden. The wrapper also reloads its ROS overlay inside its own child shell
+instead of trusting an inherited `NJRH_COMMON_ENV_LOADED` marker.

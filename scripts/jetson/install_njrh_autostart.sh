@@ -23,10 +23,22 @@ require_sudo() {
   sudo -v
 }
 
+upsert_env_value() {
+  local key="$1"
+  local value="$2"
+  if sudo grep -q "^${key}=" "${ENV_FILE}"; then
+    sudo sed -i "s|^${key}=.*|${key}=${value}|" "${ENV_FILE}"
+  else
+    echo "${key}=${value}" | sudo tee -a "${ENV_FILE}" >/dev/null
+  fi
+}
+
 write_env_file_if_missing() {
   require_sudo
   sudo mkdir -p "$(dirname "${ENV_FILE}")"
   if [[ -f "${ENV_FILE}" ]]; then
+    upsert_env_value "NJRH_DOCKING_SENSOR_BACKEND" "orbbec_336l"
+    upsert_env_value "NJRH_GS2_AUTOSTART" "false"
     if grep -q '^NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION=' "${ENV_FILE}"; then
       sudo sed -i 's/^NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION=.*/NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION=false/' "${ENV_FILE}"
     else
@@ -92,6 +104,8 @@ NJRH_UPSTREAM_WORKSPACE_HOST=${UPSTREAM_WORKSPACE_HOST}
 NJRH_UPSTREAM_WORKSPACE_CONTAINER=${UPSTREAM_WORKSPACE_CONTAINER}
 NJRH_CONTAINER_NAME=${CONTAINER_NAME}
 NJRH_REUSE_COMMON_SERVICES=true
+NJRH_DOCKING_SENSOR_BACKEND=orbbec_336l
+NJRH_GS2_AUTOSTART=false
 NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION=false
 NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION=false
 NJRH_INITIAL_GLOBAL_LOCALIZATION_BACKGROUND_START=false

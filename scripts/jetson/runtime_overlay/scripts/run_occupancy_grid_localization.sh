@@ -347,7 +347,7 @@ require_common_ranger_chassis_for_localization() {
     echo "[runtime-overlay] common-owned Ranger chassis process is not running; localization will not start or restart it" >&2
     return 1
   fi
-  if runtime_health_check "local_state_ready"; then
+  if runtime_health_check "local_state_ready" || runtime_health_check "local_state_topic_ready"; then
     echo "[runtime-overlay] common runtime health confirms the Ranger-to-local-state chain" >&2
     return 0
   fi

@@ -23,6 +23,7 @@
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp/serialized_message.hpp"
+#include "robot_interfaces/msg/dock_target_observation.hpp"
 #include "sensor_msgs/msg/imu.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
@@ -462,6 +463,11 @@ bool wait_for_fresh_stamped_topic(const rclcpp::Node::SharedPtr & node, const st
   }
   if (topic_type == "geometry_msgs/msg/PoseWithCovarianceStamped") {
     return wait_for_fresh_stamped_topic_typed<geometry_msgs::msg::PoseWithCovarianceStamped>(
+      node, topic, std::max(0.1, std::chrono::duration<double>(deadline - Clock::now()).count()),
+      max_age_sec, max_future_sec);
+  }
+  if (topic_type == "robot_interfaces/msg/DockTargetObservation") {
+    return wait_for_fresh_stamped_topic_typed<robot_interfaces::msg::DockTargetObservation>(
       node, topic, std::max(0.1, std::chrono::duration<double>(deadline - Clock::now()).count()),
       max_age_sec, max_future_sec);
   }

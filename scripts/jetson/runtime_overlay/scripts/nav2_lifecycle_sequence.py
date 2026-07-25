@@ -287,44 +287,48 @@ def main(argv: Iterable[str]) -> int:
     nodes = [normalize_node_name(name) for name in args.nodes]
     rclpy.init()
     node = rclpy.create_node(f"nav2_lifecycle_sequence_{os.getpid()}")
-    try:
-        if args.configure_all_before_activate:
-            log("lifecycle sequence: configuring all managed nodes before activation")
-            for node_name in nodes:
-                configure_node(
-                    node,
-                    node_name,
-                    args.per_node_timeout_sec,
-                    args.change_state_response_timeout_sec,
-                    args.trust_change_state_response,
-                )
-            for node_name in nodes:
-                activate_node(
-                    node,
-                    node_name,
-                    args.per_node_timeout_sec,
-                    args.change_state_response_timeout_sec,
-                    args.trust_change_state_response,
-                )
-        else:
-            for node_name in nodes:
-                bringup_node(
-                    node,
-                    node_name,
-                    args.per_node_timeout_sec,
-                    args.change_state_response_timeout_sec,
-                    args.trust_change_state_response,
-                )
-        log("lifecycle sequence: managed nodes are active")
-        return 0
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
+    if args.configure_all_before_activate:
+        log("lifecycle sequence: configuring all managed nodes before activation")
+        for node_name in nodes:
+            configure_node(
+                node,
+                node_name,
+                args.per_node_timeout_sec,
+                args.change_state_response_timeout_sec,
+                args.trust_change_state_response,
+            )
+        for node_name in nodes:
+            activate_node(
+                node,
+                node_name,
+                args.per_node_timeout_sec,
+                args.change_state_response_timeout_sec,
+                args.trust_change_state_response,
+            )
+    else:
+        for node_name in nodes:
+            bringup_node(
+                node,
+                node_name,
+                args.per_node_timeout_sec,
+                args.change_state_response_timeout_sec,
+                args.trust_change_state_response,
+            )
+    log("lifecycle sequence: managed nodes are active")
+    return 0
 
 
 if __name__ == "__main__":
+    exit_code = 0
     try:
-        raise SystemExit(main(sys.argv[1:]))
+        exit_code = main(sys.argv[1:])
     except Exception as exc:  # noqa: BLE001 - shell caller needs one clear failure line.
         warn(f"lifecycle sequence failed: {exc}")
-        raise SystemExit(1)
+        exit_code = 1
+    # Fast DDS can block indefinitely while a short-lived lifecycle client
+    # destroys its node after a lost service response. All requested lifecycle
+    # states have already been confirmed here, so let process teardown reclaim
+    # the one-shot participant instead of turning success into an outer timeout.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(exit_code)

@@ -33,6 +33,9 @@ def generate_launch_description():
     use_sim_time = LaunchConfiguration("use_sim_time")
     autostart = LaunchConfiguration("autostart")
     params_file = LaunchConfiguration("params_file")
+    planner_profile_file = LaunchConfiguration("planner_profile_file")
+    ranger_lattice_filepath = LaunchConfiguration("ranger_lattice_filepath")
+    nav_to_pose_bt_xml = LaunchConfiguration("nav_to_pose_bt_xml")
     keepout_mask_yaml = LaunchConfiguration("keepout_mask_yaml")
     speed_mask_yaml = LaunchConfiguration("speed_mask_yaml")
     use_respawn = LaunchConfiguration("use_respawn")
@@ -43,6 +46,23 @@ def generate_launch_description():
 
     default_params_file = PathJoinSubstitution(
         [FindPackageShare("robot_nav_config"), "config", "nav2.yaml"]
+    )
+    default_planner_profile_file = PathJoinSubstitution(
+        [FindPackageShare("robot_nav_config"), "config", "planner_profiles", "preserve_base.yaml"]
+    )
+    default_ranger_lattice_filepath = PathJoinSubstitution(
+        [
+            FindPackageShare("robot_nav_config"),
+            "lattice",
+            "ranger_mini3_ackermann_0p05m_0p81m_16.json",
+        ]
+    )
+    default_nav_to_pose_bt_xml = PathJoinSubstitution(
+        [
+            FindPackageShare("robot_nav_config"),
+            "behavior_trees",
+            "navigate_to_pose.xml",
+        ]
     )
     default_keepout_mask_yaml = PathJoinSubstitution(
         [FindPackageShare("robot_nav_config"), "config", "neutral_keepout_mask.yaml"]
@@ -161,6 +181,17 @@ def generate_launch_description():
         ),
         allow_substs=True,
     )
+    configured_planner_profile = ParameterFile(
+        RewrittenYaml(
+            source_file=planner_profile_file,
+            root_key=namespace,
+            param_rewrites={
+                "lattice_filepath": ranger_lattice_filepath,
+            },
+            convert_types=True,
+        ),
+        allow_substs=True,
+    )
 
     node_kwargs = {
         "output": "screen",
@@ -169,6 +200,13 @@ def generate_launch_description():
         "parameters": [configured_params],
         "arguments": ["--ros-args", "--log-level", log_level],
     }
+    planner_node_kwargs = dict(node_kwargs)
+    planner_node_kwargs["parameters"] = [configured_params, configured_planner_profile]
+    bt_navigator_node_kwargs = dict(node_kwargs)
+    bt_navigator_node_kwargs["parameters"] = [
+        configured_params,
+        {"default_nav_to_pose_bt_xml": nav_to_pose_bt_xml},
+    ]
 
     speed_filter_nodes = []
     if enable_speed_filter:
@@ -245,6 +283,18 @@ def generate_launch_description():
             DeclareLaunchArgument("use_sim_time", default_value="false"),
             DeclareLaunchArgument("autostart", default_value="true"),
             DeclareLaunchArgument("params_file", default_value=default_params_file),
+            DeclareLaunchArgument(
+                "planner_profile_file",
+                default_value=default_planner_profile_file,
+            ),
+            DeclareLaunchArgument(
+                "ranger_lattice_filepath",
+                default_value=default_ranger_lattice_filepath,
+            ),
+            DeclareLaunchArgument(
+                "nav_to_pose_bt_xml",
+                default_value=default_nav_to_pose_bt_xml,
+            ),
             DeclareLaunchArgument("keepout_mask_yaml", default_value=default_keepout_mask_yaml),
             DeclareLaunchArgument("speed_mask_yaml", default_value=default_speed_mask_yaml),
             DeclareLaunchArgument("use_respawn", default_value="False"),
@@ -274,7 +324,7 @@ def generate_launch_description():
                 executable="planner_server",
                 name="planner_server",
                 remappings=remappings,
-                **with_cpu_affinity("planner_server", node_kwargs),
+                **with_cpu_affinity("planner_server", planner_node_kwargs),
             ),
             Node(
                 package="nav2_behaviors",
@@ -295,7 +345,7 @@ def generate_launch_description():
                 executable="bt_navigator",
                 name="bt_navigator",
                 remappings=remappings,
-                **with_cpu_affinity("bt_navigator", node_kwargs),
+                **with_cpu_affinity("bt_navigator", bt_navigator_node_kwargs),
             ),
             Node(
                 package="nav2_velocity_smoother",

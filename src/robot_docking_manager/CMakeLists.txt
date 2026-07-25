@@ -4,7 +4,9 @@ project(robot_docking_manager)
 find_package(ament_cmake REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(ranger_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(robot_interfaces REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
@@ -15,7 +17,9 @@ ament_target_dependencies(
   docking_manager_node
   geometry_msgs
   nav_msgs
+  ranger_msgs
   rclcpp
+  robot_interfaces
   sensor_msgs
   std_msgs
   std_srvs

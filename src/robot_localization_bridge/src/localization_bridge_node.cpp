@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -20,8 +19,17 @@
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/executors/multi_threaded_executor.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "robot_interfaces/msg/correction_pause_state.hpp"
+#include "robot_interfaces/msg/localization_health.hpp"
+#include "robot_interfaces/srv/begin_floor_transition.hpp"
+#include "robot_interfaces/srv/set_correction_pause.hpp"
+#include "robot_localization_bridge/correction_pause_arbiter.hpp"
+#include "robot_localization_bridge/floor_transition_context.hpp"
+#include "robot_localization_bridge/post_isaac_refine_gate.hpp"
+#include "robot_localization_bridge/se2_correction.hpp"
 #include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/string.hpp"
+#include "std_srvs/srv/empty.hpp"
 #include "std_srvs/srv/set_bool.hpp"
 #include "std_srvs/srv/trigger.hpp"
 #include "tf2_ros/buffer.h"
@@ -53,7 +61,7 @@ double stamp_to_sec(const builtin_interfaces::msg::Time & stamp)
 
 double normalize_yaw(const double yaw)
 {
-  return std::atan2(std::sin(yaw), std::cos(yaw));
+  return robot_localization_bridge::se2::normalize_yaw(yaw);
 }
 
 std::string json_escape(const std::string & input)
@@ -262,19 +270,21 @@ double env_double_field(
   }
 }
 
-struct MapToOdom
-{
-  double x{0.0};
-  double y{0.0};
-  double yaw{0.0};
-};
+using MapToOdom = robot_localization_bridge::se2::Pose2D;
+using robot_localization_bridge::PostIsaacRefineDisposition;
 
 struct CandidateCorrection
 {
   MapToOdom transform;
+  MapToOdom odom_base_pose;
   geometry_msgs::msg::PoseWithCovarianceStamped map_base_pose;
+  double correction_dx_map_m{0.0};
+  double correction_dy_map_m{0.0};
+  double correction_dyaw_rad{0.0};
   double correction_translation_m{0.0};
   double correction_yaw_rad{0.0};
+  double map_odom_parameter_translation_m{0.0};
+  double map_odom_parameter_yaw_rad{0.0};
   double result_age_ms{-1.0};
   double gate_result_age_limit_ms{-1.0};
   double xy_covariance{-1.0};
@@ -308,12 +318,19 @@ struct MapOdomState
   std::string last_correction_source{"none"};
   double correction_translation_m{0.0};
   double correction_yaw_rad{0.0};
+  double map_odom_parameter_translation_m{0.0};
+  double map_odom_parameter_yaw_rad{0.0};
   double remaining_translation_error_m{0.0};
   double remaining_yaw_error_rad{0.0};
+  double remaining_map_odom_parameter_translation_m{0.0};
+  double remaining_map_odom_parameter_yaw_rad{0.0};
   double last_step_translation_m{0.0};
   double last_step_yaw_rad{0.0};
   double smoothing_translation_rate_mps{0.0};
   double smoothing_yaw_rate_radps{0.0};
+  double smoothing_total_duration_sec{0.0};
+  double smoothing_remaining_duration_sec{0.0};
+  double smoothing_progress{1.0};
   double last_correction_delta_translation_m{0.0};
   double last_correction_delta_yaw_rad{0.0};
   std::string smoothing_policy{"default"};
@@ -388,6 +405,21 @@ public:
       "force_accept_service", "/robot_localization_bridge/force_accept_next_localization");
     correction_pause_service_ = declare_parameter<std::string>(
       "correction_pause_service", "/robot_localization_bridge/set_correction_paused");
+    correction_pause_lease_service_ = declare_parameter<std::string>(
+      "correction_pause_lease_service",
+      "/robot_localization_bridge/set_correction_pause_lease");
+    correction_pause_state_topic_ = declare_parameter<std::string>(
+      "correction_pause_state_topic",
+      "/localization/correction_pause_state");
+    floor_health_topic_ = declare_parameter<std::string>(
+      "floor_health_topic", "/localization/floor_health");
+    begin_floor_transition_service_ = declare_parameter<std::string>(
+      "begin_floor_transition_service",
+      "/robot_localization_bridge/begin_floor_transition");
+    floor_transition_pause_owner_ = declare_parameter<std::string>(
+      "floor_transition_pause_owner", "robot_floor_manager");
+    live_floor_transition_service_enabled_ =
+      declare_parameter<bool>("live_floor_transition_service_enabled", false);
     two_d_mode_ = declare_parameter<bool>("two_d_mode", true);
     const bool deprecated_continuous_localization_enabled = declare_parameter<bool>(
       "continuous_localization_enabled", false);
@@ -456,6 +488,18 @@ public:
       "amcl_post_isaac_refine_agreement_yaw_rad", 0.08);
     amcl_post_isaac_refine_require_stationary_ = declare_parameter<bool>(
       "amcl_post_isaac_refine_require_stationary", true);
+    amcl_post_isaac_refine_min_delay_sec_ = declare_parameter<double>(
+      "amcl_post_isaac_refine_min_delay_sec", 0.25);
+    amcl_post_isaac_refine_min_pose_stamp_delta_sec_ = declare_parameter<double>(
+      "amcl_post_isaac_refine_min_pose_stamp_delta_sec", 0.0);
+    amcl_post_isaac_refine_request_nomotion_update_ = declare_parameter<bool>(
+      "amcl_post_isaac_refine_request_nomotion_update", true);
+    amcl_post_isaac_refine_nomotion_update_service_ = declare_parameter<std::string>(
+      "amcl_post_isaac_refine_nomotion_update_service", "/request_nomotion_update");
+    amcl_post_isaac_refine_nomotion_request_period_sec_ = declare_parameter<double>(
+      "amcl_post_isaac_refine_nomotion_request_period_sec", 0.5);
+    amcl_post_isaac_refine_nomotion_max_requests_ = declare_parameter<int>(
+      "amcl_post_isaac_refine_nomotion_max_requests", 4);
     amcl_initial_pose_topic_ = declare_parameter<std::string>(
       "amcl_initial_pose_topic", "/initialpose");
     amcl_initial_pose_seed_enabled_ = declare_parameter<bool>(
@@ -578,6 +622,14 @@ public:
       std::max(0.0, amcl_post_isaac_refine_agreement_translation_m_);
     amcl_post_isaac_refine_agreement_yaw_rad_ =
       std::max(0.0, amcl_post_isaac_refine_agreement_yaw_rad_);
+    amcl_post_isaac_refine_min_delay_sec_ =
+      std::max(0.0, amcl_post_isaac_refine_min_delay_sec_);
+    amcl_post_isaac_refine_min_pose_stamp_delta_sec_ =
+      std::max(0.0, amcl_post_isaac_refine_min_pose_stamp_delta_sec_);
+    amcl_post_isaac_refine_nomotion_request_period_sec_ =
+      std::max(0.1, amcl_post_isaac_refine_nomotion_request_period_sec_);
+    amcl_post_isaac_refine_nomotion_max_requests_ =
+      std::clamp(amcl_post_isaac_refine_nomotion_max_requests_, 0, 20);
     amcl_initial_pose_xy_covariance_ = std::max(0.0, amcl_initial_pose_xy_covariance_);
     amcl_initial_pose_yaw_covariance_ =
       std::max(0.0, amcl_initial_pose_yaw_covariance_);
@@ -644,6 +696,8 @@ public:
     amcl_initial_pose_pub_ = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
       amcl_initial_pose_topic_,
       rclcpp::QoS(10));
+    amcl_nomotion_update_client_ = create_client<std_srvs::srv::Empty>(
+      amcl_post_isaac_refine_nomotion_update_service_);
     force_accept_srv_ = create_service<std_srvs::srv::Trigger>(
       force_accept_service_,
       std::bind(
@@ -655,6 +709,30 @@ public:
       correction_pause_service_,
       std::bind(
         &LocalizationBridgeNode::on_correction_pause_request,
+        this,
+        std::placeholders::_1,
+        std::placeholders::_2));
+    correction_pause_state_pub_ =
+      create_publisher<robot_interfaces::msg::CorrectionPauseState>(
+      correction_pause_state_topic_,
+      rclcpp::QoS(1).reliable().transient_local());
+    floor_health_pub_ =
+      create_publisher<robot_interfaces::msg::LocalizationHealth>(
+      floor_health_topic_,
+      rclcpp::QoS(1).reliable().transient_local());
+    correction_pause_lease_srv_ =
+      create_service<robot_interfaces::srv::SetCorrectionPause>(
+      correction_pause_lease_service_,
+      std::bind(
+        &LocalizationBridgeNode::on_correction_pause_lease_request,
+        this,
+        std::placeholders::_1,
+        std::placeholders::_2));
+    begin_floor_transition_srv_ =
+      create_service<robot_interfaces::srv::BeginFloorTransition>(
+      begin_floor_transition_service_,
+      std::bind(
+        &LocalizationBridgeNode::on_begin_floor_transition_request,
         this,
         std::placeholders::_1,
         std::placeholders::_2));
@@ -678,6 +756,11 @@ public:
     status_timer_ = create_wall_timer(
       std::chrono::milliseconds(status_period_ms),
       std::bind(&LocalizationBridgeNode::on_status_timer, this));
+    post_isaac_refine_timer_ = create_wall_timer(
+      std::chrono::milliseconds(100),
+      std::bind(&LocalizationBridgeNode::maybe_request_post_isaac_nomotion_update, this));
+    publish_correction_pause_state(correction_pause_snapshot());
+    publish_floor_health(false, false, false, false);
     RCLCPP_INFO(
       get_logger(),
       "map->odom publisher decoupled from correction callbacks: rate=%.1fHz warn_gap=%.1fms fail_gap=%.1fms",
@@ -790,6 +873,39 @@ private:
       reject_candidate(amcl_scan_admission_reject_reason(), "amcl_pose", false);
       return;
     }
+    if (explicit_isaac_target_in_progress()) {
+      hold_post_isaac_refine(
+        "waiting_for_isaac_settle",
+        "AMCL_POST_ISAAC_REFINE_WAITING_FOR_ISAAC_SETTLE");
+      return;
+    }
+    const auto refine_disposition = post_isaac_refine_disposition(
+      now_sec,
+      stamp_to_sec(msg->header.stamp),
+      last_amcl_pose_received_sec_);
+    switch (refine_disposition) {
+      case PostIsaacRefineDisposition::kWaitingForIsaacSettle:
+        hold_post_isaac_refine(
+          "waiting_for_isaac_settle",
+          "AMCL_POST_ISAAC_REFINE_WAITING_FOR_ISAAC_SETTLE");
+        return;
+      case PostIsaacRefineDisposition::kWaitingForMinimumDelay:
+        hold_post_isaac_refine(
+          "waiting_for_post_seed_delay",
+          "AMCL_POST_ISAAC_REFINE_WAITING_FOR_POST_SEED_DELAY");
+        return;
+      case PostIsaacRefineDisposition::kPreseedPose:
+        hold_post_isaac_refine(
+          "preseed_pose_suppressed",
+          "AMCL_POST_ISAAC_REFINE_PRESEED_POSE");
+        return;
+      case PostIsaacRefineDisposition::kAbandonBecauseMoving:
+        abandon_post_isaac_refine("robot_started_moving");
+        break;
+      case PostIsaacRefineDisposition::kEligible:
+      case PostIsaacRefineDisposition::kNotApplicable:
+        break;
+    }
     auto candidate = build_candidate(
       *msg,
       amcl_source_name(),
@@ -798,7 +914,7 @@ private:
       amcl_covariance_gate_enabled_,
       amcl_max_xy_covariance_,
       amcl_max_yaw_covariance_);
-    if (amcl_post_isaac_refine_eligible(now_sec)) {
+    if (refine_disposition == PostIsaacRefineDisposition::kEligible) {
       (void)accept_post_isaac_refine_candidate(candidate, "amcl_pose");
       return;
     }
@@ -828,8 +944,96 @@ private:
 
   void on_status_timer()
   {
+    publish_correction_pause_state(correction_pause_snapshot());
     refresh_state("status_timer");
     publish_status_if_due();
+  }
+
+  robot_localization_bridge::CorrectionPauseSnapshot correction_pause_snapshot() const
+  {
+    std::lock_guard<std::mutex> lock(correction_pause_mutex_);
+    return correction_pause_arbiter_.snapshot();
+  }
+
+  robot_localization_bridge::PauseDecision apply_correction_pause_command(
+    const robot_localization_bridge::PauseCommand & command)
+  {
+    std::lock_guard<std::mutex> lock(correction_pause_mutex_);
+    return correction_pause_arbiter_.apply(command);
+  }
+
+  robot_localization_bridge::FloorTransitionContextSnapshot floor_transition_snapshot() const
+  {
+    std::lock_guard<std::mutex> lock(floor_transition_context_mutex_);
+    return floor_transition_context_.snapshot();
+  }
+
+  bool floor_transition_candidate_allowed(
+    const bool explicit_trigger,
+    const bool corrections_paused) const
+  {
+    std::lock_guard<std::mutex> lock(floor_transition_context_mutex_);
+    return floor_transition_context_.candidate_allowed(
+      explicit_trigger, corrections_paused);
+  }
+
+  bool floor_pause_is_owned(
+    const robot_localization_bridge::CorrectionPauseSnapshot & pause,
+    const std::string & transaction_id) const
+  {
+    const std::string expected_key =
+      floor_transition_pause_owner_ + ":" + transaction_id;
+    return std::find(
+      pause.lease_keys.cbegin(), pause.lease_keys.cend(), expected_key) !=
+           pause.lease_keys.cend();
+  }
+
+  bool effective_safe_for_goal_start(
+    const bool map_odom_safe_for_goal_start,
+    const robot_localization_bridge::FloorTransitionContextSnapshot & floor) const
+  {
+    return map_odom_safe_for_goal_start &&
+           floor.runtime_context_valid &&
+           !floor.transition_active &&
+           !floor.failed_locked;
+  }
+
+  void publish_floor_health(
+    const bool amcl_ready,
+    const bool map_odom_state_valid,
+    const bool map_odom_correction_active,
+    const bool map_odom_safe_for_goal_start)
+  {
+    const auto floor = floor_transition_snapshot();
+    const auto & identity =
+      (floor.transition_active || floor.failed_locked) &&
+      !floor.pending.transaction_id.empty() ?
+      floor.pending : floor.active;
+    const bool effective_safe =
+      effective_safe_for_goal_start(map_odom_safe_for_goal_start, floor);
+
+    robot_interfaces::msg::LocalizationHealth health;
+    health.stamp = now();
+    health.building_id = identity.building_id;
+    health.floor_id = identity.floor_id;
+    health.map_id = identity.map_id;
+    health.asset_epoch = identity.asset_epoch;
+    health.asset_digest = identity.asset_digest;
+    health.localizer_ready = false;
+    health.localizer_generation = 0U;
+    health.bridge_ready =
+      has_map_to_odom_ &&
+      map_odom_state_valid &&
+      !map_odom_correction_active &&
+      effective_safe;
+    health.tf_unique = false;
+    health.explicit_relocalization_sequence =
+      last_explicit_relocalization_sequence_;
+    health.amcl_ready = amcl_ready;
+    health.transition_active = floor.transition_active;
+    health.runtime_context_valid = floor.runtime_context_valid;
+    health.detail = floor.detail;
+    floor_health_pub_->publish(health);
   }
 
   void publish_health(const bool ok, const std::string & reason)
@@ -850,10 +1054,129 @@ private:
     }
   }
 
+  void on_begin_floor_transition_request(
+    const std::shared_ptr<robot_interfaces::srv::BeginFloorTransition::Request> request,
+    std::shared_ptr<robot_interfaces::srv::BeginFloorTransition::Response> response)
+  {
+    robot_localization_bridge::FloorTransitionIdentity identity;
+    identity.transaction_id = request->transaction_id;
+    identity.building_id = request->building_id;
+    identity.floor_id = request->floor_id;
+    identity.map_id = request->map_id;
+    identity.asset_epoch = request->asset_epoch;
+    identity.asset_digest = request->asset_digest;
+
+    const auto pause = correction_pause_snapshot();
+    robot_localization_bridge::FloorTransitionContextDecision decision;
+    if (!live_floor_transition_service_enabled_ &&
+      (request->operation == robot_interfaces::srv::BeginFloorTransition::Request::OP_BEGIN ||
+      request->operation == robot_interfaces::srv::BeginFloorTransition::Request::OP_COMMIT))
+    {
+      decision.accepted = false;
+      decision.code =
+        robot_localization_bridge::FloorTransitionDecisionCode::kInvalidRequest;
+      decision.message =
+        "LIVE_FLOOR_TRANSITION_DISABLED: bridge BEGIN/COMMIT are disabled until "
+        "the strict floor action proves motion hold, asset identity, localization, and costmaps";
+      decision.state = floor_transition_snapshot();
+    } else if (
+      request->operation == robot_interfaces::srv::BeginFloorTransition::Request::OP_BEGIN)
+    {
+      {
+        std::lock_guard<std::mutex> lock(floor_transition_context_mutex_);
+        decision = floor_transition_context_.begin(
+          identity,
+          floor_pause_is_owned(pause, identity.transaction_id),
+          last_explicit_relocalization_sequence_);
+      }
+      if (decision.accepted && !decision.idempotent) {
+        force_accept_next_pose_ = false;
+        force_accept_next_pose_explicit_trigger_ = false;
+        force_accept_armed_sec_ = 0.0;
+      }
+    } else if (
+      request->operation == robot_interfaces::srv::BeginFloorTransition::Request::OP_COMMIT)
+    {
+      MapOdomState map_state;
+      {
+        std::lock_guard<std::mutex> lock(map_odom_state_mutex_);
+        map_state = map_odom_state_;
+      }
+      std::uint64_t last_published_sequence = 0U;
+      {
+        std::lock_guard<std::mutex> lock(map_odom_publish_stats_mutex_);
+        last_published_sequence = map_odom_last_published_sequence_;
+      }
+      robot_localization_bridge::FloorTransitionCommitEvidence evidence;
+      evidence.correction_pause_released = !pause.paused;
+      evidence.explicit_relocalization_sequence =
+        last_explicit_relocalization_sequence_;
+      evidence.map_odom_valid = has_map_to_odom_ && map_state.valid;
+      evidence.correction_active = map_state.correction_active;
+      evidence.current_sequence = map_state.current_sequence;
+      evidence.target_sequence = map_state.target_sequence;
+      evidence.last_published_sequence = last_published_sequence;
+      {
+        std::lock_guard<std::mutex> lock(floor_transition_context_mutex_);
+        decision = floor_transition_context_.commit(identity, evidence);
+      }
+    } else if (
+      request->operation == robot_interfaces::srv::BeginFloorTransition::Request::OP_ABORT)
+    {
+      {
+        std::lock_guard<std::mutex> lock(floor_transition_context_mutex_);
+        decision = floor_transition_context_.abort(identity);
+      }
+      if (decision.accepted) {
+        force_accept_next_pose_ = false;
+        force_accept_next_pose_explicit_trigger_ = false;
+        force_accept_armed_sec_ = 0.0;
+      }
+    } else {
+      decision.accepted = false;
+      decision.code =
+        robot_localization_bridge::FloorTransitionDecisionCode::kInvalidRequest;
+      decision.message = "unknown floor transition operation";
+      decision.state = floor_transition_snapshot();
+    }
+
+    MapOdomState map_state;
+    {
+      std::lock_guard<std::mutex> lock(map_odom_state_mutex_);
+      map_state = map_odom_state_;
+    }
+    const bool effective_safe =
+      effective_safe_for_goal_start(map_state.safe_for_goal_start, decision.state);
+    const auto & accepted_identity =
+      decision.state.runtime_context_valid ?
+      decision.state.active : decision.state.pending;
+    response->success = decision.accepted;
+    response->message =
+      std::string(robot_localization_bridge::to_string(decision.code)) +
+      ": " + decision.message;
+    response->runtime_context_valid = decision.state.runtime_context_valid;
+    response->safe_for_goal_start = effective_safe;
+    response->accepted_asset_epoch = accepted_identity.asset_epoch;
+    response->explicit_relocalization_sequence =
+      last_explicit_relocalization_sequence_;
+    publish_floor_health(
+      false, map_state.valid, map_state.correction_active,
+      map_state.safe_for_goal_start);
+  }
+
   void on_force_accept_request(
     const std::shared_ptr<std_srvs::srv::Trigger::Request>,
     const std::shared_ptr<std_srvs::srv::Trigger::Response> response)
   {
+    const auto floor = floor_transition_snapshot();
+    if (floor.failed_locked) {
+      force_accept_next_pose_ = false;
+      force_accept_next_pose_explicit_trigger_ = false;
+      response->success = false;
+      response->message =
+        "FAILED_LOCKED: explicit localization is blocked until floor recovery";
+      return;
+    }
     force_accept_armed_sec_ = now().seconds();
     force_accept_next_pose_ = true;
     force_accept_next_pose_explicit_trigger_ = true;
@@ -874,18 +1197,110 @@ private:
     const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
     const std::shared_ptr<std_srvs::srv::SetBool::Response> response)
   {
-    correction_paused_ = request->data;
-    correction_pause_reason_ = correction_paused_ ? "docking_fine" : "none";
-    update_map_odom_pause_state();
-    response->success = true;
-    response->message = correction_paused_ ?
-      "global localization corrections are paused" :
-      "global localization corrections are enabled";
+    constexpr const char * kLegacyOwner = "legacy_set_bool";
+    constexpr const char * kLegacyTransaction = "legacy_set_bool";
+    const auto before = correction_pause_snapshot();
+    const std::string legacy_key =
+      std::string(kLegacyOwner) + ":" + kLegacyTransaction;
+    const bool legacy_held =
+      std::find(before.lease_keys.cbegin(), before.lease_keys.cend(), legacy_key) !=
+      before.lease_keys.cend();
+
+    if (!request->data && !legacy_held) {
+      apply_correction_pause_snapshot(before);
+      response->success = true;
+      response->message = before.paused ?
+        "legacy correction pause was already released; another owner still holds pause" :
+        "global localization corrections are already enabled";
+      return;
+    }
+
+    robot_localization_bridge::PauseCommand command;
+    command.operation = request->data ?
+      robot_localization_bridge::PauseOperation::kAcquire :
+      robot_localization_bridge::PauseOperation::kRelease;
+    command.owner = kLegacyOwner;
+    command.transaction_id = kLegacyTransaction;
+    command.reason = "docking_fine";
+    const auto decision = apply_correction_pause_command(command);
+    apply_correction_pause_snapshot(decision.state);
+    response->success = decision.accepted;
+    response->message = decision.message;
     RCLCPP_WARN(
       get_logger(),
-      "global localization correction pause=%s reason=%s",
-      correction_paused_ ? "true" : "false",
-      correction_pause_reason_.c_str());
+      "legacy global localization correction pause=%s effective_pause=%s leases=%zu",
+      request->data ? "true" : "false",
+      decision.state.paused ? "true" : "false",
+      decision.state.lease_keys.size());
+  }
+
+  robot_interfaces::msg::CorrectionPauseState make_correction_pause_state(
+    const robot_localization_bridge::CorrectionPauseSnapshot & snapshot) const
+  {
+    robot_interfaces::msg::CorrectionPauseState state;
+    state.stamp = now();
+    state.generation = snapshot.generation;
+    state.paused = snapshot.paused;
+    state.lease_keys = snapshot.lease_keys;
+    state.transition_reason = snapshot.transition_reason;
+    return state;
+  }
+
+  void publish_correction_pause_state(
+    const robot_localization_bridge::CorrectionPauseSnapshot & snapshot)
+  {
+    correction_pause_state_pub_->publish(make_correction_pause_state(snapshot));
+  }
+
+  void apply_correction_pause_snapshot(
+    const robot_localization_bridge::CorrectionPauseSnapshot & snapshot)
+  {
+    correction_paused_ = snapshot.paused;
+    correction_pause_reason_ = snapshot.paused ?
+      snapshot.transition_reason : "none";
+    update_map_odom_pause_state();
+    publish_correction_pause_state(snapshot);
+  }
+
+  void on_correction_pause_lease_request(
+    const std::shared_ptr<robot_interfaces::srv::SetCorrectionPause::Request> request,
+    std::shared_ptr<robot_interfaces::srv::SetCorrectionPause::Response> response)
+  {
+    if (
+      request->owner == "legacy_set_bool" ||
+      request->transaction_id == "legacy_set_bool")
+    {
+      const auto state = correction_pause_snapshot();
+      response->success = false;
+      response->result_code = static_cast<std::uint8_t>(
+        robot_localization_bridge::PauseDecisionCode::kInvalidRequest);
+      response->message =
+        "legacy_set_bool owner/transaction identifiers are reserved";
+      response->state = make_correction_pause_state(state);
+      publish_correction_pause_state(state);
+      return;
+    }
+    robot_localization_bridge::PauseCommand command;
+    command.operation =
+      static_cast<robot_localization_bridge::PauseOperation>(request->operation);
+    command.owner = request->owner;
+    command.transaction_id = request->transaction_id;
+    command.reason = request->reason;
+    const auto decision = apply_correction_pause_command(command);
+    apply_correction_pause_snapshot(decision.state);
+    response->success = decision.accepted;
+    response->result_code = static_cast<std::uint8_t>(decision.code);
+    response->message = decision.message;
+    response->state = make_correction_pause_state(decision.state);
+    RCLCPP_WARN(
+      get_logger(),
+      "owner-scoped correction pause request owner=%s transaction=%s accepted=%s "
+      "effective_pause=%s leases=%zu",
+      request->owner.c_str(),
+      request->transaction_id.c_str(),
+      decision.accepted ? "true" : "false",
+      decision.state.paused ? "true" : "false",
+      decision.state.lease_keys.size());
   }
 
   void on_amcl_seed_request(
@@ -1112,30 +1527,29 @@ private:
       return candidate;
     }
 
-    const double map_x = pose.pose.pose.position.x;
-    const double map_y = pose.pose.pose.position.y;
-    const double map_yaw = yaw_from_quaternion(pose.pose.pose.orientation);
-    const double odom_x = odom_base_tf.transform.translation.x;
-    const double odom_y = odom_base_tf.transform.translation.y;
-    const double odom_yaw = yaw_from_quaternion(odom_base_tf.transform.rotation);
+    const MapToOdom measured_map_base{
+      pose.pose.pose.position.x,
+      pose.pose.pose.position.y,
+      yaw_from_quaternion(pose.pose.pose.orientation)};
+    candidate.odom_base_pose = MapToOdom{
+      odom_base_tf.transform.translation.x,
+      odom_base_tf.transform.translation.y,
+      yaw_from_quaternion(odom_base_tf.transform.rotation)};
 
-    const double map_to_odom_yaw = normalize_yaw(map_yaw - odom_yaw);
-    const double cos_delta = std::cos(map_to_odom_yaw);
-    const double sin_delta = std::sin(map_to_odom_yaw);
-    const double map_to_odom_x = map_x - (cos_delta * odom_x - sin_delta * odom_y);
-    const double map_to_odom_y = map_y - (sin_delta * odom_x + cos_delta * odom_y);
-
-    candidate.transform.x = map_to_odom_x;
-    candidate.transform.y = map_to_odom_y;
-    candidate.transform.yaw = map_to_odom_yaw;
+    const auto current_map_to_odom = current_map_to_odom_snapshot();
+    const auto solution = robot_localization_bridge::se2::solve_correction(
+      current_map_to_odom, candidate.odom_base_pose, measured_map_base);
+    candidate.transform = solution.target_map_odom;
     candidate.map_base_pose = pose;
     if (has_map_to_odom_) {
-      const auto current_map_to_odom = current_map_to_odom_snapshot();
-      candidate.correction_translation_m = std::hypot(
-        map_to_odom_x - current_map_to_odom.x,
-        map_to_odom_y - current_map_to_odom.y);
-      candidate.correction_yaw_rad =
-        std::abs(normalize_yaw(map_to_odom_yaw - current_map_to_odom.yaw));
+      candidate.correction_dx_map_m = solution.base_dx_map_m;
+      candidate.correction_dy_map_m = solution.base_dy_map_m;
+      candidate.correction_dyaw_rad = solution.base_dyaw_rad;
+      candidate.correction_translation_m = solution.base_translation_m;
+      candidate.correction_yaw_rad = solution.base_yaw_rad;
+      candidate.map_odom_parameter_translation_m =
+        solution.map_odom_parameter_translation_m;
+      candidate.map_odom_parameter_yaw_rad = solution.map_odom_parameter_yaw_rad;
     }
     candidate.valid = true;
     return candidate;
@@ -1167,13 +1581,12 @@ private:
       amcl_medium_candidate_agreement_count_ = 1;
       return false;
     }
-    const double dx = candidate.transform.x - last_amcl_medium_candidate_.x;
-    const double dy = candidate.transform.y - last_amcl_medium_candidate_.y;
-    const double dyaw =
-      std::abs(normalize_yaw(candidate.transform.yaw - last_amcl_medium_candidate_.yaw));
+    const auto agreement =
+      robot_localization_bridge::se2::compare_map_odom_hypotheses_at_reference(
+      last_amcl_medium_candidate_, candidate.transform, candidate.odom_base_pose);
     if (
-      std::hypot(dx, dy) <= amcl_small_correction_translation_m_ &&
-      dyaw <= amcl_small_correction_yaw_rad_)
+      agreement.translation_m <= amcl_small_correction_translation_m_ &&
+      agreement.yaw_rad <= amcl_small_correction_yaw_rad_)
     {
       ++amcl_medium_candidate_agreement_count_;
     } else {
@@ -1195,39 +1608,179 @@ private:
            now_sec - last_isaac_triggered_accept_sec_ < amcl_accept_after_isaac_delay_sec_;
   }
 
-  bool amcl_post_isaac_refine_eligible(const double now_sec) const
+  bool explicit_isaac_target_settled() const
   {
-    if (!amcl_post_isaac_refine_enabled_ || amcl_gate_mode_ != "gated") {
-      return false;
-    }
-    if (last_isaac_triggered_accept_sec_ <= 0.0) {
-      return false;
-    }
-    if (
-      last_explicit_relocalization_sequence_ > 0U &&
-      amcl_post_isaac_refined_sequence_ == last_explicit_relocalization_sequence_)
-    {
-      return false;
-    }
-    const double refine_reference_sec = amcl_post_isaac_refine_reference_sec();
-    if (refine_reference_sec <= 0.0) {
-      return false;
-    }
-    if (now_sec - refine_reference_sec > amcl_post_isaac_refine_window_sec_) {
-      return false;
-    }
-    return !amcl_post_isaac_refine_require_stationary_ || !amcl_robot_moving_now();
+    std::lock_guard<std::mutex> lock(map_odom_state_mutex_);
+    return
+      last_explicit_map_odom_target_sequence_ > 0U &&
+      map_odom_state_.valid &&
+      !map_odom_state_.correction_active &&
+      map_odom_state_.current_sequence == last_explicit_map_odom_target_sequence_ &&
+      map_odom_state_.target_sequence == last_explicit_map_odom_target_sequence_ &&
+      map_odom_state_.current_source == "isaac_triggered" &&
+      map_odom_state_.target_source == "isaac_triggered";
+  }
+
+  bool explicit_isaac_target_in_progress() const
+  {
+    std::lock_guard<std::mutex> lock(map_odom_state_mutex_);
+    return
+      last_explicit_map_odom_target_sequence_ > 0U &&
+      map_odom_state_.valid &&
+      map_odom_state_.target_sequence == last_explicit_map_odom_target_sequence_ &&
+      map_odom_state_.target_source == "isaac_triggered" &&
+      (map_odom_state_.correction_active ||
+      map_odom_state_.current_sequence != map_odom_state_.target_sequence);
+  }
+
+  PostIsaacRefineDisposition post_isaac_refine_disposition(
+    const double now_sec,
+    const double pose_stamp_sec,
+    const double received_sec) const
+  {
+    robot_localization_bridge::PostIsaacRefineGateInput input;
+    input.enabled = amcl_post_isaac_refine_enabled_;
+    input.gated_mode = amcl_gate_mode_ == "gated";
+    input.explicit_target_settled = explicit_isaac_target_settled();
+    input.require_stationary = amcl_post_isaac_refine_require_stationary_;
+    input.robot_moving = amcl_robot_moving_now();
+    input.explicit_sequence = last_explicit_relocalization_sequence_;
+    input.refined_sequence = amcl_post_isaac_refined_sequence_;
+    input.abandoned_sequence = amcl_post_isaac_refine_abandoned_sequence_;
+    input.now_sec = now_sec;
+    input.refine_reference_sec = amcl_post_isaac_refine_reference_sec();
+    input.pose_stamp_sec = pose_stamp_sec;
+    input.received_sec = received_sec;
+    input.window_sec = amcl_post_isaac_refine_window_sec_;
+    input.min_delay_sec = amcl_post_isaac_refine_min_delay_sec_;
+    input.min_pose_stamp_delta_sec = amcl_post_isaac_refine_min_pose_stamp_delta_sec_;
+    return robot_localization_bridge::evaluate_post_isaac_refine_gate(input);
+  }
+
+  void hold_post_isaac_refine(
+    const std::string & state,
+    const std::string & reason)
+  {
+    ++amcl_suppressed_after_isaac_count_;
+    ++amcl_post_isaac_refine_held_count_;
+    reset_post_isaac_refine_consistency();
+    last_amcl_state_ = state;
+    last_post_isaac_refine_hold_reason_ = reason;
+    last_reject_reason_ = reason + " (amcl_pose)";
+    last_rejected_source_ = amcl_source_name();
+  }
+
+  void abandon_post_isaac_refine(const std::string & reason)
+  {
+    amcl_post_isaac_refine_abandoned_sequence_ = last_explicit_relocalization_sequence_;
+    reset_post_isaac_refine_consistency();
+    last_amcl_state_ = "post_isaac_refine_abandoned";
+    last_post_isaac_refine_hold_reason_ = "abandoned:" + reason;
   }
 
   double amcl_post_isaac_refine_reference_sec() const
   {
     if (
-      last_amcl_initial_pose_seed_sec_ > 0.0 &&
-      last_amcl_initial_pose_seed_sec_ >= last_isaac_triggered_accept_sec_)
+      last_post_isaac_refine_seed_sec_ > 0.0 &&
+      last_post_isaac_refine_seed_sec_ >= last_isaac_triggered_accept_sec_)
     {
-      return last_amcl_initial_pose_seed_sec_;
+      return last_post_isaac_refine_seed_sec_;
     }
     return last_isaac_triggered_accept_sec_;
+  }
+
+  bool post_isaac_refine_pending(const double now_sec) const
+  {
+    if (
+      !amcl_post_isaac_refine_enabled_ || amcl_gate_mode_ != "gated" ||
+      last_explicit_relocalization_sequence_ == 0U ||
+      amcl_post_isaac_refined_sequence_ == last_explicit_relocalization_sequence_ ||
+      amcl_post_isaac_refine_abandoned_sequence_ == last_explicit_relocalization_sequence_)
+    {
+      return false;
+    }
+    const double reference_sec = amcl_post_isaac_refine_reference_sec();
+    const double age_sec = now_sec - reference_sec;
+    return reference_sec > 0.0 && age_sec >= 0.0 &&
+           age_sec <= amcl_post_isaac_refine_window_sec_;
+  }
+
+  void maybe_request_post_isaac_nomotion_update()
+  {
+    const double now_sec = now().seconds();
+    const bool refine_pending = post_isaac_refine_pending(now_sec);
+    if (!refine_pending) {
+      if (
+        last_explicit_relocalization_sequence_ > 0U &&
+        amcl_post_isaac_refined_sequence_ == last_explicit_relocalization_sequence_)
+      {
+        amcl_post_isaac_refine_nomotion_state_ = "refined";
+      } else if (
+        last_explicit_relocalization_sequence_ > 0U &&
+        amcl_post_isaac_refine_abandoned_sequence_ == last_explicit_relocalization_sequence_)
+      {
+        amcl_post_isaac_refine_nomotion_state_ = "abandoned";
+      }
+      return;
+    }
+
+    const bool robot_moving = amcl_robot_moving_now();
+    if (amcl_post_isaac_refine_require_stationary_ && robot_moving) {
+      abandon_post_isaac_refine("robot_started_moving_before_nomotion_refine");
+      amcl_post_isaac_refine_nomotion_state_ = "abandoned_robot_moving";
+      return;
+    }
+
+    const bool service_ready =
+      amcl_nomotion_update_client_ && amcl_nomotion_update_client_->service_is_ready();
+    robot_localization_bridge::PostIsaacNomotionRequestGateInput input;
+    input.enabled = amcl_post_isaac_refine_request_nomotion_update_;
+    input.refine_pending = refine_pending;
+    input.explicit_target_settled = explicit_isaac_target_settled();
+    input.require_stationary = amcl_post_isaac_refine_require_stationary_;
+    input.robot_moving = robot_moving;
+    input.service_ready = service_ready;
+    input.request_count = amcl_post_isaac_refine_nomotion_request_count_;
+    input.max_requests = amcl_post_isaac_refine_nomotion_max_requests_;
+    input.now_sec = now_sec;
+    input.seed_sec = last_post_isaac_refine_seed_sec_;
+    input.last_request_sec = amcl_post_isaac_refine_nomotion_last_request_sec_;
+    input.min_delay_sec = amcl_post_isaac_refine_min_delay_sec_;
+    input.request_period_sec = amcl_post_isaac_refine_nomotion_request_period_sec_;
+    if (!robot_localization_bridge::should_request_post_isaac_nomotion_update(input)) {
+      if (!amcl_post_isaac_refine_request_nomotion_update_) {
+        amcl_post_isaac_refine_nomotion_state_ = "disabled";
+      } else if (last_post_isaac_refine_seed_sec_ <= 0.0) {
+        amcl_post_isaac_refine_nomotion_state_ = "waiting_for_seed";
+      } else if (!input.explicit_target_settled) {
+        amcl_post_isaac_refine_nomotion_state_ = "waiting_for_isaac_settle";
+      } else if (!service_ready) {
+        amcl_post_isaac_refine_nomotion_state_ = "waiting_for_service";
+      } else if (
+        amcl_post_isaac_refine_nomotion_request_count_ >=
+        amcl_post_isaac_refine_nomotion_max_requests_)
+      {
+        amcl_post_isaac_refine_nomotion_state_ = "max_requests_reached";
+      } else {
+        amcl_post_isaac_refine_nomotion_state_ = "waiting_for_request_window";
+      }
+      return;
+    }
+
+    auto request = std::make_shared<std_srvs::srv::Empty::Request>();
+    (void)amcl_nomotion_update_client_->async_send_request(request);
+    ++amcl_post_isaac_refine_nomotion_request_count_;
+    ++amcl_post_isaac_refine_nomotion_total_request_count_;
+    amcl_post_isaac_refine_nomotion_last_request_sec_ = now_sec;
+    amcl_post_isaac_refine_nomotion_request_sequence_ =
+      last_explicit_relocalization_sequence_;
+    amcl_post_isaac_refine_nomotion_state_ = "requested";
+    RCLCPP_INFO(
+      get_logger(),
+      "requested AMCL no-motion update for post-Isaac refine sequence=%llu request=%d/%d",
+      static_cast<unsigned long long>(last_explicit_relocalization_sequence_),
+      amcl_post_isaac_refine_nomotion_request_count_,
+      amcl_post_isaac_refine_nomotion_max_requests_);
   }
 
   bool post_isaac_refine_candidate_agrees(const CandidateCorrection & candidate)
@@ -1238,13 +1791,12 @@ private:
       amcl_post_isaac_refine_agreement_count_ = 1;
       return amcl_post_isaac_refine_consistency_count_ <= 1;
     }
-    const double dx = candidate.transform.x - last_post_isaac_refine_candidate_.x;
-    const double dy = candidate.transform.y - last_post_isaac_refine_candidate_.y;
-    const double dyaw =
-      std::abs(normalize_yaw(candidate.transform.yaw - last_post_isaac_refine_candidate_.yaw));
+    const auto agreement =
+      robot_localization_bridge::se2::compare_map_odom_hypotheses_at_reference(
+      last_post_isaac_refine_candidate_, candidate.transform, candidate.odom_base_pose);
     if (
-      std::hypot(dx, dy) <= amcl_post_isaac_refine_agreement_translation_m_ &&
-      dyaw <= amcl_post_isaac_refine_agreement_yaw_rad_)
+      agreement.translation_m <= amcl_post_isaac_refine_agreement_translation_m_ &&
+      agreement.yaw_rad <= amcl_post_isaac_refine_agreement_yaw_rad_)
     {
       ++amcl_post_isaac_refine_agreement_count_;
     } else {
@@ -1273,8 +1825,14 @@ private:
   bool accept_candidate(CandidateCorrection & candidate, const char * source)
   {
     record_gate_result_count(candidate);
+    last_candidate_correction_dx_map_m_ = candidate.correction_dx_map_m;
+    last_candidate_correction_dy_map_m_ = candidate.correction_dy_map_m;
+    last_candidate_correction_dyaw_rad_ = candidate.correction_dyaw_rad;
     last_candidate_correction_translation_m_ = candidate.correction_translation_m;
     last_candidate_correction_yaw_rad_ = candidate.correction_yaw_rad;
+    last_candidate_map_odom_parameter_translation_m_ =
+      candidate.map_odom_parameter_translation_m;
+    last_candidate_map_odom_parameter_yaw_rad_ = candidate.map_odom_parameter_yaw_rad;
     last_gate_mode_ = candidate.gate_mode;
     last_gate_result_age_limit_ms_ = candidate.gate_result_age_limit_ms;
     last_result_age_ms_ = candidate.result_age_ms;
@@ -1288,6 +1846,12 @@ private:
       return false;
     }
     mark_latest_pose_stamp_used();
+
+    if (!floor_transition_candidate_allowed(candidate.explicit_trigger, correction_paused_)) {
+      reject_candidate(
+        "FLOOR_TRANSITION_REJECTED_NONEXPLICIT_OR_PAUSED_CANDIDATE", source, false);
+      return false;
+    }
 
     if (correction_paused_) {
       reject_candidate("GLOBAL_CORRECTION_PAUSED:" + correction_pause_reason_, source, false);
@@ -1350,8 +1914,14 @@ private:
   {
     record_gate_result_count(candidate);
     ++amcl_post_isaac_refine_candidate_count_;
+    last_candidate_correction_dx_map_m_ = candidate.correction_dx_map_m;
+    last_candidate_correction_dy_map_m_ = candidate.correction_dy_map_m;
+    last_candidate_correction_dyaw_rad_ = candidate.correction_dyaw_rad;
     last_candidate_correction_translation_m_ = candidate.correction_translation_m;
     last_candidate_correction_yaw_rad_ = candidate.correction_yaw_rad;
+    last_candidate_map_odom_parameter_translation_m_ =
+      candidate.map_odom_parameter_translation_m;
+    last_candidate_map_odom_parameter_yaw_rad_ = candidate.map_odom_parameter_yaw_rad;
     last_gate_mode_ = candidate.gate_mode;
     last_gate_result_age_limit_ms_ = candidate.gate_result_age_limit_ms;
     last_result_age_ms_ = candidate.result_age_ms;
@@ -1363,6 +1933,14 @@ private:
       last_amcl_state_ = "post_isaac_refine_rejected";
       ++amcl_post_isaac_refine_rejected_count_;
       reject_candidate(normalize_amcl_reject_reason(candidate.reject_reason), source, false);
+      return false;
+    }
+
+    if (!floor_transition_candidate_allowed(false, correction_paused_)) {
+      reset_post_isaac_refine_consistency();
+      last_amcl_state_ = "post_isaac_refine_floor_transition_blocked";
+      ++amcl_post_isaac_refine_rejected_count_;
+      reject_candidate("FLOOR_TRANSITION_BLOCKS_AMCL_REFINE", source, false);
       return false;
     }
 
@@ -1395,6 +1973,7 @@ private:
 
     reset_post_isaac_refine_consistency();
     last_amcl_state_ = "accepted_post_isaac_refine_correction";
+    last_post_isaac_refine_hold_reason_ = "none";
     ++amcl_post_isaac_refine_accepted_count_;
     apply_candidate(candidate, source, "AMCL_POST_ISAAC_REFINE_CORRECTION");
     amcl_post_isaac_refined_sequence_ = last_explicit_relocalization_sequence_;
@@ -1404,8 +1983,14 @@ private:
   bool accept_amcl_candidate(CandidateCorrection & candidate, const char * source)
   {
     record_gate_result_count(candidate);
+    last_candidate_correction_dx_map_m_ = candidate.correction_dx_map_m;
+    last_candidate_correction_dy_map_m_ = candidate.correction_dy_map_m;
+    last_candidate_correction_dyaw_rad_ = candidate.correction_dyaw_rad;
     last_candidate_correction_translation_m_ = candidate.correction_translation_m;
     last_candidate_correction_yaw_rad_ = candidate.correction_yaw_rad;
+    last_candidate_map_odom_parameter_translation_m_ =
+      candidate.map_odom_parameter_translation_m;
+    last_candidate_map_odom_parameter_yaw_rad_ = candidate.map_odom_parameter_yaw_rad;
     last_gate_mode_ = candidate.gate_mode;
     last_gate_result_age_limit_ms_ = candidate.gate_result_age_limit_ms;
     last_result_age_ms_ = candidate.result_age_ms;
@@ -1415,6 +2000,12 @@ private:
     if (!candidate.valid) {
       last_amcl_state_ = "rejected";
       reject_candidate(normalize_amcl_reject_reason(candidate.reject_reason), source, false);
+      return false;
+    }
+
+    if (!floor_transition_candidate_allowed(false, correction_paused_)) {
+      last_amcl_state_ = "floor_transition_blocked";
+      reject_candidate("FLOOR_TRANSITION_BLOCKS_AMCL", source, false);
       return false;
     }
 
@@ -1526,12 +2117,20 @@ private:
     const double dy = state.target_transform.y - state.current_transform.y;
     const double dyaw =
       std::abs(normalize_yaw(state.target_transform.yaw - state.current_transform.yaw));
-    state.remaining_translation_error_m = std::hypot(dx, dy);
-    state.remaining_yaw_error_rad = dyaw;
+    state.remaining_map_odom_parameter_translation_m = std::hypot(dx, dy);
+    state.remaining_map_odom_parameter_yaw_rad = dyaw;
     state.correction_active =
-      state.remaining_translation_error_m > map_odom_smoothing_snap_translation_epsilon_m_ ||
-      state.remaining_yaw_error_rad > map_odom_smoothing_snap_yaw_epsilon_rad_;
+      state.remaining_map_odom_parameter_translation_m >
+      map_odom_smoothing_snap_translation_epsilon_m_ ||
+      state.remaining_map_odom_parameter_yaw_rad > map_odom_smoothing_snap_yaw_epsilon_rad_;
     state.safe_for_goal_start = !state.correction_active;
+    const double remaining_ratio = state.smoothing_total_duration_sec > 0.0 ?
+      std::clamp(
+      state.smoothing_remaining_duration_sec / state.smoothing_total_duration_sec,
+      0.0, 1.0) : 0.0;
+    state.remaining_translation_error_m = state.correction_translation_m * remaining_ratio;
+    state.remaining_yaw_error_rad = state.correction_yaw_rad * remaining_ratio;
+    state.smoothing_progress = 1.0 - remaining_ratio;
     if (!state.correction_active) {
       state.current_transform = state.target_transform;
       state.current_z = state.target_z;
@@ -1539,6 +2138,10 @@ private:
       state.current_source = state.target_source;
       state.remaining_translation_error_m = 0.0;
       state.remaining_yaw_error_rad = 0.0;
+      state.remaining_map_odom_parameter_translation_m = 0.0;
+      state.remaining_map_odom_parameter_yaw_rad = 0.0;
+      state.smoothing_remaining_duration_sec = 0.0;
+      state.smoothing_progress = 1.0;
     }
     state.transform = state.current_transform;
     state.z = state.current_z;
@@ -1602,6 +2205,8 @@ private:
     state.last_correction_source = candidate.source;
     state.correction_translation_m = candidate.correction_translation_m;
     state.correction_yaw_rad = candidate.correction_yaw_rad;
+    state.map_odom_parameter_translation_m = candidate.map_odom_parameter_translation_m;
+    state.map_odom_parameter_yaw_rad = candidate.map_odom_parameter_yaw_rad;
     state.last_correction_delta_translation_m = candidate.correction_translation_m;
     state.last_correction_delta_yaw_rad = candidate.correction_yaw_rad;
     state.valid = true;
@@ -1609,6 +2214,11 @@ private:
     state.frozen_due_to_pause = correction_paused_;
     state.smoothing_enabled = map_odom_smoothing_enabled_;
     configure_correction_smoothing_locked(state, candidate, initial_lock);
+    state.smoothing_total_duration_sec = std::max(
+      candidate.correction_translation_m / state.smoothing_translation_rate_mps,
+      candidate.correction_yaw_rad / state.smoothing_yaw_rate_radps);
+    state.smoothing_remaining_duration_sec = state.smoothing_total_duration_sec;
+    state.smoothing_progress = state.smoothing_total_duration_sec > 0.0 ? 0.0 : 1.0;
     state.large_correction_requires_recovery = map_odom_large_correction_requires_recovery_;
 
     const bool snap_immediately = initial_lock || !map_odom_smoothing_enabled_;
@@ -1619,6 +2229,8 @@ private:
       state.current_source = state.target_source;
       state.last_step_translation_m = candidate.correction_translation_m;
       state.last_step_yaw_rad = candidate.correction_yaw_rad;
+      state.smoothing_remaining_duration_sec = 0.0;
+      state.smoothing_progress = 1.0;
       ++online_correction_snap_count_;
     } else {
       refresh_map_odom_error_locked(state);
@@ -1670,32 +2282,21 @@ private:
 
     const double dx = state.target_transform.x - state.current_transform.x;
     const double dy = state.target_transform.y - state.current_transform.y;
-    const double distance = std::hypot(dx, dy);
-    const double max_translation_step = state.smoothing_translation_rate_mps * dt;
-    if (distance <= map_odom_smoothing_snap_translation_epsilon_m_ || distance <= max_translation_step) {
-      state.last_step_translation_m = distance;
-      state.current_transform.x = state.target_transform.x;
-      state.current_transform.y = state.target_transform.y;
-    } else if (distance > 0.0) {
-      const double ratio = max_translation_step / distance;
-      state.current_transform.x += dx * ratio;
-      state.current_transform.y += dy * ratio;
-      state.last_step_translation_m = max_translation_step;
-    }
-
     const double yaw_error = normalize_yaw(state.target_transform.yaw - state.current_transform.yaw);
-    const double abs_yaw_error = std::abs(yaw_error);
-    const double max_yaw_step = state.smoothing_yaw_rate_radps * dt;
-    if (abs_yaw_error <= map_odom_smoothing_snap_yaw_epsilon_rad_ || abs_yaw_error <= max_yaw_step) {
-      state.current_transform.yaw = state.target_transform.yaw;
-      state.last_step_yaw_rad = abs_yaw_error;
-    } else {
-      const double yaw_step = std::copysign(max_yaw_step, yaw_error);
-      state.current_transform.yaw = normalize_yaw(state.current_transform.yaw + yaw_step);
-      state.last_step_yaw_rad = std::abs(yaw_step);
-    }
+    const double remaining_duration_sec = state.smoothing_remaining_duration_sec;
+    const double progress_step = remaining_duration_sec > 0.0 ?
+      std::clamp(dt / remaining_duration_sec, 0.0, 1.0) : 1.0;
+    const double previous_remaining_translation_m = state.remaining_translation_error_m;
+    const double previous_remaining_yaw_rad = state.remaining_yaw_error_rad;
 
-    state.current_z = state.target_z;
+    state.current_transform.x += dx * progress_step;
+    state.current_transform.y += dy * progress_step;
+    state.current_transform.yaw = normalize_yaw(
+      state.current_transform.yaw + yaw_error * progress_step);
+    state.current_z += (state.target_z - state.current_z) * progress_step;
+    state.last_step_translation_m = previous_remaining_translation_m * progress_step;
+    state.last_step_yaw_rad = previous_remaining_yaw_rad * progress_step;
+    state.smoothing_remaining_duration_sec = std::max(0.0, remaining_duration_sec - dt);
     state.last_correction_apply_time = now_sec;
     refresh_map_odom_error_locked(state);
   }
@@ -1707,8 +2308,14 @@ private:
   {
     const bool initial_lock = !has_map_to_odom_;
     mark_latest_pose_stamp_used();
+    last_accepted_correction_dx_map_m_ = candidate.correction_dx_map_m;
+    last_accepted_correction_dy_map_m_ = candidate.correction_dy_map_m;
+    last_accepted_correction_dyaw_rad_ = candidate.correction_dyaw_rad;
     last_accepted_correction_translation_m_ = candidate.correction_translation_m;
     last_accepted_correction_yaw_rad_ = candidate.correction_yaw_rad;
+    last_accepted_map_odom_parameter_translation_m_ =
+      candidate.map_odom_parameter_translation_m;
+    last_accepted_map_odom_parameter_yaw_rad_ = candidate.map_odom_parameter_yaw_rad;
     last_accepted_sec_ = now().seconds();
     last_accept_reason_ = accept_reason;
     last_reject_reason_.clear();
@@ -1717,8 +2324,17 @@ private:
     ++accepted_result_count_;
     if (candidate.source == "isaac_triggered" && candidate.explicit_trigger) {
       ++last_explicit_relocalization_sequence_;
+      last_explicit_map_odom_target_sequence_ = accepted_result_count_;
       last_explicit_relocalization_accept_sec_ = last_accepted_sec_;
       last_explicit_relocalization_source_ = candidate.source;
+      amcl_post_isaac_refine_abandoned_sequence_ = 0U;
+      last_post_isaac_refine_seed_sec_ = 0.0;
+      last_post_isaac_refine_hold_reason_ = "none";
+      amcl_post_isaac_refine_nomotion_request_count_ = 0;
+      amcl_post_isaac_refine_nomotion_last_request_sec_ = 0.0;
+      amcl_post_isaac_refine_nomotion_request_sequence_ =
+        last_explicit_relocalization_sequence_;
+      amcl_post_isaac_refine_nomotion_state_ = "waiting_for_seed";
     }
     if (candidate.source == "amcl_gated") {
       ++amcl_accepted_count_;
@@ -1734,11 +2350,15 @@ private:
     }
     RCLCPP_INFO(
       get_logger(),
-      "accepted map->odom correction reason=%s source=%s translation=%.3f yaw=%.3f",
+      "accepted localization correction reason=%s source=%s "
+      "base_translation=%.3f base_yaw=%.3f map_odom_parameter_translation=%.3f "
+      "map_odom_parameter_yaw=%.3f",
       accept_reason.c_str(),
       source,
       candidate.correction_translation_m,
-      candidate.correction_yaw_rad);
+      candidate.correction_yaw_rad,
+      candidate.map_odom_parameter_translation_m,
+      candidate.map_odom_parameter_yaw_rad);
   }
 
   void fill_amcl_initial_pose_covariance(
@@ -1786,6 +2406,11 @@ private:
     }
     last_amcl_initial_pose_seed_sec_ = now().seconds();
     last_amcl_initial_pose_reason_ = reason;
+    if (reason == "isaac_triggered_accept") {
+      last_post_isaac_refine_seed_sec_ = last_amcl_initial_pose_seed_sec_;
+      amcl_pose_count_at_post_isaac_seed_ = amcl_pose_count_;
+      amcl_post_isaac_refine_nomotion_state_ = "waiting_for_isaac_settle";
+    }
     ++amcl_initial_pose_seed_count_;
     amcl_seed_succeeded_ = true;
     amcl_seed_last_error_ = "none";
@@ -1866,8 +2491,16 @@ private:
     map_odom_target_source_snapshot_ = state.target_source;
     map_odom_remaining_translation_error_m_snapshot_ = state.remaining_translation_error_m;
     map_odom_remaining_yaw_error_rad_snapshot_ = state.remaining_yaw_error_rad;
+    map_odom_remaining_parameter_translation_m_snapshot_ =
+      state.remaining_map_odom_parameter_translation_m;
+    map_odom_remaining_parameter_yaw_rad_snapshot_ =
+      state.remaining_map_odom_parameter_yaw_rad;
     map_odom_last_step_translation_m_snapshot_ = state.last_step_translation_m;
     map_odom_last_step_yaw_rad_snapshot_ = state.last_step_yaw_rad;
+    map_odom_smoothing_total_duration_sec_snapshot_ = state.smoothing_total_duration_sec;
+    map_odom_smoothing_remaining_duration_sec_snapshot_ =
+      state.smoothing_remaining_duration_sec;
+    map_odom_smoothing_progress_snapshot_ = state.smoothing_progress;
     map_odom_active_smoothing_translation_rate_mps_snapshot_ = state.smoothing_translation_rate_mps;
     map_odom_active_smoothing_yaw_rate_radps_snapshot_ = state.smoothing_yaw_rate_radps;
     map_odom_smoothing_policy_snapshot_ = state.smoothing_policy;
@@ -2077,8 +2710,13 @@ private:
     bool map_odom_safe_for_goal_start = true;
     double map_odom_remaining_translation_error_m = 0.0;
     double map_odom_remaining_yaw_error_rad = 0.0;
+    double map_odom_remaining_parameter_translation_m = 0.0;
+    double map_odom_remaining_parameter_yaw_rad = 0.0;
     double map_odom_last_step_translation_m = 0.0;
     double map_odom_last_step_yaw_rad = 0.0;
+    double map_odom_smoothing_total_duration_sec = 0.0;
+    double map_odom_smoothing_remaining_duration_sec = 0.0;
+    double map_odom_smoothing_progress = 1.0;
     double map_odom_active_smoothing_translation_rate_mps = map_odom_smoothing_translation_rate_mps_;
     double map_odom_active_smoothing_yaw_rate_radps = map_odom_smoothing_yaw_rate_radps_;
     std::string map_odom_smoothing_policy{"default"};
@@ -2111,8 +2749,15 @@ private:
       map_odom_safe_for_goal_start = map_odom_safe_for_goal_start_snapshot_;
       map_odom_remaining_translation_error_m = map_odom_remaining_translation_error_m_snapshot_;
       map_odom_remaining_yaw_error_rad = map_odom_remaining_yaw_error_rad_snapshot_;
+      map_odom_remaining_parameter_translation_m =
+        map_odom_remaining_parameter_translation_m_snapshot_;
+      map_odom_remaining_parameter_yaw_rad = map_odom_remaining_parameter_yaw_rad_snapshot_;
       map_odom_last_step_translation_m = map_odom_last_step_translation_m_snapshot_;
       map_odom_last_step_yaw_rad = map_odom_last_step_yaw_rad_snapshot_;
+      map_odom_smoothing_total_duration_sec = map_odom_smoothing_total_duration_sec_snapshot_;
+      map_odom_smoothing_remaining_duration_sec =
+        map_odom_smoothing_remaining_duration_sec_snapshot_;
+      map_odom_smoothing_progress = map_odom_smoothing_progress_snapshot_;
       map_odom_active_smoothing_translation_rate_mps =
         map_odom_active_smoothing_translation_rate_mps_snapshot_;
       map_odom_active_smoothing_yaw_rate_radps = map_odom_active_smoothing_yaw_rate_radps_snapshot_;
@@ -2261,12 +2906,15 @@ private:
     const double amcl_post_isaac_refine_age_sec =
       amcl_post_isaac_refine_reference_time_sec > 0.0 ?
       now_sec - amcl_post_isaac_refine_reference_time_sec : -1.0;
+    const bool explicit_isaac_target_is_settled = explicit_isaac_target_settled();
     const bool amcl_post_isaac_refine_active =
       amcl_post_isaac_refine_enabled_ &&
       amcl_post_isaac_refine_age_sec >= 0.0 &&
       amcl_post_isaac_refine_age_sec <= amcl_post_isaac_refine_window_sec_ &&
       amcl_gate_mode_ == "gated" &&
-      (!amcl_post_isaac_refine_require_stationary_ || !amcl_robot_moving);
+      last_explicit_relocalization_sequence_ > 0U &&
+      amcl_post_isaac_refined_sequence_ != last_explicit_relocalization_sequence_ &&
+      amcl_post_isaac_refine_abandoned_sequence_ != last_explicit_relocalization_sequence_;
     const bool localization_degraded =
       amcl_input_enabled_ &&
       ((amcl_runtime_status_authoritative && amcl_runtime_status.degraded) ||
@@ -2288,6 +2936,14 @@ private:
     if (!localization_degraded) {
       amcl_degraded_reason.clear();
     }
+    const auto floor_context = floor_transition_snapshot();
+    const auto & floor_identity =
+      (floor_context.transition_active || floor_context.failed_locked) &&
+      !floor_context.pending.transaction_id.empty() ?
+      floor_context.pending : floor_context.active;
+    const bool effective_map_odom_safe_for_goal_start =
+      effective_safe_for_goal_start(
+      map_odom_safe_for_goal_start, floor_context);
     std::ostringstream out;
     out << std::fixed << std::setprecision(3)
         << "{\"localization_mode\":\"" << continuous_localization_mode_
@@ -2302,6 +2958,8 @@ private:
         << json_escape(last_explicit_relocalization_source_)
         << "\",\"last_explicit_relocalization_sequence\":"
         << last_explicit_relocalization_sequence_
+        << ",\"last_explicit_map_odom_target_sequence\":"
+        << last_explicit_map_odom_target_sequence_
         << ",\"isaac_background_correction_removed\":true"
         << ",\"triggered_max_result_age_ms\":" << triggered_max_result_age_ms_
         << ",\"force_accept_armed_time\":" << force_accept_armed_sec_
@@ -2388,6 +3046,36 @@ private:
         << amcl_post_isaac_refine_reference_time_sec
         << ",\"amcl_post_isaac_refine_age_sec\":" << amcl_post_isaac_refine_age_sec
         << ",\"amcl_post_isaac_refine_window_sec\":" << amcl_post_isaac_refine_window_sec_
+        << ",\"amcl_post_isaac_refine_min_delay_sec\":"
+        << amcl_post_isaac_refine_min_delay_sec_
+        << ",\"amcl_post_isaac_refine_min_pose_stamp_delta_sec\":"
+        << amcl_post_isaac_refine_min_pose_stamp_delta_sec_
+        << ",\"amcl_post_isaac_refine_seed_time\":" << last_post_isaac_refine_seed_sec_
+        << ",\"amcl_post_isaac_refine_request_nomotion_update\":"
+        << (amcl_post_isaac_refine_request_nomotion_update_ ? "true" : "false")
+        << ",\"amcl_post_isaac_refine_nomotion_update_service\":\""
+        << json_escape(amcl_post_isaac_refine_nomotion_update_service_) << "\""
+        << ",\"amcl_post_isaac_refine_nomotion_service_ready\":"
+        << ((amcl_nomotion_update_client_ && amcl_nomotion_update_client_->service_is_ready()) ?
+        "true" : "false")
+        << ",\"amcl_post_isaac_refine_nomotion_request_period_sec\":"
+        << amcl_post_isaac_refine_nomotion_request_period_sec_
+        << ",\"amcl_post_isaac_refine_nomotion_max_requests\":"
+        << amcl_post_isaac_refine_nomotion_max_requests_
+        << ",\"amcl_post_isaac_refine_nomotion_request_count\":"
+        << amcl_post_isaac_refine_nomotion_request_count_
+        << ",\"amcl_post_isaac_refine_nomotion_total_request_count\":"
+        << amcl_post_isaac_refine_nomotion_total_request_count_
+        << ",\"amcl_post_isaac_refine_nomotion_last_request_time\":"
+        << amcl_post_isaac_refine_nomotion_last_request_sec_
+        << ",\"amcl_post_isaac_refine_nomotion_request_sequence\":"
+        << amcl_post_isaac_refine_nomotion_request_sequence_
+        << ",\"amcl_post_isaac_refine_nomotion_state\":\""
+        << json_escape(amcl_post_isaac_refine_nomotion_state_) << "\""
+        << ",\"amcl_post_isaac_refine_explicit_target_settled\":"
+        << (explicit_isaac_target_is_settled ? "true" : "false")
+        << ",\"amcl_post_isaac_refine_hold_reason\":\""
+        << json_escape(last_post_isaac_refine_hold_reason_) << "\""
         << ",\"amcl_post_isaac_refine_max_translation_m\":"
         << amcl_post_isaac_refine_max_translation_m_
         << ",\"amcl_post_isaac_refine_max_yaw_rad\":"
@@ -2404,8 +3092,14 @@ private:
         << amcl_post_isaac_refine_rejected_count_
         << ",\"amcl_post_isaac_refine_waiting_count\":"
         << amcl_post_isaac_refine_waiting_count_
+        << ",\"amcl_post_isaac_refine_held_count\":"
+        << amcl_post_isaac_refine_held_count_
         << ",\"amcl_post_isaac_refined_sequence\":"
         << amcl_post_isaac_refined_sequence_
+        << ",\"amcl_post_isaac_refine_abandoned_sequence\":"
+        << amcl_post_isaac_refine_abandoned_sequence_
+        << ",\"amcl_pose_count_at_post_isaac_seed\":"
+        << amcl_pose_count_at_post_isaac_seed_
         << ",\"global_correction_paused\":" << (correction_paused_ ? "true" : "false")
         << ",\"correction_paused\":" << (correction_paused_ ? "true" : "false")
         << ",\"correction_pause_reason\":\"" << json_escape(correction_pause_reason_) << "\""
@@ -2461,10 +3155,25 @@ private:
         << "\",\"amcl_correction_suppressed_after_seed\":"
         << (amcl_correction_suppressed_after_seed ? "true" : "false")
         << ",\"localization_degraded\":" << (localization_degraded ? "true" : "false")
+        << ",\"correction_metric_frame\":\"map_base_link\""
+        << ",\"last_candidate_correction_dx_map_m\":" << last_candidate_correction_dx_map_m_
+        << ",\"last_candidate_correction_dy_map_m\":" << last_candidate_correction_dy_map_m_
+        << ",\"last_candidate_correction_dyaw_rad\":" << last_candidate_correction_dyaw_rad_
         << ",\"last_candidate_correction_translation_m\":" << last_candidate_correction_translation_m_
         << ",\"last_candidate_correction_yaw_rad\":" << last_candidate_correction_yaw_rad_
+        << ",\"last_candidate_map_odom_parameter_translation_m\":"
+        << last_candidate_map_odom_parameter_translation_m_
+        << ",\"last_candidate_map_odom_parameter_yaw_rad\":"
+        << last_candidate_map_odom_parameter_yaw_rad_
+        << ",\"last_accepted_correction_dx_map_m\":" << last_accepted_correction_dx_map_m_
+        << ",\"last_accepted_correction_dy_map_m\":" << last_accepted_correction_dy_map_m_
+        << ",\"last_accepted_correction_dyaw_rad\":" << last_accepted_correction_dyaw_rad_
         << ",\"last_accepted_correction_translation_m\":" << last_accepted_correction_translation_m_
         << ",\"last_accepted_correction_yaw_rad\":" << last_accepted_correction_yaw_rad_
+        << ",\"last_accepted_map_odom_parameter_translation_m\":"
+        << last_accepted_map_odom_parameter_translation_m_
+        << ",\"last_accepted_map_odom_parameter_yaw_rad\":"
+        << last_accepted_map_odom_parameter_yaw_rad_
         << ",\"map_to_odom_age_ms\":" << map_to_odom_age_ms
         << ",\"map_odom_publish_loop_hz\":" << map_odom_publish_loop_hz
         << ",\"map_odom_publish_gap_ms\":" << map_odom_publish_gap_ms
@@ -2483,7 +3192,22 @@ private:
         << (map_odom_frozen_due_to_pause ? "true" : "false")
         << ",\"smoothing_enabled\":" << (map_odom_smoothing_enabled ? "true" : "false")
         << ",\"correction_active\":" << (map_odom_correction_active ? "true" : "false")
-        << ",\"safe_for_goal_start\":" << (map_odom_safe_for_goal_start ? "true" : "false")
+        << ",\"safe_for_goal_start\":"
+        << (effective_map_odom_safe_for_goal_start ? "true" : "false")
+        << ",\"floor_transition_active\":"
+        << (floor_context.transition_active ? "true" : "false")
+        << ",\"floor_runtime_context_valid\":"
+        << (floor_context.runtime_context_valid ? "true" : "false")
+        << ",\"floor_failed_locked\":"
+        << (floor_context.failed_locked ? "true" : "false")
+        << ",\"floor_transition_transaction_id\":\""
+        << json_escape(floor_identity.transaction_id)
+        << "\",\"floor_building_id\":\"" << json_escape(floor_identity.building_id)
+        << "\",\"floor_id\":\"" << json_escape(floor_identity.floor_id)
+        << "\",\"floor_map_id\":\"" << json_escape(floor_identity.map_id)
+        << "\",\"floor_asset_epoch\":" << floor_identity.asset_epoch
+        << ",\"floor_asset_digest\":\"" << json_escape(floor_identity.asset_digest)
+        << "\",\"floor_transition_detail\":\"" << json_escape(floor_context.detail) << "\""
         << ",\"current_sequence\":" << map_odom_current_sequence
         << ",\"target_sequence\":" << map_odom_target_sequence
         << ",\"last_accepted_sequence\":" << map_odom_last_accepted_sequence
@@ -2492,8 +3216,16 @@ private:
         << "\",\"target_source\":\"" << json_escape(map_odom_target_source)
         << "\",\"remaining_translation_error_m\":" << map_odom_remaining_translation_error_m
         << ",\"remaining_yaw_error_rad\":" << map_odom_remaining_yaw_error_rad
+        << ",\"remaining_map_odom_parameter_translation_m\":"
+        << map_odom_remaining_parameter_translation_m
+        << ",\"remaining_map_odom_parameter_yaw_rad\":"
+        << map_odom_remaining_parameter_yaw_rad
         << ",\"last_step_translation_m\":" << map_odom_last_step_translation_m
         << ",\"last_step_yaw_rad\":" << map_odom_last_step_yaw_rad
+        << ",\"smoothing_total_duration_sec\":" << map_odom_smoothing_total_duration_sec
+        << ",\"smoothing_remaining_duration_sec\":"
+        << map_odom_smoothing_remaining_duration_sec
+        << ",\"smoothing_progress\":" << map_odom_smoothing_progress
         << ",\"smoothing_policy\":\"" << json_escape(map_odom_smoothing_policy)
         << "\",\"smoothing_translation_rate_mps\":"
         << map_odom_active_smoothing_translation_rate_mps
@@ -2538,6 +3270,11 @@ private:
     std_msgs::msg::String msg;
     msg.data = out.str();
     status_pub_->publish(msg);
+    publish_floor_health(
+      amcl_ready,
+      map_odom_state_valid,
+      map_odom_correction_active,
+      map_odom_safe_for_goal_start);
   }
 
   bool publish_tf_{true};
@@ -2550,6 +3287,7 @@ private:
   bool amcl_accept_corrections_while_moving_{true};
   bool amcl_post_isaac_refine_enabled_{true};
   bool amcl_post_isaac_refine_require_stationary_{true};
+  bool amcl_post_isaac_refine_request_nomotion_update_{true};
   bool amcl_seed_requested_{false};
   bool amcl_seed_succeeded_{false};
   bool amcl_message_filter_drop_detected_{false};
@@ -2557,6 +3295,8 @@ private:
   int amcl_medium_candidate_agreement_count_{0};
   int amcl_post_isaac_refine_consistency_count_{2};
   int amcl_post_isaac_refine_agreement_count_{0};
+  int amcl_post_isaac_refine_nomotion_max_requests_{4};
+  int amcl_post_isaac_refine_nomotion_request_count_{0};
   int amcl_initial_pose_publish_repetitions_{3};
   int amcl_initial_pose_repeat_period_ms_{100};
   double jump_threshold_m_{1.0};
@@ -2586,6 +3326,10 @@ private:
   double amcl_post_isaac_refine_max_yaw_rad_{0.10};
   double amcl_post_isaac_refine_agreement_translation_m_{0.08};
   double amcl_post_isaac_refine_agreement_yaw_rad_{0.08};
+  double amcl_post_isaac_refine_min_delay_sec_{0.25};
+  double amcl_post_isaac_refine_min_pose_stamp_delta_sec_{0.0};
+  double amcl_post_isaac_refine_nomotion_request_period_sec_{0.5};
+  double amcl_post_isaac_refine_nomotion_last_request_sec_{0.0};
   double amcl_initial_pose_xy_covariance_{0.01};
   double amcl_initial_pose_yaw_covariance_{0.0076};
   double amcl_pose_max_age_ms_{1000.0};
@@ -2617,10 +3361,20 @@ private:
   double last_gate_result_age_limit_ms_{5000.0};
   double last_tf_lookup_stamp_sec_{-1.0};
   double latest_odom_tf_age_ms_{-1.0};
+  double last_candidate_correction_dx_map_m_{0.0};
+  double last_candidate_correction_dy_map_m_{0.0};
+  double last_candidate_correction_dyaw_rad_{0.0};
   double last_candidate_correction_translation_m_{0.0};
   double last_candidate_correction_yaw_rad_{0.0};
+  double last_candidate_map_odom_parameter_translation_m_{0.0};
+  double last_candidate_map_odom_parameter_yaw_rad_{0.0};
+  double last_accepted_correction_dx_map_m_{0.0};
+  double last_accepted_correction_dy_map_m_{0.0};
+  double last_accepted_correction_dyaw_rad_{0.0};
   double last_accepted_correction_translation_m_{0.0};
   double last_accepted_correction_yaw_rad_{0.0};
+  double last_accepted_map_odom_parameter_translation_m_{0.0};
+  double last_accepted_map_odom_parameter_yaw_rad_{0.0};
   double last_accepted_sec_{0.0};
   double last_explicit_relocalization_accept_sec_{0.0};
   double last_isaac_triggered_accept_sec_{0.0};
@@ -2629,12 +3383,14 @@ private:
   double last_amcl_xy_covariance_{-1.0};
   double last_amcl_yaw_covariance_{-1.0};
   double last_amcl_initial_pose_seed_sec_{0.0};
+  double last_post_isaac_refine_seed_sec_{0.0};
   std::uint64_t localization_result_count_{0U};
   std::uint64_t accepted_result_count_{0U};
   std::uint64_t rejected_result_count_{0U};
   std::uint64_t force_accept_ignored_pretrigger_result_count_{0U};
   std::uint64_t triggered_result_count_{0U};
   std::uint64_t last_explicit_relocalization_sequence_{0U};
+  std::uint64_t last_explicit_map_odom_target_sequence_{0U};
   std::uint64_t shadow_candidate_count_{0U};
   std::uint64_t amcl_pose_count_{0U};
   std::uint64_t amcl_candidate_count_{0U};
@@ -2646,7 +3402,12 @@ private:
   std::uint64_t amcl_post_isaac_refine_accepted_count_{0U};
   std::uint64_t amcl_post_isaac_refine_rejected_count_{0U};
   std::uint64_t amcl_post_isaac_refine_waiting_count_{0U};
+  std::uint64_t amcl_post_isaac_refine_held_count_{0U};
   std::uint64_t amcl_post_isaac_refined_sequence_{0U};
+  std::uint64_t amcl_post_isaac_refine_abandoned_sequence_{0U};
+  std::uint64_t amcl_post_isaac_refine_nomotion_request_sequence_{0U};
+  std::uint64_t amcl_post_isaac_refine_nomotion_total_request_count_{0U};
+  std::uint64_t amcl_pose_count_at_post_isaac_seed_{0U};
   std::uint64_t amcl_initial_pose_seed_count_{0U};
   std::uint64_t amcl_initial_pose_published_count_{0U};
   std::uint64_t amcl_seed_attempt_count_{0U};
@@ -2674,8 +3435,13 @@ private:
   double map_odom_publish_callback_duration_us_{0.0};
   double map_odom_remaining_translation_error_m_snapshot_{0.0};
   double map_odom_remaining_yaw_error_rad_snapshot_{0.0};
+  double map_odom_remaining_parameter_translation_m_snapshot_{0.0};
+  double map_odom_remaining_parameter_yaw_rad_snapshot_{0.0};
   double map_odom_last_step_translation_m_snapshot_{0.0};
   double map_odom_last_step_yaw_rad_snapshot_{0.0};
+  double map_odom_smoothing_total_duration_sec_snapshot_{0.0};
+  double map_odom_smoothing_remaining_duration_sec_snapshot_{0.0};
+  double map_odom_smoothing_progress_snapshot_{1.0};
   double map_odom_active_smoothing_translation_rate_mps_snapshot_{0.20};
   double map_odom_active_smoothing_yaw_rate_radps_snapshot_{0.25};
   double map_odom_last_correction_accept_time_snapshot_{0.0};
@@ -2692,6 +3458,9 @@ private:
   std::string map_odom_target_source_snapshot_{"none"};
   std::string map_odom_smoothing_policy_snapshot_{"default"};
   std::string map_odom_last_correction_source_snapshot_{"none"};
+  std::string last_post_isaac_refine_hold_reason_{"none"};
+  std::string amcl_post_isaac_refine_nomotion_update_service_{"/request_nomotion_update"};
+  std::string amcl_post_isaac_refine_nomotion_state_{"idle"};
   std::string map_frame_;
   std::string odom_frame_;
   std::string base_frame_;
@@ -2701,6 +3470,11 @@ private:
   std::string status_topic_;
   std::string force_accept_service_;
   std::string correction_pause_service_;
+  std::string correction_pause_lease_service_;
+  std::string correction_pause_state_topic_;
+  std::string floor_health_topic_;
+  std::string begin_floor_transition_service_;
+  std::string floor_transition_pause_owner_{"robot_floor_manager"};
   std::string amcl_pose_topic_;
   std::string amcl_runtime_status_file_;
   std::string amcl_gate_mode_{"shadow"};
@@ -2735,6 +3509,7 @@ private:
   bool force_accept_next_pose_{false};
   bool force_accept_next_pose_explicit_trigger_{false};
   bool correction_paused_{false};
+  bool live_floor_transition_service_enabled_{false};
   bool triggered_allow_large_correction_{true};
   bool map_odom_smoothing_enabled_{true};
   bool map_odom_large_correction_requires_recovery_{true};
@@ -2750,6 +3525,10 @@ private:
   MapToOdom last_amcl_medium_candidate_;
   MapToOdom last_post_isaac_refine_candidate_;
   MapOdomState map_odom_state_;
+  robot_localization_bridge::CorrectionPauseArbiter correction_pause_arbiter_;
+  robot_localization_bridge::FloorTransitionContext floor_transition_context_;
+  mutable std::mutex correction_pause_mutex_;
+  mutable std::mutex floor_transition_context_mutex_;
   mutable std::mutex map_odom_state_mutex_;
   mutable std::mutex map_odom_publish_stats_mutex_;
 
@@ -2761,12 +3540,22 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr health_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
+  rclcpp::Publisher<robot_interfaces::msg::CorrectionPauseState>::SharedPtr
+    correction_pause_state_pub_;
+  rclcpp::Publisher<robot_interfaces::msg::LocalizationHealth>::SharedPtr
+    floor_health_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr amcl_initial_pose_pub_;
+  rclcpp::Client<std_srvs::srv::Empty>::SharedPtr amcl_nomotion_update_client_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr force_accept_srv_;
   rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr correction_pause_srv_;
+  rclcpp::Service<robot_interfaces::srv::SetCorrectionPause>::SharedPtr
+    correction_pause_lease_srv_;
+  rclcpp::Service<robot_interfaces::srv::BeginFloorTransition>::SharedPtr
+    begin_floor_transition_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr amcl_seed_srv_;
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::TimerBase::SharedPtr status_timer_;
+  rclcpp::TimerBase::SharedPtr post_isaac_refine_timer_;
   rclcpp::CallbackGroup::SharedPtr map_odom_publisher_callback_group_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 };

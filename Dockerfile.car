@@ -21,6 +21,16 @@ RUN if [[ -f /etc/apt/sources.list.d/yarn.list ]]; then mv /etc/apt/sources.list
     ros-humble-isaac-ros-nvblox \
  && rm -rf /var/lib/apt/lists/*
 
+COPY scripts/jetson/vendor/orbbec/*.deb /tmp/njrh-orbbec/
+
+RUN apt-get update \
+ && apt-get install -y \
+    /tmp/njrh-orbbec/ros-humble-diagnostic-updater_*.deb \
+    /tmp/njrh-orbbec/ros-humble-orbbec-camera-msgs_*.deb \
+    /tmp/njrh-orbbec/ros-humble-orbbec-description_*.deb \
+    /tmp/njrh-orbbec/ros-humble-orbbec-camera_*.deb \
+ && rm -rf /var/lib/apt/lists/* /tmp/njrh-orbbec
+
 RUN sed -i \
     -e 's/^\(\s*lidar_width:\).*/\1 900/' \
     -e 's/^\(\s*lidar_height:\).*/\1 128/' \

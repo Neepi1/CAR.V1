@@ -42,3 +42,16 @@ charge_contact_z: 0.255
 charge_contact_roll: 0.0
 charge_contact_pitch: 0.0
 charge_contact_yaw: 0.0
+# Gemini 336L depth optical center on the final front-center mount. The camera
+# body axes are aligned with base_link; robot_description owns the fixed
+# camera336l_link -> camera336l_depth_optical_frame REP-103 rotation.
+# X uses 0.369 m from base_link to the chassis front, plus 0.030 m camera depth,
+# less the observed 0.005 m protective-cover-to-optical-origin offset.
+docking_camera_frame: camera336l_link
+docking_camera_depth_optical_frame: camera336l_depth_optical_frame
+docking_camera_x: 0.394
+docking_camera_y: 0.000
+docking_camera_z: 0.350
+docking_camera_roll: 0.000
+docking_camera_pitch: 0.000
+docking_camera_yaw: 0.000

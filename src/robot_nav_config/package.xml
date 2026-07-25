@@ -7,8 +7,24 @@
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>angles</depend>
+  <depend>builtin_interfaces</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav2_core</depend>
+  <depend>nav2_costmap_2d</depend>
+  <depend>nav2_rotation_shim_controller</depend>
+  <depend>nav2_smac_planner</depend>
+  <depend>nav2_util</depend>
+  <depend>nav_msgs</depend>
+  <depend>pluginlib</depend>
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>tf2</depend>
   <exec_depend>nav2_bringup</exec_depend>
   <exec_depend>nav2_smoother</exec_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
 
-  <export/>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
 </package>

@@ -24,6 +24,9 @@ fi
 ALLOW_BASE_IMAGE_FALLBACK="${NJRH_ALLOW_BASE_IMAGE_FALLBACK:-true}"
 DOCKER_BUILD_NETWORK="${NJRH_DOCKER_BUILD_NETWORK:-host}"
 DOCKERFILE_PATH="${NJRH_DOCKERFILE_PATH:-${WORKSPACE_HOST}/Dockerfile.car}"
+ORBBEC_LAYER_DOCKERFILE_PATH="${NJRH_ORBBEC_LAYER_DOCKERFILE_PATH:-${WORKSPACE_HOST}/Dockerfile.orbbec-runtime}"
+ORBBEC_LAYER_IMAGE="${NJRH_ORBBEC_LAYER_IMAGE:-njrh-car:orbbec-usb-v2}"
+ORBBEC_VENDOR_ROOT="${NJRH_ORBBEC_VENDOR_ROOT:-${WORKSPACE_HOST}/scripts/jetson/vendor/orbbec}"
 DASHBOARD_PORT="${NJRH_DASHBOARD_PORT:-2048}"
 DASHBOARD_HOST="${NJRH_DASHBOARD_HOST:-}"
 ROBOT_API_SERVER_PORT="${NJRH_ROBOT_API_SERVER_PORT:-8080}"
@@ -69,9 +72,87 @@ container_running() {
   docker ps --format '{{.Names}}' | grep -Fx "$CONTAINER_NAME" >/dev/null 2>&1
 }
 
+container_has_dynamic_usb_bus_bind() {
+  container_exists || return 1
+  docker inspect --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}' \
+    "$CONTAINER_NAME" 2>/dev/null | grep -Fx '/dev/bus/usb -> /dev/bus/usb' >/dev/null 2>&1
+}
+
 ensure_base_image() {
   docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 || die \
     "base image not found: $BASE_IMAGE. Build the Isaac ROS dev base first or override NJRH_BASE_IMAGE."
+}
+
+prepare_image_build_context() {
+  local dockerfile_path="${1:-$DOCKERFILE_PATH}"
+  [[ -f "$dockerfile_path" ]] || die "dockerfile not found: $dockerfile_path"
+  [[ -d "$ORBBEC_VENDOR_ROOT" ]] || die "Orbbec vendor directory not found: $ORBBEC_VENDOR_ROOT"
+  [[ -f "${ORBBEC_VENDOR_ROOT}/SHA256SUMS" ]] || die \
+    "Orbbec checksum manifest not found: ${ORBBEC_VENDOR_ROOT}/SHA256SUMS"
+  (
+    cd "$ORBBEC_VENDOR_ROOT"
+    sha256sum -c SHA256SUMS >/dev/null
+  ) || die "Orbbec vendor package checksum validation failed"
+
+  local build_context
+  build_context="$(mktemp -d "${TMPDIR:-/tmp}/njrh-car-build.XXXXXX")"
+  mkdir -p "${build_context}/scripts/jetson/vendor/orbbec"
+  cp "$dockerfile_path" "${build_context}/Dockerfile.car"
+  cp "${ORBBEC_VENDOR_ROOT}"/*.deb \
+    "${build_context}/scripts/jetson/vendor/orbbec/"
+  printf '%s\n' "$build_context"
+}
+
+build_image() {
+  local allow_fallback="${1:-false}"
+  ensure_base_image
+  [[ -d "$WORKSPACE_HOST" ]] || die "workspace host path not found: $WORKSPACE_HOST"
+  local build_context
+  build_context="$(prepare_image_build_context "$DOCKERFILE_PATH")"
+
+  echo "[njrh-container] building image $IMAGE_NAME from $DOCKERFILE_PATH"
+  if docker build \
+    --network "$DOCKER_BUILD_NETWORK" \
+    --build-arg "BASE_IMAGE=$BASE_IMAGE" \
+    -f "${build_context}/Dockerfile.car" \
+    -t "$IMAGE_NAME" \
+    "$build_context"; then
+    rm -rf -- "$build_context"
+    RUNTIME_IMAGE_NAME="$IMAGE_NAME"
+    return
+  fi
+  rm -rf -- "$build_context"
+
+  if [[ "$allow_fallback" == "true" ]]; then
+    echo "[njrh-container] image build failed, falling back to base image $BASE_IMAGE"
+    RUNTIME_IMAGE_NAME="$BASE_IMAGE"
+    return
+  fi
+
+  die "failed to build runtime image $IMAGE_NAME"
+}
+
+build_orbbec_layer_image() {
+  docker image inspect "$IMAGE_NAME" >/dev/null 2>&1 || die \
+    "validated base image not found: $IMAGE_NAME"
+  local build_context
+  build_context="$(prepare_image_build_context "$ORBBEC_LAYER_DOCKERFILE_PATH")"
+  local base_image_id
+  base_image_id="$(docker image inspect --format '{{.Id}}' "$IMAGE_NAME")"
+
+  echo "[njrh-container] building Orbbec-only image ${ORBBEC_LAYER_IMAGE} from ${IMAGE_NAME} (${base_image_id})"
+  if docker build \
+    --network none \
+    --build-arg "BASE_IMAGE=$IMAGE_NAME" \
+    --label "njrh.runtime.orbbec.base_image_id=${base_image_id}" \
+    -f "${build_context}/Dockerfile.car" \
+    -t "$ORBBEC_LAYER_IMAGE" \
+    "$build_context"; then
+    rm -rf -- "$build_context"
+    return
+  fi
+  rm -rf -- "$build_context"
+  die "failed to build Orbbec-only runtime image $ORBBEC_LAYER_IMAGE"
 }
 
 ensure_image() {
@@ -79,29 +160,7 @@ ensure_image() {
     RUNTIME_IMAGE_NAME="$IMAGE_NAME"
     return
   fi
-
-  ensure_base_image
-  [[ -d "$WORKSPACE_HOST" ]] || die "workspace host path not found: $WORKSPACE_HOST"
-  [[ -f "$DOCKERFILE_PATH" ]] || die "dockerfile not found: $DOCKERFILE_PATH"
-
-  echo "[njrh-container] building image $IMAGE_NAME from $DOCKERFILE_PATH"
-  if docker build \
-    --network "$DOCKER_BUILD_NETWORK" \
-    --build-arg "BASE_IMAGE=$BASE_IMAGE" \
-    -f "$DOCKERFILE_PATH" \
-    -t "$IMAGE_NAME" \
-    "$WORKSPACE_HOST"; then
-    RUNTIME_IMAGE_NAME="$IMAGE_NAME"
-    return
-  fi
-
-  if [[ "$ALLOW_BASE_IMAGE_FALLBACK" == "true" ]]; then
-    echo "[njrh-container] image build failed, falling back to base image $BASE_IMAGE"
-    RUNTIME_IMAGE_NAME="$BASE_IMAGE"
-    return
-  fi
-
-  die "failed to build runtime image $IMAGE_NAME"
+  build_image "$ALLOW_BASE_IMAGE_FALLBACK"
 }
 
 remove_stopped_container() {
@@ -150,6 +209,12 @@ run_container() {
   fi
   if [[ -d "/dev/input" ]]; then
     docker_args+=("-v" "/dev/input:/dev/input")
+  fi
+  if [[ -d "/dev/bus/usb" ]]; then
+    # libusb devices receive a new /dev/bus/usb node after reset/re-enumeration.
+    # Bind the directory, not an individual device node, so long-lived containers
+    # keep seeing Orbbec reconnects without being recreated.
+    docker_args+=("-v" "/dev/bus/usb:/dev/bus/usb")
   fi
   if [[ -S "/run/jtop.sock" ]]; then
     docker_args+=("-v" "/run/jtop.sock:/run/jtop.sock:ro")
@@ -245,6 +310,9 @@ wait_for_and_prepare_running_container() {
 
 start_container() {
   if container_running; then
+    if [[ -d "/dev/bus/usb" ]] && ! container_has_dynamic_usb_bus_bind; then
+      die "running container lacks /dev/bus/usb dynamic bind; rebuild the image and run '${0} restart' once"
+    fi
     RUNTIME_IMAGE_NAME="$(docker inspect --format '{{.Config.Image}}' "$CONTAINER_NAME")"
     wait_for_and_prepare_running_container
     echo "[njrh-container] container already running: $CONTAINER_NAME"
@@ -752,6 +820,15 @@ print_status() {
   echo "dashboard_url: $(dashboard_url)"
   if container_running; then
     echo "container_status: running"
+    if [[ -d "/dev/bus/usb" ]]; then
+      if container_has_dynamic_usb_bus_bind; then
+        echo "usb_bus_bind: dynamic"
+      else
+        echo "usb_bus_bind: missing"
+      fi
+    else
+      echo "usb_bus_bind: host_unavailable"
+    fi
     if common_services_running; then
       echo "common_services_status: running"
     else
@@ -807,6 +884,14 @@ case "$ACTION" in
   build-image)
     ensure_image
     echo "[njrh-container] image ready: $IMAGE_NAME"
+    ;;
+  rebuild-image)
+    build_image false
+    echo "[njrh-container] image rebuilt: $IMAGE_NAME"
+    ;;
+  build-orbbec-layer)
+    build_orbbec_layer_image
+    echo "[njrh-container] Orbbec-only image ready: $ORBBEC_LAYER_IMAGE"
     ;;
   start)
     start_container

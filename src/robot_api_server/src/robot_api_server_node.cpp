@@ -41,20 +41,32 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <yaml-cpp/yaml.h>
+
+#include "action_msgs/msg/goal_status.hpp"
+#include "action_msgs/msg/goal_status_array.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 #include "builtin_interfaces/msg/time.hpp"
 #include "lifecycle_msgs/msg/state.hpp"
 #include "lifecycle_msgs/srv/get_state.hpp"
 #include "nav2_msgs/action/navigate_to_pose.hpp"
+#include "nav2_msgs/msg/costmap_filter_info.hpp"
 #include "nav2_msgs/msg/speed_limit.hpp"
+#include "nav2_msgs/srv/clear_entire_costmap.hpp"
+#include "nav2_msgs/srv/load_map.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "rcl_interfaces/msg/log.hpp"
+#include "rcl_interfaces/msg/parameter_type.hpp"
+#include "rcl_interfaces/srv/get_parameters.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "robot_interfaces/msg/floor_switch_status.hpp"
+#include "robot_interfaces/msg/localization_health.hpp"
 #include "robot_interfaces/srv/switch_floor.hpp"
 #include "robot_interfaces/srv/trigger_localization.hpp"
+#include "robot_interfaces/msg/dock_target_observation.hpp"
 #include "sensor_msgs/msg/battery_state.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "std_msgs/msg/bool.hpp"
@@ -68,10 +80,15 @@
 #include "robot_api_server/bms_contact.hpp"
 #include "robot_api_server/docking_job_model.hpp"
 #include "robot_api_server/docking_status_utils.hpp"
+#include "robot_api_server/elevator_configuration_module.hpp"
 #include "robot_api_server/file_utils.hpp"
 #include "robot_api_server/floor_asset_resolver.hpp"
+#include "robot_api_server/floor_runtime_interlock.hpp"
 #include "robot_api_server/http_common.hpp"
+#include "robot_api_server/keepout_layer.hpp"
 #include "robot_api_server/localization_result_model.hpp"
+#include "robot_api_server/map_asset_digest.hpp"
+#include "robot_api_server/map_asset_identity_binding.hpp"
 #include "robot_api_server/map_catalog.hpp"
 #include "robot_api_server/map_asset_io.hpp"
 #include "robot_api_server/map_asset_writer.hpp"
@@ -104,6 +121,11 @@ using robot_api_server::docking_status_is_undock_failed;
 using robot_api_server::docking_status_is_undocked;
 using robot_api_server::docking_status_is_undocking;
 using robot_api_server::evaluate_battery_charging_contact;
+using robot_api_server::ElevatorConfigurationCommand;
+using robot_api_server::ElevatorConfigurationCommandType;
+using robot_api_server::ElevatorConfigurationModule;
+using robot_api_server::ElevatorConfigurationQuery;
+using robot_api_server::ElevatorFloorAssetSnapshot;
 using robot_api_server::content_length_from_headers;
 using robot_api_server::copy_file_if_exists;
 using robot_api_server::copy_yaml_with_image_if_exists;
@@ -113,6 +135,8 @@ using robot_api_server::generate_current_pose_id;
 using robot_api_server::HttpRequest;
 using robot_api_server::HttpResponse;
 using robot_api_server::is_pid_directory;
+using robot_api_server::is_elevator_internal_pose_type;
+using robot_api_server::is_reserved_elevator_pose_id;
 using robot_api_server::json_bool_value;
 using robot_api_server::json_nested_number_value;
 using robot_api_server::json_number_value;
@@ -121,10 +145,18 @@ using robot_api_server::json_object_value;
 using robot_api_server::json_string;
 using robot_api_server::json_string_array_value;
 using robot_api_server::json_string_value;
+using robot_api_server::KeepoutAssetPaths;
+using robot_api_server::KeepoutLayerError;
+using robot_api_server::KeepoutLayerModule;
+using robot_api_server::KeepoutMaskSummary;
+using robot_api_server::KeepoutRuntimePort;
+using robot_api_server::KeepoutRuntimeMutationState;
+using robot_api_server::KeepoutRuntimeProof;
 using robot_api_server::keepout_filter_json;
 using robot_api_server::keepout_semantic_json_path;
 using robot_api_server::keepout_semantic_payload_json;
 using robot_api_server::LocalizationResultSnapshot;
+using robot_api_server::list_proc_pids;
 using robot_api_server::localization_result_recent_fallback_detail;
 using robot_api_server::localization_result_success_detail;
 using robot_api_server::localization_result_wait_failure_detail;
@@ -133,7 +165,13 @@ using robot_api_server::fill_manifest_paths;
 using robot_api_server::find_floor_catalog_pose;
 using robot_api_server::fixed_hex;
 using robot_api_server::FloorAssetPaths;
+using robot_api_server::FloorRuntimeInterlockDecision;
 using robot_api_server::fnv1a64;
+using robot_api_server::inspect_map_asset_identity_for_keepout_repair;
+using robot_api_server::stamp_map_asset_identity;
+using robot_api_server::verify_map_asset_identity;
+using robot_api_server::verify_map_asset_identity_snapshot;
+using robot_api_server::MapAssetCommitTransaction;
 using robot_api_server::MapCatalog;
 using robot_api_server::map_manifest_json;
 using robot_api_server::map_info_json;
@@ -157,12 +195,14 @@ using robot_api_server::quaternion_yaw;
 using robot_api_server::read_floor_poses;
 using robot_api_server::read_binary_file;
 using robot_api_server::read_nav_map_info;
+using robot_api_server::read_nav_map_info_exact_content;
 using robot_api_server::read_optional_text_file;
 using robot_api_server::read_proc_cmdline;
 using robot_api_server::read_proc_environ;
 using robot_api_server::read_runtime_map_context_file;
 using robot_api_server::read_text_file;
 using robot_api_server::reason_phrase;
+using robot_api_server::ReplaceKeepoutCommand;
 using robot_api_server::resource_list_json;
 using robot_api_server::resolve_mapping_2d_png;
 using robot_api_server::resolve_floor_asset_paths;
@@ -198,6 +238,7 @@ using robot_api_server::write_neutral_filter_assets;
 using robot_api_server::write_pgm_file;
 using robot_api_server::write_runtime_map_context_file;
 using robot_api_server::write_text_file;
+using robot_api_server::yaml_with_image_file;
 
 bool is_transient_action_client_exception(const std::exception & exc)
 {
@@ -208,6 +249,348 @@ bool is_transient_action_client_exception(const std::exception & exc)
 bool starts_with(const std::string & value, const std::string & prefix)
 {
   return value.rfind(prefix, 0) == 0;
+}
+
+bool path_lexically_within(
+  const fs::path & child,
+  const fs::path & parent)
+{
+  try {
+    const auto normalized_child = fs::absolute(child).lexically_normal();
+    const auto normalized_parent = fs::absolute(parent).lexically_normal();
+    auto child_iterator = normalized_child.begin();
+    for (auto parent_iterator = normalized_parent.begin();
+      parent_iterator != normalized_parent.end();
+      ++parent_iterator, ++child_iterator)
+    {
+      if (child_iterator == normalized_child.end() ||
+        *child_iterator != *parent_iterator)
+      {
+        return false;
+      }
+    }
+    return true;
+  } catch (const std::exception &) {
+    return false;
+  }
+}
+
+bool same_normalized_path(
+  const fs::path & left,
+  const fs::path & right)
+{
+  try {
+    return fs::absolute(left).lexically_normal() ==
+           fs::absolute(right).lexically_normal();
+  } catch (const std::exception &) {
+    return false;
+  }
+}
+
+bool safe_bundle_directory(
+  const fs::path & directory,
+  const fs::path & managed_root)
+{
+  try {
+    if (!path_lexically_within(directory, managed_root)) {
+      return false;
+    }
+    const auto normalized_root =
+      fs::absolute(managed_root).lexically_normal();
+    const auto normalized_directory =
+      fs::absolute(directory).lexically_normal();
+    std::error_code error;
+    auto cursor = normalized_root;
+    auto status = fs::symlink_status(cursor, error);
+    if (error || status.type() == fs::file_type::symlink ||
+      status.type() != fs::file_type::directory)
+    {
+      return false;
+    }
+    const auto relative =
+      normalized_directory.lexically_relative(normalized_root);
+    for (const auto & component : relative) {
+      if (component == "..") {
+        return false;
+      }
+      cursor /= component;
+      status = fs::symlink_status(cursor, error);
+      if (error || status.type() == fs::file_type::symlink ||
+        status.type() != fs::file_type::directory)
+      {
+        return false;
+      }
+    }
+    return true;
+  } catch (const std::exception &) {
+    return false;
+  }
+}
+
+void durable_sync_directory(const fs::path & directory)
+{
+  const int descriptor =
+    ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (descriptor < 0) {
+    throw std::runtime_error(
+            "failed to open directory for fsync: " + directory.string() +
+            " errno=" + std::to_string(errno));
+  }
+  const int result = ::fsync(descriptor);
+  const int saved_errno = errno;
+  ::close(descriptor);
+  if (result != 0) {
+    throw std::runtime_error(
+            "failed to fsync directory: " + directory.string() +
+            " errno=" + std::to_string(saved_errno));
+  }
+}
+
+void durable_sync_regular_file(const fs::path & path)
+{
+  const int descriptor =
+    ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (descriptor < 0) {
+    throw std::runtime_error(
+            "failed to open file for fsync: " + path.string() +
+            " errno=" + std::to_string(errno));
+  }
+  struct stat status {};
+  if (::fstat(descriptor, &status) != 0 || !S_ISREG(status.st_mode)) {
+    const int saved_errno = errno;
+    ::close(descriptor);
+    throw std::runtime_error(
+            "refusing to fsync a non-regular projection file: " +
+            path.string() + " errno=" + std::to_string(saved_errno));
+  }
+  const int result = ::fsync(descriptor);
+  const int saved_errno = errno;
+  const int close_result = ::close(descriptor);
+  const int close_errno = errno;
+  if (result != 0) {
+    throw std::runtime_error(
+            "failed to fsync projection file: " + path.string() +
+            " errno=" + std::to_string(saved_errno));
+  }
+  if (close_result != 0) {
+    throw std::runtime_error(
+            "failed to close projection file after fsync: " +
+            path.string() + " errno=" + std::to_string(close_errno));
+  }
+}
+
+std::string read_regular_text_file_checked(
+  const fs::path & path,
+  const std::size_t maximum_size = 16U * 1024U * 1024U)
+{
+  int descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (descriptor < 0) {
+    throw std::runtime_error(
+            "failed to open projection source: " + path.string() +
+            " errno=" + std::to_string(errno));
+  }
+  try {
+    struct stat before {};
+    if (::fstat(descriptor, &before) != 0 || !S_ISREG(before.st_mode) ||
+      before.st_size < 0 ||
+      static_cast<std::uint64_t>(before.st_size) >
+      static_cast<std::uint64_t>(maximum_size))
+    {
+      throw std::runtime_error(
+              "projection source is not a bounded regular file: " +
+              path.string());
+    }
+    std::string content(static_cast<std::size_t>(before.st_size), '\0');
+    std::size_t offset = 0U;
+    while (offset < content.size()) {
+      const auto count =
+        ::read(descriptor, content.data() + offset, content.size() - offset);
+      if (count < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        throw std::runtime_error(
+                "failed to read projection source: " + path.string() +
+                " errno=" + std::to_string(errno));
+      }
+      if (count == 0) {
+        throw std::runtime_error(
+                "projection source was truncated while reading: " +
+                path.string());
+      }
+      offset += static_cast<std::size_t>(count);
+    }
+    char extra = '\0';
+    ssize_t extra_count = -1;
+    do {
+      extra_count = ::read(descriptor, &extra, 1U);
+    } while (extra_count < 0 && errno == EINTR);
+    if (extra_count < 0) {
+      throw std::runtime_error(
+              "failed to finish reading projection source: " +
+              path.string() + " errno=" + std::to_string(errno));
+    }
+    struct stat after {};
+    if (extra_count != 0 || ::fstat(descriptor, &after) != 0 ||
+      before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
+      before.st_size != after.st_size ||
+      before.st_mtim.tv_sec != after.st_mtim.tv_sec ||
+      before.st_mtim.tv_nsec != after.st_mtim.tv_nsec)
+    {
+      throw std::runtime_error(
+              "projection source changed while reading: " + path.string());
+    }
+    const int close_result = ::close(descriptor);
+    descriptor = -1;
+    if (close_result != 0) {
+      throw std::runtime_error(
+              "failed to close projection source: " + path.string() +
+              " errno=" + std::to_string(errno));
+    }
+    return content;
+  } catch (...) {
+    if (descriptor >= 0) {
+      (void)::close(descriptor);
+    }
+    throw;
+  }
+}
+
+void durable_write_text_file_atomic(
+  const fs::path & path,
+  const std::string & content,
+  const mode_t mode = 0600)
+{
+  static std::atomic<std::uint64_t> sequence{0U};
+  const auto parent = path.parent_path();
+  if (parent.empty() || !fs::is_directory(parent)) {
+    throw std::runtime_error(
+            "durable file parent is not an existing directory: " +
+            parent.string());
+  }
+  const auto temporary =
+    parent /
+    ("." + path.filename().string() + ".tmp." +
+    std::to_string(::getpid()) + "." +
+    std::to_string(sequence.fetch_add(1U)));
+  int descriptor = ::open(
+    temporary.c_str(),
+    O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+    mode);
+  if (descriptor < 0) {
+    throw std::runtime_error(
+            "failed to create durable temporary file: " +
+            temporary.string() + " errno=" + std::to_string(errno));
+  }
+  bool renamed = false;
+  try {
+    std::size_t offset = 0U;
+    while (offset < content.size()) {
+      const auto count = ::write(
+        descriptor, content.data() + offset, content.size() - offset);
+      if (count < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        throw std::runtime_error(
+                "failed to write durable temporary file: " +
+                temporary.string() + " errno=" + std::to_string(errno));
+      }
+      if (count == 0) {
+        throw std::runtime_error(
+                "durable temporary file write made no progress: " +
+                temporary.string());
+      }
+      offset += static_cast<std::size_t>(count);
+    }
+    if (::fsync(descriptor) != 0) {
+      throw std::runtime_error(
+              "failed to fsync durable temporary file: " +
+              temporary.string() + " errno=" + std::to_string(errno));
+    }
+    if (::close(descriptor) != 0) {
+      descriptor = -1;
+      throw std::runtime_error(
+              "failed to close durable temporary file: " +
+              temporary.string() + " errno=" + std::to_string(errno));
+    }
+    descriptor = -1;
+    if (::rename(temporary.c_str(), path.c_str()) != 0) {
+      throw std::runtime_error(
+              "failed to commit durable file: " + path.string() +
+              " errno=" + std::to_string(errno));
+    }
+    renamed = true;
+    durable_sync_directory(parent);
+  } catch (...) {
+    if (descriptor >= 0) {
+      (void)::close(descriptor);
+    }
+    if (!renamed) {
+      (void)::unlink(temporary.c_str());
+    }
+    throw;
+  }
+}
+
+void durable_remove_file(const fs::path & path)
+{
+  if (::unlink(path.c_str()) != 0 && errno != ENOENT) {
+    throw std::runtime_error(
+            "failed to remove durable marker: " + path.string() +
+            " errno=" + std::to_string(errno));
+  }
+  durable_sync_directory(path.parent_path());
+}
+
+fs::path map_delete_tombstone_path(const fs::path & map_root)
+{
+  static std::atomic<std::uint64_t> sequence{0U};
+  const auto ticks =
+    std::chrono::steady_clock::now().time_since_epoch().count();
+  return map_root.parent_path() /
+         ("." + map_root.filename().string() + ".delete-" +
+         std::to_string(::getpid()) + "-" + std::to_string(ticks) + "-" +
+         std::to_string(sequence.fetch_add(1U)));
+}
+
+bool safe_bundle_regular_file(
+  const fs::path & path,
+  const fs::path & bundle_root)
+{
+  try {
+    std::error_code error;
+    if (fs::is_symlink(bundle_root) || !fs::is_directory(bundle_root) ||
+      !path_lexically_within(path, bundle_root))
+    {
+      return false;
+    }
+    const auto normalized_root =
+      fs::absolute(bundle_root).lexically_normal();
+    const auto normalized_path =
+      fs::absolute(path).lexically_normal();
+    auto relative = normalized_path.lexically_relative(normalized_root);
+    if (relative.empty() || relative.is_absolute()) {
+      return false;
+    }
+    fs::path cursor = normalized_root;
+    for (const auto & component : relative) {
+      if (component == "..") {
+        return false;
+      }
+      cursor /= component;
+      const auto status = fs::symlink_status(cursor, error);
+      if (error || status.type() == fs::file_type::symlink ||
+        status.type() == fs::file_type::not_found)
+      {
+        return false;
+      }
+    }
+    return fs::is_regular_file(normalized_path) &&
+           !fs::is_symlink(normalized_path);
+  } catch (const std::exception &) {
+    return false;
+  }
 }
 
 std::string unquote_env_value(std::string value)
@@ -333,6 +716,28 @@ std::string dock_latch_source_strength(const std::string & source)
   return "unknown";
 }
 
+class ScopeExit
+{
+public:
+  explicit ScopeExit(std::function<void()> callback)
+  : callback_(std::move(callback))
+  {
+  }
+
+  ScopeExit(const ScopeExit &) = delete;
+  ScopeExit & operator=(const ScopeExit &) = delete;
+
+  ~ScopeExit()
+  {
+    if (callback_) {
+      callback_();
+    }
+  }
+
+private:
+  std::function<void()> callback_;
+};
+
 }  // namespace
 
 class RobotApiServerNode : public rclcpp::Node
@@ -356,6 +761,126 @@ public:
       [this](const std::string & building_id, const std::string & floor_id) {
         ensure_legacy_floor_map_manifest(building_id, floor_id);
       });
+    bool activation_recovery_ok = true;
+    try {
+      recover_pending_map_activation();
+    } catch (const std::exception & error) {
+      activation_recovery_ok = false;
+      persist_map_asset_integrity_degraded(
+        "", std::string("activation recovery failed: ") + error.what());
+      RCLCPP_ERROR(
+        get_logger(), "map activation recovery failed closed: %s", error.what());
+    }
+    // Import complete legacy floors and stamp complete v1 catalog manifests
+    // only in this explicit, single-threaded startup migration. Incomplete
+    // bundles remain unavailable; all later catalog lookups stay read-only.
+    const bool startup_integrity_marker_present =
+      persisted_map_asset_integrity_marker().has_value();
+    const bool migration_allowed =
+      activation_recovery_ok && !startup_integrity_marker_present;
+    const auto startup_manifests =
+      map_catalog_->read_all_map_manifests(migration_allowed);
+    for (auto manifest : startup_manifests) {
+      if (!migration_allowed) {
+        break;
+      }
+      if (manifest.asset_epoch != 0U && !manifest.asset_digest.empty()) {
+        continue;
+      }
+      std::string migration_error;
+      if (!validate_map_manifest_assets(manifest, migration_error)) {
+        RCLCPP_WARN(
+          get_logger(),
+          "legacy map identity migration skipped for %s: %s",
+          manifest.map_id.c_str(), migration_error.c_str());
+        continue;
+      }
+      try {
+        stamp_map_asset_identity(manifest, fs::path(maps_root_));
+      } catch (const std::exception & error) {
+        RCLCPP_ERROR(
+          get_logger(),
+          "legacy map identity migration failed for %s: %s",
+          manifest.map_id.c_str(), error.what());
+      }
+    }
+    restore_map_asset_integrity_state();
+    elevator_configuration_ = std::make_unique<ElevatorConfigurationModule>(
+      fs::path(maps_root_),
+      [this](
+        const std::string & building_id,
+        const std::string & floor_id,
+        const std::string & map_id)
+      -> std::optional<ElevatorFloorAssetSnapshot>
+      {
+        const auto maps =
+          map_catalog_->read_floor_map_manifests(building_id, floor_id, false);
+        const auto match = std::find_if(
+          maps.begin(), maps.end(), [&map_id](const MapManifest & manifest) {
+            return manifest.map_id == map_id;
+          });
+        if (match == maps.end()) {
+          return std::nullopt;
+        }
+
+        ElevatorFloorAssetSnapshot snapshot;
+        const auto frozen_manifest = *match;
+        snapshot.manifest = frozen_manifest;
+        snapshot.asset_epoch = frozen_manifest.asset_epoch;
+        snapshot.asset_digest = frozen_manifest.asset_digest;
+        const std::vector<std::pair<std::string, fs::path>> required_assets{
+          {"nav_map_yaml", frozen_manifest.nav_map_yaml},
+          {"nav_map_pgm", frozen_manifest.nav_map_pgm},
+          {"localizer_map_png", frozen_manifest.localizer_map_png},
+          {"localizer_params_yaml", frozen_manifest.localizer_params_yaml},
+          {"keepout_mask_yaml", frozen_manifest.keepout_mask_yaml},
+          {"keepout_mask_pgm", frozen_manifest.keepout_mask_pgm},
+          {"speed_mask_yaml", frozen_manifest.speed_mask_yaml},
+          {"speed_mask_pgm", frozen_manifest.speed_mask_pgm},
+          {"binary_mask_yaml", frozen_manifest.binary_mask_yaml},
+          {"binary_mask_pgm", frozen_manifest.binary_mask_pgm},
+          {"asset_report_json", frozen_manifest.asset_report_json},
+          {"poses_yaml", frozen_manifest.poses_yaml},
+        };
+        const auto expected_root = map_catalog_->map_root_path(
+          building_id, floor_id, map_id);
+        const bool root_identity_matches =
+          same_normalized_path(frozen_manifest.root, expected_root);
+        const bool bundle_root_is_safe = safe_bundle_directory(
+          frozen_manifest.root, fs::path(maps_root_));
+        const bool manifest_is_safe =
+          safe_bundle_regular_file(
+          frozen_manifest.manifest_json, frozen_manifest.root);
+        const bool required_assets_safe = std::all_of(
+          required_assets.begin(), required_assets.end(),
+          [&frozen_manifest](const auto & asset) {
+            return safe_bundle_regular_file(asset.second, frozen_manifest.root);
+          });
+        const bool base_assets_safe =
+          root_identity_matches && bundle_root_is_safe && manifest_is_safe &&
+          required_assets_safe;
+        snapshot.required_assets_complete = base_assets_safe;
+        if (base_assets_safe) {
+          try {
+            const auto verified = verify_map_asset_identity_snapshot(
+              frozen_manifest, fs::path(maps_root_));
+            snapshot.manifest = verified.manifest;
+            snapshot.asset_epoch = verified.manifest.asset_epoch;
+            snapshot.asset_digest = verified.manifest.asset_digest;
+            snapshot.map_info = read_nav_map_info_exact_content(
+              verified.nav_map_yaml,
+              verified.nav_map_pgm_header,
+              verified.manifest.nav_map_pgm.filename().string());
+            if (!snapshot.map_info) {
+              snapshot.required_assets_complete = false;
+            }
+          } catch (const std::exception &) {
+            snapshot.required_assets_complete = false;
+            snapshot.map_info.reset();
+          }
+        }
+        return snapshot;
+      });
     runtime_maps_dir_ = declare_parameter<std::string>(
       "runtime_maps_dir", "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/maps");
 
@@ -364,6 +889,10 @@ public:
     safety_motion_allowed_topic_ =
       declare_parameter<std::string>("safety_motion_allowed_topic", "/safety/motion_allowed");
     floor_status_topic_ = declare_parameter<std::string>("floor_status_topic", "/floor_manager/status");
+    floor_transition_status_topic_ = declare_parameter<std::string>(
+      "floor_transition_status_topic", "/floor_manager/transition_status");
+    floor_runtime_negative_interlock_enabled_ =
+      declare_parameter<bool>("floor_runtime_negative_interlock_enabled", true);
     bms_state_topic_ = declare_parameter<std::string>("bms_state_topic", "/battery_state");
     bms_state_max_age_sec_ = std::max(0.1, declare_parameter<double>("bms_state_max_age_sec", 3.0));
     teleop_stop_on_charging_ = declare_parameter<bool>("teleop_stop_on_charging", true);
@@ -379,6 +908,30 @@ public:
     bms_full_soc_voltage_contact_enable_ =
       declare_parameter<bool>("bms_full_soc_voltage_contact_enable", true);
     floor_switch_service_ = declare_parameter<std::string>("floor_switch_service", "/floor_manager/switch_floor");
+    keepout_mask_load_service_ = declare_parameter<std::string>(
+      "keepout_mask_load_service", "/keepout_filter_mask_server/load_map");
+    keepout_mask_state_service_ = declare_parameter<std::string>(
+      "keepout_mask_state_service", "/keepout_filter_mask_server/get_state");
+    keepout_filter_info_state_service_ = declare_parameter<std::string>(
+      "keepout_filter_info_state_service", "/keepout_costmap_filter_info_server/get_state");
+    keepout_mask_get_parameters_service_ = declare_parameter<std::string>(
+      "keepout_mask_get_parameters_service", "/keepout_filter_mask_server/get_parameters");
+    keepout_runtime_stage_root_ = declare_parameter<std::string>(
+      "keepout_runtime_stage_root",
+      "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/filters/runtime_nav2");
+    keepout_mask_topic_ = declare_parameter<std::string>(
+      "keepout_mask_topic", "/keepout_filter_mask");
+    keepout_filter_info_topic_ = declare_parameter<std::string>(
+      "keepout_filter_info_topic", "/costmap_filter_info/keepout");
+    global_costmap_get_parameters_service_ = declare_parameter<std::string>(
+      "global_costmap_get_parameters_service",
+      "/global_costmap/global_costmap/get_parameters");
+    global_costmap_clear_service_ = declare_parameter<std::string>(
+      "global_costmap_clear_service", "/global_costmap/clear_entirely_global_costmap");
+    global_costmap_topic_ = declare_parameter<std::string>(
+      "global_costmap_topic", "/global_costmap/costmap");
+    keepout_runtime_apply_timeout_sec_ = std::clamp(
+      declare_parameter<double>("keepout_runtime_apply_timeout_sec", 5.0), 0.5, 15.0);
     localization_trigger_service_ =
       declare_parameter<std::string>("localization_trigger_service", "/global_localization/trigger");
     localization_bridge_force_accept_service_ = declare_parameter<std::string>(
@@ -388,7 +941,11 @@ public:
       declare_parameter<std::string>("localization_result_topic", "/localization_result");
     localization_bridge_status_topic_ =
       declare_parameter<std::string>("localization_bridge_status_topic", "/localization/bridge_status");
+    localization_floor_health_topic_ =
+      declare_parameter<std::string>("localization_floor_health_topic", "/localization/floor_health");
     navigate_to_pose_action_ = declare_parameter<std::string>("navigate_to_pose_action", "/navigate_to_pose");
+    navigate_to_pose_status_topic_ = declare_parameter<std::string>(
+      "navigate_to_pose_status_topic", "/navigate_to_pose/_action/status");
     mapping_2d_start_command_ = declare_parameter<std::string>(
       "mapping_2d_start_command",
       "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/run_projected_map.sh");
@@ -431,7 +988,13 @@ public:
     docking_stop_service_ = declare_parameter<std::string>("docking_stop_service", "/docking/stop");
     docking_undock_service_ = declare_parameter<std::string>("docking_undock_service", "/docking/undock");
     docking_status_topic_ = declare_parameter<std::string>("docking_status_topic", "/docking/status");
+    docking_observation_backend_ = declare_parameter<std::string>(
+      "docking_observation_backend", "target_observation");
     docking_gs2_scan_topic_ = declare_parameter<std::string>("docking_gs2_scan_topic", "/dock/gs2_scan");
+    docking_target_observation_topic_ = declare_parameter<std::string>(
+      "docking_target_observation_topic", "/dock/target_observation");
+    docking_target_observation_source_ = declare_parameter<std::string>(
+      "docking_target_observation_source", "orbbec_336l_depth");
     docking_contact_latch_file_ = declare_parameter<std::string>(
       "docking_contact_latch_file",
       "/workspaces/njrh-v3/workspace1/maps_release/docking_contact_latch.json");
@@ -511,7 +1074,7 @@ public:
     manual_relocalization_amcl_refine_required_ =
       declare_parameter<bool>("manual_relocalization_amcl_refine_required", true);
     manual_relocalization_amcl_refine_timeout_sec_ = std::clamp(
-      declare_parameter<double>("manual_relocalization_amcl_refine_timeout_sec", 8.0),
+      declare_parameter<double>("manual_relocalization_amcl_refine_timeout_sec", 4.0),
       0.5,
       20.0);
     manual_relocalization_amcl_refine_poll_ms_ = std::clamp(
@@ -642,10 +1205,10 @@ public:
       declare_parameter<double>("post_nav2_final_verify_xy_retry_min_error_m", 0.06),
       0.0,
       2.0);
-    post_nav2_final_verify_xy_retry_max_error_m_ = std::clamp(
-      declare_parameter<double>("post_nav2_final_verify_xy_retry_max_error_m", 0.35),
+    navigation_terminal_recovery_max_distance_m_ = std::clamp(
+      declare_parameter<double>("navigation_terminal_recovery_max_distance_m", 0.40),
       post_nav2_final_verify_xy_retry_min_error_m_,
-      3.0);
+      0.60);
     post_nav2_final_verify_yaw_retry_if_failed_ =
       declare_parameter<bool>("post_nav2_final_verify_yaw_retry_if_failed", true);
     post_nav2_final_verify_retry_uses_same_nav2_goal_ =
@@ -656,6 +1219,20 @@ public:
       declare_parameter<bool>("post_nav2_final_verify_reverse_permit_enabled", true);
     post_nav2_final_verify_reverse_enable_topic_ = declare_parameter<std::string>(
       "post_nav2_final_verify_reverse_enable_topic", "/ranger_mini3/allow_reverse");
+    navigation_terminal_reverse_permit_enabled_ =
+      declare_parameter<bool>("navigation_terminal_reverse_permit_enabled", true);
+    navigation_terminal_reverse_permit_enter_distance_m_ = std::clamp(
+      declare_parameter<double>("navigation_terminal_reverse_permit_enter_distance_m", 0.30),
+      navigation_goal_position_success_tolerance_m_,
+      1.0);
+    navigation_terminal_reverse_permit_exit_distance_m_ = std::clamp(
+      declare_parameter<double>("navigation_terminal_reverse_permit_exit_distance_m", 0.35),
+      navigation_terminal_reverse_permit_enter_distance_m_,
+      1.5);
+    navigation_terminal_reverse_permit_refresh_period_sec_ = std::clamp(
+      declare_parameter<double>("navigation_terminal_reverse_permit_refresh_period_sec", 0.20),
+      0.05,
+      0.50);
     post_nav2_final_verify_terminal_lateral_correction_enabled_ =
       declare_parameter<bool>("post_nav2_final_verify_terminal_lateral_correction_enabled", true);
     post_nav2_final_verify_terminal_lateral_target_m_ = std::clamp(
@@ -665,15 +1242,11 @@ public:
     post_nav2_final_verify_terminal_lateral_trigger_m_ = std::clamp(
       declare_parameter<double>("post_nav2_final_verify_terminal_lateral_trigger_m", 0.04),
       post_nav2_final_verify_terminal_lateral_target_m_,
-      post_nav2_final_verify_xy_retry_max_error_m_);
-    post_nav2_final_verify_terminal_lateral_max_xy_m_ = std::clamp(
-      declare_parameter<double>("post_nav2_final_verify_terminal_lateral_max_xy_m", 0.30),
-      post_nav2_final_verify_terminal_lateral_trigger_m_,
-      post_nav2_final_verify_xy_retry_max_error_m_);
+      navigation_terminal_recovery_max_distance_m_);
     post_nav2_final_verify_terminal_lateral_max_forward_m_ = std::clamp(
-      declare_parameter<double>("post_nav2_final_verify_terminal_lateral_max_forward_m", 0.08),
+      declare_parameter<double>("post_nav2_final_verify_terminal_lateral_max_forward_m", 0.15),
       0.01,
-      post_nav2_final_verify_terminal_lateral_max_xy_m_);
+      navigation_terminal_recovery_max_distance_m_);
     post_nav2_final_verify_terminal_lateral_speed_mps_ = std::clamp(
       declare_parameter<double>("post_nav2_final_verify_terminal_lateral_speed_mps", 0.04),
       0.005,
@@ -683,9 +1256,24 @@ public:
       0.05,
       5.0);
     post_nav2_final_verify_terminal_lateral_timeout_sec_ = std::clamp(
-      declare_parameter<double>("post_nav2_final_verify_terminal_lateral_timeout_sec", 8.0),
+      declare_parameter<double>("post_nav2_final_verify_terminal_lateral_timeout_sec", 20.0),
       0.5,
-      10.0);
+      30.0);
+    navigation_terminal_recovery_costmap_guard_enabled_ =
+      declare_parameter<bool>("navigation_terminal_recovery_costmap_guard_enabled", true);
+    navigation_terminal_recovery_costmap_max_age_sec_ = std::clamp(
+      declare_parameter<double>("navigation_terminal_recovery_costmap_max_age_sec", 0.50),
+      0.05,
+      2.0);
+    navigation_terminal_recovery_costmap_occupied_threshold_ = std::clamp(
+      static_cast<int>(declare_parameter<int>(
+        "navigation_terminal_recovery_costmap_occupied_threshold", 50)),
+      1,
+      100);
+    navigation_terminal_recovery_costmap_lookahead_m_ = std::clamp(
+      declare_parameter<double>("navigation_terminal_recovery_costmap_lookahead_m", 0.15),
+      0.05,
+      navigation_terminal_recovery_max_distance_m_);
     post_nav2_final_verify_terminal_lateral_command_sign_ = std::clamp(
       declare_parameter<double>("post_nav2_final_verify_terminal_lateral_command_sign", 1.0),
       -1.0,
@@ -732,11 +1320,7 @@ public:
       0,
       3);
     navigation_near_goal_stalled_handoff_enabled_ =
-      declare_parameter<bool>("navigation_near_goal_stalled_handoff_enabled", true);
-    navigation_near_goal_stalled_handoff_distance_m_ = std::clamp(
-      declare_parameter<double>("navigation_near_goal_stalled_handoff_distance_m", 0.30),
-      navigation_goal_position_success_tolerance_m_,
-      post_nav2_final_verify_xy_retry_max_error_m_);
+      declare_parameter<bool>("navigation_near_goal_stalled_handoff_enabled", false);
     navigation_near_goal_stalled_handoff_min_wait_sec_ = std::clamp(
       declare_parameter<double>("navigation_near_goal_stalled_handoff_min_wait_sec", 3.0),
       1.0,
@@ -755,10 +1339,6 @@ public:
       static_cast<int>(declare_parameter<int>("navigation_nav2_failed_near_goal_retry_max_count", 1)),
       0,
       3);
-    navigation_nav2_failed_near_goal_retry_max_distance_m_ = std::clamp(
-      declare_parameter<double>("navigation_nav2_failed_near_goal_retry_max_distance_m", 0.35),
-      0.05,
-      1.0);
     navigation_nav2_failed_near_goal_retry_requires_yaw_error_ =
       declare_parameter<bool>("navigation_nav2_failed_near_goal_retry_requires_yaw_error", false);
     navigation_max_reposition_after_yaw_retry_ = static_cast<int>(
@@ -878,6 +1458,10 @@ public:
       std::max(service_timeout_sec_, declare_parameter<double>("docking_navigation_start_wait_sec", 45.0));
     docking_predock_nav_timeout_sec_ =
       std::max(5.0, declare_parameter<double>("docking_predock_nav_timeout_sec", 180.0));
+    docking_predock_behavior_tree_ = declare_parameter<std::string>(
+      "docking_predock_behavior_tree",
+      "/workspaces/njrh-v3/workspace1/install/robot_nav_config/share/robot_nav_config/behavior_trees/"
+      "navigate_to_predock.xml");
     docking_predock_early_handoff_enabled_ =
       declare_parameter<bool>("docking_predock_early_handoff_enabled", false);
     docking_relocalize_before_predock_ =
@@ -1151,11 +1735,23 @@ public:
       [this](const std_msgs::msg::String::SharedPtr msg) {
         handle_docking_status(msg->data);
       });
-    docking_gs2_scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
-      docking_gs2_scan_topic_, rclcpp::SensorDataQoS(),
-      [this](const sensor_msgs::msg::LaserScan::SharedPtr msg) {
-        handle_docking_gs2_scan(msg);
-      });
+    if (docking_observation_backend_ == "target_observation") {
+      docking_target_observation_sub_ =
+        create_subscription<robot_interfaces::msg::DockTargetObservation>(
+        docking_target_observation_topic_, rclcpp::QoS(5).reliable(),
+        [this](const robot_interfaces::msg::DockTargetObservation::SharedPtr msg) {
+          handle_docking_target_observation(msg);
+        });
+    } else if (docking_observation_backend_ == "gs2_scan") {
+      docking_gs2_scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
+        docking_gs2_scan_topic_, rclcpp::SensorDataQoS(),
+        [this](const sensor_msgs::msg::LaserScan::SharedPtr msg) {
+          handle_docking_gs2_scan(msg);
+        });
+    } else {
+      throw std::invalid_argument(
+              "unsupported docking_observation_backend: " + docking_observation_backend_);
+    }
     mode_controller_status_sub_ = create_subscription<std_msgs::msg::String>(
       mode_controller_status_topic_, rclcpp::QoS(10),
       [this](const std_msgs::msg::String::SharedPtr msg) {
@@ -1180,6 +1776,52 @@ public:
       localization_bridge_status_topic_, rclcpp::QoS(10),
       [this](const std_msgs::msg::String::SharedPtr msg) {
         handle_localization_bridge_status(msg);
+      });
+    floor_transition_status_sub_ =
+      create_subscription<robot_interfaces::msg::FloorSwitchStatus>(
+      floor_transition_status_topic_,
+      rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
+      [this](const robot_interfaces::msg::FloorSwitchStatus::SharedPtr msg) {
+        handle_floor_transition_status(msg);
+      });
+    localization_floor_health_sub_ =
+      create_subscription<robot_interfaces::msg::LocalizationHealth>(
+      localization_floor_health_topic_,
+      rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
+      [this](const robot_interfaces::msg::LocalizationHealth::SharedPtr msg) {
+        handle_localization_floor_health(msg);
+      });
+    keepout_mask_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
+      keepout_mask_topic_,
+      rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
+      [this](const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+        handle_keepout_mask(msg);
+      });
+    keepout_filter_info_sub_ = create_subscription<nav2_msgs::msg::CostmapFilterInfo>(
+      keepout_filter_info_topic_,
+      rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
+      [this](const nav2_msgs::msg::CostmapFilterInfo::SharedPtr msg) {
+        handle_keepout_filter_info(msg);
+      });
+    navigate_to_pose_status_sub_ =
+      create_subscription<action_msgs::msg::GoalStatusArray>(
+      navigate_to_pose_status_topic_,
+      rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
+      [this](const action_msgs::msg::GoalStatusArray::SharedPtr msg) {
+        bool active = false;
+        for (const auto & status : msg->status_list) {
+          if (status.status == action_msgs::msg::GoalStatus::STATUS_ACCEPTED ||
+            status.status == action_msgs::msg::GoalStatus::STATUS_EXECUTING ||
+            status.status == action_msgs::msg::GoalStatus::STATUS_CANCELING)
+          {
+            active = true;
+            break;
+          }
+        }
+        std::lock_guard<std::mutex> lock(navigate_to_pose_status_mutex_);
+        have_navigate_to_pose_status_ = true;
+        navigate_to_pose_action_goal_active_ = active;
+        navigate_to_pose_status_received_at_ = std::chrono::steady_clock::now();
       });
     local_costmap_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
       local_costmap_topic_, rclcpp::QoS(rclcpp::KeepLast(5)).reliable().transient_local(),
@@ -1230,6 +1872,24 @@ public:
       post_nav2_final_verify_amcl_nomotion_update_service_,
       rmw_qos_profile_services_default,
       callback_group_);
+    keepout_mask_load_client_ = create_client<nav2_msgs::srv::LoadMap>(
+      keepout_mask_load_service_, rmw_qos_profile_services_default, callback_group_);
+    keepout_mask_state_client_ = create_client<lifecycle_msgs::srv::GetState>(
+      keepout_mask_state_service_, rmw_qos_profile_services_default, callback_group_);
+    keepout_filter_info_state_client_ = create_client<lifecycle_msgs::srv::GetState>(
+      keepout_filter_info_state_service_, rmw_qos_profile_services_default, callback_group_);
+    keepout_mask_get_parameters_client_ =
+      create_client<rcl_interfaces::srv::GetParameters>(
+      keepout_mask_get_parameters_service_,
+      rmw_qos_profile_services_default,
+      callback_group_);
+    global_costmap_get_parameters_client_ =
+      create_client<rcl_interfaces::srv::GetParameters>(
+      global_costmap_get_parameters_service_,
+      rmw_qos_profile_services_default,
+      callback_group_);
+    global_costmap_clear_client_ = create_client<nav2_msgs::srv::ClearEntireCostmap>(
+      global_costmap_clear_service_, rmw_qos_profile_services_default, callback_group_);
     for (const auto & node_name : navigation_lifecycle_node_names()) {
       navigation_lifecycle_clients_[node_name] = create_client<lifecycle_msgs::srv::GetState>(
         node_name + "/get_state", rmw_qos_profile_services_default, callback_group_);
@@ -1248,6 +1908,8 @@ public:
   ~RobotApiServerNode() override
   {
     stop_server();
+    request_mapping_start_cancel();
+    join_mapping_start_worker();
     join_navigation_goal_worker();
     join_navigation_cancel_worker();
     join_docking_worker();
@@ -1274,6 +1936,54 @@ private:
     bool navigation_active{false};
     bool docking_active{false};
     bool healthy{true};
+  };
+
+  struct KeepoutMaskObservation
+  {
+    std::uint64_t sequence{0U};
+    std::uint32_t width{0U};
+    std::uint32_t height{0U};
+    double resolution{0.0};
+    double origin_x{0.0};
+    double origin_y{0.0};
+    double origin_yaw{0.0};
+    std::size_t active_cells{0U};
+    std::string occupancy_digest;
+    std::chrono::steady_clock::time_point received_at{};
+  };
+
+  struct KeepoutFilterInfoObservation
+  {
+    bool valid{false};
+    std::uint8_t type{255U};
+    std::string mask_topic;
+    double base{0.0};
+    double multiplier{0.0};
+    std::chrono::steady_clock::time_point received_at{};
+  };
+
+  struct KeepoutCostmapProbeState
+  {
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::uint64_t sequence{0U};
+    nav_msgs::msg::OccupancyGrid::SharedPtr latest;
+    std::chrono::steady_clock::time_point received_at{};
+  };
+
+  struct MappingStartJob
+  {
+    std::uint64_t id{0U};
+    std::string state{"idle"};
+    std::string phase{"idle"};
+    std::string detail;
+    std::string started_at;
+    std::string finished_at;
+    bool navigation_was_active{false};
+    bool navigation_cancel_ok{false};
+    bool navigation_stop_ok{false};
+    bool cancel_requested{false};
+    pid_t mapping_pid{-1};
   };
 
   struct BmsChargingContactSnapshot
@@ -1661,11 +2371,15 @@ private:
     std::string amcl_scan_admission_last_error{"none"};
     bool amcl_post_isaac_refine_enabled{false};
     bool amcl_post_isaac_refine_active{false};
+    bool amcl_post_isaac_refine_request_nomotion_update{false};
+    bool amcl_post_isaac_refine_nomotion_service_ready{false};
     std::uint64_t amcl_post_isaac_refined_sequence{0U};
     std::uint64_t amcl_post_isaac_refine_candidate_count{0U};
     std::uint64_t amcl_post_isaac_refine_accepted_count{0U};
     std::uint64_t amcl_post_isaac_refine_rejected_count{0U};
     std::uint64_t amcl_post_isaac_refine_waiting_count{0U};
+    std::uint64_t amcl_post_isaac_refine_nomotion_request_count{0U};
+    std::string amcl_post_isaac_refine_nomotion_state{"idle"};
     std::string amcl_last_reject_reason{"none"};
     double amcl_pose_age_ms{-1.0};
     bool localization_degraded{false};
@@ -2035,6 +2749,81 @@ private:
     }
     const double distance_m = std::hypot(target.x - pose.x, target.y - pose.y);
     publish_navigation_terminal_speed_limit_value(navigation_terminal_speed_limit_for_distance(distance_m));
+  }
+
+  void publish_navigation_terminal_reverse_permit(const bool enabled)
+  {
+    if (!post_nav2_final_verify_reverse_enable_pub_) {
+      return;
+    }
+    std_msgs::msg::Bool msg;
+    msg.data = enabled && navigation_terminal_reverse_permit_enabled_;
+    post_nav2_final_verify_reverse_enable_pub_->publish(msg);
+  }
+
+  void clear_navigation_terminal_reverse_permit(
+    bool & permit_active,
+    const std::string & context)
+  {
+    if (!permit_active) {
+      return;
+    }
+    publish_navigation_terminal_reverse_permit(false);
+    permit_active = false;
+    RCLCPP_INFO(
+      get_logger(),
+      "navigation terminal reverse permit cleared context=%s",
+      context.c_str());
+  }
+
+  void update_navigation_terminal_reverse_permit_for_goal(
+    const StoredPose & target,
+    bool & permit_active,
+    std::chrono::steady_clock::time_point & next_refresh_at,
+    const std::string & context)
+  {
+    if (!navigation_terminal_reverse_permit_enabled_ ||
+      !post_nav2_final_verify_reverse_enable_pub_)
+    {
+      clear_navigation_terminal_reverse_permit(permit_active, context + ":disabled");
+      return;
+    }
+
+    const auto now_steady = std::chrono::steady_clock::now();
+    if (now_steady < next_refresh_at) {
+      return;
+    }
+    next_refresh_at = now_steady +
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+      std::chrono::duration<double>(navigation_terminal_reverse_permit_refresh_period_sec_));
+
+    const auto pose = current_robot_pose_snapshot();
+    const bool pose_usable = pose.available && pose.frame_id == tf_map_frame_ &&
+      pose.age_sec <= robot_pose_freshness_sec_;
+    const double distance_m = pose_usable ? std::hypot(target.x - pose.x, target.y - pose.y) : -1.0;
+    const double distance_limit_m = permit_active ?
+      navigation_terminal_reverse_permit_exit_distance_m_ :
+      navigation_terminal_reverse_permit_enter_distance_m_;
+    const bool should_enable = pose_usable && distance_m <= distance_limit_m;
+
+    if (!should_enable) {
+      clear_navigation_terminal_reverse_permit(
+        permit_active,
+        context + (pose_usable ? ":outside_window" : ":pose_unavailable"));
+      return;
+    }
+
+    publish_navigation_terminal_reverse_permit(true);
+    if (!permit_active) {
+      RCLCPP_INFO(
+        get_logger(),
+        "navigation terminal reverse permit enabled context=%s distance_m=%.3f enter_m=%.3f exit_m=%.3f",
+        context.c_str(),
+        distance_m,
+        navigation_terminal_reverse_permit_enter_distance_m_,
+        navigation_terminal_reverse_permit_exit_distance_m_);
+    }
+    permit_active = true;
   }
 
   TfChainFreshnessSnapshot tf_chain_freshness_snapshot()
@@ -2972,6 +3761,10 @@ private:
       json_bool_value(msg->data, "amcl_post_isaac_refine_enabled", false);
     snapshot.amcl_post_isaac_refine_active =
       json_bool_value(msg->data, "amcl_post_isaac_refine_active", false);
+    snapshot.amcl_post_isaac_refine_request_nomotion_update =
+      json_bool_value(msg->data, "amcl_post_isaac_refine_request_nomotion_update", false);
+    snapshot.amcl_post_isaac_refine_nomotion_service_ready =
+      json_bool_value(msg->data, "amcl_post_isaac_refine_nomotion_service_ready", false);
     snapshot.amcl_post_isaac_refined_sequence =
       json_uint64_value(msg->data, "amcl_post_isaac_refined_sequence");
     snapshot.amcl_post_isaac_refine_candidate_count =
@@ -2982,6 +3775,10 @@ private:
       json_uint64_value(msg->data, "amcl_post_isaac_refine_rejected_count");
     snapshot.amcl_post_isaac_refine_waiting_count =
       json_uint64_value(msg->data, "amcl_post_isaac_refine_waiting_count");
+    snapshot.amcl_post_isaac_refine_nomotion_request_count =
+      json_uint64_value(msg->data, "amcl_post_isaac_refine_nomotion_request_count");
+    snapshot.amcl_post_isaac_refine_nomotion_state =
+      json_string_value(msg->data, "amcl_post_isaac_refine_nomotion_state").value_or("idle");
     snapshot.amcl_last_reject_reason =
       json_string_value(msg->data, "amcl_last_reject_reason").value_or("none");
     snapshot.amcl_pose_age_ms =
@@ -2990,6 +3787,93 @@ private:
 
     std::lock_guard<std::mutex> lock(bridge_status_mutex_);
     latest_bridge_status_ = snapshot;
+  }
+
+  void handle_floor_transition_status(
+    const robot_interfaces::msg::FloorSwitchStatus::SharedPtr msg)
+  {
+    std::lock_guard<std::mutex> lock(floor_runtime_interlock_mutex_);
+    floor_runtime_interlock_.observe_floor_switch_status(
+      msg->transaction_id,
+      msg->state,
+      msg->stage,
+      msg->failure_code,
+      msg->detail);
+  }
+
+  void handle_localization_floor_health(
+    const robot_interfaces::msg::LocalizationHealth::SharedPtr msg)
+  {
+    std::lock_guard<std::mutex> lock(floor_runtime_interlock_mutex_);
+    floor_runtime_interlock_.observe_localization_health(
+      msg->transition_active,
+      msg->runtime_context_valid,
+      msg->detail);
+  }
+
+  FloorRuntimeInterlockDecision floor_runtime_interlock_decision() const
+  {
+    if (!floor_runtime_negative_interlock_enabled_) {
+      FloorRuntimeInterlockDecision decision;
+      decision.code = "FLOOR_RUNTIME_INTERLOCK_DISABLED";
+      decision.detail = "floor runtime negative interlock is disabled by configuration";
+      return decision;
+    }
+    std::lock_guard<std::mutex> lock(floor_runtime_interlock_mutex_);
+    return floor_runtime_interlock_.decision();
+  }
+
+  bool floor_runtime_operation_blocked(
+    const std::string & operation,
+    std::string & detail,
+    std::string * reason_code = nullptr) const
+  {
+    const auto decision = floor_runtime_interlock_decision();
+    if (!decision.blocked) {
+      detail.clear();
+      if (reason_code != nullptr) {
+        *reason_code = decision.code;
+      }
+      return false;
+    }
+
+    std::ostringstream message;
+    message << operation << " is blocked by the floor runtime interlock: "
+            << decision.detail;
+    if (!decision.transaction_id.empty()) {
+      message << " transaction_id=" << decision.transaction_id;
+    }
+    detail = message.str();
+    if (reason_code != nullptr) {
+      *reason_code = decision.code;
+    }
+    return true;
+  }
+
+  std::optional<HttpResponse> floor_runtime_interlock_response(
+    const std::string & operation) const
+  {
+    const auto decision = floor_runtime_interlock_decision();
+    if (!decision.blocked) {
+      return std::nullopt;
+    }
+
+    std::ostringstream detail;
+    detail << operation << " is blocked by the floor runtime interlock: "
+           << decision.detail;
+    if (!decision.transaction_id.empty()) {
+      detail << " transaction_id=" << decision.transaction_id;
+    }
+    std::ostringstream body;
+    body << "{\"ok\":false,"
+         << "\"code\":\"FLOOR_TRANSITION_BLOCKED\","
+         << "\"reason_code\":" << json_string(decision.code) << ","
+         << "\"operation\":" << json_string(operation) << ","
+         << "\"transaction_id\":" << json_string(decision.transaction_id) << ","
+         << "\"error\":" << json_string(detail.str()) << "}";
+    const int status =
+      decision.code == "FLOOR_TRANSITION_ACTIVE" ? 409 : 503;
+    return HttpResponse{status, "application/json", body.str()};
   }
 
   BridgeStatusSnapshot bridge_status_snapshot() const
@@ -3506,7 +4390,9 @@ private:
     terminal_actual_stop_stable_since_ = {};
   }
 
-  bool terminal_actual_stop_stable_snapshot(std::string & detail) const
+  bool terminal_actual_stop_stable_snapshot(
+    std::string & detail,
+    const bool require_dual_ackermann_mode) const
   {
     if (!post_nav2_final_verify_terminal_settle_enabled_) {
       detail = "disabled";
@@ -3548,7 +4434,7 @@ private:
     const bool mode_fresh = mode_status.available && mode_status.actual_available &&
       mode_status.actual_fresh && mode_status.age_sec >= 0.0 &&
       mode_status.age_sec <= post_nav2_final_verify_terminal_settle_mode_status_max_age_sec_;
-    const bool mode_exited = !post_nav2_final_verify_terminal_settle_require_dual_ackermann_mode_ ||
+    const bool mode_exited = !require_dual_ackermann_mode ||
       (mode_fresh && mode_status.actual_motion_mode_code == 0 && mode_status.mode_aligned);
 
     std::ostringstream out;
@@ -3559,7 +4445,7 @@ private:
         << "/" << post_nav2_final_verify_terminal_settle_stable_duration_sec_
         << " odom_age_sec=" << odom_age_sec
         << " mode_required="
-        << (post_nav2_final_verify_terminal_settle_require_dual_ackermann_mode_ ? "true" : "false")
+        << (require_dual_ackermann_mode ? "true" : "false")
         << " mode_available=" << (mode_status.available ? "true" : "false")
         << " mode_fresh=" << (mode_fresh ? "true" : "false")
         << " actual_mode=" << mode_status.actual_motion_mode_code
@@ -3570,7 +4456,10 @@ private:
     return odom_stable && mode_exited;
   }
 
-  bool wait_for_terminal_actual_stop(const std::string & context, std::string & detail) const
+  bool wait_for_terminal_actual_stop(
+    const std::string & context,
+    std::string & detail,
+    const bool require_dual_ackermann_mode) const
   {
     if (!post_nav2_final_verify_terminal_settle_enabled_) {
       detail = "disabled";
@@ -3580,23 +4469,84 @@ private:
       std::chrono::duration_cast<std::chrono::steady_clock::duration>(
       std::chrono::duration<double>(post_nav2_final_verify_terminal_settle_timeout_sec_));
     do {
-      if (terminal_actual_stop_stable_snapshot(detail)) {
+      if (terminal_actual_stop_stable_snapshot(detail, require_dual_ackermann_mode)) {
         return true;
       }
       std::this_thread::sleep_for(20ms);
     } while (std::chrono::steady_clock::now() < deadline && running_.load());
 
-    const bool stable = terminal_actual_stop_stable_snapshot(detail);
+    const bool stable = terminal_actual_stop_stable_snapshot(detail, require_dual_ackermann_mode);
     if (!stable) {
       detail = context + ": " + detail;
     }
     return stable;
   }
 
+  bool wait_for_terminal_actual_stop(const std::string & context, std::string & detail) const
+  {
+    return wait_for_terminal_actual_stop(
+      context,
+      detail,
+      post_nav2_final_verify_terminal_settle_require_dual_ackermann_mode_);
+  }
+
+  void handle_keepout_mask(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
+  {
+    KeepoutMaskObservation observation;
+    observation.width = msg->info.width;
+    observation.height = msg->info.height;
+    observation.resolution = msg->info.resolution;
+    observation.origin_x = msg->info.origin.position.x;
+    observation.origin_y = msg->info.origin.position.y;
+    const auto & orientation = msg->info.origin.orientation;
+    observation.origin_yaw = quaternion_yaw(
+      orientation.x, orientation.y, orientation.z, orientation.w);
+    observation.received_at = std::chrono::steady_clock::now();
+    std::string normalized;
+    normalized.resize(msg->data.size());
+    for (std::size_t index = 0U; index < msg->data.size(); ++index) {
+      const auto value = msg->data[index];
+      if (value < 0) {
+        normalized[index] = '\2';
+      } else if (value > 0) {
+        normalized[index] = '\1';
+        ++observation.active_cells;
+      } else {
+        normalized[index] = '\0';
+      }
+    }
+    observation.occupancy_digest =
+      "occupancy-fnv64-" + fixed_hex(fnv1a64(normalized), 16);
+
+    {
+      std::lock_guard<std::mutex> lock(keepout_observation_mutex_);
+      observation.sequence = latest_keepout_mask_.sequence + 1U;
+      latest_keepout_mask_ = std::move(observation);
+    }
+    keepout_observation_cv_.notify_all();
+  }
+
+  void handle_keepout_filter_info(const nav2_msgs::msg::CostmapFilterInfo::SharedPtr msg)
+  {
+    KeepoutFilterInfoObservation observation;
+    observation.type = msg->type;
+    observation.mask_topic = msg->filter_mask_topic;
+    observation.base = msg->base;
+    observation.multiplier = msg->multiplier;
+    observation.received_at = std::chrono::steady_clock::now();
+    observation.valid =
+      msg->type == 0U &&
+      msg->filter_mask_topic == keepout_mask_topic_ &&
+      std::isfinite(msg->base) &&
+      std::isfinite(msg->multiplier);
+    std::lock_guard<std::mutex> lock(keepout_observation_mutex_);
+    latest_keepout_filter_info_ = std::move(observation);
+  }
+
   void handle_local_costmap(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
   {
-    (void)msg;
     std::lock_guard<std::mutex> lock(local_costmap_mutex_);
+    latest_local_costmap_ = msg;
     ++local_costmap_update_count_;
     latest_local_costmap_received_at_ = std::chrono::steady_clock::now();
   }
@@ -3748,6 +4698,9 @@ private:
     const double wait_timeout_sec = -1.0,
     std::uint64_t * accepted_sequence = nullptr)
   {
+    if (floor_runtime_operation_blocked("localization_trigger", detail)) {
+      return false;
+    }
     const auto trigger_started_at = std::chrono::steady_clock::now();
     if (accepted_sequence != nullptr) {
       *accepted_sequence = 0U;
@@ -3759,6 +4712,9 @@ private:
     const auto trigger_timeout = localization_trigger_service_timeout(timeout_sec);
     if (!localization_trigger_client_->wait_for_service(trigger_timeout)) {
       detail = "service unavailable: " + localization_trigger_service_;
+      return false;
+    }
+    if (floor_runtime_operation_blocked("localization_trigger", detail)) {
       return false;
     }
 
@@ -4423,14 +5379,24 @@ private:
         continue;
       }
 
-      if (bridge.amcl_post_isaac_refined_sequence == relocalization_sequence) {
+      const bool refine_accepted =
+        bridge.amcl_post_isaac_refined_sequence == relocalization_sequence;
+      const bool refine_fully_applied =
+        refine_accepted && bridge.safe_for_goal_start && !bridge.correction_active &&
+        bridge.current_sequence == bridge.target_sequence &&
+        bridge.last_published_sequence >= bridge.current_sequence;
+      if (refine_fully_applied) {
         std::ostringstream out;
-        out << "manual relocalization AMCL refine accepted sequence=" << relocalization_sequence
+        out << "manual relocalization AMCL refine applied sequence=" << relocalization_sequence
             << " source=" << bridge.map_odom_latest_source
             << " candidate_translation_m=" << bridge.last_candidate_correction_translation_m
             << " candidate_yaw_rad=" << bridge.last_candidate_correction_yaw_rad
             << " accepted_count=" << bridge.amcl_post_isaac_refine_accepted_count
-            << " requests=" << request_count;
+            << " bridge_requests=" << bridge.amcl_post_isaac_refine_nomotion_request_count
+            << " api_requests=" << request_count
+            << " current_sequence=" << bridge.current_sequence
+            << " target_sequence=" << bridge.target_sequence
+            << " published_sequence=" << bridge.last_published_sequence;
         detail = out.str();
         return true;
       }
@@ -4445,7 +5411,12 @@ private:
       }
 
       const auto now = std::chrono::steady_clock::now();
-      if (now >= next_request_at && bridge.amcl_process_ready && bridge.amcl_seeded) {
+      const bool bridge_owns_nomotion_requests =
+        bridge.amcl_post_isaac_refine_request_nomotion_update;
+      if (
+        now >= next_request_at && bridge.amcl_process_ready && bridge.amcl_seeded &&
+        !bridge_owns_nomotion_requests)
+      {
         std::string request_detail;
         if (request_amcl_nomotion_update(
             "manual_relocalization_amcl_refine",
@@ -4470,6 +5441,18 @@ private:
           << " accepted=" << bridge.amcl_post_isaac_refine_accepted_count
           << " rejected=" << bridge.amcl_post_isaac_refine_rejected_count
           << " waiting=" << bridge.amcl_post_isaac_refine_waiting_count
+          << " refine_accepted=" << (refine_accepted ? "true" : "false")
+          << " correction_active=" << (bridge.correction_active ? "true" : "false")
+          << " safe_for_goal_start=" << (bridge.safe_for_goal_start ? "true" : "false")
+          << " current_sequence=" << bridge.current_sequence
+          << " target_sequence=" << bridge.target_sequence
+          << " published_sequence=" << bridge.last_published_sequence
+          << " bridge_owns_nomotion=" << (bridge_owns_nomotion_requests ? "true" : "false")
+          << " bridge_nomotion_service_ready="
+          << (bridge.amcl_post_isaac_refine_nomotion_service_ready ? "true" : "false")
+          << " bridge_nomotion_requests="
+          << bridge.amcl_post_isaac_refine_nomotion_request_count
+          << " bridge_nomotion_state=" << bridge.amcl_post_isaac_refine_nomotion_state
           << " last_reject=" << bridge.amcl_last_reject_reason
           << " candidate_translation_m=" << bridge.last_candidate_correction_translation_m
           << " candidate_yaw_rad=" << bridge.last_candidate_correction_yaw_rad
@@ -4704,8 +5687,8 @@ private:
     double last_yaw = initial_check.pose.yaw;
     int success_hold = 0;
     bool nonzero_command_published = false;
-    bool mode_switch_diagnostic_logged = false;
-    std::string mode_switch_diagnostic;
+    bool actual_spin_confirmed = !predock_yaw_align_require_actual_spin_;
+    std::chrono::steady_clock::time_point first_nonzero_command_time;
 
     while (std::chrono::steady_clock::now() < deadline) {
       if (docking_cancel_requested(job_id)) {
@@ -4755,6 +5738,15 @@ private:
       }
 
       if (result.final_error_rad <= stop_threshold) {
+        if (nonzero_command_published && predock_yaw_align_require_actual_spin_ &&
+          !actual_spin_confirmed)
+        {
+          result.blocked = true;
+          result.failure_code = "PREDOCK_YAW_ALIGN_NO_CONFIRMED_PHYSICAL_SPIN";
+          result.detail =
+            "predock map yaw entered tolerance before Ranger feedback confirmed SPINNING=2";
+          break;
+        }
         ++success_hold;
         publish_predock_yaw_align_command(geometry_msgs::msg::Twist{});
         if (success_hold >= predock_yaw_align_success_hold_count_) {
@@ -4797,26 +5789,37 @@ private:
       geometry_msgs::msg::Twist twist;
       twist.angular.z = std::copysign(command_speed, signed_error);
       reset_yaw_align_actual_stop_stability();
+      const auto command_time = std::chrono::steady_clock::now();
+      if (!nonzero_command_published) {
+        first_nonzero_command_time = command_time;
+      }
       publish_predock_yaw_align_command(twist);
       nonzero_command_published = true;
 
-      const auto elapsed_sec =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-      if (predock_yaw_align_require_actual_spin_ && elapsed_sec >= predock_yaw_align_mode_switch_timeout_sec_) {
+      if (predock_yaw_align_require_actual_spin_ && !actual_spin_confirmed) {
         const auto mode_status = mode_controller_status_snapshot();
         const bool actual_spinning = mode_status.available &&
-          mode_status.actual_available && mode_status.actual_motion_mode_code == 2;
-        if (!actual_spinning && !mode_switch_diagnostic_logged) {
-          std::ostringstream detail;
-          detail << "actual motion_mode has not confirmed SPINNING=2; continuing predock yaw alignment"
-                 << " status_available=" << (mode_status.available ? "true" : "false")
-                 << " actual_available=" << (mode_status.actual_available ? "true" : "false")
-                 << " actual_fresh=" << (mode_status.actual_fresh ? "true" : "false")
-                 << " actual_code=" << mode_status.actual_motion_mode_code
-                 << " status_age_sec=" << mode_status.age_sec;
-          mode_switch_diagnostic = detail.str();
-          mode_switch_diagnostic_logged = true;
-          RCLCPP_WARN(get_logger(), "%s", mode_switch_diagnostic.c_str());
+          mode_status.actual_available && mode_status.actual_fresh &&
+          mode_status.actual_motion_mode_code == 2;
+        if (actual_spinning) {
+          actual_spin_confirmed = true;
+        } else {
+          const double mode_wait_sec = std::chrono::duration<double>(
+            command_time - first_nonzero_command_time).count();
+          if (mode_wait_sec >= predock_yaw_align_mode_switch_timeout_sec_) {
+            result.blocked = true;
+            result.failure_code = "PREDOCK_YAW_ALIGN_MODE_SWITCH_TIMEOUT";
+            std::ostringstream detail;
+            detail << "Ranger feedback did not confirm SPINNING=2 before predock yaw command timeout"
+                   << " wait_sec=" << mode_wait_sec
+                   << " status_available=" << (mode_status.available ? "true" : "false")
+                   << " actual_available=" << (mode_status.actual_available ? "true" : "false")
+                   << " actual_fresh=" << (mode_status.actual_fresh ? "true" : "false")
+                   << " actual_code=" << mode_status.actual_motion_mode_code
+                   << " status_age_sec=" << mode_status.age_sec;
+            result.detail = detail.str();
+            break;
+          }
         }
       }
       if (nonzero_command_published) {
@@ -4826,9 +5829,6 @@ private:
           result.blocked = true;
           result.failure_code = "PREDOCK_YAW_ALIGN_NO_YAW_MOTION";
           result.detail = "predock yaw command published but map-frame yaw did not change";
-          if (!mode_switch_diagnostic.empty()) {
-            result.detail += "; " + mode_switch_diagnostic;
-          }
           break;
         }
       }
@@ -4852,9 +5852,6 @@ private:
       result.blocked = true;
       result.failure_code = "PREDOCK_YAW_ALIGN_TIMEOUT";
       result.detail = "predock yaw alignment timed out";
-      if (!mode_switch_diagnostic.empty()) {
-        result.detail += "; " + mode_switch_diagnostic;
-      }
     }
     if (result.detail.empty()) {
       std::ostringstream detail;
@@ -5339,7 +6336,9 @@ private:
     std::string & detail)
   {
     check = evaluate_predock_pose(job);
-    const double gs2_age_sec = docking_gs2_scan_age_sec();
+    const double observation_age_sec = docking_observation_age_sec();
+    const bool observation_usable = docking_observation_usable();
+    const std::string observation_detail = docking_observation_detail();
     const double lateral_m = check.pose_available ? check.lateral_abs_m : -1.0;
     std::string current_policy = job.goal_completion_policy;
     bool dock_staging_handoff_ready = job.dock_staging_handoff_ready;
@@ -5373,8 +6372,12 @@ private:
         << " lateral=" << lateral_m << "/" << fine_docking_entry_max_lateral_m_
         << " base_yaw_error=" << check.base_yaw_error_rad << "/" << fine_docking_entry_max_yaw_rad_
         << " contact_yaw_error=" << check.contact_yaw_error_rad << "/" << fine_docking_entry_max_yaw_rad_
-        << " gs2_scan_age_sec=" << gs2_age_sec
-        << " require_gs2_fresh=" << (fine_docking_entry_require_gs2_fresh_ ? "true" : "false")
+        << " observation_backend=" << docking_observation_backend_
+        << " observation_age_sec=" << observation_age_sec
+        << " observation_usable=" << (observation_usable ? "true" : "false")
+        << " observation_detail=" << observation_detail
+        << " require_observation_fresh=" <<
+      (fine_docking_entry_require_gs2_fresh_ ? "true" : "false")
         << " predock_yaw_aligned=" << (predock_yaw_aligned ? "true" : "false");
     detail = out.str();
 
@@ -5394,8 +6397,11 @@ private:
       failure_code = "FINE_DOCKING_ENTRY_CONDITION_FAILED";
       return false;
     }
-    if (fine_docking_entry_require_gs2_fresh_ && (gs2_age_sec < 0.0 || gs2_age_sec > 0.5)) {
-      failure_code = "GS2_DOCK_DETECT_TIMEOUT";
+    if (fine_docking_entry_require_gs2_fresh_ &&
+      (observation_age_sec < 0.0 || observation_age_sec > 0.5 || !observation_usable))
+    {
+      failure_code = docking_observation_backend_ == "target_observation" ?
+        "DOCK_TARGET_OBSERVATION_TIMEOUT" : "GS2_DOCK_DETECT_TIMEOUT";
       return false;
     }
     if (fine_docking_entry_require_predock_yaw_aligned_ && !predock_yaw_aligned) {
@@ -5423,13 +6429,16 @@ private:
   std::string classify_fine_docking_failure_code(const std::string & status) const
   {
     const auto text = lower_copy(status);
-    if (text.find("contact_verify_timeout") != std::string::npos) {
+    if (text.find("contact_verify_timeout") != std::string::npos ||
+      text.find("contact_verify_failed") != std::string::npos)
+    {
       return "FINAL_INSERTION_NO_CONTACT";
     }
     if (text.find("dock_feature_not_found") != std::string::npos ||
       text.find("lost_dock_feature") != std::string::npos)
     {
-      return "GS2_DOCK_DETECT_TIMEOUT";
+      return docking_observation_backend_ == "target_observation" ?
+        "DOCK_TARGET_OBSERVATION_TIMEOUT" : "GS2_DOCK_DETECT_TIMEOUT";
     }
     if (text.find("yaw") != std::string::npos || text.find("outside hard limit") != std::string::npos) {
       return "FINE_DOCKING_REJECTED_YAW_TOO_LARGE";
@@ -6066,6 +7075,18 @@ private:
     if (request.method == "GET" && request.path == "/api/v1/maps/poses") {
       return handle_get_poses(request);
     }
+    if (request.method == "GET" && request.path == "/api/v1/elevator-config") {
+      return handle_get_elevator_configuration(request);
+    }
+    if (request.method == "PUT" && request.path == "/api/v1/elevator-config/draft") {
+      return handle_save_elevator_configuration_draft(request.body);
+    }
+    if (request.method == "POST" && request.path == "/api/v1/elevator-config/publish") {
+      return handle_publish_elevator_configuration(request.body);
+    }
+    if (request.method == "POST" && request.path == "/api/v1/elevator-config/rollback") {
+      return handle_rollback_elevator_configuration(request.body);
+    }
     if (request.method == "GET" && request.path == "/api/v1/maps/filters/keepout") {
       return handle_get_keepout_filter(request);
     }
@@ -6128,6 +7149,9 @@ private:
       return publish_estop(true);
     }
     if (request.method == "POST" && request.path == "/api/v1/safety/resume") {
+      if (const auto blocked = floor_runtime_interlock_response("safety_resume")) {
+        return *blocked;
+      }
       return publish_estop(false);
     }
     if (request.method == "POST" && request.path == "/api/v1/floors/switch") {
@@ -6181,7 +7205,9 @@ private:
   HttpResponse handle_status()
   {
     refresh_mapping_2d_runtime_state();
-    refresh_navigation_resume_runtime_state(false);
+    if (mode_transition_owner_snapshot() != "mapping_start") {
+      refresh_navigation_resume_runtime_state(false);
+    }
 
     std::string safety_status;
     std::string floor_status;
@@ -6301,11 +7327,14 @@ private:
       std::lock_guard<std::mutex> lock(navigation_goal_job_mutex_);
       navigation_goal_json = navigation_goal_job_json_locked();
     }
+    const std::string mapping_start_json = mapping_start_job_json();
+    const std::string mode_transition_owner = mode_transition_owner_snapshot();
     std::string post_undock_settle_json;
     {
       std::lock_guard<std::mutex> lock(docking_job_mutex_);
       post_undock_settle_json = post_undock_settle_state_json_locked();
     }
+    const auto floor_runtime_interlock = floor_runtime_interlock_decision();
 
     std::ostringstream body;
     body << "{";
@@ -6318,7 +7347,21 @@ private:
     body << "\"mapping_active\":" << (runtime.mapping_active ? "true" : "false") << ",";
     body << "\"navigation_active\":" << (runtime.navigation_active ? "true" : "false") << ",";
     body << "\"healthy\":" << (runtime.healthy ? "true" : "false") << ",";
+    body << "\"keepout_integrity_degraded\":"
+         << (map_asset_integrity_degraded() ? "true" : "false") << ",";
     body << "\"message\":" << json_string(runtime.message) << ",";
+    body << "\"mode_transition\":{";
+    body << "\"active\":" << (!mode_transition_owner.empty() ? "true" : "false") << ",";
+    body << "\"owner\":" << json_string(mode_transition_owner) << "},";
+    body << "\"floor_runtime_interlock\":{";
+    body << "\"enabled\":"
+         << (floor_runtime_negative_interlock_enabled_ ? "true" : "false") << ",";
+    body << "\"negative_only\":true,";
+    body << "\"blocked\":" << (floor_runtime_interlock.blocked ? "true" : "false") << ",";
+    body << "\"reason_code\":" << json_string(floor_runtime_interlock.code) << ",";
+    body << "\"transaction_id\":"
+         << json_string(floor_runtime_interlock.transaction_id) << ",";
+    body << "\"detail\":" << json_string(floor_runtime_interlock.detail) << "},";
     body << "\"localization_degraded\":" << (localization_degraded ? "true" : "false") << ",";
     body << "\"localization_degraded_reason\":"
          << json_string(localization_degraded_reason) << ",";
@@ -6339,6 +7382,7 @@ private:
       body << "\"live_map_width\":0,";
       body << "\"live_map_height\":0";
     }
+    body << ",\"start_job\":" << mapping_start_json;
     body << "},";
     body << "\"navigation\":{";
     body << "\"active\":" << (runtime.navigation_active ? "true" : "false") << ",";
@@ -6573,6 +7617,10 @@ private:
       "\"GET /api/v1/maps\","
       "\"GET /api/v1/maps/semantic_layer\","
       "\"GET /api/v1/maps/poses\","
+      "\"GET /api/v1/elevator-config\","
+      "\"PUT /api/v1/elevator-config/draft\","
+      "\"POST /api/v1/elevator-config/publish\","
+      "\"POST /api/v1/elevator-config/rollback\","
       "\"GET /api/v1/maps/filters/keepout\","
       "\"GET /api/v1/mapping/2d/map\","
       "\"GET /api/v1/openapi\","
@@ -6893,28 +7941,129 @@ private:
     const fs::path & fixed_root,
     const bool include_manifest) const
   {
-    copy_file_if_exists(manifest.nav_map_pgm, fixed_root / "nav" / "nav_map.pgm");
-    copy_yaml_with_image_if_exists(
+    const auto durable_copy = [](const fs::path & source, const fs::path & target) {
+        std::error_code source_error;
+        const auto source_status = fs::symlink_status(source, source_error);
+        if (source_error ||
+          source_status.type() != fs::file_type::regular)
+        {
+          throw std::runtime_error(
+                  "required projection source is not a regular file: " +
+                  source.string());
+        }
+        copy_file_if_exists(source, target);
+        durable_sync_regular_file(target);
+      };
+    const auto durable_yaml_copy =
+      [](const fs::path & source, const fs::path & target, const std::string & image_file) {
+        std::error_code source_error;
+        const auto source_status = fs::symlink_status(source, source_error);
+        if (source_error ||
+          source_status.type() != fs::file_type::regular)
+        {
+          throw std::runtime_error(
+                  "required YAML projection source is not a regular file: " +
+                  source.string());
+        }
+        fs::create_directories(target.parent_path());
+        durable_write_text_file_atomic(
+          target,
+          yaml_with_image_file(
+            read_regular_text_file_checked(source), image_file),
+          0644);
+      };
+    const auto durable_remove_optional =
+      [](const fs::path & path) {
+        std::error_code remove_error;
+        const bool removed = fs::remove(path, remove_error);
+        if (remove_error) {
+          throw std::runtime_error(
+                  "failed to remove stale projection file: " +
+                  path.string() + " error=" + remove_error.message());
+        }
+        if (removed) {
+          durable_sync_directory(path.parent_path());
+        }
+      };
+    const auto durable_optional_copy =
+      [&](const fs::path & source, const fs::path & target) {
+        std::error_code source_error;
+        const auto source_status = fs::symlink_status(source, source_error);
+        if (!source_error &&
+          source_status.type() == fs::file_type::regular)
+        {
+          durable_copy(source, target);
+        } else if (!source_error &&
+          source_status.type() == fs::file_type::not_found)
+        {
+          durable_remove_optional(target);
+        } else if (source_error == std::errc::no_such_file_or_directory) {
+          durable_remove_optional(target);
+        } else {
+          throw std::runtime_error(
+                  "optional projection source is unsafe or unreadable: " +
+                  source.string() +
+                  (source_error ? " error=" + source_error.message() : ""));
+        }
+      };
+
+    durable_copy(manifest.nav_map_pgm, fixed_root / "nav" / "nav_map.pgm");
+    durable_yaml_copy(
       manifest.nav_map_yaml, fixed_root / "nav" / "nav_map.yaml", "nav_map.pgm");
-    copy_file_if_exists(manifest.localizer_map_png, fixed_root / "localizer" / "localizer_map.png");
-    copy_yaml_with_image_if_exists(
+    durable_copy(
+      manifest.localizer_map_png, fixed_root / "localizer" / "localizer_map.png");
+    durable_yaml_copy(
       manifest.localizer_params_yaml,
       fixed_root / "localizer" / "localizer_params.yaml",
       "localizer_map.png");
-    copy_file_if_exists(manifest.keepout_mask_pgm, fixed_root / "filters" / "keepout_mask.pgm");
-    copy_yaml_with_image_if_exists(
-      manifest.keepout_mask_yaml, fixed_root / "filters" / "keepout_mask.yaml", "keepout_mask.pgm");
-    copy_file_if_exists(manifest.speed_mask_pgm, fixed_root / "filters" / "speed_mask.pgm");
-    copy_yaml_with_image_if_exists(
-      manifest.speed_mask_yaml, fixed_root / "filters" / "speed_mask.yaml", "speed_mask.pgm");
-    copy_file_if_exists(manifest.binary_mask_pgm, fixed_root / "filters" / "binary_mask.pgm");
-    copy_yaml_with_image_if_exists(
-      manifest.binary_mask_yaml, fixed_root / "filters" / "binary_mask.yaml", "binary_mask.pgm");
-    copy_file_if_exists(manifest.asset_report_json, fixed_root / "reports" / "asset_report.json");
-    copy_file_if_exists(manifest.poses_yaml, fixed_root / "poses.yaml");
+    durable_copy(
+      manifest.keepout_mask_pgm, fixed_root / "filters" / "keepout_mask.pgm");
+    durable_yaml_copy(
+      manifest.keepout_mask_yaml,
+      fixed_root / "filters" / "keepout_mask.yaml",
+      "keepout_mask.pgm");
+    durable_optional_copy(
+      keepout_semantic_json_path(manifest),
+      fixed_root / "filters" / "keepout_semantic_layer.json");
+    const auto keepout_commit =
+      manifest.keepout_mask_yaml.parent_path() / "keepout_commit.json";
+    const auto fixed_keepout_commit =
+      fixed_root / "filters" / "keepout_commit.json";
+    durable_optional_copy(keepout_commit, fixed_keepout_commit);
+    durable_copy(
+      manifest.speed_mask_pgm, fixed_root / "filters" / "speed_mask.pgm");
+    durable_yaml_copy(
+      manifest.speed_mask_yaml,
+      fixed_root / "filters" / "speed_mask.yaml",
+      "speed_mask.pgm");
+    durable_copy(
+      manifest.binary_mask_pgm, fixed_root / "filters" / "binary_mask.pgm");
+    durable_yaml_copy(
+      manifest.binary_mask_yaml,
+      fixed_root / "filters" / "binary_mask.yaml",
+      "binary_mask.pgm");
+    durable_copy(
+      manifest.asset_report_json, fixed_root / "reports" / "asset_report.json");
+    durable_copy(manifest.poses_yaml, fixed_root / "poses.yaml");
     if (include_manifest) {
-      write_text_file(fixed_root / "manifest.json", map_manifest_json(manifest));
+      const auto fixed_manifest = fixed_root / "manifest.json";
+      durable_write_text_file_atomic(
+        fixed_manifest, map_manifest_json(manifest), 0644);
     }
+
+    // The activation journal may be removed only after every compatibility
+    // projection and every directory entry needed to reach it is durable.
+    for (const auto & child :
+      std::array<fs::path, 4>{
+        fixed_root / "nav",
+        fixed_root / "localizer",
+        fixed_root / "filters",
+        fixed_root / "reports"})
+    {
+      durable_sync_directory(child);
+    }
+    durable_sync_directory(fixed_root);
+    durable_sync_directory(fixed_root.parent_path());
   }
 
   void remove_current_map_entry(const std::string & building_id, const std::string & floor_id) const
@@ -6974,31 +8123,384 @@ private:
     }
   }
 
-  void activate_map_manifest(MapManifest manifest)
+  fs::path map_activation_journal_path() const
   {
+    return fs::path(maps_root_) / ".map_activation_transaction.v1";
+  }
+
+  fs::path map_asset_integrity_marker_path() const
+  {
+    return fs::path(maps_root_) / ".map_asset_integrity_degraded.v1";
+  }
+
+  struct PersistedMapAssetIntegrityMarker
+  {
+    std::string map_id;
+    std::string non_keepout_asset_digest;
+
+    bool repairable_for(const std::string & requested_map_id) const
+    {
+      return map_id == requested_map_id &&
+             robot_api_server::is_canonical_sha256_digest(
+        non_keepout_asset_digest);
+    }
+  };
+
+  void persist_map_asset_integrity_degraded(
+    const std::string & map_id,
+    const std::string & reason,
+    const std::string & non_keepout_asset_digest = "unknown")
+  {
+    const auto safe_map_id =
+      safe_asset_id(map_id) ? map_id : std::string("unknown");
+    const auto safe_non_keepout_digest =
+      robot_api_server::is_canonical_sha256_digest(
+      non_keepout_asset_digest) ?
+      non_keepout_asset_digest : std::string("unknown");
+    std::ostringstream marker;
+    marker << "schema=njrh.map_asset_integrity_degraded.v1\n"
+           << "map_id=" << safe_map_id << "\n"
+           << "non_keepout_asset_digest=" << safe_non_keepout_digest << "\n"
+           << "reason_digest=" << fixed_hex(fnv1a64(reason), 16) << "\n";
+    durable_write_text_file_atomic(
+      map_asset_integrity_marker_path(), marker.str());
+    keepout_integrity_degraded_.store(true);
+  }
+
+  void clear_map_asset_integrity_degraded()
+  {
+    if (map_activation_journal_blocks_mutation()) {
+      throw std::runtime_error(
+              "cannot clear map integrity latch while an activation journal exists");
+    }
+    durable_remove_file(map_asset_integrity_marker_path());
+    keepout_integrity_degraded_.store(false);
+  }
+
+  std::optional<PersistedMapAssetIntegrityMarker>
+  persisted_map_asset_integrity_marker() const
+  {
+    const auto path = map_asset_integrity_marker_path();
+    std::error_code error;
+    const auto status = fs::symlink_status(path, error);
+    if (status.type() == fs::file_type::not_found &&
+      (!error || error == std::errc::no_such_file_or_directory))
+    {
+      return std::nullopt;
+    }
+    if (error || status.type() != fs::file_type::regular ||
+      fs::hard_link_count(path, error) != 1U || error ||
+      fs::file_size(path, error) > 4096U || error)
+    {
+      return PersistedMapAssetIntegrityMarker{"unknown", "unknown"};
+    }
+    try {
+      std::istringstream input(read_text_file(path));
+      std::map<std::string, std::string> fields;
+      std::string line;
+      while (std::getline(input, line)) {
+        if (line.empty()) {
+          continue;
+        }
+        const auto separator = line.find('=');
+        if (separator == std::string::npos ||
+          line.find('=', separator + 1U) != std::string::npos ||
+          !fields.emplace(
+            line.substr(0U, separator),
+            line.substr(separator + 1U)).second)
+        {
+          return PersistedMapAssetIntegrityMarker{"unknown", "unknown"};
+        }
+      }
+      if (fields.size() != 4U ||
+        fields["schema"] != "njrh.map_asset_integrity_degraded.v1" ||
+        !safe_asset_id(fields["map_id"]) ||
+        (fields["non_keepout_asset_digest"] != "unknown" &&
+        !robot_api_server::is_canonical_sha256_digest(
+          fields["non_keepout_asset_digest"])) ||
+        fields["reason_digest"].size() != 16U)
+      {
+        return PersistedMapAssetIntegrityMarker{"unknown", "unknown"};
+      }
+      return PersistedMapAssetIntegrityMarker{
+        fields["map_id"], fields["non_keepout_asset_digest"]};
+    } catch (const std::exception &) {
+      return PersistedMapAssetIntegrityMarker{"unknown", "unknown"};
+    }
+  }
+
+  bool map_asset_integrity_degraded()
+  {
+    if (keepout_integrity_degraded_.load()) {
+      return true;
+    }
+    if (map_activation_journal_blocks_mutation()) {
+      return true;
+    }
+    if (const auto persisted = persisted_map_asset_integrity_marker()) {
+      keepout_integrity_degraded_.store(true);
+      return true;
+    }
+    return false;
+  }
+
+  void restore_map_asset_integrity_state()
+  {
+    const auto persisted = persisted_map_asset_integrity_marker();
+    if (persisted) {
+      keepout_integrity_degraded_.store(true);
+    }
+    const bool marker_repairable =
+      persisted && persisted->repairable_for(persisted->map_id);
+    std::unique_ptr<MapAssetCommitTransaction> repair_transaction;
+    bool unexplained_failure = false;
+    bool marker_map_seen = false;
+    if (marker_repairable) {
+      try {
+        repair_transaction =
+          std::make_unique<MapAssetCommitTransaction>(fs::path(maps_root_));
+      } catch (const std::exception & error) {
+        unexplained_failure = true;
+        RCLCPP_ERROR(
+          get_logger(),
+          "failed to open the startup keepout repair transaction: %s",
+          error.what());
+      }
+    }
+    for (const auto & manifest :
+      map_catalog_->read_all_map_manifests(false))
+    {
+      if (manifest.schema != "njrh.map_manifest.v2" ||
+        manifest.asset_epoch == 0U || manifest.asset_digest.empty())
+      {
+        continue;
+      }
+      if (persisted && manifest.map_id == persisted->map_id) {
+        marker_map_seen = true;
+      }
+      try {
+        if (repair_transaction) {
+          (void)verify_map_asset_identity_snapshot(
+            manifest, fs::path(maps_root_), *repair_transaction);
+        } else {
+          verify_map_asset_identity(manifest, fs::path(maps_root_));
+        }
+      } catch (const std::exception & error) {
+        bool explained_keepout_crash = false;
+        if (repair_transaction && persisted &&
+          manifest.map_id == persisted->map_id)
+        {
+          try {
+            const auto inspected =
+              inspect_map_asset_identity_for_keepout_repair(
+              manifest, fs::path(maps_root_), *repair_transaction);
+            explained_keepout_crash =
+              inspected.non_keepout_asset_digest ==
+              persisted->non_keepout_asset_digest;
+          } catch (const std::exception & inspection_error) {
+            RCLCPP_ERROR(
+              get_logger(),
+              "startup keepout repair proof failed for %s: %s",
+              manifest.map_id.c_str(), inspection_error.what());
+          }
+        }
+        if (!explained_keepout_crash) {
+          unexplained_failure = true;
+        }
+        RCLCPP_ERROR(
+          get_logger(),
+          "map identity verification failed closed for %s%s: %s",
+          manifest.map_id.c_str(),
+          explained_keepout_crash ?
+          " (preserving exact keepout crash-repair proof)" :
+          " (unexplained integrity failure)",
+          error.what());
+      }
+    }
+    if (marker_repairable && !marker_map_seen) {
+      unexplained_failure = true;
+      RCLCPP_ERROR(
+        get_logger(),
+        "persistent keepout repair marker refers to a missing map: %s",
+        persisted->map_id.c_str());
+    }
+    if (!unexplained_failure) {
+      return;
+    }
+    try {
+      // A single persistent marker may remain repairable only when it fully
+      // explains the sole aggregate mismatch. Any unrelated failure must
+      // collapse the global latch to an unrepairable state so repairing one
+      // map cannot accidentally clear another map's fault.
+      persist_map_asset_integrity_degraded(
+        "unknown", "startup map identity verification found an unexplained failure");
+    } catch (const std::exception & marker_error) {
+      keepout_integrity_degraded_.store(true);
+      RCLCPP_ERROR(
+        get_logger(),
+        "failed to persist the unrepairable startup integrity latch: %s",
+        marker_error.what());
+    }
+  }
+
+  void write_map_activation_journal(const MapManifest & manifest) const
+  {
+    const auto existing = read_map_activation_journal();
+    if (existing &&
+      ((*existing)[0] != manifest.building_id ||
+      (*existing)[1] != manifest.floor_id ||
+      (*existing)[2] != manifest.map_id))
+    {
+      throw std::runtime_error(
+              "refusing to overwrite a different pending map activation");
+    }
+    std::ostringstream journal;
+    journal << "schema=njrh.map_activation_transaction.v1\n"
+            << "building_id=" << manifest.building_id << "\n"
+            << "floor_id=" << manifest.floor_id << "\n"
+            << "map_id=" << manifest.map_id << "\n";
+    durable_write_text_file_atomic(
+      map_activation_journal_path(), journal.str());
+  }
+
+  std::optional<std::array<std::string, 3>> read_map_activation_journal() const
+  {
+    const auto path = map_activation_journal_path();
+    std::error_code error;
+    const auto status = fs::symlink_status(path, error);
+    if (status.type() == fs::file_type::not_found &&
+      (!error || error == std::errc::no_such_file_or_directory))
+    {
+      return std::nullopt;
+    }
+    if (error || status.type() != fs::file_type::regular ||
+      fs::hard_link_count(path, error) != 1U || error ||
+      fs::file_size(path, error) > 4096U || error)
+    {
+      throw std::runtime_error(
+              "map activation journal is not a bounded single-link regular file");
+    }
+    std::istringstream input(read_text_file(path));
+    std::map<std::string, std::string> fields;
+    std::string line;
+    while (std::getline(input, line)) {
+      if (line.empty()) {
+        continue;
+      }
+      const auto separator = line.find('=');
+      if (separator == std::string::npos ||
+        line.find('=', separator + 1U) != std::string::npos)
+      {
+        throw std::runtime_error("map activation journal is malformed");
+      }
+      const auto key = line.substr(0U, separator);
+      const auto value = line.substr(separator + 1U);
+      if (!fields.emplace(key, value).second) {
+        throw std::runtime_error(
+                "map activation journal has duplicate fields");
+      }
+    }
+    if (fields.size() != 4U ||
+      fields["schema"] != "njrh.map_activation_transaction.v1" ||
+      !safe_asset_id(fields["building_id"]) ||
+      !safe_asset_id(fields["floor_id"]) ||
+      !safe_asset_id(fields["map_id"]))
+    {
+      throw std::runtime_error("map activation journal has invalid fields");
+    }
+    return std::array<std::string, 3>{
+      fields["building_id"], fields["floor_id"], fields["map_id"]};
+  }
+
+  bool map_activation_journal_blocks_mutation() const
+  {
+    try {
+      return read_map_activation_journal().has_value();
+    } catch (const std::exception &) {
+      // Invalid, inaccessible, or link-based journal state is never
+      // equivalent to an absent journal.
+      return true;
+    }
+  }
+
+  void activate_map_manifest(MapManifest requested_manifest)
+  {
+    MapAssetCommitTransaction transaction{fs::path(maps_root_)};
+    const auto refreshed =
+      map_catalog_->find_map_by_id(requested_manifest.map_id);
+    if (!refreshed ||
+      refreshed->building_id != requested_manifest.building_id ||
+      refreshed->floor_id != requested_manifest.floor_id ||
+      refreshed->map_id != requested_manifest.map_id)
+    {
+      throw std::runtime_error(
+              "map identity changed before activation transaction");
+    }
+    auto manifest = *refreshed;
     std::string error;
     if (!validate_map_manifest_assets(manifest, error)) {
       throw std::runtime_error(error);
     }
-    for (auto other : map_catalog_->read_floor_map_manifests(manifest.building_id, manifest.floor_id, false)) {
-      if (other.map_id == manifest.map_id) {
-        continue;
+    write_map_activation_journal(manifest);
+    try {
+      for (auto other : map_catalog_->read_floor_map_manifests(
+          manifest.building_id, manifest.floor_id, false))
+      {
+        if (other.map_id == manifest.map_id) {
+          continue;
+        }
+        if (other.active) {
+          stamp_map_asset_identity(
+            other, fs::path(maps_root_), transaction, false);
+        }
       }
-      if (other.active) {
-        other.active = false;
-        write_map_manifest(other);
+
+      stamp_map_asset_identity(
+        manifest, fs::path(maps_root_), transaction, true);
+
+      const auto current_root = map_catalog_->floor_current_root_path(
+        manifest.building_id, manifest.floor_id);
+      remove_current_map_entry(manifest.building_id, manifest.floor_id);
+      sync_manifest_to_fixed_entry(manifest, current_root, true);
+
+      // Keep the historical fixed role files in the floor root as a
+      // compatibility shim for older tools.
+      sync_manifest_to_fixed_entry(
+        manifest,
+        map_catalog_->floor_root_path(
+          manifest.building_id, manifest.floor_id),
+        false);
+      durable_remove_file(map_activation_journal_path());
+    } catch (...) {
+      try {
+        persist_map_asset_integrity_degraded(
+          manifest.map_id, "map activation transaction failed");
+      } catch (const std::exception & marker_error) {
+        keepout_integrity_degraded_.store(true);
+        RCLCPP_ERROR(
+          get_logger(),
+          "failed to persist activation integrity latch for %s: %s",
+          manifest.map_id.c_str(), marker_error.what());
       }
+      throw;
     }
+  }
 
-    manifest.active = true;
-    write_map_manifest(manifest);
-
-    const auto current_root = map_catalog_->floor_current_root_path(manifest.building_id, manifest.floor_id);
-    remove_current_map_entry(manifest.building_id, manifest.floor_id);
-    sync_manifest_to_fixed_entry(manifest, current_root, true);
-
-    // Keep the historical fixed role files in the floor root as a compatibility shim for older tools.
-    sync_manifest_to_fixed_entry(manifest, map_catalog_->floor_root_path(manifest.building_id, manifest.floor_id), false);
+  void recover_pending_map_activation()
+  {
+    const auto pending = read_map_activation_journal();
+    if (!pending) {
+      return;
+    }
+    const auto manifest = map_catalog_->find_map_by_id((*pending)[2]);
+    if (!manifest ||
+      manifest->building_id != (*pending)[0] ||
+      manifest->floor_id != (*pending)[1])
+    {
+      throw std::runtime_error(
+              "pending map activation target is no longer present");
+    }
+    activate_map_manifest(*manifest);
   }
 
   void clear_fixed_floor_entries(const std::string & building_id, const std::string & floor_id) const
@@ -7086,11 +8588,9 @@ private:
     }
     std::string error;
     if (validate_map_manifest_assets(manifest, error)) {
-      write_map_manifest(manifest);
+      stamp_map_asset_identity(manifest, fs::path(maps_root_));
       activate_map_manifest(manifest);
     } else {
-      manifest.active = false;
-      write_map_manifest(manifest);
       RCLCPP_WARN(get_logger(), "legacy map manifest created but not activated: %s", error.c_str());
     }
   }
@@ -7125,7 +8625,7 @@ private:
       }
     }
 
-    const auto manifests = map_catalog_->read_all_map_manifests(true);
+    const auto manifests = map_catalog_->read_all_map_manifests(false);
     body << "],\"floor_maps\":[";
     first = true;
     for (const auto & manifest : manifests) {
@@ -7138,6 +8638,8 @@ private:
            << ",\"map_name\":" << json_string(manifest.display_name)
            << ",\"building_id\":" << json_string(manifest.building_id)
            << ",\"floor_id\":" << json_string(manifest.floor_id)
+           << ",\"asset_epoch\":" << manifest.asset_epoch
+           << ",\"asset_digest\":" << json_string(manifest.asset_digest)
            << ",\"active\":" << (manifest.active ? "true" : "false")
            << ",\"nav_map_yaml\":" << json_string(manifest.nav_map_yaml.string())
            << ",\"localizer_map_png\":" << json_string(manifest.localizer_map_png.string())
@@ -7178,6 +8680,9 @@ private:
                << ",\"floor_id\":" << json_string(floor_id)
                << ",\"active_map_id\":" << json_string(active ? active->map_id : "")
                << ",\"active_display_name\":" << json_string(active ? active->display_name : "")
+               << ",\"active_asset_epoch\":" << (active ? active->asset_epoch : 0U)
+               << ",\"active_asset_digest\":"
+               << json_string(active ? active->asset_digest : "")
                << ",\"nav_map_yaml\":" << json_string(nav_yaml.string())
                << ",\"nav_map_pgm\":" << json_string(nav_pgm.string())
                << ",\"localizer_map_png\":" << json_string(localizer_png.string())
@@ -7192,6 +8697,17 @@ private:
 
   HttpResponse handle_delete_map(const std::string & body)
   {
+    std::lock_guard<std::mutex> keepout_guard(keepout_update_mutex_);
+    std::lock_guard<std::mutex> elevator_guard(elevator_asset_mutation_mutex_);
+    if (const auto blocked = floor_runtime_interlock_response("map_delete")) {
+      return *blocked;
+    }
+    if (map_asset_integrity_degraded()) {
+      return {
+        503,
+        "application/json",
+        error_json("keepout integrity is degraded; repair the keepout layer before deleting maps")};
+    }
     const auto map_id = json_string_value(body, "map_id");
     const auto building_id = json_string_value(body, "building_id");
     const auto floor_id = json_string_value(body, "floor_id");
@@ -7214,22 +8730,138 @@ private:
     if (!manifest) {
       return {404, "application/json", error_json("map_id not found: " + *map_id)};
     }
+    const auto active_map_delete_response = [](const std::string & detail) {
+        std::ostringstream response;
+        response << "{\"ok\":false,\"code\":\"ACTIVE_MAP_DELETE_DISABLED\","
+                 << "\"detail\":" << json_string(detail) << "}";
+        return HttpResponse{409, "application/json", response.str()};
+      };
+    const auto unsafe_map_asset_response = [](const std::string & detail) {
+        std::ostringstream response;
+        response << "{\"ok\":false,\"code\":\"UNSAFE_MAP_ASSET_PATH\","
+                 << "\"detail\":" << json_string(detail) << "}";
+        return HttpResponse{409, "application/json", response.str()};
+      };
+    const auto map_is_bound_to_runtime = [this](const MapManifest & candidate) {
+        const auto context = read_runtime_map_context();
+        return context &&
+               context->building_id == candidate.building_id &&
+               context->floor_id == candidate.floor_id &&
+               context->map_id == candidate.map_id;
+      };
+    if (manifest->active || map_is_bound_to_runtime(*manifest)) {
+      return active_map_delete_response(
+        "refusing to delete an active or runtime-bound map; stop the runtime and "
+        "select another map explicitly before deletion");
+    }
+    if (!elevator_configuration_) {
+      return {
+        503,
+        "application/json",
+        error_json("elevator configuration module is not initialized")};
+    }
+    ElevatorConfigurationQuery reference_query;
+    reference_query.building_id = manifest->building_id;
+    reference_query.floor_id = manifest->floor_id;
+    reference_query.map_id = manifest->map_id;
+    const auto reference =
+      elevator_configuration_->query(reference_query);
+    if (!reference.ok()) {
+      return elevator_configuration_response(reference);
+    }
+    if (json_bool_value(reference.body, "referenced", false)) {
+      const auto referenced_release_id =
+        json_string_value(reference.body, "release_id");
+      std::ostringstream response;
+      response << "{\"ok\":false,"
+               << "\"code\":\"ELEVATOR_CONFIG_MAP_IN_USE\","
+               << "\"detail\":\"refusing to delete a map referenced by the current "
+                  "elevator configuration release\","
+               << "\"building_id\":" << json_string(manifest->building_id) << ","
+               << "\"floor_id\":" << json_string(manifest->floor_id) << ","
+               << "\"map_id\":" << json_string(manifest->map_id) << ","
+               << "\"release_id\":"
+               << (referenced_release_id ?
+        json_string(*referenced_release_id) :
+        std::string("null"))
+               << "}";
+      return {409, "application/json", response.str()};
+    }
 
     std::uintmax_t entries_deleted = 0;
+    if (const auto blocked = floor_runtime_interlock_response("map_delete_commit")) {
+      return *blocked;
+    }
     try {
+      MapAssetCommitTransaction asset_transaction{fs::path(maps_root_)};
+      (void)asset_transaction;
+      if (persisted_map_asset_integrity_marker()) {
+        return {
+          503,
+          "application/json",
+          error_json(
+            "map asset integrity is persistently degraded; deletion is blocked")};
+      }
+      const auto commit_manifest = map_catalog_->find_map_by_id(*map_id);
+      if (!commit_manifest) {
+        return {404, "application/json", error_json("map_id disappeared before deletion: " + *map_id)};
+      }
+      if (commit_manifest->active || map_is_bound_to_runtime(*commit_manifest)) {
+        return active_map_delete_response(
+          "map became active or runtime-bound while deletion was pending; retry only "
+          "after an explicit safe map selection");
+      }
+      if (commit_manifest->building_id != manifest->building_id ||
+        commit_manifest->floor_id != manifest->floor_id ||
+        commit_manifest->map_id != manifest->map_id)
+      {
+        return unsafe_map_asset_response(
+          "map identity changed while deletion was pending");
+      }
+      const auto expected_root = map_catalog_->map_root_path(
+        commit_manifest->building_id,
+        commit_manifest->floor_id,
+        commit_manifest->map_id);
+      if (!same_normalized_path(commit_manifest->root, expected_root) ||
+        !safe_bundle_directory(expected_root, fs::path(maps_root_)))
+      {
+        return unsafe_map_asset_response(
+          "map root is not the exact real directory beneath maps_root");
+      }
+
+      const auto tombstone = map_delete_tombstone_path(expected_root);
       std::error_code ec;
-      entries_deleted = fs::remove_all(manifest->root, ec);
+      if (fs::symlink_status(tombstone, ec).type() !=
+        fs::file_type::not_found)
+      {
+        return {
+          500,
+          "application/json",
+          error_json("refusing to replace an existing map deletion tombstone")};
+      }
+      ec.clear();
+      fs::rename(expected_root, tombstone, ec);
       if (ec) {
-        return {500, "application/json", error_json("failed to delete map asset: " + manifest->root.string())};
+        return {
+          500,
+          "application/json",
+          error_json("failed to quarantine map asset before deletion: " +
+            expected_root.string())};
       }
-      if (manifest->active) {
-        auto remaining = map_catalog_->read_floor_map_manifests(manifest->building_id, manifest->floor_id, false);
-        if (!remaining.empty()) {
-          activate_map_manifest(remaining.front());
-        } else {
-          clear_fixed_floor_entries(manifest->building_id, manifest->floor_id);
-        }
+      // The rename is the logical deletion commit. Persist it before
+      // recursively cleaning the now-unreachable tombstone.
+      durable_sync_directory(expected_root.parent_path());
+
+      entries_deleted = fs::remove_all(tombstone, ec);
+      if (ec) {
+        return {
+          500,
+          "application/json",
+          error_json(
+            "map was quarantined but tombstone cleanup failed: " +
+            tombstone.string())};
       }
+      durable_sync_directory(expected_root.parent_path());
     } catch (const std::exception & exc) {
       return {500, "application/json", error_json(exc.what())};
     }
@@ -7348,14 +8980,27 @@ private:
       return lookup.error;
     }
     try {
+      KeepoutLayerModule keepout_module;
+      const auto summary = keepout_module.inspect(lookup.manifest);
       std::ostringstream response;
-      response << "{\"ok\":true,"
+      response << std::fixed << std::setprecision(9)
+               << "{\"ok\":true,"
                << "\"building_id\":" << json_string(lookup.manifest.building_id) << ","
                << "\"floor_id\":" << json_string(lookup.manifest.floor_id) << ","
                << "\"map_id\":" << json_string(lookup.manifest.map_id) << ","
                << "\"display_name\":" << json_string(lookup.manifest.display_name) << ","
                << "\"map_name\":" << json_string(lookup.manifest.display_name) << ","
                << "\"active\":" << (lookup.manifest.active ? "true" : "false") << ","
+               << "\"revision\":" << json_string(summary.revision) << ","
+               << "\"keepout_revision\":" << json_string(summary.revision) << ","
+               << "\"mask\":{"
+               << "\"width\":" << summary.width << ","
+               << "\"height\":" << summary.height << ","
+               << "\"resolution\":" << summary.resolution << ","
+               << "\"origin\":[" << summary.origin_x << "," << summary.origin_y << ","
+               << summary.origin_yaw << "],"
+               << "\"active_cells\":" << summary.active_cells << ","
+               << "\"occupancy_digest\":" << json_string(summary.occupancy_digest) << "},"
                << "\"filter\":\"keepout\","
                << "\"keepout\":" << keepout_filter_json(lookup.manifest) << ","
                << "\"filters\":{\"keepout\":" << keepout_filter_json(lookup.manifest) << "}"
@@ -7366,6 +9011,146 @@ private:
     }
   }
 
+  static HttpResponse elevator_configuration_response(
+    const robot_api_server::ElevatorConfigurationReply & reply)
+  {
+    return {reply.status, "application/json", reply.body};
+  }
+
+  static HttpResponse elevator_internal_pose_requires_mission_response(
+    const std::string & detail)
+  {
+    std::ostringstream response;
+    response << "{\"ok\":false,"
+             << "\"code\":\"ELEVATOR_INTERNAL_POSE_REQUIRES_MISSION\","
+             << "\"detail\":" << json_string(detail) << "}";
+    return {409, "application/json", response.str()};
+  }
+
+  HttpResponse handle_get_elevator_configuration(const HttpRequest & request)
+  {
+    if (!elevator_configuration_) {
+      return {
+        503, "application/json",
+        error_json("elevator configuration module is not initialized")};
+    }
+    const auto building_id = query_value(request, "building_id");
+    if (!building_id) {
+      return {
+        400, "application/json",
+        error_json("building_id query parameter is required")};
+    }
+    ElevatorConfigurationQuery query;
+    query.building_id = *building_id;
+    query.release_id = query_value(request, "release_id").value_or("");
+    return elevator_configuration_response(elevator_configuration_->query(query));
+  }
+
+  HttpResponse handle_save_elevator_configuration_draft(const std::string & body)
+  {
+    if (const auto blocked =
+      floor_runtime_interlock_response("elevator_config_save_draft"))
+    {
+      return *blocked;
+    }
+    if (!elevator_configuration_) {
+      return {
+        503, "application/json",
+        error_json("elevator configuration module is not initialized")};
+    }
+    std::lock_guard<std::mutex> keepout_guard(keepout_update_mutex_);
+    std::lock_guard<std::mutex> elevator_guard(elevator_asset_mutation_mutex_);
+    if (const auto blocked =
+      floor_runtime_interlock_response("elevator_config_save_draft_commit"))
+    {
+      return *blocked;
+    }
+    const auto document = json_object_value(body, "configuration").value_or(
+      json_object_value(body, "config").value_or(body));
+    const auto building_id = json_string_value(document, "building_id").value_or(
+      json_string_value(body, "building_id").value_or(""));
+    if (building_id.empty()) {
+      return {
+        400, "application/json",
+        error_json("building_id is required in the elevator configuration")};
+    }
+    ElevatorConfigurationCommand command;
+    command.type = ElevatorConfigurationCommandType::kSaveDraft;
+    command.building_id = building_id;
+    command.document = document;
+    command.expected_draft_revision =
+      json_string_value(body, "expected_draft_revision").value_or(
+      json_string_value(body, "expected_revision").value_or(""));
+    command.actor_id = json_string_value(body, "actor_id").value_or("");
+    return elevator_configuration_response(
+      elevator_configuration_->execute(command));
+  }
+
+  HttpResponse handle_publish_elevator_configuration(const std::string & body)
+  {
+    if (const auto blocked =
+      floor_runtime_interlock_response("elevator_config_publish"))
+    {
+      return *blocked;
+    }
+    if (!elevator_configuration_) {
+      return {
+        503, "application/json",
+        error_json("elevator configuration module is not initialized")};
+    }
+    std::lock_guard<std::mutex> keepout_guard(keepout_update_mutex_);
+    std::lock_guard<std::mutex> elevator_guard(elevator_asset_mutation_mutex_);
+    if (const auto blocked =
+      floor_runtime_interlock_response("elevator_config_publish_commit"))
+    {
+      return *blocked;
+    }
+    ElevatorConfigurationCommand command;
+    command.type = ElevatorConfigurationCommandType::kPublish;
+    command.building_id = json_string_value(body, "building_id").value_or("");
+    command.expected_draft_revision =
+      json_string_value(body, "expected_draft_revision").value_or(
+      json_string_value(body, "expected_revision").value_or(""));
+    command.expected_release_id =
+      json_string_value(body, "expected_release_id").value_or(
+      json_string_value(body, "expected_current_release_id").value_or(""));
+    command.actor_id = json_string_value(body, "actor_id").value_or("");
+    return elevator_configuration_response(
+      elevator_configuration_->execute(command));
+  }
+
+  HttpResponse handle_rollback_elevator_configuration(const std::string & body)
+  {
+    if (const auto blocked =
+      floor_runtime_interlock_response("elevator_config_rollback"))
+    {
+      return *blocked;
+    }
+    if (!elevator_configuration_) {
+      return {
+        503, "application/json",
+        error_json("elevator configuration module is not initialized")};
+    }
+    std::lock_guard<std::mutex> keepout_guard(keepout_update_mutex_);
+    std::lock_guard<std::mutex> elevator_guard(elevator_asset_mutation_mutex_);
+    if (const auto blocked =
+      floor_runtime_interlock_response("elevator_config_rollback_commit"))
+    {
+      return *blocked;
+    }
+    ElevatorConfigurationCommand command;
+    command.type = ElevatorConfigurationCommandType::kRollback;
+    command.building_id = json_string_value(body, "building_id").value_or("");
+    command.release_id = json_string_value(body, "release_id").value_or(
+      json_string_value(body, "target_release_id").value_or(""));
+    command.expected_release_id =
+      json_string_value(body, "expected_release_id").value_or(
+      json_string_value(body, "expected_current_release_id").value_or(""));
+    command.actor_id = json_string_value(body, "actor_id").value_or("");
+    return elevator_configuration_response(
+      elevator_configuration_->execute(command));
+  }
+
   HttpResponse handle_get_semantic_layer(const HttpRequest & request)
   {
     const auto lookup = resolve_map_manifest_from_query(request);
@@ -7374,7 +9159,16 @@ private:
     }
 
     try {
-      const auto poses = read_floor_poses(lookup.manifest.poses_yaml);
+      auto poses = read_floor_poses(lookup.manifest.poses_yaml);
+      poses.erase(
+        std::remove_if(
+          poses.begin(), poses.end(), [](const StoredPose & pose) {
+            return is_elevator_internal_pose_type(pose.type) ||
+                   is_reserved_elevator_pose_id(pose.id);
+          }),
+        poses.end());
+      KeepoutLayerModule keepout_module;
+      const auto keepout_summary = keepout_module.inspect(lookup.manifest);
       const auto keepout_filter = keepout_filter_json(lookup.manifest);
       const auto keepout_payload = keepout_semantic_payload_json(
         read_optional_text_file(keepout_semantic_json_path(lookup.manifest)));
@@ -7387,6 +9181,7 @@ private:
                << "\"display_name\":" << json_string(lookup.manifest.display_name) << ","
                << "\"map_name\":" << json_string(lookup.manifest.display_name) << ","
                << "\"active\":" << (lookup.manifest.active ? "true" : "false") << ","
+               << "\"keepout_revision\":" << json_string(keepout_summary.revision) << ","
                << "\"poses_yaml\":" << json_string(lookup.manifest.poses_yaml.string()) << ","
                << "\"poses\":" << poses_json_array(poses) << ","
                << "\"filters\":{\"keepout\":" << keepout_filter << "},"
@@ -7409,6 +9204,13 @@ private:
     std::vector<StoredPose> poses;
     try {
       poses = read_floor_poses(lookup.manifest.poses_yaml);
+      poses.erase(
+        std::remove_if(
+          poses.begin(), poses.end(), [](const StoredPose & pose) {
+            return is_elevator_internal_pose_type(pose.type) ||
+                   is_reserved_elevator_pose_id(pose.id);
+          }),
+        poses.end());
     } catch (const std::exception & exc) {
       return {500, "application/json", error_json(exc.what())};
     }
@@ -7458,6 +9260,16 @@ private:
 
   HttpResponse handle_save_mapping_2d(const std::string & body)
   {
+    std::lock_guard<std::mutex> keepout_guard(keepout_update_mutex_);
+    if (const auto blocked = floor_runtime_interlock_response("mapping_save")) {
+      return *blocked;
+    }
+    if (map_asset_integrity_degraded()) {
+      return {
+        503,
+        "application/json",
+        error_json("keepout integrity is degraded; repair the keepout layer before saving maps")};
+    }
     const auto map_name = json_string_value(body, "map_name");
     const auto building_id = json_string_value(body, "building_id");
     const auto floor_id = json_string_value(body, "floor_id");
@@ -7489,6 +9301,9 @@ private:
     const std::uint32_t height = map.info.height;
     if (width == 0U || height == 0U || map.data.size() != static_cast<std::size_t>(width) * height) {
       return {503, "application/json", error_json("live slam_toolbox /map has invalid dimensions")};
+    }
+    if (const auto blocked = floor_runtime_interlock_response("mapping_save_commit")) {
+      return *blocked;
     }
     set_mapping_runtime_state(true, "saving", "saving live 2D mapping assets");
     clear_runtime_map_context();
@@ -7530,7 +9345,7 @@ private:
         write_text_file(manifest.poses_yaml, "poses: []\n");
       }
       write_asset_report(manifest, map);
-      write_map_manifest(manifest);
+      stamp_map_asset_identity(manifest, fs::path(maps_root_));
     } catch (const std::exception & exc) {
       set_mapping_runtime_state(true, "running", std::string("map save failed: ") + exc.what(), false);
       return {500, "application/json", error_json(exc.what())};
@@ -7559,6 +9374,8 @@ private:
              << "\"safe_map_name\":" << json_string(manifest.safe_map_name) << ","
              << "\"building_id\":" << json_string(*building_id) << ","
              << "\"floor_id\":" << json_string(*floor_id) << ","
+             << "\"asset_epoch\":" << manifest.asset_epoch << ","
+             << "\"asset_digest\":" << json_string(manifest.asset_digest) << ","
              << "\"active\":false,"
              << "\"selected_for_navigation\":false,"
              << "\"requires_manual_navigation_selection\":true,"
@@ -7674,14 +9491,7 @@ private:
   {
     std::set<pid_t> groups;
     const pid_t self_pid = ::getpid();
-    if (!fs::exists("/proc")) {
-      return groups;
-    }
-    for (const auto & entry : fs::directory_iterator("/proc")) {
-      if (!entry.is_directory() || !is_pid_directory(entry.path())) {
-        continue;
-      }
-      const pid_t pid = static_cast<pid_t>(std::stol(entry.path().filename().string()));
+    for (const pid_t pid : list_proc_pids()) {
       if (pid <= 1 || pid == self_pid) {
         continue;
       }
@@ -7699,14 +9509,7 @@ private:
   {
     std::set<pid_t> pids;
     const pid_t self_pid = ::getpid();
-    if (!fs::exists("/proc")) {
-      return pids;
-    }
-    for (const auto & entry : fs::directory_iterator("/proc")) {
-      if (!entry.is_directory() || !is_pid_directory(entry.path())) {
-        continue;
-      }
-      const pid_t pid = static_cast<pid_t>(std::stol(entry.path().filename().string()));
+    for (const pid_t pid : list_proc_pids()) {
       if (pid <= 1 || pid == self_pid) {
         continue;
       }
@@ -7888,39 +9691,137 @@ private:
     return requested_groups + requested_residuals;
   }
 
-  HttpResponse handle_start_mapping_2d()
+  std::string mapping_start_job_json_locked() const
   {
-    if (mapping_2d_start_command_.empty() || !fs::exists(mapping_2d_start_command_)) {
-      return {
-        503,
-        "application/json",
-        error_json("2D slam_toolbox start command is not available: " + mapping_2d_start_command_)
-      };
-    }
+    const auto & job = mapping_start_job_;
+    std::ostringstream out;
+    out << "{\"id\":" << job.id
+        << ",\"state\":" << json_string(job.state)
+        << ",\"phase\":" << json_string(job.phase)
+        << ",\"detail\":" << json_string(job.detail)
+        << ",\"navigation_was_active\":" << (job.navigation_was_active ? "true" : "false")
+        << ",\"navigation_cancel_ok\":" << (job.navigation_cancel_ok ? "true" : "false")
+        << ",\"navigation_stop_ok\":" << (job.navigation_stop_ok ? "true" : "false")
+        << ",\"cancel_requested\":" << (job.cancel_requested ? "true" : "false")
+        << ",\"mapping_pid\":" << job.mapping_pid
+        << ",\"started_at\":" << json_string(job.started_at)
+        << ",\"finished_at\":" << json_string(job.finished_at) << "}";
+    return out.str();
+  }
 
-    const auto runtime = runtime_mode_snapshot();
-    if (runtime.docking_active) {
-      return {409, "application/json", error_json("cannot start 2D mapping while docking is active")};
-    }
-    if (runtime.navigation_active) {
-      return {
-        409,
-        "application/json",
-        error_json("cannot start 2D mapping while navigation runtime is active; stop navigation runtime first")
-      };
-    }
-    clear_runtime_map_context();
+  std::string mapping_start_job_json() const
+  {
+    std::lock_guard<std::mutex> lock(mapping_start_job_mutex_);
+    return mapping_start_job_json_locked();
+  }
 
+  bool mapping_start_job_running() const
+  {
+    std::lock_guard<std::mutex> lock(mapping_start_job_mutex_);
+    return mapping_start_job_.state == "running";
+  }
+
+  void request_mapping_start_cancel()
+  {
+    std::lock_guard<std::mutex> lock(mapping_start_job_mutex_);
+    if (mapping_start_job_.state == "running") {
+      mapping_start_job_.cancel_requested = true;
+      mapping_start_job_.detail = "2D mapping start cancellation requested";
+    }
+  }
+
+  bool mapping_start_cancel_requested(const std::uint64_t job_id) const
+  {
+    std::lock_guard<std::mutex> lock(mapping_start_job_mutex_);
+    return mapping_start_job_.id == job_id && mapping_start_job_.cancel_requested;
+  }
+
+  void set_mapping_start_job_phase(
+    const std::uint64_t job_id,
+    const std::string & phase,
+    const std::string & detail = "")
+  {
+    std::lock_guard<std::mutex> lock(mapping_start_job_mutex_);
+    if (mapping_start_job_.id == job_id && mapping_start_job_.state == "running") {
+      mapping_start_job_.phase = phase;
+      if (!detail.empty()) {
+        mapping_start_job_.detail = detail;
+      }
+    }
+  }
+
+  void set_mapping_start_navigation_result(
+    const std::uint64_t job_id,
+    const bool cancel_ok,
+    const bool stop_ok)
+  {
+    std::lock_guard<std::mutex> lock(mapping_start_job_mutex_);
+    if (mapping_start_job_.id == job_id && mapping_start_job_.state == "running") {
+      mapping_start_job_.navigation_cancel_ok = cancel_ok;
+      mapping_start_job_.navigation_stop_ok = stop_ok;
+    }
+  }
+
+  bool begin_mode_transition(const std::string & owner, std::string & conflict_owner)
+  {
+    std::lock_guard<std::mutex> lock(mode_transition_mutex_);
+    if (!mode_transition_owner_.empty()) {
+      conflict_owner = mode_transition_owner_;
+      return false;
+    }
+    mode_transition_owner_ = owner;
+    conflict_owner.clear();
+    return true;
+  }
+
+  void finish_mode_transition(const std::string & owner)
+  {
+    std::lock_guard<std::mutex> lock(mode_transition_mutex_);
+    if (mode_transition_owner_ == owner) {
+      mode_transition_owner_.clear();
+    }
+  }
+
+  std::string mode_transition_owner_snapshot() const
+  {
+    std::lock_guard<std::mutex> lock(mode_transition_mutex_);
+    return mode_transition_owner_;
+  }
+
+  void finish_mapping_start_job(
+    const std::uint64_t job_id,
+    const std::string & state,
+    const std::string & detail,
+    const pid_t mapping_pid = -1)
+  {
+    {
+      std::lock_guard<std::mutex> lock(mapping_start_job_mutex_);
+      if (mapping_start_job_.id != job_id) {
+        return;
+      }
+      mapping_start_job_.state = state;
+      mapping_start_job_.phase = "finished";
+      mapping_start_job_.detail = detail;
+      mapping_start_job_.mapping_pid = mapping_pid;
+      mapping_start_job_.finished_at = utc_timestamp_iso8601();
+    }
+    finish_mode_transition("mapping_start");
+  }
+
+  void join_mapping_start_worker()
+  {
+    if (mapping_start_worker_.joinable()) {
+      mapping_start_worker_.join();
+    }
+  }
+
+  bool start_mapping_2d_process(pid_t & pid, std::string & detail)
+  {
     std::lock_guard<std::mutex> process_lock(mapping_process_mutex_);
     if (mapping_2d_process_running_locked()) {
-      set_mapping_live_map_cache_active(true);
-      set_mapping_runtime_state(true, "running", "2D mapping chain is already running");
-      return {
-        202,
-        "application/json",
-        "{\"ok\":true,\"state\":\"already_running\",\"map_topic\":" + json_string(mapping_2d_live_map_topic_) +
-        ",\"map_endpoint\":\"/api/v1/mapping/2d/map\"}"
-      };
+      pid = mapping_2d_pid_;
+      detail = "2D mapping chain is already running";
+      return true;
     }
 
     {
@@ -7930,9 +9831,10 @@ private:
       latest_live_map_received_at_ = {};
     }
 
-    const pid_t pid = ::fork();
+    pid = ::fork();
     if (pid < 0) {
-      return {500, "application/json", error_json("failed to fork 2D slam_toolbox mapping process")};
+      detail = "failed to fork 2D slam_toolbox mapping process";
+      return false;
     }
     if (pid == 0) {
       prepare_child_process(mapping_2d_log_file_);
@@ -7943,22 +9845,257 @@ private:
     mapping_2d_pid_ = pid;
     mapping_2d_active_ = true;
     mapping_2d_started_at_ = std::chrono::steady_clock::now();
+    detail = "2D mapping process started";
+    return true;
+  }
+
+  void run_mapping_start_job(const std::uint64_t job_id, const bool navigation_was_active)
+  {
+    bool navigation_cancel_ok = true;
+    bool navigation_stop_ok = true;
+    std::string floor_interlock_detail;
+    if (floor_runtime_operation_blocked("mapping_start_worker", floor_interlock_detail)) {
+      set_mapping_runtime_state(false, "blocked", floor_interlock_detail, false);
+      finish_mapping_start_job(job_id, "failed", floor_interlock_detail);
+      return;
+    }
+
+    if (navigation_was_active) {
+      set_mapping_start_job_phase(
+        job_id,
+        "cancel_navigation",
+        "canceling active navigation task before 2D mapping");
+      {
+        std::lock_guard<std::mutex> cancel_start_lock(navigation_cancel_start_mutex_);
+        join_navigation_cancel_worker();
+        std::string cancel_detail;
+        navigation_cancel_ok = cancel_navigation_task_for_mode_switch(
+          "2D mapping mode transition",
+          cancel_detail);
+        set_mapping_start_job_phase(job_id, "cancel_navigation", cancel_detail);
+      }
+      set_mapping_start_navigation_result(job_id, navigation_cancel_ok, false);
+      publish_teleop_zero_burst();
+      publish_final_yaw_align_zero_burst();
+
+      if (mapping_start_cancel_requested(job_id)) {
+        set_navigation_runtime_state(true, "ready", "2D mapping start canceled; navigation remains active");
+        finish_mapping_start_job(job_id, "canceled", "2D mapping start canceled before navigation stop");
+        return;
+      }
+
+      set_mapping_start_job_phase(
+        job_id,
+        "stop_navigation_runtime",
+        "stopping navigation mode services before 2D mapping");
+      std::string stop_detail;
+      navigation_stop_ok = stop_navigation_runtime_stack(stop_detail);
+      set_mapping_start_navigation_result(job_id, navigation_cancel_ok, navigation_stop_ok);
+      set_mapping_start_job_phase(job_id, "stop_navigation_runtime", stop_detail);
+      publish_teleop_zero_burst();
+      publish_final_yaw_align_zero_burst();
+      if (!navigation_stop_ok) {
+        set_navigation_runtime_state(true, "error", stop_detail, false);
+        finish_mapping_start_job(job_id, "failed", stop_detail);
+        return;
+      }
+
+      set_navigation_runtime_state(false, "stopped", "navigation runtime stopped for 2D mapping");
+      join_navigation_goal_worker();
+    }
+    set_mapping_start_navigation_result(job_id, navigation_cancel_ok, navigation_stop_ok);
+
+    if (mapping_start_cancel_requested(job_id)) {
+      set_mapping_runtime_state(false, "stopped", "2D mapping start canceled");
+      finish_mapping_start_job(job_id, "canceled", "2D mapping start canceled before process launch");
+      return;
+    }
+
+    if (floor_runtime_operation_blocked(
+        "mapping_start_context_clear", floor_interlock_detail))
+    {
+      set_mapping_runtime_state(false, "blocked", floor_interlock_detail, false);
+      finish_mapping_start_job(job_id, "failed", floor_interlock_detail);
+      return;
+    }
+    set_mapping_start_job_phase(job_id, "clear_navigation_context", "clearing navigation map context");
+    clear_runtime_map_context();
+
+    pid_t pid = -1;
+    std::string start_detail;
+    {
+      std::lock_guard<std::mutex> launch_lock(mapping_transition_launch_mutex_);
+      if (mapping_start_cancel_requested(job_id)) {
+        set_mapping_runtime_state(false, "stopped", "2D mapping start canceled");
+        finish_mapping_start_job(job_id, "canceled", "2D mapping start canceled before process launch");
+        return;
+      }
+      if (floor_runtime_operation_blocked(
+          "mapping_process_launch", floor_interlock_detail))
+      {
+        set_mapping_runtime_state(false, "blocked", floor_interlock_detail, false);
+        finish_mapping_start_job(job_id, "failed", floor_interlock_detail);
+        return;
+      }
+      set_mapping_start_job_phase(job_id, "start_mapping_process", "starting 2D mapping process");
+      if (!start_mapping_2d_process(pid, start_detail)) {
+        set_mapping_live_map_cache_active(false);
+        set_mapping_runtime_state(false, "failed", start_detail, false);
+        finish_mapping_start_job(job_id, "failed", start_detail);
+        return;
+      }
+    }
+
     set_mapping_live_map_cache_active(true);
     set_mapping_runtime_state(true, "starting", "2D mapping chain start accepted");
+    finish_mapping_start_job(job_id, "succeeded", start_detail, pid);
+  }
 
+  void run_mapping_start_job_guarded(
+    const std::uint64_t job_id,
+    const bool navigation_was_active)
+  {
+    try {
+      run_mapping_start_job(job_id, navigation_was_active);
+    } catch (const std::exception & exc) {
+      const std::string detail = std::string("2D mapping start worker exception: ") + exc.what();
+      set_mapping_runtime_state(false, "failed", detail, false);
+      finish_mapping_start_job(job_id, "failed", detail);
+    } catch (...) {
+      const std::string detail = "2D mapping start worker unknown exception";
+      set_mapping_runtime_state(false, "failed", detail, false);
+      finish_mapping_start_job(job_id, "failed", detail);
+    }
+  }
+
+  HttpResponse handle_start_mapping_2d()
+  {
+    std::lock_guard<std::mutex> keepout_guard(keepout_update_mutex_);
+    if (const auto blocked = floor_runtime_interlock_response("mapping_start")) {
+      return *blocked;
+    }
+    if (map_asset_integrity_degraded()) {
+      return {
+        503,
+        "application/json",
+        error_json("keepout integrity is degraded; navigation and mapping admission are blocked")};
+    }
+    if (mapping_2d_start_command_.empty() || !fs::exists(mapping_2d_start_command_)) {
+      return {
+        503,
+        "application/json",
+        error_json("2D slam_toolbox start command is not available: " + mapping_2d_start_command_)
+      };
+    }
+
+    auto runtime = runtime_mode_snapshot();
+    if (runtime.docking_active) {
+      return {409, "application/json", error_json("cannot start 2D mapping while docking is active")};
+    }
+    {
+      std::lock_guard<std::mutex> process_lock(mapping_process_mutex_);
+      if (mapping_2d_process_running_locked()) {
+        set_mapping_live_map_cache_active(true);
+        set_mapping_runtime_state(true, "running", "2D mapping chain is already running");
+        return {
+          202,
+          "application/json",
+          "{\"ok\":true,\"state\":\"already_running\",\"map_topic\":" +
+          json_string(mapping_2d_live_map_topic_) +
+          ",\"map_endpoint\":\"/api/v1/mapping/2d/map\"}"
+        };
+      }
+    }
+
+    std::lock_guard<std::mutex> start_lock(mapping_start_start_mutex_);
+    {
+      std::lock_guard<std::mutex> job_lock(mapping_start_job_mutex_);
+      if (mapping_start_job_.state == "running") {
+        return {
+          202,
+          "application/json",
+          "{\"ok\":true,\"accepted\":true,\"already_running\":true,\"mapping_start\":" +
+          mapping_start_job_json_locked() + "}"
+        };
+      }
+    }
+    join_mapping_start_worker();
+
+    std::string conflict_owner;
+    if (!begin_mode_transition("mapping_start", conflict_owner)) {
+      return {
+        409,
+        "application/json",
+        error_json("runtime mode transition is already active: " + conflict_owner)};
+    }
+
+    runtime = runtime_mode_snapshot();
+    if (runtime.docking_active) {
+      finish_mode_transition("mapping_start");
+      return {409, "application/json", error_json("cannot start 2D mapping while docking is active")};
+    }
+    const bool navigation_was_active =
+      runtime.navigation_active || navigation_goal_job_running();
+
+    std::uint64_t job_id = 0U;
+    {
+      std::lock_guard<std::mutex> job_lock(mapping_start_job_mutex_);
+      job_id = ++mapping_start_job_seq_;
+      mapping_start_job_ = MappingStartJob{};
+      mapping_start_job_.id = job_id;
+      mapping_start_job_.state = "running";
+      mapping_start_job_.phase = "accepted";
+      mapping_start_job_.detail = navigation_was_active ?
+        "2D mapping transition accepted; navigation shutdown queued" :
+        "2D mapping start accepted";
+      mapping_start_job_.navigation_was_active = navigation_was_active;
+      mapping_start_job_.started_at = utc_timestamp_iso8601();
+    }
+
+    if (navigation_was_active) {
+      set_navigation_runtime_state(
+        true,
+        "stopping_for_mapping",
+        "2D mapping transition accepted; stopping navigation runtime");
+    }
+
+    try {
+      mapping_start_worker_ = std::thread(
+        [this, job_id, navigation_was_active]() {
+          run_mapping_start_job_guarded(job_id, navigation_was_active);
+        });
+    } catch (const std::exception & exc) {
+      const std::string detail = std::string("failed to start 2D mapping transition worker: ") + exc.what();
+      if (navigation_was_active) {
+        set_navigation_runtime_state(true, "ready", "2D mapping transition worker did not start");
+      }
+      finish_mapping_start_job(job_id, "failed", detail);
+      return {500, "application/json", error_json(detail)};
+    }
+
+    std::lock_guard<std::mutex> job_lock(mapping_start_job_mutex_);
     std::ostringstream body;
-    body << "{\"ok\":true,\"state\":\"starting\","
-         << "\"pid\":" << pid << ","
+    body << "{\"ok\":true,\"accepted\":true,\"state\":\"starting\","
          << "\"map_topic\":" << json_string(mapping_2d_live_map_topic_) << ","
          << "\"map_endpoint\":\"/api/v1/mapping/2d/map\","
-         << "\"log_file\":" << json_string(mapping_2d_log_file_) << "}";
+         << "\"mapping_start\":" << mapping_start_job_json_locked() << "}";
     return {202, "application/json", body.str()};
   }
 
   HttpResponse handle_stop_mapping_2d()
   {
     std::size_t requested_groups = 0U;
+    bool start_transition_cancel_requested = false;
     {
+      std::lock_guard<std::mutex> launch_lock(mapping_transition_launch_mutex_);
+      {
+        std::lock_guard<std::mutex> job_lock(mapping_start_job_mutex_);
+        if (mapping_start_job_.state == "running") {
+          mapping_start_job_.cancel_requested = true;
+          mapping_start_job_.detail = "2D mapping stop requested during startup transition";
+          start_transition_cancel_requested = true;
+        }
+      }
       std::lock_guard<std::mutex> process_lock(mapping_process_mutex_);
       requested_groups = terminate_mapping_2d_process_groups_locked();
     }
@@ -7967,10 +10104,12 @@ private:
     set_mapping_runtime_state(false, "stopped", "2D mapping chain stopped");
 
     std::ostringstream body;
-    body << "{\"ok\":true,\"mapping_active\":false,\"stopped\":"
+    body << "{\"ok\":true,\"mapping_active\":false,\"start_transition_cancel_requested\":"
+         << (start_transition_cancel_requested ? "true" : "false")
+         << ",\"stopped\":"
          << (requested_groups > 0U ? "true" : "false")
          << ",\"stopped_groups\":" << requested_groups << "}";
-    return {200, "application/json", body.str()};
+    return {start_transition_cancel_requested ? 202 : 200, "application/json", body.str()};
   }
 
   bool navigation_resume_process_running_locked()
@@ -8049,6 +10188,12 @@ private:
 
   void refresh_navigation_resume_runtime_state(const bool probe_lifecycle = false)
   {
+    if (runtime_mode_snapshot().mapping_active ||
+      mode_transition_owner_snapshot() == "mapping_start")
+    {
+      return;
+    }
+
     bool process_exited = false;
     bool process_running = false;
     {
@@ -8155,6 +10300,9 @@ private:
     const std::string & floor_id,
     const std::optional<MapManifest> & selected_map = std::nullopt)
   {
+    if (const auto blocked = floor_runtime_interlock_response("navigation_runtime_resume")) {
+      return *blocked;
+    }
     FloorAssetPaths assets;
     std::string error;
     if (!resolve_floor_asset_paths(*map_catalog_, building_id, floor_id, assets, error)) {
@@ -8169,6 +10317,9 @@ private:
     }
 
     std::lock_guard<std::mutex> process_lock(navigation_process_mutex_);
+    if (const auto blocked = floor_runtime_interlock_response("navigation_runtime_resume_commit")) {
+      return *blocked;
+    }
     const bool existing_resume_process_running = navigation_resume_process_running_locked();
     const auto existing_context = selected_map ? read_runtime_map_context() : std::nullopt;
     const bool navigate_action_ready =
@@ -8238,6 +10389,9 @@ private:
       }
     }
 
+    if (const auto blocked = floor_runtime_interlock_response("navigation_runtime_launch")) {
+      return *blocked;
+    }
     terminate_navigation_resume_process_locked();
     if (selected_map) {
       try {
@@ -8373,6 +10527,9 @@ private:
     const std::string & body,
     const std::optional<std::string> & forced_pose_id = std::nullopt)
   {
+    if (const auto blocked = floor_runtime_interlock_response("pose_save")) {
+      return *blocked;
+    }
     const auto requested_building_id = json_string_value(body, "building_id");
     const auto requested_floor_id = json_string_value(body, "floor_id");
     const auto map_id = json_string_value(body, "map_id");
@@ -8389,6 +10546,16 @@ private:
     }
     if (!safe_pose_id(pose_id)) {
       return {400, "application/json", error_json("valid pose_id is required")};
+    }
+    const auto requested_pose_type =
+      json_string_value(body, "type").value_or("delivery_point");
+    if (is_elevator_internal_pose_type(requested_pose_type) ||
+      is_reserved_elevator_pose_id(pose_id))
+    {
+      return {
+        400, "application/json",
+        error_json(
+          "elevator internal poses are reserved for the elevator configuration module")};
     }
     if (forced_pose_id && !body_pose_id.empty() && body_pose_id != *forced_pose_id) {
       return {400, "application/json", error_json("pose_id in body does not match path pose_id")};
@@ -8441,7 +10608,7 @@ private:
     StoredPose pose;
     pose.id = pose_id;
     pose.name = json_string_value(body, "name").value_or(pose_id);
-    pose.type = json_string_value(body, "type").value_or("delivery_point");
+    pose.type = requested_pose_type;
     pose.x = x;
     pose.y = y;
     pose.yaw = normalize_angle(yaw);
@@ -8453,6 +10620,14 @@ private:
       bool updated = false;
       for (auto & existing : poses) {
         if (existing.id == pose.id) {
+          if (is_elevator_internal_pose_type(existing.type) ||
+            is_reserved_elevator_pose_id(existing.id))
+          {
+            return {
+              400, "application/json",
+              error_json(
+                "elevator internal poses are managed only by the elevator configuration module")};
+          }
           existing = pose;
           updated = true;
           break;
@@ -8460,6 +10635,9 @@ private:
       }
       if (!updated) {
         poses.push_back(pose);
+      }
+      if (const auto blocked = floor_runtime_interlock_response("pose_save_commit")) {
+        return *blocked;
       }
       write_floor_poses(path, poses);
       if (manifest && manifest->active) {
@@ -8485,6 +10663,9 @@ private:
 
   HttpResponse handle_save_current_pose(const std::string & body)
   {
+    if (const auto blocked = floor_runtime_interlock_response("current_pose_save")) {
+      return *blocked;
+    }
     const auto stripped_body = trim(body);
     if (stripped_body.empty() || stripped_body.front() != '{') {
       return {400, "application/json", error_json("JSON request body is required")};
@@ -8527,6 +10708,14 @@ private:
       body_pose_id.empty() ? generate_current_pose_id(pose_type, pose_name) : body_pose_id;
     if (!safe_pose_id(pose_id)) {
       return {400, "application/json", error_json("valid pose_id is required")};
+    }
+    if (is_elevator_internal_pose_type(pose_type) ||
+      is_reserved_elevator_pose_id(pose_id))
+    {
+      return {
+        400, "application/json",
+        error_json(
+          "elevator internal poses are reserved for the elevator configuration module")};
     }
 
     std::string pose_error;
@@ -8572,6 +10761,14 @@ private:
       bool updated = false;
       for (auto & existing : poses) {
         if (existing.id == pose.id) {
+          if (is_elevator_internal_pose_type(existing.type) ||
+            is_reserved_elevator_pose_id(existing.id))
+          {
+            return {
+              400, "application/json",
+              error_json(
+                "elevator internal poses are managed only by the elevator configuration module")};
+          }
           existing = pose;
           updated = true;
           break;
@@ -8579,6 +10776,9 @@ private:
       }
       if (!updated) {
         poses.push_back(pose);
+      }
+      if (const auto blocked = floor_runtime_interlock_response("current_pose_save_commit")) {
+        return *blocked;
       }
       write_floor_poses(path, poses);
       sync_active_poses_if_needed(manifest, resolved_building_id, resolved_floor_id, path);
@@ -8732,6 +10932,13 @@ private:
     pose.id = pose_id;
     pose.name = json_string_value(payload, "name").value_or(pose_id);
     pose.type = json_string_value(payload, "type").value_or("delivery_point");
+    if (is_elevator_internal_pose_type(pose.type) ||
+      is_reserved_elevator_pose_id(pose.id))
+    {
+      error =
+        "elevator internal poses are reserved for the elevator configuration module";
+      return std::nullopt;
+    }
     pose.x = x;
     pose.y = y;
     pose.yaw = normalize_angle(yaw);
@@ -8740,6 +10947,9 @@ private:
 
   HttpResponse handle_delete_pose(const HttpRequest & request, const std::string & pose_id)
   {
+    if (const auto blocked = floor_runtime_interlock_response("pose_delete")) {
+      return *blocked;
+    }
     if (!safe_pose_id(pose_id)) {
       return {400, "application/json", error_json("valid pose_id is required")};
     }
@@ -8768,6 +10978,19 @@ private:
     const auto path = pose_target_path(manifest, resolved_building_id, resolved_floor_id);
     try {
       auto poses = read_floor_poses(path);
+      const auto requested = std::find_if(
+        poses.begin(), poses.end(), [&pose_id](const StoredPose & pose) {
+          return pose.id == pose_id;
+        });
+      if (requested != poses.end() &&
+        (is_elevator_internal_pose_type(requested->type) ||
+        is_reserved_elevator_pose_id(requested->id)))
+      {
+        return {
+          400, "application/json",
+          error_json(
+            "elevator internal poses are managed only by the elevator configuration module")};
+      }
       const auto before = poses.size();
       poses.erase(
         std::remove_if(poses.begin(), poses.end(), [&pose_id](const StoredPose & pose) {
@@ -8776,6 +10999,9 @@ private:
         poses.end());
       if (poses.size() == before) {
         return {404, "application/json", error_json("pose_id not found in poses.yaml: " + pose_id)};
+      }
+      if (const auto blocked = floor_runtime_interlock_response("pose_delete_commit")) {
+        return *blocked;
       }
       write_floor_poses(path, poses);
       sync_active_poses_if_needed(manifest, resolved_building_id, resolved_floor_id, path);
@@ -8797,6 +11023,9 @@ private:
 
   HttpResponse handle_replace_poses_batch(const std::string & body)
   {
+    if (const auto blocked = floor_runtime_interlock_response("pose_batch_replace")) {
+      return *blocked;
+    }
     if (body.find("\"poses\"") == std::string::npos) {
       return {400, "application/json", error_json("poses array is required")};
     }
@@ -8835,9 +11064,28 @@ private:
       }
       poses.push_back(*pose);
     }
+    const auto requested_pose_count = poses.size();
 
     const auto path = pose_target_path(manifest, resolved_building_id, resolved_floor_id);
     try {
+      const auto existing = read_floor_poses(path);
+      for (const auto & preserved : existing) {
+        if (!is_elevator_internal_pose_type(preserved.type) &&
+          !is_reserved_elevator_pose_id(preserved.id))
+        {
+          continue;
+        }
+        if (pose_ids.count(preserved.id) > 0U) {
+          return {
+            400, "application/json",
+            error_json(
+              "batch replacement cannot overwrite an elevator internal pose")};
+        }
+        poses.push_back(preserved);
+      }
+      if (const auto blocked = floor_runtime_interlock_response("pose_batch_replace_commit")) {
+        return *blocked;
+      }
       write_floor_poses(path, poses);
       sync_active_poses_if_needed(manifest, resolved_building_id, resolved_floor_id, path);
 
@@ -8847,7 +11095,7 @@ private:
                << "\"building_id\":" << json_string(resolved_building_id) << ","
                << "\"floor_id\":" << json_string(resolved_floor_id) << ","
                << "\"map_id\":" << json_string(manifest ? manifest->map_id : "") << ","
-               << "\"count\":" << poses.size() << ","
+               << "\"count\":" << requested_pose_count << ","
                << "\"poses_yaml\":" << json_string(path.string()) << "}";
       return {200, "application/json", response.str()};
     } catch (const std::exception & exc) {
@@ -8855,8 +11103,519 @@ private:
     }
   }
 
+  bool runtime_context_matches_map(const MapManifest & map, std::string & error) const
+  {
+    const auto context = read_runtime_map_context();
+    if (!context) {
+      error = "no runtime map context";
+      return false;
+    }
+    if (!context->confirmed || context->state != "ready") {
+      error =
+        "runtime map context is not ready: " + context->building_id + "/" +
+        context->floor_id + "/" + context->map_id + " state=" + context->state;
+      return false;
+    }
+    if (context->building_id != map.building_id ||
+      context->floor_id != map.floor_id ||
+      context->map_id != map.map_id)
+    {
+      error =
+        "runtime map changed: expected " + map.building_id + "/" + map.floor_id + "/" +
+        map.map_id + " but found " + context->building_id + "/" + context->floor_id + "/" +
+        context->map_id;
+      return false;
+    }
+    return true;
+  }
+
+  bool lifecycle_service_is_active(
+    const rclcpp::Client<lifecycle_msgs::srv::GetState>::SharedPtr & client,
+    const std::string & service,
+    std::string & error)
+  {
+    const auto timeout = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::duration<double>(keepout_runtime_apply_timeout_sec_));
+    if (!client || !client->wait_for_service(timeout)) {
+      error = "lifecycle service unavailable: " + service;
+      return false;
+    }
+    auto request = std::make_shared<lifecycle_msgs::srv::GetState::Request>();
+    auto future = client->async_send_request(request);
+    if (future.wait_for(timeout) != std::future_status::ready) {
+      error = "timed out querying lifecycle service: " + service;
+      return false;
+    }
+    const auto response = future.get();
+    if (response->current_state.id != lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) {
+      error =
+        service + " is not active: " + response->current_state.label +
+        " [" + std::to_string(response->current_state.id) + "]";
+      return false;
+    }
+    return true;
+  }
+
+  bool keepout_plugin_is_enabled(std::string & error)
+  {
+    const auto timeout = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::duration<double>(keepout_runtime_apply_timeout_sec_));
+    if (!global_costmap_get_parameters_client_ ||
+      !global_costmap_get_parameters_client_->wait_for_service(timeout))
+    {
+      error = "global costmap parameter service unavailable: " +
+        global_costmap_get_parameters_service_;
+      return false;
+    }
+    auto request = std::make_shared<rcl_interfaces::srv::GetParameters::Request>();
+    request->names = {"filters", "keepout_filter.enabled"};
+    auto future = global_costmap_get_parameters_client_->async_send_request(request);
+    if (future.wait_for(timeout) != std::future_status::ready) {
+      error = "timed out reading global costmap keepout parameters";
+      return false;
+    }
+    const auto response = future.get();
+    if (response->values.size() != 2U) {
+      error = "global costmap returned incomplete keepout parameters";
+      return false;
+    }
+    const auto & filters = response->values[0];
+    const auto & enabled = response->values[1];
+    if (filters.type != rcl_interfaces::msg::ParameterType::PARAMETER_STRING_ARRAY ||
+      enabled.type != rcl_interfaces::msg::ParameterType::PARAMETER_BOOL)
+    {
+      error = "global costmap keepout parameters have unexpected types";
+      return false;
+    }
+    const bool listed = std::find(
+      filters.string_array_value.begin(),
+      filters.string_array_value.end(),
+      "keepout_filter") != filters.string_array_value.end();
+    if (!listed || !enabled.bool_value) {
+      error = "global costmap KeepoutFilter is not enabled";
+      return false;
+    }
+
+    std::lock_guard<std::mutex> lock(keepout_observation_mutex_);
+    if (!latest_keepout_filter_info_.valid) {
+      error =
+        "keepout filter info is missing or invalid; expected type=0 and mask_topic=" +
+        keepout_mask_topic_;
+      return false;
+    }
+    return true;
+  }
+
+  std::optional<KeepoutAssetPaths> resolve_keepout_runtime_projection(std::string & error)
+  {
+    const auto timeout = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::duration<double>(keepout_runtime_apply_timeout_sec_));
+    if (!keepout_mask_get_parameters_client_ ||
+      !keepout_mask_get_parameters_client_->wait_for_service(timeout))
+    {
+      error =
+        "keepout mask parameter service unavailable: " + keepout_mask_get_parameters_service_;
+      return std::nullopt;
+    }
+
+    auto request = std::make_shared<rcl_interfaces::srv::GetParameters::Request>();
+    request->names = {"yaml_filename"};
+    auto future = keepout_mask_get_parameters_client_->async_send_request(request);
+    if (future.wait_for(timeout) != std::future_status::ready) {
+      error = "timed out reading keepout mask yaml_filename";
+      return std::nullopt;
+    }
+    const auto response = future.get();
+    if (response->values.size() != 1U ||
+      response->values.front().type !=
+      rcl_interfaces::msg::ParameterType::PARAMETER_STRING ||
+      response->values.front().string_value.empty())
+    {
+      error = "keepout mask server returned an invalid yaml_filename";
+      return std::nullopt;
+    }
+
+    std::error_code root_error;
+    std::error_code yaml_error;
+    const auto stage_root = fs::weakly_canonical(
+      fs::path(keepout_runtime_stage_root_), root_error);
+    const auto stage_yaml = fs::weakly_canonical(
+      fs::path(response->values.front().string_value), yaml_error);
+    if (root_error || yaml_error || !fs::exists(stage_yaml) || !fs::is_regular_file(stage_yaml)) {
+      error =
+        "keepout runtime yaml_filename cannot be resolved: " +
+        response->values.front().string_value;
+      return std::nullopt;
+    }
+    const auto relative = stage_yaml.lexically_relative(stage_root);
+    const auto relative_text = relative.generic_string();
+    if (relative.empty() || relative.is_absolute() ||
+      relative_text == ".." || relative_text.rfind("../", 0U) == 0U)
+    {
+      error =
+        "keepout runtime yaml_filename is outside the managed staging root: " +
+        stage_yaml.string();
+      return std::nullopt;
+    }
+
+    return KeepoutAssetPaths{
+      stage_yaml.parent_path() / "keepout_semantic_layer.json",
+      stage_yaml,
+      stage_yaml.parent_path() / "keepout_mask.pgm"};
+  }
+
+  bool keepout_mask_observation_matches(
+    const KeepoutMaskObservation & observation,
+    const KeepoutMaskSummary & expected) const
+  {
+    constexpr double geometry_tolerance = 1e-6;
+    return observation.width == expected.width &&
+           observation.height == expected.height &&
+           std::fabs(observation.resolution - expected.resolution) <= geometry_tolerance &&
+           std::fabs(observation.origin_x - expected.origin_x) <= geometry_tolerance &&
+           std::fabs(observation.origin_y - expected.origin_y) <= geometry_tolerance &&
+           std::fabs(normalize_angle(observation.origin_yaw - expected.origin_yaw)) <=
+           geometry_tolerance &&
+           observation.active_cells == expected.active_cells &&
+           observation.occupancy_digest == expected.occupancy_digest;
+  }
+
+  bool global_costmap_matches_keepout_samples(
+    const nav_msgs::msg::OccupancyGrid & costmap,
+    const KeepoutMaskSummary & expected,
+    std::size_t & checked,
+    std::size_t & blocked,
+    std::size_t & cleared,
+    std::string & error) const
+  {
+    checked = 0U;
+    blocked = 0U;
+    cleared = 0U;
+    if (normalized_frame_id(costmap.header.frame_id) != "map") {
+      error =
+        "global costmap frame is not map: " + normalized_frame_id(costmap.header.frame_id);
+      return false;
+    }
+    if (costmap.info.width == 0U || costmap.info.height == 0U ||
+      !std::isfinite(costmap.info.resolution) || costmap.info.resolution <= 0.0 ||
+      costmap.data.size() !=
+      static_cast<std::size_t>(costmap.info.width) *
+      static_cast<std::size_t>(costmap.info.height))
+    {
+      error = "global costmap has invalid geometry or data length";
+      return false;
+    }
+
+    const double origin_yaw = quaternion_yaw(
+      costmap.info.origin.orientation.x,
+      costmap.info.origin.orientation.y,
+      costmap.info.origin.orientation.z,
+      costmap.info.origin.orientation.w);
+    const double cosine = std::cos(origin_yaw);
+    const double sine = std::sin(origin_yaw);
+    const auto cost_at = [&](const robot_api_server::KeepoutCostmapSample & sample)
+      -> std::optional<int>
+      {
+        const double dx = sample.map_x - costmap.info.origin.position.x;
+        const double dy = sample.map_y - costmap.info.origin.position.y;
+        const double local_x = cosine * dx + sine * dy;
+        const double local_y = -sine * dx + cosine * dy;
+        const auto column = static_cast<long long>(
+          std::floor(local_x / static_cast<double>(costmap.info.resolution)));
+        const auto row = static_cast<long long>(
+          std::floor(local_y / static_cast<double>(costmap.info.resolution)));
+        if (column < 0 || row < 0 ||
+          column >= static_cast<long long>(costmap.info.width) ||
+          row >= static_cast<long long>(costmap.info.height))
+        {
+          std::ostringstream detail;
+          detail << "keepout verification sample is outside the global costmap: map=("
+                 << sample.map_x << "," << sample.map_y << ")";
+          error = detail.str();
+          return std::nullopt;
+        }
+        const auto index =
+          static_cast<std::size_t>(row) * static_cast<std::size_t>(costmap.info.width) +
+          static_cast<std::size_t>(column);
+        return static_cast<int>(costmap.data[index]);
+      };
+
+    for (const auto & sample : expected.blocked_costmap_samples) {
+      const auto value = cost_at(sample);
+      if (!value) {
+        return false;
+      }
+      ++checked;
+      // OccupancyGrid value 100 is lethal. Value 99 can be the static
+      // inflation/inscribed band and must not be accepted as keepout proof.
+      if (*value == 100) {
+        ++blocked;
+        continue;
+      }
+      std::ostringstream detail;
+      detail << "global costmap does not mark keepout sample lethal: map=("
+             << sample.map_x << "," << sample.map_y << ") value=" << *value
+             << " checked=" << checked << " blocked=" << blocked;
+      error = detail.str();
+      return false;
+    }
+    for (const auto & sample : expected.cleared_costmap_samples) {
+      const auto value = cost_at(sample);
+      if (!value) {
+        return false;
+      }
+      ++checked;
+      if (*value >= 0 && *value < 100) {
+        ++cleared;
+        continue;
+      }
+      std::ostringstream detail;
+      detail << "global costmap still marks a removed keepout sample lethal or unknown: map=("
+             << sample.map_x << "," << sample.map_y << ") value=" << *value
+             << " checked=" << checked << " cleared=" << cleared;
+      error = detail.str();
+      return false;
+    }
+    return true;
+  }
+
+  bool apply_keepout_runtime(
+    const MapManifest & map,
+    const fs::path & mask_yaml,
+    const KeepoutMaskSummary & expected,
+    KeepoutRuntimeProof & proof,
+    std::string & error)
+  {
+    if (!runtime_context_matches_map(map, error)) {
+      return false;
+    }
+    if (!lifecycle_service_is_active(
+        keepout_mask_state_client_, keepout_mask_state_service_, error))
+    {
+      return false;
+    }
+    proof.mask_server_active = true;
+    if (!lifecycle_service_is_active(
+        keepout_filter_info_state_client_, keepout_filter_info_state_service_, error))
+    {
+      return false;
+    }
+
+    const auto global_lifecycle = navigation_lifecycle_clients_.find(
+      "/global_costmap/global_costmap");
+    if (global_lifecycle == navigation_lifecycle_clients_.end() ||
+      !lifecycle_service_is_active(
+        global_lifecycle->second,
+        "/global_costmap/global_costmap/get_state",
+        error))
+    {
+      return false;
+    }
+    if (!keepout_plugin_is_enabled(error)) {
+      return false;
+    }
+    proof.filter_plugin_enabled = true;
+
+    std::uint64_t baseline_sequence = 0U;
+    {
+      std::lock_guard<std::mutex> lock(keepout_observation_mutex_);
+      baseline_sequence = latest_keepout_mask_.sequence;
+    }
+
+    const auto timeout = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::duration<double>(keepout_runtime_apply_timeout_sec_));
+    if (!keepout_mask_load_client_ || !keepout_mask_load_client_->wait_for_service(timeout)) {
+      error = "keepout mask load service unavailable: " + keepout_mask_load_service_;
+      return false;
+    }
+    auto load_request = std::make_shared<nav2_msgs::srv::LoadMap::Request>();
+    load_request->map_url = mask_yaml.string();
+    proof.mutation_state = KeepoutRuntimeMutationState::MAY_HAVE_CHANGED;
+    auto load_future = keepout_mask_load_client_->async_send_request(load_request);
+    if (load_future.wait_for(timeout) != std::future_status::ready) {
+      error = "timed out loading keepout mask: " + mask_yaml.string();
+      return false;
+    }
+    const auto load_response = load_future.get();
+    if (load_response->result != nav2_msgs::srv::LoadMap::Response::RESULT_SUCCESS) {
+      error =
+        keepout_mask_load_service_ + " rejected keepout mask with result code " +
+        std::to_string(load_response->result);
+      return false;
+    }
+    proof.load_map_succeeded = true;
+
+    {
+      std::unique_lock<std::mutex> lock(keepout_observation_mutex_);
+      const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(keepout_runtime_apply_timeout_sec_));
+      const bool matched = keepout_observation_cv_.wait_until(
+        lock,
+        deadline,
+        [&]() {
+          return latest_keepout_mask_.sequence > baseline_sequence &&
+                 keepout_mask_observation_matches(latest_keepout_mask_, expected);
+        });
+      if (!matched) {
+        std::ostringstream detail;
+        detail << "keepout mask topic did not publish the requested artifact"
+               << " expected=" << expected.width << "x" << expected.height
+               << " active=" << expected.active_cells
+               << " digest=" << expected.occupancy_digest
+               << " observed_seq=" << latest_keepout_mask_.sequence
+               << " baseline_seq=" << baseline_sequence
+               << " observed=" << latest_keepout_mask_.width << "x"
+               << latest_keepout_mask_.height
+               << " active=" << latest_keepout_mask_.active_cells
+               << " digest=" << latest_keepout_mask_.occupancy_digest;
+        error = detail.str();
+        return false;
+      }
+    }
+    proof.mask_topic_matches = true;
+
+    auto costmap_probe = std::make_shared<KeepoutCostmapProbeState>();
+    auto costmap_probe_subscription = create_subscription<nav_msgs::msg::OccupancyGrid>(
+      global_costmap_topic_,
+      rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
+      [costmap_probe](const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+        {
+          std::lock_guard<std::mutex> lock(costmap_probe->mutex);
+          ++costmap_probe->sequence;
+          costmap_probe->latest = msg;
+          costmap_probe->received_at = std::chrono::steady_clock::now();
+        }
+        costmap_probe->condition.notify_all();
+      });
+    {
+      std::unique_lock<std::mutex> lock(costmap_probe->mutex);
+      const bool observed = costmap_probe->condition.wait_for(
+        lock,
+        timeout,
+        [&]() {return costmap_probe->sequence > 0U;});
+      if (!observed) {
+        error = "global costmap topic unavailable before keepout clear: " + global_costmap_topic_;
+        return false;
+      }
+    }
+
+    if (!global_costmap_clear_client_ ||
+      !global_costmap_clear_client_->wait_for_service(timeout))
+    {
+      error = "global costmap clear service unavailable: " + global_costmap_clear_service_;
+      return false;
+    }
+    auto clear_request = std::make_shared<nav2_msgs::srv::ClearEntireCostmap::Request>();
+    auto clear_future = global_costmap_clear_client_->async_send_request(clear_request);
+    if (clear_future.wait_for(timeout) != std::future_status::ready) {
+      error = "timed out clearing global costmap after keepout reload";
+      return false;
+    }
+    (void)clear_future.get();
+    const auto clear_completed_steady = std::chrono::steady_clock::now();
+    const auto clear_completed_ros_ns = now().nanoseconds();
+    std::uint64_t costmap_baseline = 0U;
+    {
+      std::lock_guard<std::mutex> lock(costmap_probe->mutex);
+      costmap_baseline = costmap_probe->sequence;
+    }
+    proof.global_costmap_cleared = true;
+
+    nav_msgs::msg::OccupancyGrid::SharedPtr verified_costmap;
+    {
+      std::unique_lock<std::mutex> lock(costmap_probe->mutex);
+      const bool updated = costmap_probe->condition.wait_for(
+        lock,
+        timeout,
+        [&]() {
+          if (costmap_probe->sequence <= costmap_baseline ||
+            !costmap_probe->latest ||
+            costmap_probe->received_at <= clear_completed_steady)
+          {
+            return false;
+          }
+          return rclcpp::Time(costmap_probe->latest->header.stamp).nanoseconds() >
+                 clear_completed_ros_ns;
+        });
+      if (!updated) {
+        error =
+          "global costmap did not publish a fresh full map after keepout reload and clear: " +
+          global_costmap_topic_;
+        return false;
+      }
+      verified_costmap = costmap_probe->latest;
+    }
+    proof.global_costmap_updated = true;
+    costmap_probe_subscription.reset();
+
+    if (!verified_costmap ||
+      !global_costmap_matches_keepout_samples(
+        *verified_costmap,
+        expected,
+        proof.costmap_samples_checked,
+        proof.costmap_samples_blocked,
+        proof.costmap_samples_cleared,
+        error))
+    {
+      return false;
+    }
+    proof.global_costmap_content_matches = true;
+
+    if (!runtime_context_matches_map(map, error)) {
+      return false;
+    }
+    std::ostringstream detail;
+    detail << "mask_server=active; filter_info_server=active; plugin=enabled"
+           << "; load_map=success; mask_topic=matched"
+           << "; global_costmap=cleared_updated_and_sampled"
+           << "; samples=" << proof.costmap_samples_blocked << "/"
+           << expected.blocked_costmap_samples.size()
+           << " blocked, " << proof.costmap_samples_cleared << "/"
+           << expected.cleared_costmap_samples.size() << " cleared"
+           << ", " << proof.costmap_samples_checked << " total"
+           << "; active_cells=" << expected.active_cells
+           << "; digest=" << expected.occupancy_digest;
+    proof.detail = detail.str();
+    return true;
+  }
+
+  class RosKeepoutRuntimeAdapter final : public KeepoutRuntimePort
+  {
+  public:
+    RosKeepoutRuntimeAdapter(RobotApiServerNode & owner, MapManifest map)
+    : owner_(owner), map_(std::move(map))
+    {
+    }
+
+    bool apply(
+      const fs::path & mask_yaml,
+      const KeepoutMaskSummary & expected,
+      KeepoutRuntimeProof & proof,
+      std::string & error) override
+    {
+      return owner_.apply_keepout_runtime(map_, mask_yaml, expected, proof, error);
+    }
+
+    bool restore(
+      const fs::path & mask_yaml,
+      const KeepoutMaskSummary & expected,
+      KeepoutRuntimeProof & proof,
+      std::string & error) override
+    {
+      return owner_.apply_keepout_runtime(map_, mask_yaml, expected, proof, error);
+    }
+
+  private:
+    RobotApiServerNode & owner_;
+    MapManifest map_;
+  };
+
   HttpResponse handle_save_keepout_filter(const std::string & body)
   {
+    if (const auto blocked = floor_runtime_interlock_response("keepout_update")) {
+      return *blocked;
+    }
     const auto stripped_body = trim(body);
     if (stripped_body.empty() || stripped_body.front() != '{') {
       return {400, "application/json", error_json("JSON request body is required")};
@@ -8875,6 +11634,8 @@ private:
       return {400, "application/json", error_json("valid map_id is required")};
     }
 
+    std::lock_guard<std::mutex> update_lock(keepout_update_mutex_);
+    std::lock_guard<std::mutex> elevator_lock(elevator_asset_mutation_mutex_);
     std::optional<MapManifest> manifest;
     std::string resolved_building_id;
     std::string resolved_floor_id;
@@ -8910,34 +11671,410 @@ private:
       }
     }
 
-    const auto path = keepout_semantic_json_path(*manifest);
-    try {
-      write_text_file(path, stripped_body + "\n");
-      if (manifest->active) {
-        copy_file_if_exists(
-          path,
-          map_catalog_->floor_current_root_path(resolved_building_id, resolved_floor_id) /
-          "filters" / "keepout_semantic_layer.json");
-        copy_file_if_exists(
-          path,
-          map_catalog_->floor_root_path(resolved_building_id, resolved_floor_id) /
-          "filters" / "keepout_semantic_layer.json");
-      }
+    const bool reload_filter = json_bool_value(body, "reload_filter", true);
+    const auto busy_response = [](const std::string & code, const std::string & message) {
+        std::ostringstream response;
+        response << "{\"ok\":false,\"persisted\":false,\"effective\":false,"
+                 << "\"error\":{\"code\":" << json_string(code)
+                 << ",\"stage\":\"precondition\",\"retryable\":true,\"message\":"
+                 << json_string(message) << "}}";
+        return HttpResponse{409, "application/json", response.str()};
+    };
 
+    if (!elevator_configuration_) {
+      return {
+        503,
+        "application/json",
+        error_json("elevator configuration module is not initialized")};
+    }
+    ElevatorConfigurationQuery reference_query;
+    reference_query.building_id = manifest->building_id;
+    reference_query.floor_id = manifest->floor_id;
+    reference_query.map_id = manifest->map_id;
+    const auto elevator_reference =
+      elevator_configuration_->query(reference_query);
+    if (!elevator_reference.ok()) {
+      return elevator_configuration_response(elevator_reference);
+    }
+    if (json_bool_value(elevator_reference.body, "referenced", false)) {
+      const auto release_id =
+        json_string_value(elevator_reference.body, "release_id");
       std::ostringstream response;
-      response << "{\"ok\":true,"
+      response
+        << "{\"ok\":false,\"persisted\":false,\"effective\":false,"
+        << "\"error\":{\"code\":\"ELEVATOR_CONFIG_MAP_IN_USE\","
+        << "\"stage\":\"precondition\",\"retryable\":false,"
+        << "\"message\":\"published elevator configuration binds this immutable "
+           "map bundle; publish a new map/configuration release before editing "
+           "keepout assets\"},"
+        << "\"building_id\":" << json_string(manifest->building_id) << ","
+        << "\"floor_id\":" << json_string(manifest->floor_id) << ","
+        << "\"map_id\":" << json_string(manifest->map_id) << ","
+        << "\"release_id\":"
+        << (release_id ? json_string(*release_id) : std::string("null"))
+        << "}";
+      return {409, "application/json", response.str()};
+    }
+    refresh_mapping_2d_runtime_state();
+    if (mode_transition_owner_snapshot() != "mapping_start") {
+      refresh_navigation_resume_runtime_state(false);
+    }
+    const auto runtime = runtime_mode_snapshot();
+    if (runtime.mapping_active || mapping_start_job_running()) {
+      return busy_response(
+        "RUNTIME_BUSY", "keepout editing is blocked while mapping is active or starting");
+    }
+    if (runtime.docking_active) {
+      return busy_response("RUNTIME_BUSY", "keepout editing is blocked while docking is active");
+    }
+    if (navigation_goal_job_running()) {
+      return busy_response(
+        "NAVIGATION_BUSY", "keepout editing is blocked while a navigation goal is running");
+    }
+    {
+      std::lock_guard<std::mutex> status_lock(navigate_to_pose_status_mutex_);
+      if (have_navigate_to_pose_status_ && navigate_to_pose_action_goal_active_) {
+        return busy_response(
+          "NAVIGATION_BUSY",
+          "keepout editing is blocked while Nav2 reports an active action goal");
+      }
+    }
+
+    bool runtime_selected = false;
+    const auto runtime_context = read_runtime_map_context();
+    if (runtime.navigation_active) {
+      if (!runtime_context || !runtime_context->confirmed || runtime_context->state != "ready") {
+        return busy_response(
+          "ACTIVE_MAP_UNCONFIRMED",
+          "navigation is active but its exact runtime map context is not confirmed");
+      }
+      runtime_selected =
+        runtime_context->building_id == manifest->building_id &&
+        runtime_context->floor_id == manifest->floor_id &&
+        runtime_context->map_id == manifest->map_id;
+    }
+    if (runtime_selected && !manifest->active) {
+      return busy_response(
+        "ACTIVE_MAP_CHANGED",
+        "the runtime map is no longer the active manifest for its floor");
+    }
+    if (runtime_selected && !reload_filter) {
+      return busy_response(
+        "RUNTIME_APPLY_REQUIRED",
+        "the selected map is loaded by navigation; reload_filter must remain enabled");
+    }
+    if (runtime_selected) {
+      std::string stop_detail;
+      if (!wait_for_terminal_actual_stop("keepout update requires stable wheel odometry", stop_detail, false)) {
+        return busy_response(
+          "ROBOT_NOT_STATIONARY",
+          "keepout editing is blocked until the robot is stably stopped: " + stop_detail);
+      }
+      std::lock_guard<std::mutex> status_lock(navigate_to_pose_status_mutex_);
+      if (have_navigate_to_pose_status_ && navigate_to_pose_action_goal_active_) {
+        return busy_response(
+          "NAVIGATION_BUSY",
+          "Nav2 accepted a goal while keepout preconditions were being checked");
+      }
+    }
+
+    MapAssetCommitTransaction asset_transaction{fs::path(maps_root_)};
+    if (map_activation_journal_blocks_mutation()) {
+      return {
+        503,
+        "application/json",
+        error_json(
+          "a map activation transaction is pending; keepout repair is blocked")};
+    }
+    const auto persisted_integrity_marker =
+      persisted_map_asset_integrity_marker();
+    if (keepout_integrity_degraded_.load() &&
+      !persisted_integrity_marker)
+    {
+      return {
+        503,
+        "application/json",
+        error_json(
+          "map asset integrity is latched without repairable persistent "
+          "evidence; keepout self-repair is refused")};
+    }
+    const auto commit_manifest =
+      map_catalog_->find_map_by_id(manifest->map_id);
+    if (!commit_manifest ||
+      commit_manifest->building_id != manifest->building_id ||
+      commit_manifest->floor_id != manifest->floor_id ||
+      commit_manifest->map_id != manifest->map_id)
+    {
+      return busy_response(
+        "MAP_ASSET_CHANGED",
+        "map identity changed before the keepout commit transaction");
+    }
+    manifest = *commit_manifest;
+    resolved_building_id = manifest->building_id;
+    resolved_floor_id = manifest->floor_id;
+    if (runtime_selected && !manifest->active) {
+      return busy_response(
+        "ACTIVE_MAP_CHANGED",
+        "the map became inactive before the keepout commit transaction");
+    }
+
+    std::string expected_non_keepout_digest;
+    try {
+      if (persisted_integrity_marker) {
+        const auto & persisted = *persisted_integrity_marker;
+        if (!persisted.repairable_for(manifest->map_id)) {
+          return {
+            503,
+            "application/json",
+            error_json(
+              "a different or unprovable map asset integrity latch is active; "
+              "this keepout update cannot clear it")};
+        }
+        const auto inspected =
+          inspect_map_asset_identity_for_keepout_repair(
+          *manifest, fs::path(maps_root_), asset_transaction);
+        if (inspected.non_keepout_asset_digest !=
+          persisted.non_keepout_asset_digest)
+        {
+          return {
+            503,
+            "application/json",
+            error_json(
+              "non-keepout map assets changed while the keepout transaction "
+              "was degraded; automatic repair is refused")};
+        }
+        expected_non_keepout_digest =
+          persisted.non_keepout_asset_digest;
+      } else {
+        const auto verified = verify_map_asset_identity_snapshot(
+          *manifest, fs::path(maps_root_), asset_transaction);
+        expected_non_keepout_digest =
+          verified.non_keepout_asset_digest;
+      }
+    } catch (const std::exception & error) {
+      return {
+        503,
+        "application/json",
+        error_json(
+          std::string("map identity preflight failed before keepout update: ") +
+          error.what())};
+    }
+
+    ReplaceKeepoutCommand command;
+    command.request_json = stripped_body;
+    command.expected_revision = json_string_value(body, "expected_revision");
+    if (command.expected_revision && command.expected_revision->empty()) {
+      return {
+        400,
+        "application/json",
+        error_json("expected_revision must be a non-empty revision when provided")};
+    }
+    command.map = *manifest;
+    command.runtime_selected = runtime_selected;
+    command.runtime_apply_requested = runtime_selected && reload_filter;
+    command.projections.push_back(
+      KeepoutAssetPaths{
+        keepout_semantic_json_path(*manifest),
+        manifest->keepout_mask_yaml,
+        manifest->keepout_mask_pgm});
+    if (manifest->active) {
+      const auto current_filters =
+        map_catalog_->floor_current_root_path(resolved_building_id, resolved_floor_id) / "filters";
+      command.projections.push_back(
+        KeepoutAssetPaths{
+          current_filters / "keepout_semantic_layer.json",
+          current_filters / "keepout_mask.yaml",
+          current_filters / "keepout_mask.pgm"});
+      const auto floor_filters =
+        map_catalog_->floor_root_path(resolved_building_id, resolved_floor_id) / "filters";
+      command.projections.push_back(
+        KeepoutAssetPaths{
+          floor_filters / "keepout_semantic_layer.json",
+          floor_filters / "keepout_mask.yaml",
+          floor_filters / "keepout_mask.pgm"});
+    }
+    if (runtime_selected) {
+      std::string staging_error;
+      const auto runtime_projection = resolve_keepout_runtime_projection(staging_error);
+      if (!runtime_projection) {
+        return {
+          503,
+          "application/json",
+          error_json("failed to resolve active keepout staging artifact: " + staging_error)};
+      }
+      const bool already_projected = std::any_of(
+        command.projections.begin(),
+        command.projections.end(),
+        [&](const KeepoutAssetPaths & projection) {
+          return projection.mask_yaml == runtime_projection->mask_yaml;
+        });
+      if (!already_projected) {
+        command.projections.push_back(*runtime_projection);
+      }
+    }
+
+    KeepoutLayerModule keepout_module;
+    RosKeepoutRuntimeAdapter runtime_adapter(*this, *manifest);
+    if (const auto blocked = floor_runtime_interlock_response("keepout_update_commit")) {
+      return *blocked;
+    }
+    try {
+      // Persist the fail-closed latch before the first payload write. A crash
+      // anywhere after this point remains blocked across process restart until
+      // the exact bundle identity and active projection are re-proved.
+      persist_map_asset_integrity_degraded(
+        manifest->map_id,
+        "keepout update transaction in progress",
+        expected_non_keepout_digest);
+      const auto result = keepout_module.replace(
+        command,
+        command.runtime_apply_requested ? &runtime_adapter : nullptr);
+      const auto changed_snapshot =
+        inspect_map_asset_identity_for_keepout_repair(
+        *manifest, fs::path(maps_root_), asset_transaction);
+      if (changed_snapshot.non_keepout_asset_digest !=
+        expected_non_keepout_digest)
+      {
+        throw std::runtime_error(
+                "non-keepout map assets changed during keepout commit");
+      }
+      stamp_map_asset_identity(
+        *manifest,
+        fs::path(maps_root_),
+        asset_transaction);
+      const auto committed_snapshot = verify_map_asset_identity_snapshot(
+        *manifest, fs::path(maps_root_), asset_transaction);
+      if (committed_snapshot.non_keepout_asset_digest !=
+        expected_non_keepout_digest)
+      {
+        throw std::runtime_error(
+                "non-keepout map asset proof changed after keepout commit");
+      }
+      if (manifest->active) {
+        const auto current_manifest =
+          map_catalog_->floor_current_root_path(
+          manifest->building_id, manifest->floor_id) / "manifest.json";
+        durable_write_text_file_atomic(
+          current_manifest, map_manifest_json(*manifest));
+      }
+      clear_map_asset_integrity_degraded();
+      std::ostringstream response;
+      response << std::fixed << std::setprecision(9)
+               << "{\"ok\":true,"
+               << "\"persisted\":" << (result.persisted ? "true" : "false") << ","
+               << "\"changed\":" << (result.changed ? "true" : "false") << ","
+               << "\"mask_updated\":" << (result.changed ? "true" : "false") << ","
+               << "\"effective\":" << (result.runtime_effective ? "true" : "false") << ","
+               << "\"runtime_effective\":"
+               << (result.runtime_effective ? "true" : "false") << ","
+               << "\"integrity_degraded\":"
+               << (keepout_integrity_degraded_.load() ? "true" : "false") << ","
+               << "\"runtime_selected\":" << (result.runtime_selected ? "true" : "false") << ","
+               << "\"effective_on_next_activation\":"
+               << (result.effective_on_next_activation ? "true" : "false") << ","
+               << "\"outcome\":" << json_string(result.outcome) << ","
+               << "\"revision\":" << json_string(result.revision) << ","
+               << "\"previous_revision\":" << json_string(result.previous_revision) << ","
                << "\"building_id\":" << json_string(resolved_building_id) << ","
                << "\"floor_id\":" << json_string(resolved_floor_id) << ","
                << "\"map_id\":" << json_string(manifest->map_id) << ","
+               << "\"asset_epoch\":" << manifest->asset_epoch << ","
+               << "\"asset_digest\":" << json_string(manifest->asset_digest) << ","
+               << "\"non_keepout_asset_digest\":"
+               << json_string(expected_non_keepout_digest) << ","
                << "\"display_name\":" << json_string(manifest->display_name) << ","
                << "\"map_name\":" << json_string(manifest->display_name) << ","
                << "\"active\":" << (manifest->active ? "true" : "false") << ","
-               << "\"semantic_json_path\":" << json_string(path.string()) << ","
-               << "\"keepout_mask_yaml\":" << json_string(manifest->keepout_mask_yaml.string()) << ","
-               << "\"keepout_mask_pgm\":" << json_string(manifest->keepout_mask_pgm.string()) << "}";
+               << "\"semantic_json_path\":"
+               << json_string(keepout_semantic_json_path(*manifest).string()) << ","
+               << "\"keepout_mask_yaml\":" << json_string(manifest->keepout_mask_yaml.string())
+               << ",\"keepout_mask_pgm\":" << json_string(manifest->keepout_mask_pgm.string())
+               << ",\"mask\":{"
+               << "\"width\":" << result.mask.width << ","
+               << "\"height\":" << result.mask.height << ","
+               << "\"resolution\":" << result.mask.resolution << ","
+               << "\"origin\":[" << result.mask.origin_x << "," << result.mask.origin_y << ","
+               << result.mask.origin_yaw << "],"
+               << "\"active_cells\":" << result.mask.active_cells << ","
+               << "\"occupancy_digest\":" << json_string(result.mask.occupancy_digest)
+               << "},\"runtime\":{"
+               << "\"mask_server_active\":"
+               << (result.runtime_proof.mask_server_active ? "true" : "false") << ","
+               << "\"filter_plugin_enabled\":"
+               << (result.runtime_proof.filter_plugin_enabled ? "true" : "false") << ","
+               << "\"load_map_succeeded\":"
+               << (result.runtime_proof.load_map_succeeded ? "true" : "false") << ","
+               << "\"mask_topic_matches\":"
+               << (result.runtime_proof.mask_topic_matches ? "true" : "false") << ","
+               << "\"global_costmap_cleared\":"
+               << (result.runtime_proof.global_costmap_cleared ? "true" : "false") << ","
+               << "\"global_costmap_updated\":"
+               << (result.runtime_proof.global_costmap_updated ? "true" : "false") << ","
+               << "\"global_costmap_content_matches\":"
+               << (result.runtime_proof.global_costmap_content_matches ? "true" : "false") << ","
+               << "\"costmap_samples_checked\":"
+               << result.runtime_proof.costmap_samples_checked << ","
+               << "\"costmap_samples_blocked\":"
+               << result.runtime_proof.costmap_samples_blocked << ","
+               << "\"costmap_samples_cleared\":"
+               << result.runtime_proof.costmap_samples_cleared << ","
+               << "\"detail\":" << json_string(result.runtime_proof.detail) << "}}";
       return {200, "application/json", response.str()};
-    } catch (const std::exception & exc) {
-      return {500, "application/json", error_json(exc.what())};
+    } catch (const KeepoutLayerError & error) {
+      bool integrity_unknown =
+        error.code() == "ARTIFACT_ROLLBACK_FAILED" ||
+        error.code() == "RUNTIME_ROLLBACK_FAILED";
+      if (!integrity_unknown) {
+        try {
+          // The keepout module reports that rollback completed. Re-bind the
+          // exact rolled-back bytes before removing the persistent latch.
+          const auto rolled_back_snapshot =
+            inspect_map_asset_identity_for_keepout_repair(
+            *manifest, fs::path(maps_root_), asset_transaction);
+          if (rolled_back_snapshot.non_keepout_asset_digest !=
+            expected_non_keepout_digest)
+          {
+            throw std::runtime_error(
+                    "non-keepout map assets changed during keepout rollback");
+          }
+          stamp_map_asset_identity(
+            *manifest,
+            fs::path(maps_root_),
+            asset_transaction);
+          const auto committed_snapshot =
+            verify_map_asset_identity_snapshot(
+            *manifest, fs::path(maps_root_), asset_transaction);
+          if (committed_snapshot.non_keepout_asset_digest !=
+            expected_non_keepout_digest)
+          {
+            throw std::runtime_error(
+                    "non-keepout map asset proof changed after rollback");
+          }
+          if (manifest->active) {
+            const auto current_manifest =
+              map_catalog_->floor_current_root_path(
+              manifest->building_id, manifest->floor_id) / "manifest.json";
+            durable_write_text_file_atomic(
+              current_manifest, map_manifest_json(*manifest));
+          }
+          clear_map_asset_integrity_degraded();
+        } catch (const std::exception &) {
+          integrity_unknown = true;
+        }
+      }
+      std::ostringstream response;
+      response << "{\"ok\":false,\"persisted\":"
+               << (integrity_unknown ? "null" : "false")
+               << ",\"effective\":" << (integrity_unknown ? "null" : "false")
+               << ",\"integrity_degraded\":"
+               << (keepout_integrity_degraded_.load() ? "true" : "false") << ","
+               << "\"error\":{\"code\":" << json_string(error.code())
+               << ",\"stage\":\"keepout_replace\",\"retryable\":"
+               << (error.http_status() >= 500 ? "true" : "false")
+               << ",\"message\":" << json_string(error.what()) << "}}";
+      return {error.http_status(), "application/json", response.str()};
+    } catch (const std::exception & error) {
+      return {500, "application/json", error_json(error.what())};
     }
   }
 
@@ -9031,6 +12168,13 @@ private:
             if (!pose) {
               pose_status = "pose_not_found";
               pose_detail = "pose_id not found in poses.yaml: " + pose_id;
+            } else if (is_elevator_internal_pose_type(pose->type) ||
+              is_reserved_elevator_pose_id(pose->id))
+            {
+              pose_status = "elevator_internal_pose_requires_mission";
+              pose_detail =
+                "elevator internal poses can only be used by an elevator mission";
+              target_source = "elevator_configuration";
             } else {
               target = *pose;
               pose_ok = true;
@@ -9118,12 +12262,17 @@ private:
     const std::string & error,
     const bool pre_navigation_undock,
     const std::string & pre_navigation_undock_detail,
-    const std::string & pre_navigation_dock_check_json) const
+    const std::string & pre_navigation_dock_check_json,
+    const std::string & code = "") const
   {
     std::ostringstream response;
     response << "{\"ok\":false,"
              << "\"accepted\":false,"
-             << "\"error\":" << json_string(error) << ","
+             << "\"error\":" << json_string(error) << ",";
+    if (!code.empty()) {
+      response << "\"code\":" << json_string(code) << ",";
+    }
+    response
              << "\"pre_navigation_undock\":" << (pre_navigation_undock ? "true" : "false") << ","
              << "\"pre_navigation_undock_detail\":"
              << json_string(pre_navigation_undock_detail) << ","
@@ -9133,6 +12282,10 @@ private:
 
   HttpResponse handle_navigation_goal(const std::string & body)
   {
+    std::lock_guard<std::mutex> keepout_guard(keepout_update_mutex_);
+    if (const auto blocked = floor_runtime_interlock_response("navigation_goal")) {
+      return *blocked;
+    }
     const auto pose_id = json_string_value(body, "pose_id").value_or(json_string_value(body, "id").value_or(""));
     const auto building_id = json_string_value(body, "building_id");
     const auto floor_id = json_string_value(body, "floor_id");
@@ -9192,6 +12345,21 @@ private:
           pre_navigation_dock_check_payload());
       };
 
+    if (map_asset_integrity_degraded()) {
+      return navigation_goal_error(
+        503,
+        "keepout integrity is degraded; repair and re-prove the active keepout layer before navigation");
+    }
+
+    const auto goal_runtime = runtime_mode_snapshot();
+    if (goal_runtime.mapping_active || mapping_start_job_running() ||
+      mode_transition_owner_snapshot() == "mapping_start")
+    {
+      return navigation_goal_error(
+        409,
+        "navigation goals are unavailable while 2D mapping is active or starting");
+    }
+
     if (by_pose_id) {
       if (!building_id || !safe_map_name(*building_id)) {
         return navigation_goal_error(400, "valid building_id is required for pose_id navigation");
@@ -9210,6 +12378,17 @@ private:
       }
       if (!pose) {
         return navigation_goal_error(404, "pose_id not found in poses.yaml: " + pose_id);
+      }
+      if (is_elevator_internal_pose_type(pose->type) ||
+        is_reserved_elevator_pose_id(pose->id))
+      {
+        return navigation_goal_error_response(
+          409,
+          "elevator internal poses can only be used by an elevator mission",
+          false,
+          "",
+          pre_navigation_dock_check_payload(),
+          "ELEVATOR_INTERNAL_POSE_REQUIRES_MISSION");
       }
       target = *pose;
       target_source = "poses_yaml";
@@ -10234,6 +13413,159 @@ private:
     lateral_m = -s * dx + c * dy;
   }
 
+  bool terminal_recovery_costmap_path_clear(
+    const double forward_probe_m,
+    const double lateral_probe_m,
+    std::string & detail)
+  {
+    detail.clear();
+    if (!navigation_terminal_recovery_costmap_guard_enabled_) {
+      return true;
+    }
+
+    nav_msgs::msg::OccupancyGrid::SharedPtr grid;
+    std::chrono::steady_clock::time_point grid_received_at;
+    {
+      std::lock_guard<std::mutex> lock(local_costmap_mutex_);
+      grid = latest_local_costmap_;
+      grid_received_at = latest_local_costmap_received_at_;
+    }
+    const auto now_steady = std::chrono::steady_clock::now();
+    if (!grid || grid_received_at == std::chrono::steady_clock::time_point{}) {
+      detail = "terminal recovery blocked: local costmap unavailable";
+      return false;
+    }
+    const double grid_age_sec =
+      std::chrono::duration<double>(now_steady - grid_received_at).count();
+    if (grid_age_sec > navigation_terminal_recovery_costmap_max_age_sec_) {
+      std::ostringstream out;
+      out << std::fixed << std::setprecision(3)
+          << "terminal recovery blocked: local costmap stale"
+          << " age=" << grid_age_sec
+          << " max_age=" << navigation_terminal_recovery_costmap_max_age_sec_;
+      detail = out.str();
+      return false;
+    }
+
+    const std::string grid_frame = normalized_frame_id(grid->header.frame_id);
+    bool have_robot_pose = false;
+    double robot_x = 0.0;
+    double robot_y = 0.0;
+    double robot_yaw = 0.0;
+    std::chrono::steady_clock::time_point pose_received_at;
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      if (grid_frame == tf_odom_frame_ && have_odom_to_base_) {
+        have_robot_pose = true;
+        robot_x = latest_odom_to_base_x_;
+        robot_y = latest_odom_to_base_y_;
+        robot_yaw = latest_odom_to_base_yaw_;
+        pose_received_at = latest_odom_to_base_received_at_;
+      } else if (grid_frame == tf_map_frame_ && have_pose_ && latest_pose_frame_ == tf_map_frame_) {
+        have_robot_pose = true;
+        robot_x = latest_pose_x_;
+        robot_y = latest_pose_y_;
+        robot_yaw = latest_pose_yaw_;
+        pose_received_at = latest_pose_received_at_;
+      } else if (grid_frame == tf_base_frame_ || grid_frame == "base_footprint") {
+        have_robot_pose = true;
+        pose_received_at = now_steady;
+      }
+    }
+    if (!have_robot_pose || pose_received_at == std::chrono::steady_clock::time_point{}) {
+      detail = "terminal recovery blocked: no robot pose in local costmap frame " + grid_frame;
+      return false;
+    }
+    const double pose_age_sec =
+      std::chrono::duration<double>(now_steady - pose_received_at).count();
+    if (pose_age_sec > navigation_terminal_recovery_costmap_max_age_sec_) {
+      std::ostringstream out;
+      out << std::fixed << std::setprecision(3)
+          << "terminal recovery blocked: costmap-frame robot pose stale"
+          << " frame=" << grid_frame
+          << " age=" << pose_age_sec
+          << " max_age=" << navigation_terminal_recovery_costmap_max_age_sec_;
+      detail = out.str();
+      return false;
+    }
+
+    const auto & info = grid->info;
+    const std::size_t expected_cells =
+      static_cast<std::size_t>(info.width) * static_cast<std::size_t>(info.height);
+    if (info.resolution <= 0.0 || info.width == 0U || info.height == 0U ||
+      grid->data.size() < expected_cells)
+    {
+      detail = "terminal recovery blocked: malformed local costmap";
+      return false;
+    }
+
+    const double c = std::cos(robot_yaw);
+    const double s = std::sin(robot_yaw);
+    const double end_x = robot_x + c * forward_probe_m - s * lateral_probe_m;
+    const double end_y = robot_y + s * forward_probe_m + c * lateral_probe_m;
+    const double origin_yaw = quaternion_yaw(
+      info.origin.orientation.x,
+      info.origin.orientation.y,
+      info.origin.orientation.z,
+      info.origin.orientation.w);
+    const double origin_c = std::cos(origin_yaw);
+    const double origin_s = std::sin(origin_yaw);
+    const double probe_distance_m = std::hypot(forward_probe_m, lateral_probe_m);
+    const double sample_spacing_m = std::max(0.01, static_cast<double>(info.resolution) * 0.5);
+    const int sample_count = std::max(
+      1,
+      static_cast<int>(std::ceil(probe_distance_m / sample_spacing_m)));
+    int max_cost = 0;
+
+    for (int sample = 0; sample <= sample_count; ++sample) {
+      const double ratio = static_cast<double>(sample) / static_cast<double>(sample_count);
+      const double world_x = robot_x + ratio * (end_x - robot_x);
+      const double world_y = robot_y + ratio * (end_y - robot_y);
+      const double dx = world_x - info.origin.position.x;
+      const double dy = world_y - info.origin.position.y;
+      const double local_x = origin_c * dx + origin_s * dy;
+      const double local_y = -origin_s * dx + origin_c * dy;
+      const int cell_x = static_cast<int>(std::floor(local_x / info.resolution));
+      const int cell_y = static_cast<int>(std::floor(local_y / info.resolution));
+      if (cell_x < 0 || cell_y < 0 ||
+        cell_x >= static_cast<int>(info.width) || cell_y >= static_cast<int>(info.height))
+      {
+        detail = "terminal recovery blocked: probe leaves local costmap bounds";
+        return false;
+      }
+      const std::size_t index =
+        static_cast<std::size_t>(cell_y) * static_cast<std::size_t>(info.width) +
+        static_cast<std::size_t>(cell_x);
+      const int cost = static_cast<int>(grid->data[index]);
+      if (cost < 0 || cost >= navigation_terminal_recovery_costmap_occupied_threshold_) {
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(3)
+            << "terminal recovery blocked by local costmap"
+            << " frame=" << grid_frame
+            << " sample=" << sample << "/" << sample_count
+            << " cost=" << cost
+            << " occupied_threshold="
+            << navigation_terminal_recovery_costmap_occupied_threshold_
+            << " forward_probe=" << forward_probe_m
+            << " lateral_probe=" << lateral_probe_m;
+        detail = out.str();
+        return false;
+      }
+      max_cost = std::max(max_cost, cost);
+    }
+
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(3)
+        << "terminal recovery local costmap path clear"
+        << " frame=" << grid_frame
+        << " age=" << grid_age_sec
+        << " pose_age=" << pose_age_sec
+        << " samples=" << (sample_count + 1)
+        << " max_cost=" << max_cost;
+    detail = out.str();
+    return true;
+  }
+
   bool post_nav2_terminal_lateral_correction_allowed(
     const StoredPose & target,
     const FinalPoseCheck & check,
@@ -10257,7 +13589,7 @@ private:
       reason = "terminal lateral correction requires fresh final pose";
       return false;
     }
-    if (check.distance_m > post_nav2_final_verify_terminal_lateral_max_xy_m_)
+    if (check.distance_m > navigation_terminal_recovery_max_distance_m_)
     {
       reason = "terminal lateral correction gate not met: " + check.reason;
       return false;
@@ -10460,7 +13792,7 @@ private:
           }
 
           const bool settled_pose_inside_correction_gate =
-            settled_check.distance_m <= post_nav2_final_verify_terminal_lateral_max_xy_m_ &&
+            settled_check.distance_m <= navigation_terminal_recovery_max_distance_m_ &&
             std::fabs(forward_m) <= post_nav2_final_verify_terminal_lateral_max_forward_m_;
           if (settled_pose_inside_correction_gate &&
             result.settle_recheck_count <
@@ -10496,7 +13828,7 @@ private:
       success_hold = 0;
 
       const double forward_gate_m = post_nav2_final_verify_terminal_lateral_max_forward_m_;
-      if (check.distance_m > post_nav2_final_verify_terminal_lateral_max_xy_m_ ||
+      if (check.distance_m > navigation_terminal_recovery_max_distance_m_ ||
         std::fabs(forward_m) > forward_gate_m)
       {
         std::ostringstream out;
@@ -10645,6 +13977,33 @@ private:
                    << " cmd_x=" << twist.linear.x;
             navigation_goal_job_.detail = detail.str();
           }
+        }
+      }
+      if (std::fabs(twist.linear.x) > 1e-6 || std::fabs(twist.linear.y) > 1e-6) {
+        double forward_probe_m = 0.0;
+        double lateral_probe_m = 0.0;
+        if (std::fabs(twist.linear.y) > 1e-6) {
+          const double remaining_m = std::max(
+            0.0,
+            lateral_abs - post_nav2_final_verify_terminal_lateral_target_m_);
+          lateral_probe_m = std::copysign(
+            std::min(navigation_terminal_recovery_costmap_lookahead_m_, remaining_m),
+            twist.linear.y);
+        } else {
+          const double remaining_m = std::max(
+            0.0,
+            std::fabs(forward_m) - forward_target_m);
+          forward_probe_m = std::copysign(
+            std::min(navigation_terminal_recovery_costmap_lookahead_m_, remaining_m),
+            twist.linear.x);
+        }
+        std::string costmap_detail;
+        if (!terminal_recovery_costmap_path_clear(
+            forward_probe_m, lateral_probe_m, costmap_detail))
+        {
+          result.blocked = true;
+          result.detail = costmap_detail;
+          break;
         }
       }
       publish_final_yaw_align_command(twist);
@@ -10802,7 +14161,26 @@ private:
       return false;
     }
 
-    if (check.distance_m > navigation_near_goal_stalled_handoff_distance_m_) {
+    std::string goal_completion_policy;
+    {
+      std::lock_guard<std::mutex> lock(navigation_goal_job_mutex_);
+      if (navigation_goal_job_.id != job_id) {
+        return false;
+      }
+      goal_completion_policy = navigation_goal_job_.goal_completion_policy;
+    }
+
+    double forward_m = 0.0;
+    double lateral_m = 0.0;
+    std::string recovery_gate_reason;
+    if (!post_nav2_terminal_lateral_correction_allowed(
+        target,
+        check,
+        goal_completion_policy,
+        forward_m,
+        lateral_m,
+        recovery_gate_reason))
+    {
       best_distance_m.reset();
       last_progress_at = now_steady;
       return false;
@@ -10826,13 +14204,18 @@ private:
                    << " distance=" << check.distance_m
                    << " best_distance=" << (best_distance_m ? *best_distance_m : -1.0)
                    << " yaw_error=" << check.yaw_error_rad
-                   << " handoff_distance=" << navigation_near_goal_stalled_handoff_distance_m_
+                   << " forward_error=" << forward_m
+                   << " lateral_error=" << lateral_m
+                   << " recovery_distance=" << navigation_terminal_recovery_max_distance_m_
+                   << " recovery_max_forward="
+                   << post_nav2_final_verify_terminal_lateral_max_forward_m_
                    << " wait_sec=" << wait_sec
                    << " min_wait_sec=" << navigation_near_goal_stalled_handoff_min_wait_sec_
                    << " stalled_sec=" << stalled_sec
                    << " stall_sec=" << navigation_near_goal_stalled_handoff_stall_sec_
                    << " improvement_epsilon="
-                   << navigation_near_goal_stalled_handoff_improvement_epsilon_m_;
+                   << navigation_near_goal_stalled_handoff_improvement_epsilon_m_
+                   << "; handoff requires executable terminal recovery";
 
     if (wait_sec < navigation_near_goal_stalled_handoff_min_wait_sec_ ||
       stalled_sec < navigation_near_goal_stalled_handoff_stall_sec_)
@@ -11082,7 +14465,7 @@ private:
     if (!check.position_reached &&
       check.distance_m > navigation_goal_position_success_tolerance_m_ &&
       check.distance_m >= post_nav2_final_verify_xy_retry_min_error_m_ &&
-      check.distance_m <= post_nav2_final_verify_xy_retry_max_error_m_)
+      check.distance_m <= navigation_terminal_recovery_max_distance_m_)
     {
       if (check.distance_m <= kLightOverrunMaxM) {
         retry_reason = "xy_light_overrun";
@@ -11189,7 +14572,7 @@ private:
       return false;
     }
     if (check.distance_m <= yaw_align_xy_gate ||
-      check.distance_m > navigation_nav2_failed_near_goal_retry_max_distance_m_)
+      check.distance_m > navigation_terminal_recovery_max_distance_m_)
     {
       return false;
     }
@@ -11205,7 +14588,7 @@ private:
            << " distance=" << check.distance_m
            << " yaw_error=" << check.yaw_error_rad
            << " yaw_align_xy_gate=" << yaw_align_xy_gate
-           << " max_distance=" << navigation_nav2_failed_near_goal_retry_max_distance_m_
+           << " max_distance=" << navigation_terminal_recovery_max_distance_m_
            << " retry_count=" << retry_count
            << "/" << navigation_nav2_failed_near_goal_retry_max_count_;
     retry_reason = reason.str();
@@ -11269,19 +14652,13 @@ private:
       return result;
     }
 
-    const bool reverse_permit_requested =
-      post_nav2_final_verify_reverse_permit_enabled_ &&
-      static_cast<bool>(post_nav2_final_verify_reverse_enable_pub_);
-    auto refresh_reverse_permit = [&]() {
-      if (reverse_permit_requested) {
-        publish_post_nav2_final_verify_reverse_permit(true);
-      }
-    };
-    auto clear_reverse_permit = [&]() {
-      if (reverse_permit_requested) {
-        publish_post_nav2_final_verify_reverse_permit(false);
-      }
-    };
+    bool terminal_reverse_permit_active = false;
+    auto next_terminal_reverse_permit_refresh = std::chrono::steady_clock::now();
+    ScopeExit terminal_reverse_permit_cleanup([this, &terminal_reverse_permit_active]() {
+      clear_navigation_terminal_reverse_permit(
+        terminal_reverse_permit_active,
+        "post_nav2_final_verify_retry_scope_exit");
+    });
 
     {
       std::lock_guard<std::mutex> lock(navigation_goal_job_mutex_);
@@ -11299,7 +14676,11 @@ private:
       active_nav_goal_floor_id_.clear();
     }
 
-    refresh_reverse_permit();
+    update_navigation_terminal_reverse_permit_for_goal(
+      target,
+      terminal_reverse_permit_active,
+      next_terminal_reverse_permit_refresh,
+      "post_nav2_final_verify_retry");
     auto result_future = navigate_to_pose_client_->async_get_result(goal_handle);
     const auto result_wait_started = std::chrono::steady_clock::now();
     auto next_handoff_check = result_wait_started;
@@ -11312,12 +14693,18 @@ private:
     publish_navigation_terminal_speed_limit_for_goal(target);
     while (result_future.wait_for(100ms) != std::future_status::ready) {
       publish_navigation_terminal_speed_limit_for_goal(target);
-      refresh_reverse_permit();
+      update_navigation_terminal_reverse_permit_for_goal(
+        target,
+        terminal_reverse_permit_active,
+        next_terminal_reverse_permit_refresh,
+        "post_nav2_final_verify_retry");
       std::string cancel_detail;
       if (navigation_goal_cancel_requested(job_id, cancel_detail)) {
         std::string action_cancel_detail;
         cancel_active_navigation_goal(action_cancel_detail);
-        clear_reverse_permit();
+        clear_navigation_terminal_reverse_permit(
+          terminal_reverse_permit_active,
+          "post_nav2_final_verify_retry_canceled");
         clear_navigation_terminal_speed_limit();
         result.canceled = true;
         result.detail = "post-Nav2 final verify retry canceled: " +
@@ -11336,7 +14723,9 @@ private:
           retry_phase + "_near_goal_watch",
           handoff_detail))
       {
-        clear_reverse_permit();
+        clear_navigation_terminal_reverse_permit(
+          terminal_reverse_permit_active,
+          "post_nav2_final_verify_retry_handoff");
         clear_navigation_terminal_speed_limit();
         result.near_goal_stalled_handoff = true;
         result.nav2_result_code = static_cast<int>(rclcpp_action::ResultCode::ABORTED);
@@ -11348,13 +14737,17 @@ private:
       if (std::chrono::steady_clock::now() >= deadline) {
         std::string cancel_detail;
         cancel_active_navigation_goal(cancel_detail);
-        clear_reverse_permit();
+        clear_navigation_terminal_reverse_permit(
+          terminal_reverse_permit_active,
+          "post_nav2_final_verify_retry_timeout");
         clear_navigation_terminal_speed_limit();
         result.detail = "timed out waiting for post-Nav2 final verify retry result; " + cancel_detail;
         return result;
       }
     }
-    clear_reverse_permit();
+    clear_navigation_terminal_reverse_permit(
+      terminal_reverse_permit_active,
+      "post_nav2_final_verify_retry_result");
     clear_navigation_terminal_speed_limit();
 
     const auto action_result = result_future.get();
@@ -11748,14 +15141,31 @@ private:
       active_nav_goal_floor_id_.clear();
     }
 
+    bool terminal_reverse_permit_active = false;
+    auto next_terminal_reverse_permit_refresh = std::chrono::steady_clock::now();
+    ScopeExit terminal_reverse_permit_cleanup([this, &terminal_reverse_permit_active]() {
+      clear_navigation_terminal_reverse_permit(
+        terminal_reverse_permit_active,
+        "reposition_after_yaw_drift_scope_exit");
+    });
     auto result_future = navigate_to_pose_client_->async_get_result(goal_handle);
     publish_navigation_terminal_speed_limit_for_goal(target);
+    update_navigation_terminal_reverse_permit_for_goal(
+      target,
+      terminal_reverse_permit_active,
+      next_terminal_reverse_permit_refresh,
+      "reposition_after_yaw_drift");
     const auto deadline =
       std::chrono::steady_clock::now() +
       std::chrono::duration_cast<std::chrono::steady_clock::duration>(
         std::chrono::duration<double>(navigation_reposition_after_yaw_drift_timeout_sec_));
     while (result_future.wait_for(100ms) != std::future_status::ready) {
       publish_navigation_terminal_speed_limit_for_goal(target);
+      update_navigation_terminal_reverse_permit_for_goal(
+        target,
+        terminal_reverse_permit_active,
+        next_terminal_reverse_permit_refresh,
+        "reposition_after_yaw_drift");
       std::string cancel_detail;
       if (navigation_goal_cancel_requested(job_id, cancel_detail)) {
         std::string action_cancel_detail;
@@ -11773,6 +15183,9 @@ private:
         return result;
       }
     }
+    clear_navigation_terminal_reverse_permit(
+      terminal_reverse_permit_active,
+      "reposition_after_yaw_drift_result");
     clear_navigation_terminal_speed_limit();
 
     const auto action_result = result_future.get();
@@ -11813,6 +15226,14 @@ private:
     const std::string & floor_id,
     NavigateGoalHandle::SharedPtr & goal_handle)
   {
+    std::string floor_interlock_detail;
+    if (floor_runtime_operation_blocked(
+        "navigation_goal_worker", floor_interlock_detail))
+    {
+      finish_navigation_goal_send_failure(
+        job_id, "blocked_floor_transition", floor_interlock_detail);
+      return false;
+    }
     {
       std::lock_guard<std::mutex> lock(navigation_goal_job_mutex_);
       if (navigation_goal_job_.id != job_id || navigation_goal_job_.state != "running") {
@@ -11846,6 +15267,13 @@ private:
           job_id,
           "canceled",
           "navigation goal canceled before Nav2 accepted it: " + cancel_detail);
+        return false;
+      }
+      if (floor_runtime_operation_blocked(
+          "navigation_goal_submit", floor_interlock_detail))
+      {
+        finish_navigation_goal_send_failure(
+          job_id, "blocked_floor_transition", floor_interlock_detail);
         return false;
       }
 
@@ -11972,6 +15400,14 @@ private:
     const std::uint64_t job_id,
     const PreNavigationDockCheck & pre_navigation_dock_check)
   {
+    std::string floor_interlock_detail;
+    if (floor_runtime_operation_blocked(
+        "navigation_pre_send", floor_interlock_detail))
+    {
+      finish_navigation_goal_send_failure(
+        job_id, "blocked_floor_transition", floor_interlock_detail);
+      return false;
+    }
     {
       std::lock_guard<std::mutex> lock(navigation_goal_job_mutex_);
       if (navigation_goal_job_.id == job_id && navigation_goal_job_.state == "running") {
@@ -12123,6 +15559,13 @@ private:
       }
     }
 
+    bool terminal_reverse_permit_active = false;
+    auto next_terminal_reverse_permit_refresh = std::chrono::steady_clock::now();
+    ScopeExit terminal_reverse_permit_cleanup([this, &terminal_reverse_permit_active]() {
+      clear_navigation_terminal_reverse_permit(
+        terminal_reverse_permit_active,
+        "ordinary_navigation_scope_exit");
+    });
     auto result_future = navigate_to_pose_client_->async_get_result(goal_handle);
     bool near_goal_stalled_handoff = false;
     std::string near_goal_stalled_handoff_detail;
@@ -12135,8 +15578,18 @@ private:
       std::chrono::duration_cast<std::chrono::steady_clock::duration>(
         std::chrono::duration<double>(navigation_goal_result_timeout_sec_));
     publish_navigation_terminal_speed_limit_for_goal(target);
+    update_navigation_terminal_reverse_permit_for_goal(
+      target,
+      terminal_reverse_permit_active,
+      next_terminal_reverse_permit_refresh,
+      "ordinary_navigation");
     while (result_future.wait_for(100ms) != std::future_status::ready) {
       publish_navigation_terminal_speed_limit_for_goal(target);
+      update_navigation_terminal_reverse_permit_for_goal(
+        target,
+        terminal_reverse_permit_active,
+        next_terminal_reverse_permit_refresh,
+        "ordinary_navigation");
       std::string cancel_detail;
       if (navigation_goal_cancel_requested(job_id, cancel_detail)) {
         std::string action_cancel_detail;
@@ -12192,6 +15645,9 @@ private:
         return;
       }
     }
+    clear_navigation_terminal_reverse_permit(
+      terminal_reverse_permit_active,
+      "ordinary_navigation_result");
     clear_navigation_terminal_speed_limit();
 
     bool nav2_succeeded = false;
@@ -12306,7 +15762,7 @@ private:
         final_yaw_align_allowed &&
         pose_check.pose_available &&
         pose_check.distance_m > final_yaw_align_xy_gate &&
-        pose_check.distance_m <= navigation_nav2_failed_near_goal_retry_max_distance_m_ &&
+        pose_check.distance_m <= navigation_terminal_recovery_max_distance_m_ &&
         pose_check.yaw_error_rad > navigation_final_yaw_align_trigger_rad_;
     };
     auto run_final_yaw_align_attempt = [&](
@@ -13046,6 +16502,19 @@ private:
     const auto reason = json_string_value(body, "reason").value_or("");
     const bool stop_stack = force_stop_stack || json_bool_value(body, "stop_stack", false);
 
+    const auto cancel_runtime = runtime_mode_snapshot();
+    if (cancel_runtime.mapping_active || mapping_start_job_running() ||
+      mode_transition_owner_snapshot() == "mapping_start")
+    {
+      clear_teleop_command();
+      publish_teleop_zero_burst();
+      publish_final_yaw_align_zero_burst();
+      return {
+        409,
+        "application/json",
+        error_json("navigation cancel/stop is unavailable while 2D mapping is active or starting")};
+    }
+
     clear_teleop_command();
     publish_teleop_zero_burst();
     request_navigation_goal_cancel(reason.empty() ? "app_navigation_cancel" : reason);
@@ -13190,11 +16659,74 @@ private:
 
   HttpResponse handle_switch_floor(const std::string & body)
   {
+    std::lock_guard<std::mutex> keepout_guard(keepout_update_mutex_);
+    if (const auto blocked = floor_runtime_interlock_response("floor_switch")) {
+      return *blocked;
+    }
+    if (map_asset_integrity_degraded()) {
+      return {
+        503,
+        "application/json",
+        error_json("keepout integrity is degraded; floor switching is blocked until repaired")};
+    }
     auto floor_id = json_string_value(body, "floor_id");
     auto building_id = json_string_value(body, "building_id").value_or("building_1");
     const auto map_id = json_string_value(body, "map_id");
     const auto map_name = json_string_value(body, "map_name");
     const bool resume_navigation = json_bool_value(body, "resume_navigation", false);
+    if (resume_navigation) {
+      return {
+        409,
+        "application/json",
+        "{\"ok\":false,\"code\":\"LIVE_FLOOR_SWITCH_DISABLED\","
+        "\"error\":\"resume_navigation=true is disabled; use the strict "
+        "/floor_manager/floor_switch transaction after hardware validation\"}"};
+    }
+    const auto floor_selection_runtime_busy_detail = [this]() -> std::optional<std::string> {
+        refresh_mapping_2d_runtime_state();
+        if (mode_transition_owner_snapshot() != "mapping_start") {
+          refresh_navigation_resume_runtime_state(false);
+        }
+        const auto runtime = runtime_mode_snapshot();
+        if (runtime.navigation_active || runtime.mapping_active || runtime.docking_active) {
+          return "navigation, mapping, or docking runtime is active";
+        }
+        if (navigation_goal_job_running()) {
+          return "a navigation goal job is still running";
+        }
+        if (mapping_start_job_running()) {
+          return "a mapping start job is still running";
+        }
+        {
+          std::lock_guard<std::mutex> lock(docking_job_mutex_);
+          if (docking_job_.state == "running") {
+            return "a docking job is still running";
+          }
+        }
+        {
+          std::lock_guard<std::mutex> lock(navigate_to_pose_status_mutex_);
+          if (have_navigate_to_pose_status_ && navigate_to_pose_action_goal_active_) {
+            return "Nav2 still reports an active action goal";
+          }
+        }
+        {
+          std::lock_guard<std::mutex> lock(navigation_process_mutex_);
+          if (navigation_resume_process_running_locked()) {
+            return "the navigation runtime process is still running";
+          }
+        }
+        return std::nullopt;
+      };
+    const auto floor_selection_busy_response = [](const std::string & detail) {
+        std::ostringstream response;
+        response << "{\"ok\":false,\"code\":\"FLOOR_SELECTION_RUNTIME_BUSY\","
+                 << "\"detail\":" << json_string(detail) << "}";
+        return HttpResponse{409, "application/json", response.str()};
+      };
+    if (const auto busy = floor_selection_runtime_busy_detail()) {
+      return floor_selection_busy_response(
+        "offline map selection is allowed only after all motion runtimes stop: " + *busy);
+    }
 
     std::optional<MapManifest> selected_map;
     if (map_id && !map_id->empty()) {
@@ -13234,20 +16766,11 @@ private:
       }
     }
 
-    if (selected_map) {
-      try {
-        activate_map_manifest(*selected_map);
-      } catch (const std::exception & exc) {
-        return {500, "application/json", error_json(exc.what())};
-      }
-    }
-
-    if (resume_navigation) {
-      return handle_resume_floor_navigation(building_id, *floor_id, selected_map);
-    }
-
     if (!floor_switch_client_->wait_for_service(service_timeout())) {
       return {503, "application/json", error_json("service unavailable: " + floor_switch_service_)};
+    }
+    if (const auto blocked = floor_runtime_interlock_response("floor_switch_submit")) {
+      return *blocked;
     }
     auto request = std::make_shared<robot_interfaces::srv::SwitchFloor::Request>();
     request->building_id = building_id;
@@ -13259,6 +16782,22 @@ private:
       return {503, "application/json", error_json("timed out waiting for floor switch")};
     }
     const auto response = future.get();
+    if (response->success && selected_map) {
+      std::lock_guard<std::mutex> elevator_guard(elevator_asset_mutation_mutex_);
+      if (const auto blocked = floor_runtime_interlock_response("floor_selection_commit")) {
+        return *blocked;
+      }
+      if (const auto busy = floor_selection_runtime_busy_detail()) {
+        return floor_selection_busy_response(
+          "runtime became active while offline map selection was pending: " + *busy);
+      }
+      try {
+        clear_runtime_map_context();
+        activate_map_manifest(*selected_map);
+      } catch (const std::exception & exc) {
+        return {500, "application/json", error_json(exc.what())};
+      }
+    }
     std::ostringstream out;
     out << "{\"ok\":" << (response->success ? "true" : "false")
         << ",\"message\":" << json_string(response->message)
@@ -13272,6 +16811,9 @@ private:
 
   HttpResponse handle_trigger_localization(const std::string & body)
   {
+    if (const auto blocked = floor_runtime_interlock_response("manual_localization")) {
+      return *blocked;
+    }
     const auto reason = json_string_value(body, "reason").value_or("robot_api_server");
     const auto wait_timeout = json_number_value(body, "wait_timeout_sec").value_or(docking_relocalize_wait_sec_);
     const bool wait_for_settle = json_bool_value(body, "wait_for_settle", false);
@@ -13706,6 +17248,57 @@ private:
       std::chrono::steady_clock::now() - latest_docking_gs2_scan_received_at_).count();
   }
 
+  void handle_docking_target_observation(
+    const robot_interfaces::msg::DockTargetObservation::SharedPtr msg)
+  {
+    if (!docking_target_observation_source_.empty() &&
+      msg->source != docking_target_observation_source_)
+    {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(docking_target_observation_mutex_);
+    latest_docking_target_observation_received_at_ = std::chrono::steady_clock::now();
+    have_docking_target_observation_ = true;
+    docking_target_observation_usable_ = msg->sensor_healthy && msg->valid;
+    docking_target_observation_reason_ = msg->reason;
+  }
+
+  double docking_target_observation_age_sec() const
+  {
+    std::lock_guard<std::mutex> lock(docking_target_observation_mutex_);
+    if (!have_docking_target_observation_) {
+      return -1.0;
+    }
+    return std::chrono::duration<double>(
+      std::chrono::steady_clock::now() -
+      latest_docking_target_observation_received_at_).count();
+  }
+
+  double docking_observation_age_sec() const
+  {
+    return docking_observation_backend_ == "target_observation" ?
+      docking_target_observation_age_sec() : docking_gs2_scan_age_sec();
+  }
+
+  bool docking_observation_usable() const
+  {
+    if (docking_observation_backend_ != "target_observation") {
+      return docking_gs2_scan_age_sec() >= 0.0;
+    }
+    std::lock_guard<std::mutex> lock(docking_target_observation_mutex_);
+    return have_docking_target_observation_ && docking_target_observation_usable_;
+  }
+
+  std::string docking_observation_detail() const
+  {
+    if (docking_observation_backend_ != "target_observation") {
+      return docking_gs2_scan_age_sec() >= 0.0 ? "gs2_scan_received" : "gs2_scan_unavailable";
+    }
+    std::lock_guard<std::mutex> lock(docking_target_observation_mutex_);
+    return have_docking_target_observation_ ?
+      docking_target_observation_reason_ : "target_observation_unavailable";
+  }
+
   void join_docking_relocalization_worker()
   {
     std::lock_guard<std::mutex> lock(docking_relocalization_worker_mutex_);
@@ -14041,7 +17634,7 @@ private:
       docking_runtime_status_ = detail;
       runtime_healthy_ = true;
       runtime_message_ = detail;
-      if (final_state == "docked") {
+      if (final_state == "docked" || final_state == "charging") {
         navigation_runtime_active_ = false;
         navigation_runtime_state_ = "stopped";
       }
@@ -14092,6 +17685,13 @@ private:
 
   void run_docking_job(const std::uint64_t job_id)
   {
+    std::string floor_interlock_detail;
+    if (floor_runtime_operation_blocked(
+        "docking_worker", floor_interlock_detail))
+    {
+      finish_docking_job(job_id, false, "failed", floor_interlock_detail);
+      return;
+    }
     DockingJob job;
     {
       std::lock_guard<std::mutex> lock(docking_job_mutex_);
@@ -14274,6 +17874,7 @@ private:
     goal.pose.pose.position.z = 0.0;
     goal.pose.pose.orientation.z = std::sin(job.approach_yaw * 0.5);
     goal.pose.pose.orientation.w = std::cos(job.approach_yaw * 0.5);
+    goal.behavior_tree = docking_predock_behavior_tree_;
 
     StoredPose predock_speed_limit_target;
     predock_speed_limit_target.id =
@@ -14297,6 +17898,12 @@ private:
       try {
         set_docking_job_phase(job_id, "NAV_TO_STAGING_NATIVE_NAV2");
         std::lock_guard<std::mutex> action_lock(navigate_action_mutex_);
+        if (floor_runtime_operation_blocked(
+            "docking_predock_goal_submit", floor_interlock_detail))
+        {
+          finish_docking_job(job_id, false, "failed", floor_interlock_detail);
+          return;
+        }
         auto future = navigate_to_pose_client_->async_send_goal(goal);
         if (future.wait_for(service_timeout()) != std::future_status::ready) {
           finish_docking_job(job_id, false, "failed", "timed out sending predock navigation goal");
@@ -14323,6 +17930,13 @@ private:
         "API will own final yaw/lateral handoff; attempt " +
           std::to_string(predock_nav_attempt) + "/" + std::to_string(predock_nav_max_attempts));
 
+      bool terminal_reverse_permit_active = false;
+      auto next_terminal_reverse_permit_refresh = std::chrono::steady_clock::now();
+      ScopeExit terminal_reverse_permit_cleanup([this, &terminal_reverse_permit_active]() {
+        clear_navigation_terminal_reverse_permit(
+          terminal_reverse_permit_active,
+          "predock_navigation_scope_exit");
+      });
       auto result_future = navigate_to_pose_client_->async_get_result(goal_handle);
       set_docking_job_phase(job_id, "NAV_TO_STAGING_NATIVE_NAV2");
       const auto predock_deadline = std::chrono::steady_clock::now() +
@@ -14330,9 +17944,92 @@ private:
           std::chrono::duration<double>(docking_predock_nav_timeout_sec_));
       auto next_handoff_check = std::chrono::steady_clock::now() + 500ms;
       publish_navigation_terminal_speed_limit_for_goal(predock_speed_limit_target);
+      update_navigation_terminal_reverse_permit_for_goal(
+        predock_speed_limit_target,
+        terminal_reverse_permit_active,
+        next_terminal_reverse_permit_refresh,
+        "predock_navigation");
       while (result_future.wait_for(200ms) != std::future_status::ready) {
         publish_navigation_terminal_speed_limit_for_goal(predock_speed_limit_target);
+        update_navigation_terminal_reverse_permit_for_goal(
+          predock_speed_limit_target,
+          terminal_reverse_permit_active,
+          next_terminal_reverse_permit_refresh,
+          "predock_navigation");
+        const auto predock_contact = bms_charging_contact_snapshot();
+        if (predock_contact.have_state && predock_contact.fresh && predock_contact.contact_stable) {
+          clear_navigation_terminal_reverse_permit(
+            terminal_reverse_permit_active,
+            "predock_navigation_bms_contact");
+          const auto contact_stop_started = std::chrono::steady_clock::now();
+          const auto contact_detected_at = utc_timestamp_iso8601();
+          set_docking_job_phase(job_id, "PREDOCK_CONTACT_STOP");
+          set_docking_runtime_state(
+            true,
+            "PREDOCK_CONTACT_STOP",
+            "stable BMS charging contact detected during predock Nav2; canceling navigation and holding zero");
+
+          reset_terminal_actual_stop_stability();
+          std::string cancel_detail;
+          const bool cancel_requested = cancel_active_navigation_goal(cancel_detail);
+          clear_navigation_terminal_speed_limit();
+          clear_teleop_command();
+          publish_teleop_zero_burst();
+
+          std::string stop_detail;
+          const bool actual_stop_confirmed = wait_for_terminal_actual_stop(
+            "predock BMS contact stop",
+            stop_detail,
+            false);
+          publish_teleop_zero_burst();
+          const auto contact_after_stop = bms_charging_contact_snapshot();
+          const bool charging_confirmed =
+            contact_after_stop.have_state && contact_after_stop.fresh &&
+            contact_after_stop.contact_stable;
+          const double stop_duration_sec = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - contact_stop_started).count();
+
+          std::ostringstream contact_detail;
+          contact_detail << "stable BMS charging contact during predock Nav2"
+                         << " reason=" << predock_contact.reason
+                         << " contact_stable_duration_sec="
+                         << predock_contact.contact_stable_duration_sec
+                         << " cancel_requested=" << (cancel_requested ? "true" : "false")
+                         << " cancel_detail=" << cancel_detail
+                         << " actual_stop_confirmed="
+                         << (actual_stop_confirmed ? "true" : "false")
+                         << " stop_duration_sec=" << stop_duration_sec
+                         << " stop_detail=" << stop_detail
+                         << " charging_confirmed_after_stop="
+                         << (charging_confirmed ? "true" : "false");
+          {
+            std::lock_guard<std::mutex> lock(docking_job_mutex_);
+            if (docking_job_.id == job_id && docking_job_.state == "running") {
+              docking_job_.predock_nav_contact_detected = true;
+              docking_job_.predock_nav_canceled_for_contact = cancel_requested;
+              docking_job_.predock_contact_stop_confirmed = actual_stop_confirmed;
+              docking_job_.predock_contact_stop_duration_sec = stop_duration_sec;
+              docking_job_.predock_contact_reason = predock_contact.reason;
+              docking_job_.predock_contact_detected_at = contact_detected_at;
+              docking_job_.predock_contact_stop_detail = contact_detail.str();
+              docking_job_.detail = contact_detail.str();
+            }
+          }
+          if (charging_confirmed) {
+            finish_docking_job(job_id, true, "charging", contact_detail.str());
+          } else {
+            finish_docking_job_with_code(
+              job_id,
+              "DOCK_FAILED_PREDOCK_CONTACT_DROPPED",
+              contact_detail.str() +
+                "; charging contact dropped after stop; explicit undock/retry is required");
+          }
+          return;
+        }
         if (docking_cancel_requested(job_id)) {
+          clear_navigation_terminal_reverse_permit(
+            terminal_reverse_permit_active,
+            "predock_navigation_canceled");
           std::string cancel_detail;
           cancel_active_navigation_goal(cancel_detail);
           clear_navigation_terminal_speed_limit();
@@ -14410,6 +18107,9 @@ private:
           }
         }
         if (now_steady > predock_deadline) {
+          clear_navigation_terminal_reverse_permit(
+            terminal_reverse_permit_active,
+            "predock_navigation_timeout");
           std::string cancel_detail;
           cancel_active_navigation_goal(cancel_detail);
           clear_navigation_terminal_speed_limit();
@@ -14417,6 +18117,9 @@ private:
           return;
         }
       }
+      clear_navigation_terminal_reverse_permit(
+        terminal_reverse_permit_active,
+        "predock_navigation_result");
       clear_navigation_terminal_speed_limit();
       if (nav2_predock_early_handoff) {
         break;
@@ -14532,87 +18235,36 @@ private:
     auto predock_check = evaluate_predock_pose(job);
     record_predock_pose_verification(job_id, predock_check);
 
-    bool predock_yaw_aligned = predock_yaw_angles_met(predock_check);
-    if (predock_yaw_aligned) {
-      PredockYawAlignResult already_aligned;
-      already_aligned.attempted = false;
-      already_aligned.succeeded = true;
-      already_aligned.actual_spin_required = false;
-      already_aligned.failure_code = "NONE";
-      already_aligned.initial_error_rad = predock_check.base_yaw_error_rad;
-      already_aligned.final_error_rad = predock_check.base_yaw_error_rad;
-      already_aligned.detail = "predock yaw already aligned during pose verify";
-      record_predock_yaw_align_result(job_id, already_aligned);
-    } else {
-      const bool predock_recovery_allowed = predock_pose_allows_staging_recovery(predock_check);
-      if (!predock_recovery_allowed || !predock_yaw_align_fallback_allowed()) {
-        PredockYawAlignResult native_verify_failed;
-        native_verify_failed.attempted = false;
-        native_verify_failed.succeeded = false;
-        native_verify_failed.actual_spin_required = false;
-        native_verify_failed.initial_error_rad = predock_check.base_yaw_error_rad;
-        native_verify_failed.final_error_rad = predock_check.base_yaw_error_rad;
-        native_verify_failed.failure_code =
-          (!predock_recovery_allowed) ?
-          (nav2_predock_succeeded ?
-          "PREDOCK_NATIVE_GOAL_VERIFY_FAILED" : "DOCK_FAILED_PREDOCK_NAV_OUTSIDE_HANDOFF_WINDOW") :
-          "PREDOCK_YAW_NOT_ALIGNED_AFTER_NAV2";
-        native_verify_failed.detail =
-          (nav2_predock_succeeded ?
-          "Nav2 predock action succeeded but read-only PREDOCK_POSE_VERIFY failed; " :
-          nav2_predock_result_detail +
-          "; Nav2 predock action aborted and current pose is outside docking recovery window; ") +
-          predock_check.detail;
-        record_predock_yaw_align_result(job_id, native_verify_failed);
-        set_docking_job_phase(job_id, native_verify_failed.failure_code);
-        set_docking_runtime_state(
-          true,
-          native_verify_failed.failure_code,
-          native_verify_failed.detail);
-        finish_docking_job_with_code(
-          job_id,
-          native_verify_failed.failure_code,
-          native_verify_failed.detail);
-        return;
-      }
-
-      set_docking_job_phase(job_id, "PREDOCK_YAW_ALIGN_RECOVERY");
-      set_docking_runtime_state(
-        true,
-        "PREDOCK_YAW_ALIGN_RECOVERY",
-        "explicit fallback: aligning staging yaw through /cmd_vel_docking");
-      auto yaw_result = run_predock_yaw_align(job_id, predock_check.expected_base_yaw, predock_check);
-      record_predock_yaw_align_result(job_id, yaw_result);
-      if (!yaw_result.succeeded) {
-        finish_docking_job_with_code(job_id, yaw_result.failure_code, yaw_result.detail);
-        return;
-      }
-
-      set_docking_job_phase(job_id, "PREDOCK_YAW_ALIGN_RECOVERY_SETTLE");
-      set_docking_runtime_state(
-        true,
-        "PREDOCK_YAW_ALIGN_RECOVERY_SETTLE",
-        "settling after explicit predock yaw alignment fallback");
-      std::this_thread::sleep_for(300ms);
-      predock_check = evaluate_predock_pose(job);
-      record_predock_pose_verification(job_id, predock_check);
-      predock_yaw_aligned = predock_yaw_angles_met(predock_check);
-      if (!predock_yaw_aligned) {
-        finish_docking_job_with_code(job_id, "PREDOCK_YAW_NOT_ALIGNED", predock_check.detail);
-        return;
-      }
+    bool predock_yaw_aligned = false;
+    const bool predock_recovery_allowed = predock_pose_allows_staging_recovery(predock_check);
+    if (!predock_recovery_allowed) {
+      const std::string failure_code = nav2_predock_succeeded ?
+        "PREDOCK_NATIVE_GOAL_VERIFY_FAILED" :
+        "DOCK_FAILED_PREDOCK_NAV_OUTSIDE_HANDOFF_WINDOW";
+      const std::string detail =
+        (nav2_predock_succeeded ?
+        "Nav2 predock action succeeded outside the docking recovery window; " :
+        nav2_predock_result_detail +
+        "; Nav2 predock action ended outside the docking recovery window; ") +
+        predock_check.detail;
+      set_docking_job_phase(job_id, failure_code);
+      set_docking_runtime_state(true, failure_code, detail);
+      finish_docking_job_with_code(job_id, failure_code, detail);
+      return;
     }
 
-    if (!ensure_predock_lateral_alignment(
-        job_id,
-        job,
-        predock_check,
-        predock_yaw_aligned,
-        "PREDOCK_LATERAL_ALIGN",
-        "PREDOCK_LATERAL_ALIGN_VERIFY",
-        "aligning staging lateral offset through /cmd_vel_docking before GS2 handoff"))
+    set_docking_job_phase(job_id, "PREDOCK_ALIGNMENT_DEFERRED_FOR_BRIDGE_SETTLE");
+    set_docking_runtime_state(
+      true,
+      "PREDOCK_ALIGNMENT_DEFERRED_FOR_BRIDGE_SETTLE",
+      "predock is inside the docking recovery window; deferring physical yaw/lateral alignment "
+      "until map->odom smoothing has settled and global corrections are frozen");
     {
-      return;
+      std::lock_guard<std::mutex> lock(docking_job_mutex_);
+      if (docking_job_.id == job_id && docking_job_.state == "running") {
+        docking_job_.detail =
+          "predock pose accepted for deferred staging alignment; " + predock_check.detail;
+      }
     }
 
     if (docking_relocalize_after_predock_) {
@@ -14763,6 +18415,15 @@ private:
       }
     }
 
+    std::string pause_detail;
+    if (!set_global_correction_paused_for_docking(
+        job_id, true, "docking_staging_alignment", pause_detail))
+    {
+      finish_docking_job_with_code(job_id, "DOCK_FAILED_PREDOCK_SETTLE", pause_detail);
+      return;
+    }
+    fine_pause_applied = true;
+
     set_docking_job_phase(job_id, "PREDOCK_POSE_VERIFY_AFTER_BRIDGE_SETTLE");
     set_docking_runtime_state(
       true,
@@ -14844,89 +18505,16 @@ private:
       }
     }
 
-    set_docking_job_phase(job_id, "PREDOCK_LATERAL_ALIGN_AFTER_BRIDGE_SETTLE_VERIFY");
-    set_docking_runtime_state(
-      true,
-      "PREDOCK_LATERAL_ALIGN_AFTER_BRIDGE_SETTLE_VERIFY",
-      "verifying staging lateral after bridge smoothing without second side-slip");
-    predock_check = evaluate_predock_pose(job);
-    record_predock_pose_verification(job_id, predock_check);
-    predock_yaw_aligned = predock_yaw_angles_met(predock_check);
-    PredockLateralAlignResult post_bridge_lateral_verify;
-    post_bridge_lateral_verify.attempted = false;
-    post_bridge_lateral_verify.initial_error_m = predock_check.lateral_m;
-    post_bridge_lateral_verify.final_error_m = predock_check.lateral_m;
-    post_bridge_lateral_verify.duration_sec = 0.0;
-    if (!predock_check.pose_available) {
-      post_bridge_lateral_verify.succeeded = false;
-      post_bridge_lateral_verify.blocked = true;
-      post_bridge_lateral_verify.failure_code = "PREDOCK_LATERAL_NOT_ALIGNED";
-      post_bridge_lateral_verify.detail =
-        "post-bridge lateral verify has no fresh map-frame pose; " + predock_check.detail;
-      record_predock_lateral_align_result(job_id, post_bridge_lateral_verify);
-      finish_docking_job_with_code(
+    if (!ensure_predock_lateral_alignment(
         job_id,
-        post_bridge_lateral_verify.failure_code,
-        post_bridge_lateral_verify.detail);
-      return;
-    }
-    if (!predock_yaw_aligned) {
-      post_bridge_lateral_verify.succeeded = false;
-      post_bridge_lateral_verify.blocked = true;
-      post_bridge_lateral_verify.failure_code = "PREDOCK_YAW_NOT_ALIGNED_AFTER_BRIDGE_SETTLE";
-      post_bridge_lateral_verify.detail =
-        "post-bridge lateral verify found yaw outside tolerance; " + predock_check.detail;
-      record_predock_lateral_align_result(job_id, post_bridge_lateral_verify);
-      finish_docking_job_with_code(
-        job_id,
-        post_bridge_lateral_verify.failure_code,
-        post_bridge_lateral_verify.detail);
-      return;
-    }
-    if (!predock_forward_capture_window_met(predock_check)) {
-      post_bridge_lateral_verify.succeeded = false;
-      post_bridge_lateral_verify.blocked = true;
-      post_bridge_lateral_verify.failure_code = "PREDOCK_LATERAL_HARD_FAIL";
-      post_bridge_lateral_verify.detail =
-        "post-bridge lateral verify found forward offset outside capture window; " +
-        predock_check.detail;
-      record_predock_lateral_align_result(job_id, post_bridge_lateral_verify);
-      finish_docking_job_with_code(
-        job_id,
-        post_bridge_lateral_verify.failure_code,
-        post_bridge_lateral_verify.detail);
-      return;
-    }
-    if (predock_check.lateral_abs_m > fine_docking_entry_max_lateral_m_) {
-      post_bridge_lateral_verify.succeeded = false;
-      post_bridge_lateral_verify.blocked = true;
-      post_bridge_lateral_verify.failure_code = "FINE_DOCKING_REJECTED_LATERAL_TOO_LARGE";
-      std::ostringstream detail;
-      detail << std::fixed << std::setprecision(3)
-             << "post-bridge lateral verify rejected without second side-slip"
-             << " lateral=" << predock_check.lateral_abs_m
-             << " fine_entry_max=" << fine_docking_entry_max_lateral_m_
-             << "; " << predock_check.detail;
-      post_bridge_lateral_verify.detail = detail.str();
-      record_predock_lateral_align_result(job_id, post_bridge_lateral_verify);
-      finish_docking_job_with_code(
-        job_id,
-        post_bridge_lateral_verify.failure_code,
-        post_bridge_lateral_verify.detail);
-      return;
-    }
+        job,
+        predock_check,
+        predock_yaw_aligned,
+        "PREDOCK_LATERAL_ALIGN_AFTER_BRIDGE_SETTLE",
+        "PREDOCK_LATERAL_ALIGN_AFTER_BRIDGE_SETTLE_VERIFY",
+        "aligning staging lateral after bridge settle with map->odom frozen"))
     {
-      std::ostringstream detail;
-      detail << std::fixed << std::setprecision(3)
-             << "post-bridge staging lateral accepted without second side-slip"
-             << " lateral=" << predock_check.lateral_abs_m
-             << " target=" << predock_lateral_align_target_m_
-             << " fine_entry_max=" << fine_docking_entry_max_lateral_m_
-             << "; " << predock_check.detail;
-      post_bridge_lateral_verify.succeeded = true;
-      post_bridge_lateral_verify.failure_code = "NONE";
-      post_bridge_lateral_verify.detail = detail.str();
-      record_predock_lateral_align_result(job_id, post_bridge_lateral_verify);
+      return;
     }
     {
       std::lock_guard<std::mutex> lock(docking_job_mutex_);
@@ -14936,15 +18524,9 @@ private:
       }
     }
 
-    std::string pause_detail;
-    if (!set_global_correction_paused_for_docking(job_id, true, "docking_fine_entry", pause_detail)) {
-      finish_docking_job_with_code(job_id, "DOCK_FAILED_PREDOCK_SETTLE", pause_detail);
-      return;
-    }
-    fine_pause_applied = true;
-
     set_docking_job_phase(job_id, "FINE_DOCKING_ENTRY_CHECK");
-    set_docking_runtime_state(true, "FINE_DOCKING_ENTRY_CHECK", "checking GS2 fine docking entry conditions");
+    set_docking_runtime_state(
+      true, "FINE_DOCKING_ENTRY_CHECK", "checking active fine docking observation conditions");
     PredockPoseVerification fine_entry_check;
     std::string fine_entry_failure_code;
     std::string fine_entry_detail;
@@ -15010,6 +18592,13 @@ private:
       return;
     }
     std::string service_detail;
+    if (floor_runtime_operation_blocked(
+        "docking_fine_start", floor_interlock_detail))
+    {
+      resume_fine_pause_if_needed("floor_transition_blocked");
+      finish_docking_job(job_id, false, "failed", floor_interlock_detail);
+      return;
+    }
     if (!call_docking_trigger_service(docking_start_client_, docking_start_service_, service_detail)) {
       resume_fine_pause_if_needed("fine_docking_start_failed");
       finish_docking_job(job_id, false, "failed", service_detail);
@@ -15043,6 +18632,16 @@ private:
 
   HttpResponse handle_docking_start(const std::string & body)
   {
+    std::lock_guard<std::mutex> keepout_guard(keepout_update_mutex_);
+    if (const auto blocked = floor_runtime_interlock_response("docking_start")) {
+      return *blocked;
+    }
+    if (map_asset_integrity_degraded()) {
+      return {
+        503,
+        "application/json",
+        error_json("keepout integrity is degraded; docking admission is blocked until repaired")};
+    }
     auto building_id = json_string_value(body, "building_id").value_or("building_1");
     auto floor_id = json_string_value(body, "floor_id");
     const auto map_id = json_string_value(body, "map_id");
@@ -15056,6 +18655,16 @@ private:
       json_number_value(body, "approach_distance_m").value_or(docking_pre_dock_distance_m_),
       0.10,
       2.00);
+
+    const auto docking_start_runtime = runtime_mode_snapshot();
+    if (docking_start_runtime.mapping_active || mapping_start_job_running() ||
+      mode_transition_owner_snapshot() == "mapping_start")
+    {
+      return {
+        409,
+        "application/json",
+        error_json("docking is unavailable while 2D mapping is active or starting")};
+    }
 
     if (!floor_id || floor_id->empty()) {
       return {400, "application/json", error_json("floor_id is required")};
@@ -15076,7 +18685,6 @@ private:
         }
         building_id = selected_map->building_id;
         floor_id = selected_map->floor_id;
-        activate_map_manifest(*selected_map);
       } else if (map_name && !map_name->empty()) {
         std::string error;
         selected_map = map_catalog_->find_floor_map_by_name(building_id, *floor_id, *map_name, error);
@@ -15086,17 +18694,54 @@ private:
         if (!selected_map) {
           return {404, "application/json", error_json("map_name not found on requested floor: " + *map_name)};
         }
-        activate_map_manifest(*selected_map);
       } else {
         selected_map = map_catalog_->active_floor_map(building_id, *floor_id);
       }
     } catch (const std::exception & exc) {
       return {500, "application/json", error_json(exc.what())};
     }
+    const auto floor_switch_required_response = [](const int status, const std::string & detail) {
+        std::ostringstream response;
+        response << "{\"ok\":false,\"code\":\"FLOOR_SWITCH_REQUIRED\","
+                 << "\"detail\":" << json_string(detail) << "}";
+        return HttpResponse{status, "application/json", response.str()};
+      };
+    if (!selected_map) {
+      return floor_switch_required_response(
+        503,
+        "docking requires a selected map and a confirmed ready runtime map context");
+    }
+    const auto docking_runtime_context = read_runtime_map_context();
+    if (!docking_runtime_context || !docking_runtime_context->confirmed ||
+      docking_runtime_context->state != "ready")
+    {
+      return floor_switch_required_response(
+        503,
+        "docking requires a confirmed ready runtime map context; complete the floor "
+        "switch before retrying");
+    }
+    std::string docking_context_error;
+    if (!selected_map->active) {
+      return floor_switch_required_response(
+        409,
+        "requested docking map is not the active manifest for its floor");
+    }
+    if (!runtime_context_matches_map(*selected_map, docking_context_error)) {
+      return floor_switch_required_response(
+        409,
+        "requested docking map is not the confirmed active runtime map: " +
+        docking_context_error);
+    }
 
     const auto pose = find_floor_catalog_pose(*map_catalog_, building_id, *floor_id, dock_id);
     if (!pose) {
       return {404, "application/json", error_json("dock_id not found in poses.yaml: " + dock_id)};
+    }
+    if (is_elevator_internal_pose_type(pose->type) ||
+      is_reserved_elevator_pose_id(pose->id))
+    {
+      return elevator_internal_pose_requires_mission_response(
+        "elevator internal poses cannot be used as docking targets");
     }
 
     std::string predock_source;
@@ -15116,6 +18761,13 @@ private:
         predock_error_status == 0 ? 409 : predock_error_status,
         "application/json",
         error_json(predock_error)};
+    }
+    if (predock_pose &&
+      (is_elevator_internal_pose_type(predock_pose->type) ||
+      is_reserved_elevator_pose_id(predock_pose->id)))
+    {
+      return elevator_internal_pose_requires_mission_response(
+        "elevator internal poses cannot be used as docking pre-approach targets");
     }
     if (predock_pose && !validate_manual_docking_predock_pose(*pose, *predock_pose, predock_error)) {
       return {409, "application/json", error_json(predock_error)};
@@ -15170,6 +18822,27 @@ private:
       }
     }
     join_docking_worker();
+    if (const auto blocked = floor_runtime_interlock_response("docking_start_commit")) {
+      return *blocked;
+    }
+    const auto commit_map = map_catalog_->find_map_by_id(selected_map->map_id);
+    if (!commit_map) {
+      return floor_switch_required_response(
+        409,
+        "requested docking map disappeared while admission was pending");
+    }
+    if (!commit_map->active) {
+      return floor_switch_required_response(
+        409,
+        "requested docking map became inactive while admission was pending");
+    }
+    std::string commit_context_error;
+    if (!runtime_context_matches_map(*commit_map, commit_context_error)) {
+      return floor_switch_required_response(
+        409,
+        "runtime map context changed while docking admission was pending: " +
+        commit_context_error);
+    }
     std::uint64_t job_id = 0U;
     {
       std::lock_guard<std::mutex> lock(docking_job_mutex_);
@@ -15314,6 +18987,9 @@ private:
 
   HttpResponse handle_docking_undock(const std::string & body)
   {
+    if (const auto blocked = floor_runtime_interlock_response("docking_undock")) {
+      return *blocked;
+    }
     const auto reason = json_string_value(body, "reason").value_or("app_manual_undock");
     auto dock_id = json_string_value(body, "dock_id").value_or("");
     if (!dock_id.empty() && !safe_pose_id(dock_id)) {
@@ -15371,6 +19047,9 @@ private:
         error_json("undock requires docked state or live charging contact")};
     }
 
+    if (const auto blocked = floor_runtime_interlock_response("docking_undock_commit")) {
+      return *blocked;
+    }
     std::string ensure_detail;
     if (!ensure_docking_manager_running(ensure_detail)) {
       return {500, "application/json", error_json(ensure_detail)};
@@ -15404,6 +19083,10 @@ private:
 
     std::string service_detail;
     TriggerServiceObservation service_observation;
+    if (const auto blocked = floor_runtime_interlock_response("docking_undock_submit")) {
+      finish_docking_job(job_id, false, "failed", blocked->body);
+      return *blocked;
+    }
     if (!call_undock_service_with_charging_retry(service_detail, charging_contact, &service_observation)) {
       const auto after_status = runtime_mode_snapshot().docking_status;
       {
@@ -16632,13 +20315,28 @@ private:
   std::string safety_status_topic_;
   std::string safety_motion_allowed_topic_;
   std::string floor_status_topic_;
+  std::string floor_transition_status_topic_;
+  bool floor_runtime_negative_interlock_enabled_{true};
   std::string bms_state_topic_;
   double bms_state_max_age_sec_{3.0};
   std::string floor_switch_service_;
+  std::string keepout_mask_load_service_;
+  std::string keepout_mask_state_service_;
+  std::string keepout_filter_info_state_service_;
+  std::string keepout_mask_get_parameters_service_;
+  std::string keepout_runtime_stage_root_;
+  std::string keepout_mask_topic_;
+  std::string keepout_filter_info_topic_;
+  std::string global_costmap_get_parameters_service_;
+  std::string global_costmap_clear_service_;
+  std::string global_costmap_topic_;
+  double keepout_runtime_apply_timeout_sec_{5.0};
   std::string localization_trigger_service_;
   std::string localization_result_topic_;
   std::string localization_bridge_status_topic_;
+  std::string localization_floor_health_topic_;
   std::string navigate_to_pose_action_;
+  std::string navigate_to_pose_status_topic_;
   std::string mapping_2d_start_command_;
   std::string mapping_2d_log_file_;
   std::string mapping_lidar_rps_xps_state_dir_;
@@ -16657,7 +20355,10 @@ private:
   std::string docking_stop_service_;
   std::string docking_undock_service_;
   std::string docking_status_topic_;
+  std::string docking_observation_backend_{"target_observation"};
   std::string docking_gs2_scan_topic_{"/dock/gs2_scan"};
+  std::string docking_target_observation_topic_{"/dock/target_observation"};
+  std::string docking_target_observation_source_{"orbbec_336l_depth"};
   std::string docking_contact_latch_file_;
   double dock_contact_latch_bms_ttl_sec_{300.0};
   double dock_contact_latch_bms_require_contact_sec_{2.0};
@@ -16674,6 +20375,7 @@ private:
   double docking_pre_dock_distance_m_{0.60};
   double docking_navigation_start_wait_sec_{45.0};
   double docking_predock_nav_timeout_sec_{180.0};
+  std::string docking_predock_behavior_tree_;
   bool docking_predock_early_handoff_enabled_{false};
   bool docking_relocalize_before_predock_{false};
   bool docking_relocalize_after_predock_{false};
@@ -16826,7 +20528,7 @@ private:
   double localization_bridge_acceptance_max_yaw_rad_{0.35};
   bool manual_relocalization_amcl_refine_enabled_{true};
   bool manual_relocalization_amcl_refine_required_{true};
-  double manual_relocalization_amcl_refine_timeout_sec_{8.0};
+  double manual_relocalization_amcl_refine_timeout_sec_{4.0};
   int manual_relocalization_amcl_refine_poll_ms_{100};
   int manual_relocalization_amcl_refine_request_period_ms_{500};
   bool navigation_relocalize_before_goal_{true};
@@ -16862,20 +20564,27 @@ private:
   int post_nav2_final_verify_max_retry_count_{3};
   double post_nav2_final_verify_acceptance_slack_m_{0.02};
   double post_nav2_final_verify_xy_retry_min_error_m_{0.06};
-  double post_nav2_final_verify_xy_retry_max_error_m_{0.35};
+  double navigation_terminal_recovery_max_distance_m_{0.40};
   bool post_nav2_final_verify_yaw_retry_if_failed_{true};
   bool post_nav2_final_verify_retry_uses_same_nav2_goal_{true};
   bool post_nav2_final_verify_api_velocity_correction_enabled_{true};
   bool post_nav2_final_verify_reverse_permit_enabled_{true};
   std::string post_nav2_final_verify_reverse_enable_topic_{"/ranger_mini3/allow_reverse"};
+  bool navigation_terminal_reverse_permit_enabled_{true};
+  double navigation_terminal_reverse_permit_enter_distance_m_{0.30};
+  double navigation_terminal_reverse_permit_exit_distance_m_{0.35};
+  double navigation_terminal_reverse_permit_refresh_period_sec_{0.20};
   bool post_nav2_final_verify_terminal_lateral_correction_enabled_{true};
   double post_nav2_final_verify_terminal_lateral_target_m_{0.03};
   double post_nav2_final_verify_terminal_lateral_trigger_m_{0.04};
-  double post_nav2_final_verify_terminal_lateral_max_xy_m_{0.30};
-  double post_nav2_final_verify_terminal_lateral_max_forward_m_{0.12};
+  double post_nav2_final_verify_terminal_lateral_max_forward_m_{0.15};
   double post_nav2_final_verify_terminal_lateral_speed_mps_{0.04};
   double post_nav2_final_verify_terminal_lateral_kp_{0.8};
-  double post_nav2_final_verify_terminal_lateral_timeout_sec_{8.0};
+  double post_nav2_final_verify_terminal_lateral_timeout_sec_{20.0};
+  bool navigation_terminal_recovery_costmap_guard_enabled_{true};
+  double navigation_terminal_recovery_costmap_max_age_sec_{0.50};
+  int navigation_terminal_recovery_costmap_occupied_threshold_{50};
+  double navigation_terminal_recovery_costmap_lookahead_m_{0.15};
   double post_nav2_final_verify_terminal_lateral_command_sign_{1.0};
   bool post_nav2_final_verify_terminal_settle_enabled_{true};
   double post_nav2_final_verify_terminal_settle_linear_speed_threshold_mps_{0.01};
@@ -16886,14 +20595,12 @@ private:
   bool post_nav2_final_verify_terminal_settle_require_dual_ackermann_mode_{true};
   double post_nav2_final_verify_terminal_settle_mode_status_max_age_sec_{0.50};
   int post_nav2_final_verify_terminal_settle_max_recheck_count_{1};
-  bool navigation_near_goal_stalled_handoff_enabled_{true};
-  double navigation_near_goal_stalled_handoff_distance_m_{0.30};
+  bool navigation_near_goal_stalled_handoff_enabled_{false};
   double navigation_near_goal_stalled_handoff_min_wait_sec_{3.0};
   double navigation_near_goal_stalled_handoff_stall_sec_{1.5};
   double navigation_near_goal_stalled_handoff_improvement_epsilon_m_{0.02};
   bool navigation_nav2_failed_near_goal_retry_enabled_{true};
   int navigation_nav2_failed_near_goal_retry_max_count_{1};
-  double navigation_nav2_failed_near_goal_retry_max_distance_m_{0.35};
   bool navigation_nav2_failed_near_goal_retry_requires_yaw_error_{false};
   int navigation_max_reposition_after_yaw_retry_{1};
   double navigation_reposition_after_yaw_drift_timeout_sec_{30.0};
@@ -16938,9 +20645,23 @@ private:
   std::condition_variable http_queue_cv_;
   std::deque<int> http_client_queue_;
   std::unique_ptr<MapCatalog> map_catalog_;
+  std::unique_ptr<ElevatorConfigurationModule> elevator_configuration_;
   std::unique_ptr<SubscriptionManager> subscription_manager_;
   rclcpp::TimerBase::SharedPtr subscription_ttl_timer_;
   std::mutex subscription_lifecycle_mutex_;
+  mutable std::mutex floor_runtime_interlock_mutex_;
+  robot_api_server::FloorRuntimeInterlock floor_runtime_interlock_;
+  std::mutex keepout_update_mutex_;
+  std::mutex elevator_asset_mutation_mutex_;
+  std::atomic<bool> keepout_integrity_degraded_{false};
+  mutable std::mutex navigate_to_pose_status_mutex_;
+  bool have_navigate_to_pose_status_{false};
+  bool navigate_to_pose_action_goal_active_{false};
+  std::chrono::steady_clock::time_point navigate_to_pose_status_received_at_{};
+  mutable std::mutex keepout_observation_mutex_;
+  std::condition_variable keepout_observation_cv_;
+  KeepoutMaskObservation latest_keepout_mask_;
+  KeepoutFilterInfoObservation latest_keepout_filter_info_;
 
   std::mutex state_mutex_;
   std::string latest_safety_status_{"UNKNOWN"};
@@ -17012,6 +20733,7 @@ private:
   std::chrono::steady_clock::time_point latest_terminal_actual_stop_received_at_{};
   std::chrono::steady_clock::time_point terminal_actual_stop_stable_since_{};
   mutable std::mutex local_costmap_mutex_;
+  nav_msgs::msg::OccupancyGrid::SharedPtr latest_local_costmap_;
   std::uint64_t local_costmap_update_count_{0U};
   std::chrono::steady_clock::time_point latest_local_costmap_received_at_{};
   mutable std::mutex rosout_mutex_;
@@ -17034,6 +20756,9 @@ private:
   std::string docking_runtime_dock_id_;
   std::string runtime_message_;
 
+  mutable std::mutex mode_transition_mutex_;
+  std::string mode_transition_owner_;
+
   std::mutex teleop_mutex_;
   int teleop_session_count_{0};
   geometry_msgs::msg::Twist latest_teleop_cmd_;
@@ -17045,6 +20770,12 @@ private:
   pid_t mapping_2d_pid_{-1};
   bool mapping_2d_active_{false};
   std::chrono::steady_clock::time_point mapping_2d_started_at_{};
+  std::mutex mapping_start_start_mutex_;
+  std::mutex mapping_transition_launch_mutex_;
+  mutable std::mutex mapping_start_job_mutex_;
+  MappingStartJob mapping_start_job_;
+  std::uint64_t mapping_start_job_seq_{0U};
+  std::thread mapping_start_worker_;
 
   std::mutex navigation_process_mutex_;
   pid_t navigation_resume_pid_{-1};
@@ -17053,6 +20784,11 @@ private:
   mutable std::mutex docking_gs2_scan_mutex_;
   bool have_docking_gs2_scan_{false};
   std::chrono::steady_clock::time_point latest_docking_gs2_scan_received_at_{};
+  mutable std::mutex docking_target_observation_mutex_;
+  bool have_docking_target_observation_{false};
+  bool docking_target_observation_usable_{false};
+  std::string docking_target_observation_reason_;
+  std::chrono::steady_clock::time_point latest_docking_target_observation_received_at_{};
   std::mutex navigation_cancel_start_mutex_;
   std::mutex navigation_goal_start_mutex_;
   std::mutex navigation_goal_job_mutex_;
@@ -17104,13 +20840,22 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::BatteryState>::SharedPtr bms_state_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr docking_status_sub_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr docking_gs2_scan_sub_;
+  rclcpp::Subscription<robot_interfaces::msg::DockTargetObservation>::SharedPtr
+    docking_target_observation_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr mode_controller_status_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr yaw_align_actual_stop_odom_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr localization_result_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr localization_bridge_status_sub_;
+  rclcpp::Subscription<robot_interfaces::msg::FloorSwitchStatus>::SharedPtr
+    floor_transition_status_sub_;
+  rclcpp::Subscription<robot_interfaces::msg::LocalizationHealth>::SharedPtr
+    localization_floor_health_sub_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr tf_sub_;
   rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr tf_static_sub_;
+  rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr keepout_mask_sub_;
+  rclcpp::Subscription<nav2_msgs::msg::CostmapFilterInfo>::SharedPtr keepout_filter_info_sub_;
+  rclcpp::Subscription<action_msgs::msg::GoalStatusArray>::SharedPtr navigate_to_pose_status_sub_;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr local_costmap_sub_;
   rclcpp::Subscription<rcl_interfaces::msg::Log>::SharedPtr rosout_sub_;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr live_map_sub_;
@@ -17121,6 +20866,14 @@ private:
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr localization_bridge_force_accept_client_;
   rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr localization_bridge_correction_pause_client_;
   rclcpp::Client<std_srvs::srv::Empty>::SharedPtr amcl_nomotion_update_client_;
+  rclcpp::Client<nav2_msgs::srv::LoadMap>::SharedPtr keepout_mask_load_client_;
+  rclcpp::Client<lifecycle_msgs::srv::GetState>::SharedPtr keepout_mask_state_client_;
+  rclcpp::Client<lifecycle_msgs::srv::GetState>::SharedPtr keepout_filter_info_state_client_;
+  rclcpp::Client<rcl_interfaces::srv::GetParameters>::SharedPtr
+    keepout_mask_get_parameters_client_;
+  rclcpp::Client<rcl_interfaces::srv::GetParameters>::SharedPtr
+    global_costmap_get_parameters_client_;
+  rclcpp::Client<nav2_msgs::srv::ClearEntireCostmap>::SharedPtr global_costmap_clear_client_;
   std::map<std::string, rclcpp::Client<lifecycle_msgs::srv::GetState>::SharedPtr>
     navigation_lifecycle_clients_;
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr docking_start_client_;

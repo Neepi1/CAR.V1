@@ -44,14 +44,20 @@ resolve_gs2_serial_port() {
   echo "/dev/gs2"
 }
 
-GS2_SERIAL_PORT="$(resolve_gs2_serial_port)"
-
 RUNTIME_OVERRIDE_ENV="${NJRH_RUNTIME_OVERRIDE_ENV:-/tmp/njrh_runtime_override.env}"
 if [[ -f "${RUNTIME_OVERRIDE_ENV}" ]]; then
   # shellcheck source=/dev/null
   set -a
   source "${RUNTIME_OVERRIDE_ENV}"
   set +a
+fi
+
+DOCKING_SENSOR_BACKEND="${NJRH_DOCKING_SENSOR_BACKEND:-orbbec_336l}"
+GS2_AUTOSTART="${NJRH_GS2_AUTOSTART:-false}"
+if [[ "${DOCKING_SENSOR_BACKEND}" == "gs2" ]]; then
+  GS2_SERIAL_PORT="$(resolve_gs2_serial_port)"
+else
+  GS2_SERIAL_PORT=""
 fi
 
 container_env=(
@@ -64,6 +70,10 @@ container_env=(
   "-e" "NJRH_NAV2_LIFECYCLE_PARALLEL_BT=${NJRH_NAV2_LIFECYCLE_PARALLEL_BT:-true}"
   "-e" "NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK=${NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK:-false}"
   "-e" "NJRH_NAV2_HELD_PRESTART_WAIT_FOR_LOCALIZER_SERVICE=${NJRH_NAV2_HELD_PRESTART_WAIT_FOR_LOCALIZER_SERVICE:-true}"
+  "-e" "NJRH_NAV2_PLANNER_PROFILE=${NJRH_NAV2_PLANNER_PROFILE:-smac2d}"
+  "-e" "NJRH_NAV2_PLANNER_PROFILE_FILE=${NJRH_NAV2_PLANNER_PROFILE_FILE:-}"
+  "-e" "NJRH_RANGER_LATTICE_FILE=${NJRH_RANGER_LATTICE_FILE:-}"
+  "-e" "NJRH_NAV2_BT_XML=${NJRH_NAV2_BT_XML:-}"
   "-e" "NJRH_COMMON_LOCAL_STATE_START_READY_MODE=${NJRH_COMMON_LOCAL_STATE_START_READY_MODE:-endpoint}"
   "-e" "NJRH_COMMON_LOCAL_STATE_BACKGROUND_START=${NJRH_COMMON_LOCAL_STATE_BACKGROUND_START:-true}"
   "-e" "NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE=${NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE:-false}"
@@ -81,6 +91,8 @@ container_env=(
   "-e" "LOCAL_STATE_EKF_PROFILE=${LOCAL_STATE_EKF_PROFILE:-}"
   "-e" "NJRH_FORCE_RESTART_CANONICAL_TF=${NJRH_FORCE_RESTART_CANONICAL_TF:-}"
   "-e" "NJRH_FORCE_RESTART_NAV_HELPERS=${NJRH_FORCE_RESTART_NAV_HELPERS:-}"
+  "-e" "NJRH_DOCKING_SENSOR_BACKEND=${DOCKING_SENSOR_BACKEND}"
+  "-e" "NJRH_GS2_AUTOSTART=${GS2_AUTOSTART}"
   "-e" "NJRH_PROJECT_ROOT=${WORKSPACE_CONTAINER}"
   "-e" "NJRH_UPSTREAM_ROOT=${UPSTREAM_WORKSPACE_CONTAINER}"
   "-e" "NJRH_UPSTREAM_HOST_ROOT=${UPSTREAM_WORKSPACE_HOST}"
@@ -196,7 +208,11 @@ case "${ACTION}" in
     prepare_container_permissions
     stop_container_common_processes
 
-    echo "[njrh-systemd] GS2 serial port resolved to ${GS2_SERIAL_PORT}" >&2
+    if [[ "${DOCKING_SENSOR_BACKEND}" == "gs2" ]]; then
+      echo "[njrh-systemd] docking backend=gs2 serial_port=${GS2_SERIAL_PORT} autostart=${GS2_AUTOSTART}" >&2
+    else
+      echo "[njrh-systemd] docking backend=${DOCKING_SENSOR_BACKEND}; GS2 disabled" >&2
+    fi
     exec docker exec -u "${RUNTIME_USER}" --workdir "${OVERLAY_CONTAINER}" "${container_env[@]}" "${CONTAINER_NAME}" \
       /bin/bash -c "cd '${OVERLAY_CONTAINER}' && exec bash scripts/run_common_services.sh"
     ;;

@@ -19,7 +19,7 @@ SENSOR_FRAME="${SENSOR_FRAME:-lidar_level_link}"
 BASE_FRAME="${BASE_FRAME:-base_link}"
 OBSTACLE_MIN_RANGE_M=0.25
 OBSTACLE_MAX_RANGE_M=5.50
-RAYTRACE_MIN_RANGE_M=0.25
+RAYTRACE_MIN_RANGE_M=0.20
 RAYTRACE_MAX_RANGE_M=8.00
 CLASSIFICATION_RADIUS_M=4.0
 RECENT_SCAN_WINDOW=45
@@ -58,7 +58,7 @@ Options:
   --base-frame FRAME            Robot base frame. Default: base_link.
   --obstacle-min-range M        Obstacle min range. Default: 0.25.
   --obstacle-max-range M        Obstacle max range. Default: 5.50.
-  --raytrace-min-range M        Raytrace min range. Default: 0.25.
+  --raytrace-min-range M        Raytrace min range. Default: 0.20.
   --raytrace-max-range M        Raytrace max range. Default: 8.00.
   --classification-radius-m M   Analyze occupied cells within this base_link radius. Default: 4.0.
   --recent-scan-window N        Use last N scans for endpoint support. Default: 45.

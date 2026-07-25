@@ -50,6 +50,13 @@ struct DockingJob
   bool resume_navigation{true};
   bool nav_goal_sent{false};
   bool nav_goal_succeeded{false};
+  bool predock_nav_contact_detected{false};
+  bool predock_nav_canceled_for_contact{false};
+  bool predock_contact_stop_confirmed{false};
+  double predock_contact_stop_duration_sec{0.0};
+  std::string predock_contact_reason;
+  std::string predock_contact_detected_at;
+  std::string predock_contact_stop_detail;
   bool predock_nav_early_handoff{false};
   std::string predock_nav_handoff_detail;
   bool dock_staging_handoff_ready{false};

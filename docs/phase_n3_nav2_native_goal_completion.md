@@ -4,7 +4,10 @@ Pose-required navigation uses Nav2 native yaw completion as the primary terminal
 
 ## Runtime Contract
 
-- `FollowPath` uses `nav2_rotation_shim_controller::RotationShimController`.
+- `FollowPath` uses `robot_nav_config::GoalScopedRotationShimController`, a
+  Humble-compatible thin wrapper around the stock RotationShim controller.
+- `FollowPath.rotate_to_heading_once=true`: same-goal 1 Hz replans continue to
+  update MPPI but cannot re-arm startup rotation after the initial handoff.
 - `FollowPath.primary_controller` remains `nav2_mppi_controller::MPPIController`; existing MPPI tuning parameters stay under `FollowPath`.
 - `FollowPath.rotate_to_goal_heading=true`.
 - `FollowPath.rotate_to_heading_angular_vel=0.60` and
@@ -38,7 +41,7 @@ API receives goal_completion_policy=position_only
 -> task_complete=true when final_pose_verified=true
 ```
 
-If the Nav2 action fails before the robot is near the target, the API records `phase=nav2_failed`. If Nav2 aborts after getting near the target but still outside the yaw-alignable XY gate, `navigation_nav2_failed_near_goal_retry_enabled=true` allows a yaw-first recovery inside the configured near-goal window, default `0.35m`: the API enters `nav2_failed_near_goal_yaw_aligning`, aligns heading once through `/cmd_vel_api`, then sends one same-goal Nav2 retry so Nav2 can close XY plus yaw instead of leaving a 20cm terminal miss. If Nav2 fails or succeeds while the robot is close enough for safe heading correction and yaw remains outside the trigger threshold, the API enters `nav2_failed_yaw_aligning` or `position_reached_yaw_aligning` and runs one bounded `final_yaw_align` through `/cmd_vel_api -> robot_safety -> /cmd_vel`. Before any bounded yaw fallback starts, `robot_api_server` waits for `robot_localization_bridge.safe_for_goal_start=true` so an already accepted `map->odom` smoothing update is not still moving underneath the spin controller. During the spin, it pauses bridge global correction intake, so AMCL/Isaac candidates can still run but cannot update `map->odom` until the final spin exits. The API does not publish to collision_monitor's `/cmd_vel_collision_checked`, does not use `/cmd_vel_docking`, and does not let the App publish chassis velocity.
+If the Nav2 action fails before the robot is near the target, the API records `phase=nav2_failed`. If Nav2 aborts after getting near the target but still outside the yaw-alignable XY gate, `navigation_nav2_failed_near_goal_retry_enabled=true` allows recovery inside the canonical `navigation_terminal_recovery_max_distance_m=0.40m` envelope: the API can align heading, run costmap-guarded axis-staged terminal correction, or send one same-goal Nav2 retry instead of leaving an uncovered terminal miss. If Nav2 fails or succeeds while the robot is close enough for safe heading correction and yaw remains outside the trigger threshold, the API enters `nav2_failed_yaw_aligning` or `position_reached_yaw_aligning` and runs one bounded `final_yaw_align` through `/cmd_vel_api -> robot_safety -> /cmd_vel`. Before any bounded yaw fallback starts, `robot_api_server` waits for `robot_localization_bridge.safe_for_goal_start=true` so an already accepted `map->odom` smoothing update is not still moving underneath the spin controller. During the spin, it pauses bridge global correction intake, so AMCL/Isaac candidates can still run but cannot update `map->odom` until the final spin exits. The App never publishes chassis velocity directly.
 
 Phase N4 extends this boundary: after Nav2 success, the API waits for bridge
 `map->odom` smoothing before final verification. If a recoverable AMCL/bridge

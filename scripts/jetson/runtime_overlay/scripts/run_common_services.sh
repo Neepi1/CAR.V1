@@ -24,7 +24,10 @@ log_common_startup_stage "profiles_loaded"
 common_pids=()
 runtime_health_guard_started=0
 ranger_chassis_common_health_failures=0
+docking_sensor_common_health_failures=0
+robot_local_state_common_health_failures=0
 NAV_LOCAL_STATE_MODE="${NJRH_NAV_LOCAL_STATE_MODE:-ekf}"
+DOCKING_SENSOR_BACKEND="${NJRH_DOCKING_SENSOR_BACKEND:-orbbec_336l}"
 # FAST-LIO2 is mapping-owned by default. Daily navigation uses wheel+IMU EKF
 # local odom, so common services must not keep the lidar-inertial frontend
 # resident unless an explicit diagnostic FAST-LIO local-state mode is selected.
@@ -173,6 +176,14 @@ wait_for_runtime_health_local_state_ready() {
       echo "[runtime-overlay] runtime health confirms local_state_ready before resident navigation autostart" >&2
       return 0
     fi
+    if runtime_health_check "local_state_topic_ready" >/dev/null 2>&1; then
+      echo "[runtime-overlay] runtime health confirms local_state_topic_ready before resident navigation autostart; TF freshness was already checked by direct readiness" >&2
+      return 0
+    fi
+    if runtime_health_check "local_state_endpoint" >/dev/null 2>&1; then
+      echo "[runtime-overlay] runtime health confirms local_state_endpoint before resident navigation autostart; freshness was already checked by direct readiness" >&2
+      return 0
+    fi
     sleep 0.2
   done
   echo "[runtime-overlay] runtime health did not confirm local_state_ready within ${timeout_sec}s; continuing because robot_local_state direct readiness already passed" >&2
@@ -216,6 +227,39 @@ verify_ranger_chassis_common_health_or_exit() {
     return 0
   fi
   echo "[runtime-overlay] ranger_chassis_common health lost after ${ranger_chassis_common_health_failures} consecutive checks; exiting common runtime so systemd restarts the complete navigation chain" >&2
+  return 1
+}
+
+verify_robot_local_state_common_health_or_exit() {
+  [[ "${NJRH_COMMON_LOCAL_STATE_HEALTH_MONITOR:-true}" == "true" ]] || return 0
+  local max_failures="${NJRH_COMMON_LOCAL_STATE_HEALTH_MAX_FAILURES:-3}"
+  if runtime_health_check "local_state_topic_ready" >/dev/null 2>&1; then
+    robot_local_state_common_health_failures=0
+    return 0
+  fi
+  robot_local_state_common_health_failures=$((robot_local_state_common_health_failures + 1))
+  if (( robot_local_state_common_health_failures < max_failures )); then
+    echo "[runtime-overlay] robot_local_state endpoint or odometry freshness degraded (${robot_local_state_common_health_failures}/${max_failures}); waiting before complete-chain recovery" >&2
+    return 0
+  fi
+  echo "[runtime-overlay] robot_local_state endpoint or odometry freshness lost after ${robot_local_state_common_health_failures} consecutive checks; exiting common owner so systemd restarts the complete navigation chain" >&2
+  return 1
+}
+
+verify_docking_sensor_common_health_or_exit() {
+  [[ "${DOCKING_SENSOR_BACKEND}" == "orbbec_336l" ]] || return 0
+  [[ "${NJRH_COMMON_DOCKING_SENSOR_HEALTH_MONITOR:-true}" == "true" ]] || return 0
+  local max_failures="${NJRH_COMMON_DOCKING_SENSOR_HEALTH_MAX_FAILURES:-3}"
+  if runtime_health_check "docking_sensor_healthy" >/dev/null 2>&1; then
+    docking_sensor_common_health_failures=0
+    return 0
+  fi
+  docking_sensor_common_health_failures=$((docking_sensor_common_health_failures + 1))
+  if (( docking_sensor_common_health_failures < max_failures )); then
+    echo "[runtime-overlay] Orbbec docking stream health degraded (${docking_sensor_common_health_failures}/${max_failures}); waiting before complete-chain recovery" >&2
+    return 0
+  fi
+  echo "[runtime-overlay] Orbbec docking stream unhealthy after ${docking_sensor_common_health_failures} consecutive checks; exiting common owner so systemd restarts the complete navigation chain" >&2
   return 1
 }
 
@@ -800,11 +844,51 @@ else
   echo "[runtime-overlay] FAST-LIO2 common autostart disabled; mapping starts FAST-LIO2 only while mapping is active" >&2
 fi
 log_common_startup_stage "fastlio_policy_done"
-if [[ "${NJRH_GS2_AUTOSTART:-true}" == "true" ]]; then
-  start_common_process "gs2_driver" "robot_eai_gs2/gs2_driver_node|gs2_driver_node --ros-args|ros2 launch robot_eai_gs2 gs2.launch.py" \
-    bash "${SCRIPT_DIR}/run_gs2_driver.sh"
-fi
-log_common_startup_stage "gs2_ready"
+case "${DOCKING_SENSOR_BACKEND}" in
+  gs2)
+    if pgrep -f "[o]rbbec_camera|[o]rbbec_depth_dock_node|[r]un_orbbec_336l_depth.sh|[r]un_orbbec_docking_perception.sh" >/dev/null 2>&1; then
+      echo "[runtime-overlay] GS2 backend refused while Orbbec docking processes are still running" >&2
+      exit 1
+    fi
+    if [[ "${NJRH_GS2_AUTOSTART:-true}" == "true" ]]; then
+      start_common_process "gs2_driver" "robot_eai_gs2/gs2_driver_node|gs2_driver_node --ros-args|ros2 launch robot_eai_gs2 gs2.launch.py" \
+        bash "${SCRIPT_DIR}/run_gs2_driver.sh"
+    fi
+    ;;
+  orbbec_336l)
+    if pgrep -f "robot_eai_gs2/[g]s2_driver_node|[g]s2_driver_node --ros-args|ros2 launch robot_eai_gs2 [g]s2.launch.py" >/dev/null 2>&1; then
+      echo "[runtime-overlay] Orbbec backend refused while GS2 docking processes are still running" >&2
+      exit 1
+    fi
+    sensors_config="${ROBOT_DESCRIPTION_CONFIG_FILE:-${NJRH_OVERLAY_ROOT}/config/sensors.yaml}"
+    for required_key in \
+      docking_camera_x docking_camera_y docking_camera_z \
+      docking_camera_roll docking_camera_pitch docking_camera_yaw
+    do
+      if ! grep -Eq "^[[:space:]]*${required_key}:" "${sensors_config}"; then
+        echo "[runtime-overlay] Orbbec docking backend refused: missing ${required_key} in ${sensors_config}" >&2
+        exit 1
+      fi
+    done
+    start_common_process "orbbec_336l_depth" "orbbec_camera|camera336l" \
+      bash "${SCRIPT_DIR}/run_orbbec_336l_depth.sh"
+    start_common_process "orbbec_docking_perception" "robot_docking_perception/orbbec_depth_dock_node|orbbec_depth_dock_node" \
+      bash "${SCRIPT_DIR}/run_orbbec_docking_perception.sh"
+    wait_for_fresh_header_topic_message \
+      "/dock/target_observation" \
+      "${NJRH_DOCKING_SENSOR_READY_TIMEOUT_SEC:-15}" \
+      "${NJRH_DOCKING_SENSOR_MAX_AGE_SEC:-1.0}" \
+      "${NJRH_DOCKING_SENSOR_MAX_FUTURE_SEC:-0.25}" || {
+      echo "[runtime-overlay] Orbbec docking observation did not become fresh" >&2
+      exit 1
+    }
+    ;;
+  *)
+    echo "[runtime-overlay] unsupported NJRH_DOCKING_SENSOR_BACKEND=${DOCKING_SENSOR_BACKEND}" >&2
+    exit 1
+    ;;
+esac
+log_common_startup_stage "docking_sensor_ready"
 if [[ "${NJRH_RUNTIME_HEALTH_GUARD_AUTOSTART:-true}" == "true" ]]; then
   start_runtime_health_guard_common
 else
@@ -861,4 +945,6 @@ echo "[runtime-overlay] common services are running; start mapping or resident n
 while true; do
   sleep "${NJRH_COMMON_MAIN_HEALTH_PERIOD_SEC:-5}"
   verify_ranger_chassis_common_health_or_exit
+  verify_robot_local_state_common_health_or_exit
+  verify_docking_sensor_common_health_or_exit
 done

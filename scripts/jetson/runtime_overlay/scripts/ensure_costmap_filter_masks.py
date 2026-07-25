@@ -9,6 +9,8 @@ mask, white/free PGM pixels load as OccupancyGrid value 0, which is the neutral
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
 import re
 import shlex
@@ -20,6 +22,10 @@ from pathlib import Path
 
 
 NEUTRAL_FILTER_PIXEL = 254
+# Match robot_api_server::fnv1a64. This project intentionally preserves its
+# historical offset basis for revision compatibility.
+FNV64_OFFSET_BASIS = 1469598103934665603
+FNV64_PRIME = 1099511628211
 
 
 def strip_yaml_value(value: str) -> str:
@@ -49,6 +55,16 @@ def parse_origin(value: str | None) -> str:
     if len(numbers) < 3:
         return "[0.0, 0.0, 0.0]"
     return f"[{float(numbers[0]):.6g}, {float(numbers[1]):.6g}, {float(numbers[2]):.6g}]"
+
+
+def origin_numbers(value: str | None) -> tuple[float, float, float] | None:
+    if not value:
+        return None
+    numbers = re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", value)
+    if len(numbers) < 3:
+        return None
+    result = (float(numbers[0]), float(numbers[1]), float(numbers[2]))
+    return result if all(math.isfinite(component) for component in result) else None
 
 
 def pgm_dimensions(path: Path) -> tuple[int, int] | None:
@@ -91,6 +107,108 @@ def image_dimensions(path: Path | None) -> tuple[int, int]:
     if dims is None:
         return 1, 1
     return dims
+
+
+def fnv1a64(data: bytes) -> str:
+    value = FNV64_OFFSET_BASIS
+    for byte in data:
+        value ^= byte
+        value = (value * FNV64_PRIME) & 0xFFFFFFFFFFFFFFFF
+    return f"{value:016x}"
+
+
+def pgm_has_active_cells(path: Path) -> bool | None:
+    data = path.read_bytes()
+    if not data.startswith((b"P2", b"P5")):
+        return None
+    tokens: list[bytes] = []
+    index = 0
+    while index < len(data) and len(tokens) < 4:
+        while index < len(data) and data[index:index + 1].isspace():
+            index += 1
+        if index < len(data) and data[index:index + 1] == b"#":
+            while index < len(data) and data[index:index + 1] not in (b"\n", b"\r"):
+                index += 1
+            continue
+        start = index
+        while index < len(data) and not data[index:index + 1].isspace():
+            index += 1
+        if start != index:
+            tokens.append(data[start:index])
+    if len(tokens) != 4:
+        return None
+    try:
+        width = int(tokens[1])
+        height = int(tokens[2])
+        max_value = int(tokens[3])
+    except ValueError:
+        return None
+    if width <= 0 or height <= 0 or max_value <= 0 or max_value > 255:
+        return None
+    sample_count = width * height
+    if tokens[0] == b"P5":
+        if index >= len(data) or not data[index:index + 1].isspace():
+            return None
+        if data[index:index + 2] == b"\r\n":
+            index += 2
+        else:
+            index += 1
+        samples = data[index:index + sample_count]
+        if len(samples) != sample_count:
+            return None
+        threshold = int(249 * max_value / 255)
+        return any(sample <= threshold for sample in samples)
+    try:
+        samples = [int(value) for value in data[index:].split()]
+    except ValueError:
+        return None
+    if len(samples) != sample_count:
+        return None
+    threshold = int(249 * max_value / 255)
+    return any(sample <= threshold for sample in samples)
+
+
+def validate_keepout_commit(source_yaml: Path, image_path: Path) -> tuple[bool, str]:
+    semantic_path = source_yaml.parent / "keepout_semantic_layer.json"
+    marker_path = source_yaml.parent / "keepout_commit.json"
+    if not semantic_path.exists():
+        active = pgm_has_active_cells(image_path)
+        if active is None:
+            return False, "cannot inspect legacy keepout PGM occupancy"
+        if active:
+            return False, "non-neutral keepout mask has no semantic layer or commit marker"
+        return True, "legacy neutral keepout mask"
+    if not marker_path.is_file():
+        return False, "managed keepout semantic layer has no commit marker"
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        return False, f"invalid keepout commit marker: {error}"
+    if not isinstance(marker, dict) or marker.get("schema") != "njrh.keepout.commit.v1":
+        return False, "keepout commit marker schema is invalid"
+    expected_files = {
+        "semantic_file": semantic_path.name,
+        "mask_yaml_file": source_yaml.name,
+        "mask_pgm_file": image_path.name,
+    }
+    for key, expected in expected_files.items():
+        if marker.get(key) != expected:
+            return False, f"keepout commit marker {key} mismatch"
+    try:
+        content_by_key = {
+            "semantic_fnv64": semantic_path.read_bytes(),
+            "mask_yaml_fnv64": source_yaml.read_bytes(),
+            "mask_pgm_fnv64": image_path.read_bytes(),
+        }
+    except OSError as error:
+        return False, f"failed to read committed keepout assets: {error}"
+    for key, content in content_by_key.items():
+        if marker.get(key) != fnv1a64(content):
+            return False, f"keepout commit marker {key} mismatch"
+    revision = marker.get("revision")
+    if not isinstance(revision, str) or not revision.startswith("keepout-v1-fnv64-"):
+        return False, "keepout commit marker revision is invalid"
+    return True, revision
 
 
 def write_bytes_atomic(path: Path, data: bytes) -> None:
@@ -173,6 +291,7 @@ def stage_source_mask(
     fallback_origin: str,
     expected_dimensions: tuple[int, int],
     stable_wait_sec: float,
+    require_keepout_integrity: bool = False,
 ) -> bool:
     if not source_yaml:
         return False
@@ -201,6 +320,50 @@ def stage_source_mask(
             file=sys.stderr,
         )
         return False
+
+    try:
+        source_resolution = float(values.get("resolution", "nan"))
+    except ValueError:
+        source_resolution = math.nan
+    source_origin = origin_numbers(values.get("origin"))
+    expected_origin = origin_numbers(fallback_origin)
+    # Floor assets can serialize the same map origin with different decimal
+    # precision (for example 4 versus 6 places).  Accept only sub-millimetre,
+    # sub-pixel rounding on x/y; keep yaw strict so a genuinely different map
+    # cannot be staged.
+    origin_xy_tolerance = max(1e-6, fallback_resolution * 1e-3)
+    origin_yaw_tolerance = 1e-6
+    origin_mismatch = (
+        source_origin is None
+        or expected_origin is None
+        or abs(source_origin[0] - expected_origin[0]) > origin_xy_tolerance
+        or abs(source_origin[1] - expected_origin[1]) > origin_xy_tolerance
+        or abs(source_origin[2] - expected_origin[2]) > origin_yaw_tolerance
+    )
+    if (
+        not math.isfinite(source_resolution)
+        or source_resolution <= 0.0
+        or abs(source_resolution - fallback_resolution) > 1e-9
+        or origin_mismatch
+    ):
+        print(
+            "[runtime-overlay] filter mask geometry does not match Nav2 map; "
+            f"source={source_yaml} resolution={values.get('resolution')} "
+            f"origin={values.get('origin')} expected_resolution={fallback_resolution} "
+            f"expected_origin={fallback_origin}",
+            file=sys.stderr,
+        )
+        return False
+
+    if require_keepout_integrity:
+        integrity_ok, integrity_detail = validate_keepout_commit(source_yaml, image_path)
+        if not integrity_ok:
+            print(
+                "[runtime-overlay] keepout source integrity validation failed; "
+                f"source={source_yaml} detail={integrity_detail}",
+                file=sys.stderr,
+            )
+            return False
 
     tmp_pgm = output_pgm.with_name(f".{output_pgm.name}.tmp.{os.getpid()}")
     output_pgm.parent.mkdir(parents=True, exist_ok=True)
@@ -264,10 +427,18 @@ def main() -> int:
             origin,
             (width, height),
             args.stable_wait_sec,
+            require_keepout_integrity=label == "keepout",
         )
         if staged:
             staged_sources.append(f"{label}:source")
         else:
+            if label == "keepout" and source_yaml:
+                print(
+                    "[runtime-overlay] refusing to replace a selected but invalid keepout mask "
+                    f"with a neutral mask: {source_yaml}",
+                    file=sys.stderr,
+                )
+                return 2
             write_pgm(pgm_path, width, height)
             write_mask_yaml(yaml_path, pgm_path.name, resolution, origin)
             staged_sources.append(f"{label}:neutral")

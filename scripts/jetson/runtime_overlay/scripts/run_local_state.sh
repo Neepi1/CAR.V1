@@ -405,7 +405,18 @@ elif [[ "${EKF_USES_IMU}" != "true" ]]; then
 fi
 
 echo "[runtime-overlay] starting robot_local_state EKF profile=${EKF_PROFILE} params=${EKF_PARAMS_FILE}" >&2
-njrh_start_affined_background ekf_pid robot_local_state "${EKF_NODE_BIN}" --ros-args \
+LOCAL_STATE_RMW_FASTRTPS_PUBLICATION_MODE="${LOCAL_STATE_RMW_FASTRTPS_PUBLICATION_MODE:-ASYNCHRONOUS}"
+case "${LOCAL_STATE_RMW_FASTRTPS_PUBLICATION_MODE}" in
+  ASYNCHRONOUS|SYNCHRONOUS|AUTO) ;;
+  *)
+    echo "[runtime-overlay] invalid LOCAL_STATE_RMW_FASTRTPS_PUBLICATION_MODE=${LOCAL_STATE_RMW_FASTRTPS_PUBLICATION_MODE}; expected ASYNCHRONOUS, SYNCHRONOUS, or AUTO" >&2
+    exit 2
+    ;;
+esac
+echo "[runtime-overlay] robot_local_state Fast DDS publication mode=${LOCAL_STATE_RMW_FASTRTPS_PUBLICATION_MODE}" >&2
+njrh_start_affined_background ekf_pid robot_local_state \
+  env RMW_FASTRTPS_PUBLICATION_MODE="${LOCAL_STATE_RMW_FASTRTPS_PUBLICATION_MODE}" \
+  "${EKF_NODE_BIN}" --ros-args \
   --params-file "${EKF_PARAMS_FILE}" \
   -r __node:=robot_local_state \
   -r /odometry/filtered:=/local_state/odometry

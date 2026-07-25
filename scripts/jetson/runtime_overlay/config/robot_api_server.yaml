@@ -12,6 +12,8 @@ robot_api_server:
     safety_status_topic: "/safety/status"
     safety_motion_allowed_topic: "/safety/motion_allowed"
     floor_status_topic: "/floor_manager/status"
+    floor_transition_status_topic: "/floor_manager/transition_status"
+    floor_runtime_negative_interlock_enabled: true
     bms_state_topic: "/battery_state"
     bms_state_max_age_sec: 3.0
     teleop_stop_on_charging: true
@@ -21,11 +23,24 @@ robot_api_server:
     bms_full_soc_threshold_pct: 99.0
     bms_full_soc_voltage_contact_enable: true
     floor_switch_service: "/floor_manager/switch_floor"
+    keepout_mask_load_service: "/keepout_filter_mask_server/load_map"
+    keepout_mask_state_service: "/keepout_filter_mask_server/get_state"
+    keepout_filter_info_state_service: "/keepout_costmap_filter_info_server/get_state"
+    keepout_mask_get_parameters_service: "/keepout_filter_mask_server/get_parameters"
+    keepout_runtime_stage_root: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/filters/runtime_nav2"
+    keepout_mask_topic: "/keepout_filter_mask"
+    keepout_filter_info_topic: "/costmap_filter_info/keepout"
+    global_costmap_get_parameters_service: "/global_costmap/global_costmap/get_parameters"
+    global_costmap_clear_service: "/global_costmap/clear_entirely_global_costmap"
+    global_costmap_topic: "/global_costmap/costmap"
+    keepout_runtime_apply_timeout_sec: 5.0
     localization_trigger_service: "/global_localization/trigger"
     localization_bridge_force_accept_service: "/robot_localization_bridge/force_accept_next_localization"
     localization_result_topic: "/localization_result"
     localization_bridge_status_topic: "/localization/bridge_status"
+    localization_floor_health_topic: "/localization/floor_health"
     navigate_to_pose_action: "/navigate_to_pose"
+    navigate_to_pose_status_topic: "/navigate_to_pose/_action/status"
 
     mapping_2d_start_command: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/run_projected_map.sh"
     mapping_2d_log_file: "/tmp/njrh_mapping2d_slam_toolbox.log"
@@ -45,7 +60,10 @@ robot_api_server:
     docking_stop_service: "/docking/stop"
     docking_undock_service: "/docking/undock"
     docking_status_topic: "/docking/status"
+    docking_observation_backend: "target_observation"
     docking_gs2_scan_topic: "/dock/gs2_scan"
+    docking_target_observation_topic: "/dock/target_observation"
+    docking_target_observation_source: "orbbec_336l_depth"
     docking_contact_latch_file: "/workspaces/njrh-v3/workspace1/maps_release/docking_contact_latch.json"
     dock_contact_latch_bms_ttl_sec: 300.0
     dock_contact_latch_bms_require_contact_sec: 2.0
@@ -56,6 +74,7 @@ robot_api_server:
     docking_pre_dock_distance_m: 0.60
     docking_navigation_start_wait_sec: 45.0
     docking_predock_nav_timeout_sec: 180.0
+    docking_predock_behavior_tree: "/workspaces/njrh-v3/workspace1/install/robot_nav_config/share/robot_nav_config/behavior_trees/navigate_to_predock.xml"
     # Keep Nav2 as the primary owner until it finishes the pre-dock goal.
     # API yaw/lateral capture still runs after Nav2 success/abort verification.
     docking_predock_early_handoff_enabled: false
@@ -79,11 +98,11 @@ robot_api_server:
     navigation_auto_undock_timeout_sec: 28.0
     docking_undock_charging_retry_sec: 3.0
     docking_framework_state_machine_enabled: true
-    docking_default_dock_profile_id: "gs2_rear_charging_dock"
-    docking_default_dock_profile_type: "gs2_near_field"
+    docking_default_dock_profile_id: "orbbec_336l_rear_charging_dock"
+    docking_default_dock_profile_type: "depth_geometry"
     docking_default_approach_direction: "reverse"
     docking_default_contact_frame: "charge_contact_link"
-    docking_default_sensor_frame: "gs2_link"
+    docking_default_sensor_frame: "camera336l_depth_optical_frame"
     docking_max_retries: 2
     predock_yaw_align_enabled: true
     predock_yaw_align_fallback_enabled: true
@@ -197,9 +216,11 @@ robot_api_server:
     localization_bridge_acceptance_timeout_sec: 3.0
     localization_bridge_acceptance_max_distance_m: 1.0
     localization_bridge_acceptance_max_yaw_rad: 0.35
-    manual_relocalization_amcl_refine_enabled: false
-    manual_relocalization_amcl_refine_required: false
-    manual_relocalization_amcl_refine_timeout_sec: 8.0
+    # Manual recovery does not report success until the bridge-owned, bounded
+    # post-Isaac AMCL refinement has reached the published map->odom state.
+    manual_relocalization_amcl_refine_enabled: true
+    manual_relocalization_amcl_refine_required: true
+    manual_relocalization_amcl_refine_timeout_sec: 4.0
     manual_relocalization_amcl_refine_poll_ms: 100
     manual_relocalization_amcl_refine_request_period_ms: 500
     # Normal navigation goals no longer trigger explicit relocalization or
@@ -240,20 +261,29 @@ robot_api_server:
     post_nav2_final_verify_max_retry_count: 3
     post_nav2_final_verify_acceptance_slack_m: 0.02
     post_nav2_final_verify_xy_retry_min_error_m: 0.06
-    post_nav2_final_verify_xy_retry_max_error_m: 0.35
+    # One envelope owns same-goal retry, failed-Nav2 recovery, and direct
+    # terminal correction so no residual can fall between independent gates.
+    navigation_terminal_recovery_max_distance_m: 0.40
     post_nav2_final_verify_yaw_retry_if_failed: true
     post_nav2_final_verify_retry_uses_same_nav2_goal: true
     post_nav2_final_verify_api_velocity_correction_enabled: true
     post_nav2_final_verify_reverse_permit_enabled: true
     post_nav2_final_verify_reverse_enable_topic: "/ranger_mini3/allow_reverse"
+    navigation_terminal_reverse_permit_enabled: true
+    navigation_terminal_reverse_permit_enter_distance_m: 0.30
+    navigation_terminal_reverse_permit_exit_distance_m: 0.35
+    navigation_terminal_reverse_permit_refresh_period_sec: 0.20
     post_nav2_final_verify_terminal_lateral_correction_enabled: true
     post_nav2_final_verify_terminal_lateral_target_m: 0.03
     post_nav2_final_verify_terminal_lateral_trigger_m: 0.04
-    post_nav2_final_verify_terminal_lateral_max_xy_m: 0.30
-    post_nav2_final_verify_terminal_lateral_max_forward_m: 0.12
+    post_nav2_final_verify_terminal_lateral_max_forward_m: 0.15
     post_nav2_final_verify_terminal_lateral_speed_mps: 0.04
     post_nav2_final_verify_terminal_lateral_kp: 0.8
-    post_nav2_final_verify_terminal_lateral_timeout_sec: 8.0
+    post_nav2_final_verify_terminal_lateral_timeout_sec: 20.0
+    navigation_terminal_recovery_costmap_guard_enabled: true
+    navigation_terminal_recovery_costmap_max_age_sec: 0.50
+    navigation_terminal_recovery_costmap_occupied_threshold: 50
+    navigation_terminal_recovery_costmap_lookahead_m: 0.15
     post_nav2_final_verify_terminal_lateral_command_sign: 1.0
     post_nav2_final_verify_terminal_settle_enabled: true
     post_nav2_final_verify_terminal_settle_linear_speed_threshold_mps: 0.01
@@ -264,14 +294,14 @@ robot_api_server:
     post_nav2_final_verify_terminal_settle_require_dual_ackermann_mode: true
     post_nav2_final_verify_terminal_settle_mode_status_max_age_sec: 0.50
     post_nav2_final_verify_terminal_settle_max_recheck_count: 1
-    navigation_near_goal_stalled_handoff_enabled: true
-    navigation_near_goal_stalled_handoff_distance_m: 0.30
+    # The Ranger FollowPath plugin now owns normal terminal handoff without
+    # ending the Nav2 task. API correction remains an abort-time fallback only.
+    navigation_near_goal_stalled_handoff_enabled: false
     navigation_near_goal_stalled_handoff_min_wait_sec: 3.0
     navigation_near_goal_stalled_handoff_stall_sec: 1.5
     navigation_near_goal_stalled_handoff_improvement_epsilon_m: 0.02
     navigation_nav2_failed_near_goal_retry_enabled: true
     navigation_nav2_failed_near_goal_retry_max_count: 1
-    navigation_nav2_failed_near_goal_retry_max_distance_m: 0.35
     navigation_nav2_failed_near_goal_retry_requires_yaw_error: false
     navigation_final_yaw_align_enable: true
     navigation_final_yaw_tolerance_rad: 0.05

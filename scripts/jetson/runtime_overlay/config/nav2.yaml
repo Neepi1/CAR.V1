@@ -65,9 +65,21 @@ controller_server:
       stateful: false
       xy_goal_tolerance: 0.06
       yaw_goal_tolerance: 0.05
+    # Humble 1.1.20 creates RotationShim's private PositionGoalChecker under
+    # this leading-dot parameter namespace. Keep XY live while terminal yaw is
+    # closing so a transient in-tolerance sample cannot remain latched.
+    ".position_checker.stateful": false
     FollowPath:
-      plugin: "nav2_rotation_shim_controller::RotationShimController"
+      plugin: "robot_nav_config::GoalScopedRotationShimController"
       primary_controller: "nav2_mppi_controller::MPPIController"
+      # Humble's stock RotationShim re-arms on every setPlan(). Keep periodic
+      # global replanning, but only arm startup heading alignment when the
+      # navigation goal itself changes. Terminal goal-yaw rotation is separate
+      # and remains enabled below.
+      rotate_to_heading_once: true
+      goal_change_xy_threshold: 0.01
+      goal_change_yaw_threshold: 0.01
+      same_goal_rearm_after_idle_sec: 2.0
       # Ackermann MPPI cannot spin in place: its hard turning-radius constraint
       # collapses wz with vx near zero. Let RotationShim own path entry heading
       # before MPPI starts crawling with physically ineffective tiny commands.
@@ -78,6 +90,43 @@ controller_server:
       # shim commands; keep Nav2-owned heading closure smooth and observable.
       rotate_to_heading_angular_vel: 0.60
       max_angular_accel: 1.2
+      # Humble 1.1.19 does not reduce pure-yaw speed as the remaining goal
+      # angle shrinks. The project wrapper backports Nav2's stopping envelope
+      # so Ranger can enter the yaw tolerance instead of reversing at 0.60rad/s.
+      closed_loop: true
+      terminal_rotation_braking_enabled: true
+      # Keep FollowPath RUNNING when a short Ackermann hairpin cannot close a
+      # mostly-lateral residual. The wrapper stops, then executes mutually
+      # exclusive yaw, side-slip, and forward/reverse terminal stages.
+      terminal_handoff_enabled: true
+      terminal_handoff_max_distance_m: 0.40
+      terminal_handoff_max_abs_forward_m: 0.15
+      terminal_handoff_minimum_abs_lateral_m: 0.08
+      terminal_handoff_lateral_dominance_ratio: 1.20
+      terminal_handoff_path_length_ratio: 1.80
+      terminal_handoff_path_cross_track_m: 0.15
+      terminal_handoff_goal_xy_tolerance_m: 0.06
+      terminal_handoff_goal_yaw_tolerance_rad: 0.05
+      terminal_handoff_yaw_exit_tolerance_rad: 0.035
+      terminal_handoff_lateral_entry_m: 0.04
+      terminal_handoff_lateral_exit_m: 0.025
+      terminal_handoff_forward_entry_m: 0.04
+      terminal_handoff_forward_exit_m: 0.025
+      terminal_handoff_yaw_kp: 1.20
+      terminal_handoff_yaw_min_speed_radps: 0.08
+      terminal_handoff_yaw_max_speed_radps: 0.30
+      terminal_handoff_lateral_kp: 0.80
+      terminal_handoff_lateral_max_speed_mps: 0.05
+      terminal_handoff_forward_kp: 0.80
+      terminal_handoff_forward_max_speed_mps: 0.10
+      terminal_handoff_reverse_max_speed_mps: 0.08
+      terminal_handoff_settle_linear_speed_mps: 0.01
+      terminal_handoff_settle_angular_speed_radps: 0.02
+      terminal_handoff_settle_duration_sec: 0.30
+      terminal_handoff_timeout_sec: 20.0
+      terminal_handoff_costmap_lookahead_m: 0.15
+      terminal_handoff_lateral_permit_topic: /ranger_mini3/nav_terminal_lateral_enable
+      terminal_handoff_reverse_permit_topic: /ranger_mini3/nav_terminal_reverse_enable
       simulate_ahead_time: 1.0
       # RotationShim owns ordinary pose_required terminal heading and docking
       # predock staging heading before the Nav2 action succeeds.
@@ -130,7 +179,7 @@ controller_server:
         enabled: true
         cost_power: 1
         cost_weight: 6.0
-        threshold_to_consider: 1.5
+        threshold_to_consider: 0.45
       ObstaclesCritic:
         enabled: true
         cost_power: 1
@@ -149,7 +198,7 @@ controller_server:
         cost_weight: 2.4
         max_path_occupancy_ratio: 0.05
         trajectory_point_step: 4
-        threshold_to_consider: 1.5
+        threshold_to_consider: 0.35
         offset_from_furthest: 12
         use_path_orientations: false
       PathFollowCritic:
@@ -160,13 +209,13 @@ controller_server:
         # recovery.
         cost_weight: 7.0
         offset_from_furthest: 10
-        threshold_to_consider: 1.2
+        threshold_to_consider: 0.35
       PathAngleCritic:
         enabled: true
         cost_power: 1
         cost_weight: 2.0
         offset_from_furthest: 4
-        threshold_to_consider: 0.8
+        threshold_to_consider: 0.35
         max_angle_to_furthest: 1.5
         mode: 0
       TwirlingCritic:
@@ -243,6 +292,9 @@ bt_navigator:
       - nav2_compute_path_through_poses_action_bt_node
       - nav2_follow_path_action_bt_node
       - nav2_pipeline_sequence_bt_node
+      - nav2_rate_controller_bt_node
+      - nav2_globally_updated_goal_condition_bt_node
+      - nav2_is_path_valid_condition_bt_node
       - nav2_navigate_to_pose_action_bt_node
       - nav2_navigate_through_poses_action_bt_node
 
@@ -270,10 +322,12 @@ velocity_smoother:
     smoothing_frequency: 30.0
     scale_velocities: false
     feedback: "OPEN_LOOP"
-    max_velocity: [1.20, 0.0, 0.70]
-    min_velocity: [-0.08, 0.0, -0.70]
-    max_accel: [0.55, 0.0, 0.90]
-    max_decel: [-0.95, 0.0, -1.10]
+    # MPPI remains Ackermann (vy_max=0). This narrow Y channel is used only
+    # when the Ranger terminal controller publishes a fresh lateral permit.
+    max_velocity: [1.20, 0.05, 0.70]
+    min_velocity: [-0.08, -0.05, -0.70]
+    max_accel: [0.55, 0.20, 0.90]
+    max_decel: [-0.95, -0.30, -1.10]
     odom_topic: /local_state/odometry
     odom_duration: 0.2
     deadband_velocity: [0.0, 0.0, 0.0]
@@ -361,7 +415,9 @@ local_costmap:
           max_obstacle_height: 1.40
           obstacle_min_range: 0.25
           obstacle_max_range: 5.50
-          raytrace_min_range: 0.25
+          # Start clearing one 5 cm cell inside the scan marking cutoff. At
+          # 0.25 m, integer raytracing left repeatable diagonal blind cells.
+          raytrace_min_range: 0.20
           raytrace_max_range: 8.00
       local_inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"

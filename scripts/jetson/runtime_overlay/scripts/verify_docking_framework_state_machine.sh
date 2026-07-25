@@ -31,6 +31,7 @@ for path in \
   "${WORKSPACE_ROOT}/src/robot_api_server/src/docking_job_model.cpp" \
   "${WORKSPACE_ROOT}/src/robot_api_server/config/robot_api_server.yaml" \
   "${WORKSPACE_ROOT}/scripts/jetson/runtime_overlay/config/robot_api_server.yaml" \
+  "${WORKSPACE_ROOT}/src/robot_nav_config/behavior_trees/navigate_to_predock.xml" \
   "${WORKSPACE_ROOT}/src/robot_nav_config/config/docking.yaml" \
   "${WORKSPACE_ROOT}/scripts/jetson/runtime_overlay/config/docking.yaml" \
   "${WORKSPACE_ROOT}/src/robot_localization_bridge/src/localization_bridge_node.cpp" \
@@ -43,12 +44,13 @@ job_hpp="${WORKSPACE_ROOT}/src/robot_api_server/include/robot_api_server/docking
 api_cfg="${WORKSPACE_ROOT}/scripts/jetson/runtime_overlay/config/robot_api_server.yaml"
 docking_cfg="${WORKSPACE_ROOT}/scripts/jetson/runtime_overlay/config/docking.yaml"
 bridge_cpp="${WORKSPACE_ROOT}/src/robot_localization_bridge/src/localization_bridge_node.cpp"
+predock_bt="${WORKSPACE_ROOT}/src/robot_nav_config/behavior_trees/navigate_to_predock.xml"
 
 for phase in \
   DOCK_REQUESTED RESOLVE_DOCK_PROFILE BEFORE_PREDOCK_RELOCALIZE BEFORE_PREDOCK_SETTLE \
-  NAV_TO_STAGING_NATIVE_NAV2 STAGING_NAV2_EARLY_HANDOFF STAGING_NAV2_GOAL_SUCCEEDED PREDOCK_POSE_VERIFY \
-  PREDOCK_NATIVE_GOAL_VERIFY_FAILED PREDOCK_YAW_ALIGN_RECOVERY \
-  PREDOCK_YAW_ALIGN_RECOVERY_SETTLE PREDOCK_LATERAL_ALIGN PREDOCK_LATERAL_ALIGN_VERIFY \
+  NAV_TO_STAGING_NATIVE_NAV2 PREDOCK_CONTACT_STOP STAGING_NAV2_EARLY_HANDOFF STAGING_NAV2_GOAL_SUCCEEDED PREDOCK_POSE_VERIFY \
+  PREDOCK_NATIVE_GOAL_VERIFY_FAILED PREDOCK_ALIGNMENT_DEFERRED_FOR_BRIDGE_SETTLE \
+  PREDOCK_YAW_ALIGN_RECOVERY \
   AFTER_PREDOCK_RELOCALIZE AFTER_PREDOCK_SETTLE \
   GS2_DOCK_DETECT FINE_DOCKING_BRIDGE_SETTLE PREDOCK_POSE_VERIFY_AFTER_BRIDGE_SETTLE \
   PREDOCK_YAW_ALIGN_AFTER_BRIDGE_SETTLE PREDOCK_YAW_ALIGN_AFTER_BRIDGE_SETTLE_VERIFY \
@@ -70,12 +72,14 @@ for code in \
   PREDOCK_POSE_DRIFTED_AFTER_BRIDGE_SETTLE PREDOCK_YAW_NOT_ALIGNED_AFTER_BRIDGE_SETTLE \
   DOCK_FAILED_FINE_LOCALIZATION_TRANSITION_TIMEOUT \
   PREDOCK_YAW_NOT_ALIGNED PREDOCK_YAW_HARD_FAIL PREDOCK_YAW_ALIGN_TIMEOUT \
-  PREDOCK_YAW_ALIGN_NO_YAW_MOTION \
+  PREDOCK_YAW_ALIGN_NO_YAW_MOTION PREDOCK_YAW_ALIGN_MODE_SWITCH_TIMEOUT \
+  PREDOCK_YAW_ALIGN_NO_CONFIRMED_PHYSICAL_SPIN \
   PREDOCK_LATERAL_NOT_ALIGNED PREDOCK_LATERAL_HARD_FAIL PREDOCK_LATERAL_ALIGN_TIMEOUT \
   PREDOCK_LATERAL_ALIGN_NO_LATERAL_MOTION PREDOCK_LATERAL_ALIGN_OWNER_CONFLICT \
   GS2_DOCK_DETECT_TIMEOUT FINE_DOCKING_ENTRY_CONDITION_FAILED \
   FINE_DOCKING_REJECTED_YAW_TOO_LARGE FINE_DOCKING_REJECTED_LATERAL_TOO_LARGE \
-  FINE_DOCKING_TIMEOUT FINAL_INSERTION_NO_CONTACT DOCK_FAILED_SAFETY_BLOCKED; do
+  FINE_DOCKING_TIMEOUT FINAL_INSERTION_NO_CONTACT DOCK_FAILED_SAFETY_BLOCKED \
+  DOCK_FAILED_PREDOCK_CONTACT_DROPPED; do
   require_text "${api_cpp}" "${code}"
 done
 
@@ -86,14 +90,24 @@ require_text "${api_cpp}" "twist.linear.y"
 require_text "${api_cpp}" "mode_controller_status_topic_"
 require_text "${api_cpp}" "actual_motion_mode_code == 2"
 require_text "${api_cpp}" "docking_gs2_scan_topic_"
-require_text "${api_cpp}" "set_global_correction_paused_for_docking(job_id, true, \"docking_fine_entry\""
+require_text "${api_cpp}" 'job_id, true, "docking_staging_alignment", pause_detail'
 require_text "${api_cpp}" "set_global_correction_paused_for_docking("
 require_text "${bridge_cpp}" "correction_pause_service"
 require_text "${bridge_cpp}" "GLOBAL_CORRECTION_PAUSED"
 require_text "${bridge_cpp}" "global_correction_paused"
+require_text "${api_cpp}" "goal.behavior_tree = docking_predock_behavior_tree_"
+require_text "${api_cpp}" "bms_charging_contact_snapshot()"
+require_text "${api_cpp}" "wait_for_terminal_actual_stop("
+require_text "${predock_bt}" "<ComputePathToPose"
+require_text "${predock_bt}" "<FollowPath"
+if grep -Eq 'RateController|PipelineSequence' "${predock_bt}"; then
+  fail "predock BT must keep one stable path per Nav2 action attempt"
+fi
 
 for field in \
   dock_profile_id approach_direction contact_frame sensor_frame max_retries retry_count \
+  predock_nav_contact_detected predock_nav_canceled_for_contact predock_contact_stop_confirmed \
+  predock_contact_reason predock_contact_stop_detail \
   predock_nav_early_handoff predock_nav_handoff_detail \
   predock_yaw_verified_by_nav2 reverse_yaw_offset_applied contact_frame_available \
   predock_forward_m predock_lateral_m predock_lateral_abs_m \
@@ -105,7 +119,7 @@ for field in \
 done
 
 for key in \
-  docking_framework_state_machine_enabled predock_yaw_align_enabled \
+  docking_framework_state_machine_enabled docking_predock_behavior_tree predock_yaw_align_enabled \
   predock_yaw_align_fallback_enabled predock_yaw_align_cmd_topic \
   predock_lateral_align_enabled predock_lateral_align_forced_mode \
   predock_yaw_align_require_actual_spin fine_docking_entry_require_gs2_fresh \

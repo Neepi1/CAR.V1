@@ -1,10 +1,13 @@
 docking:
   ros__parameters:
     base_frame: base_link
+    observation_backend: target_observation
     gs2_frame: gs2_link
     charge_contact_frame: charge_contact_link
     dock_contact_frame: dock_contact_link
     gs2_scan_topic: /dock/gs2_scan
+    target_observation_topic: /dock/target_observation
+    target_observation_source: orbbec_336l_depth
     cmd_vel_topic: /cmd_vel_docking
     status_topic: /docking/status
     start_service: /docking/start
@@ -14,6 +17,13 @@ docking:
     docking_contact_latch_file: /workspaces/njrh-v3/workspace1/maps_release/docking_contact_latch.json
 
     dock_types:
+      orbbec_336l_rear_charging_dock:
+        type: depth_geometry
+        sensor_frame: camera336l_depth_optical_frame
+        contact_frame: charge_contact_link
+        staging_offset_m: 0.60
+        approach_direction: reverse
+        max_retries: 2
       gs2_rear_charging_dock:
         type: gs2_near_field
         sensor_frame: gs2_link
@@ -50,11 +60,12 @@ docking:
       negative_electrode_position: lower
 
     approach:
+      allow_blind_approach: false
       pre_dock_distance_m: 0.60
       blind_approach_max_distance_m: 0.50
       blind_approach_speed_mps: 0.06
       gs2_acquire_distance_m: 0.28
-      final_target_distance_m: 0.05
+      final_target_distance_m: 0.34
 
     undock:
       distance_m: 0.60
@@ -69,15 +80,25 @@ docking:
       no_progress_timeout_s: 2.0
       progress_epsilon_m: 0.005
 
+    contact_stop:
+      motion_state_topic: /motion_state
+      wheel_odom_topic: /wheel/odom
+      feedback_max_age_s: 0.50
+      linear_speed_threshold_mps: 0.01
+      angular_speed_threshold_radps: 0.02
+      stable_duration_s: 0.50
+      stable_samples: 5
+      feedback_timeout_s: 3.0
+
     tolerances:
       lateral_soft_limit_m: 0.030
       lateral_hard_limit_m: 0.050
-      yaw_soft_limit_deg: 5.0
+      yaw_soft_limit_deg: 0.5
       yaw_hard_limit_deg: 7.0
-      contact_confirm_timeout_s: 3.0
+      contact_confirm_timeout_s: 16.0
 
     safety:
-      max_linear_speed_mps: 0.08
+      max_linear_speed_mps: 0.15
       max_angular_speed_radps: 0.12
       max_retries: 3
       command_timeout_ms: 300
@@ -100,21 +121,37 @@ docking:
       kx: 0.45
       ky: 0.55
       ky_lateral: 0.70
-      lateral_command_sign: -1.0
+      lateral_command_sign: 1.0
       kyaw: 0.70
       lateral_deadband_m: 0.005
-      yaw_deadband_deg: 1.0
+      yaw_deadband_deg: 0.25
       min_align_speed_mps: 0.025
+      min_angular_speed_radps: 0.05
       min_lateral_speed_mps: 0.025
       max_lateral_speed_mps: 0.04
       lateral_priority_threshold_m: 0.010
-      yaw_priority_threshold_deg: 2.0
+      yaw_priority_threshold_deg: 1.0
+      yaw_realign_enter_deg: 1.0
+      yaw_realign_stable_frames: 3
       max_forward_while_lateral_mps: 0.000
       lock_lateral_during_final_insert: true
       yaw_spin_priority_enabled: true
       max_command_steering_rad: 0.35
       ackermann_wheelbase_m: 0.494
-      contact_crawl_speed_mps: 0.025
+      contact_crawl_speed_mps: 0.05
+      contact_final_slow_zone_m: 0.30
+      contact_final_crawl_speed_mps: 0.02
+      contact_verify_max_distance_m: 0.31
+      contact_verify_retry_enabled: true
+      contact_retry_max_count: 2
+      contact_retry_backoff_distance_m: 0.60
+      contact_retry_backoff_speed_mps: 0.06
+      contact_retry_backoff_timeout_s: 20.0
+      contact_retry_backoff_command_settle_s: 0.5
+      contact_retry_backoff_motion_start_timeout_s: 6.0
+      contact_retry_backoff_no_progress_timeout_s: 2.0
+      contact_retry_backoff_progress_epsilon_m: 0.005
+      contact_retry_backoff_max_lateral_drift_m: 0.05
 
     charging:
       min_current_a: 0.10

@@ -30,6 +30,7 @@ from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid, Odometry
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from robot_interfaces.msg import DockTargetObservation
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 from tf2_msgs.msg import TFMessage
@@ -61,6 +62,20 @@ def _bool_topic(value: dict[str, Any]) -> bool:
     return bool(value.get("publishers", 0) > 0 and value.get("last_age_sec") is not None)
 
 
+def _parse_tf_edges(value: str) -> set[str]:
+    edges: set[str] = set()
+    for raw_item in str(value or "").replace(";", ",").split(","):
+        item = raw_item.strip()
+        if not item or "->" not in item:
+            continue
+        parent, child = item.split("->", 1)
+        parent = _strip_slash(parent)
+        child = _strip_slash(child)
+        if parent and child:
+            edges.add(f"{parent}->{child}")
+    return edges
+
+
 class RuntimeHealthGuard(Node):
     def __init__(self, output_path: Path, once: bool) -> None:
         super().__init__("runtime_health_guard")
@@ -68,16 +83,36 @@ class RuntimeHealthGuard(Node):
         self.once = once
         self.started_monotonic = time.monotonic()
         self.graph_last_checked = 0.0
-        self.graph_period_sec = _env_float("NJRH_RUNTIME_HEALTH_GRAPH_PERIOD_SEC", 2.0)
+        self.graph_period_sec = _env_float("NJRH_RUNTIME_HEALTH_GRAPH_PERIOD_SEC", 5.0)
         self.write_period_sec = _env_float("NJRH_RUNTIME_HEALTH_WRITE_PERIOD_SEC", 1.0)
         self.topic_fresh_sec = _env_float("NJRH_RUNTIME_HEALTH_TOPIC_FRESH_SEC", 1.5)
         self.odom_fresh_sec = _env_float("NJRH_RUNTIME_HEALTH_ODOM_FRESH_SEC", 0.75)
         self.tf_fresh_sec = _env_float("NJRH_RUNTIME_HEALTH_TF_FRESH_SEC", 0.25)
         self.map_tf_fresh_sec = _env_float("NJRH_RUNTIME_HEALTH_MAP_TF_FRESH_SEC", 1.0)
         self.scan_fresh_sec = _env_float("NJRH_RUNTIME_HEALTH_SCAN_FRESH_SEC", 1.0)
+        self.docking_fresh_sec = _env_float(
+            "NJRH_RUNTIME_HEALTH_DOCKING_FRESH_SEC", 1.5
+        )
         self.observe_heavy_topics = os.environ.get(
             "NJRH_RUNTIME_HEALTH_OBSERVE_HEAVY_TOPICS", "false"
         ).lower() in {"1", "true", "yes", "on"}
+        self.observe_topic_messages = (
+            os.environ.get("NJRH_RUNTIME_HEALTH_OBSERVE_TOPIC_MESSAGES", "false").lower()
+            in {"1", "true", "yes", "on"}
+        ) or self.observe_heavy_topics
+        self.observe_all_tf = os.environ.get(
+            "NJRH_RUNTIME_HEALTH_OBSERVE_ALL_TF", "false"
+        ).lower() in {"1", "true", "yes", "on"}
+        self.observe_tf = (
+            os.environ.get("NJRH_RUNTIME_HEALTH_OBSERVE_TF", "false").lower()
+            in {"1", "true", "yes", "on"}
+        ) or self.observe_all_tf
+        self.tracked_tf_edges = _parse_tf_edges(
+            os.environ.get(
+                "NJRH_RUNTIME_HEALTH_TF_TRACKED_EDGES",
+                "map->odom,odom->base_link",
+            )
+        )
 
         self.topics: dict[str, dict[str, Any]] = {}
         self.tf_edges: dict[str, dict[str, Any]] = {}
@@ -95,28 +130,49 @@ class RuntimeHealthGuard(Node):
         self._init_topic("/global_costmap/costmap", "nav_msgs/msg/OccupancyGrid")
         self._init_topic("/local_costmap/costmap", "nav_msgs/msg/OccupancyGrid")
         self._init_topic("/localization_result", "geometry_msgs/msg/PoseWithCovarianceStamped")
+        self._init_topic(
+            "/dock/target_observation", "robot_interfaces/msg/DockTargetObservation"
+        )
 
-        self._make_subscription(Odometry, "/local_state/odometry", self._on_topic("/local_state/odometry"), self._reliable_qos())
-        self._make_subscription(Odometry, "/fastlio/base_odometry", self._on_topic("/fastlio/base_odometry"), self._reliable_qos())
-        self._make_subscription(Odometry, "/Odometry", self._on_topic("/Odometry"), self._best_effort_qos())
-        self._make_subscription(String, "/safety/status", self._on_topic("/safety/status"), self._reliable_qos())
-        self._make_subscription(LaserScan, "/scan", self._on_topic("/scan"), self._best_effort_qos())
-        if self.observe_heavy_topics:
-            self._make_subscription(OccupancyGrid, "/map", self._on_topic("/map"), self._transient_qos())
-            self._make_subscription(
-                OccupancyGrid,
-                "/global_costmap/costmap",
-                self._on_topic("/global_costmap/costmap"),
-                self._reliable_qos(),
-            )
-            self._make_subscription(
-                OccupancyGrid,
-                "/local_costmap/costmap",
-                self._on_topic("/local_costmap/costmap"),
-                self._reliable_qos(),
-            )
-        self._make_subscription(PoseWithCovarianceStamped, "/localization_result", self._on_topic("/localization_result"), self._best_effort_qos())
-        self._make_subscription(TFMessage, "/tf", self._on_tf, self._tf_qos(ReliabilityPolicy.RELIABLE))
+        # These messages are small and safety critical. Keep them observed by
+        # one persistent participant instead of spawning short-lived CLI
+        # subscribers. BEST_EFFORT odometry avoids adding ACK/NACK pressure to
+        # the canonical robot_local_state writer while still detecting stalls.
+        self._make_subscription(
+            Odometry,
+            "/local_state/odometry",
+            self._on_topic("/local_state/odometry"),
+            self._best_effort_qos(),
+        )
+        self._make_subscription(
+            DockTargetObservation,
+            "/dock/target_observation",
+            self._on_docking_observation,
+            self._reliable_qos(),
+        )
+
+        if self.observe_topic_messages:
+            self._make_subscription(Odometry, "/fastlio/base_odometry", self._on_topic("/fastlio/base_odometry"), self._reliable_qos())
+            self._make_subscription(Odometry, "/Odometry", self._on_topic("/Odometry"), self._best_effort_qos())
+            self._make_subscription(String, "/safety/status", self._on_topic("/safety/status"), self._reliable_qos())
+            self._make_subscription(LaserScan, "/scan", self._on_topic("/scan"), self._best_effort_qos())
+            if self.observe_heavy_topics:
+                self._make_subscription(OccupancyGrid, "/map", self._on_topic("/map"), self._transient_qos())
+                self._make_subscription(
+                    OccupancyGrid,
+                    "/global_costmap/costmap",
+                    self._on_topic("/global_costmap/costmap"),
+                    self._reliable_qos(),
+                )
+                self._make_subscription(
+                    OccupancyGrid,
+                    "/local_costmap/costmap",
+                    self._on_topic("/local_costmap/costmap"),
+                    self._reliable_qos(),
+                )
+            self._make_subscription(PoseWithCovarianceStamped, "/localization_result", self._on_topic("/localization_result"), self._best_effort_qos())
+        if self.observe_tf:
+            self._make_subscription(TFMessage, "/tf", self._on_tf, self._tf_qos(ReliabilityPolicy.RELIABLE))
 
         self.create_timer(self.write_period_sec, self.write_snapshot)
 
@@ -171,21 +227,33 @@ class RuntimeHealthGuard(Node):
 
     def _on_topic(self, topic: str) -> Any:
         def callback(msg: Any) -> None:
-            now = self._now_sec()
-            item = self.topics[topic]
-            item["message_count"] += 1
-            item["last_received_at"] = time.time()
-            header = getattr(msg, "header", None)
-            if header is not None:
-                item["last_stamp_sec"] = _stamp_to_sec(header.stamp)
-                item["last_age_sec"] = now - item["last_stamp_sec"]
-                item["last_frame_id"] = str(getattr(header, "frame_id", "") or "")
-            else:
-                item["last_stamp_sec"] = None
-                item["last_age_sec"] = 0.0
-                item["last_frame_id"] = ""
+            self._record_topic(topic, msg)
 
         return callback
+
+    def _record_topic(self, topic: str, msg: Any) -> None:
+        now = self._now_sec()
+        item = self.topics[topic]
+        item["message_count"] += 1
+        item["last_received_at"] = time.time()
+        header = getattr(msg, "header", None)
+        if header is not None:
+            item["last_stamp_sec"] = _stamp_to_sec(header.stamp)
+            item["last_age_sec"] = now - item["last_stamp_sec"]
+            item["last_frame_id"] = str(getattr(header, "frame_id", "") or "")
+        else:
+            item["last_stamp_sec"] = None
+            item["last_age_sec"] = 0.0
+            item["last_frame_id"] = ""
+
+    def _on_docking_observation(self, msg: DockTargetObservation) -> None:
+        topic = "/dock/target_observation"
+        self._record_topic(topic, msg)
+        item = self.topics[topic]
+        item["sensor_healthy"] = bool(msg.sensor_healthy)
+        item["valid"] = bool(msg.valid)
+        item["source"] = str(msg.source or "")
+        item["reason"] = str(msg.reason or "")
 
     def _on_tf(self, msg: TFMessage) -> None:
         now = self._now_sec()
@@ -195,8 +263,11 @@ class RuntimeHealthGuard(Node):
             child = _strip_slash(transform.child_frame_id)
             if not parent or not child:
                 continue
+            edge = f"{parent}->{child}"
+            if not self.observe_all_tf and self.tracked_tf_edges and edge not in self.tracked_tf_edges:
+                continue
             stamp_sec = _stamp_to_sec(transform.header.stamp)
-            self.tf_edges[f"{parent}->{child}"] = {
+            self.tf_edges[edge] = {
                 "parent": parent,
                 "child": child,
                 "last_stamp_sec": stamp_sec,
@@ -298,6 +369,7 @@ class RuntimeHealthGuard(Node):
             "robot_local_state_fastlio_sub", False
         )
         local_odom_fresh = self._topic_fresh("/local_state/odometry", self.odom_fresh_sec)
+        local_state_topic_ready = local_state_endpoint and local_odom_fresh
         odom_base_tf_fresh = self._tf_fresh("odom->base_link", self.tf_fresh_sec)
         map_odom_tf_ready = self._tf_fresh("map->odom", self.map_tf_fresh_sec)
         bridge_endpoint = (
@@ -305,10 +377,17 @@ class RuntimeHealthGuard(Node):
             and self.endpoints.get("robot_localization_bridge_tf_pub", False)
             and self.service_ready.get("/robot_localization_bridge/force_accept_next_localization", False)
         )
+        docking_observation_fresh = self._topic_fresh(
+            "/dock/target_observation", self.docking_fresh_sec
+        )
+        docking_sensor_healthy = docking_observation_fresh and bool(
+            self.topics.get("/dock/target_observation", {}).get("sensor_healthy")
+        )
         return {
             "local_state_endpoint_ready": local_state_endpoint,
             "local_state_fastlio_endpoint_ready": local_state_fastlio_endpoint,
-            "local_state_ready": local_state_endpoint and local_odom_fresh and odom_base_tf_fresh,
+            "local_state_topic_ready": local_state_topic_ready,
+            "local_state_ready": local_state_topic_ready and odom_base_tf_fresh,
             "local_odom_fresh": local_odom_fresh,
             "odom_base_tf_fresh": odom_base_tf_fresh,
             "map_odom_tf_ready": map_odom_tf_ready,
@@ -318,6 +397,8 @@ class RuntimeHealthGuard(Node):
             "local_costmap_fresh": self._topic_fresh("/local_costmap/costmap", self.topic_fresh_sec),
             "global_costmap_fresh": self._topic_fresh("/global_costmap/costmap", self.topic_fresh_sec),
             "map_fresh": _bool_topic(self.topics.get("/map", {})),
+            "docking_observation_fresh": docking_observation_fresh,
+            "docking_sensor_healthy": docking_sensor_healthy,
             "global_localization_trigger_service": self.service_ready.get("/global_localization/trigger", False),
             "isaac_grid_search_trigger_service": self.service_ready.get(
                 "/trigger_grid_search_localization", False
@@ -333,7 +414,20 @@ class RuntimeHealthGuard(Node):
             "updated_at": time.time(),
             "uptime_sec": max(0.0, time.monotonic() - self.started_monotonic),
             "topics": self.topics,
+            "topic_tracking": {
+                "observe_topic_messages": self.observe_topic_messages,
+                "observe_heavy_topics": self.observe_heavy_topics,
+                "always_observed": [
+                    "/local_state/odometry",
+                    "/dock/target_observation",
+                ],
+            },
             "tf": self.tf_edges,
+            "tf_tracking": {
+                "observe_tf": self.observe_tf,
+                "observe_all_tf": self.observe_all_tf,
+                "tracked_edges": sorted(self.tracked_tf_edges),
+            },
             "endpoints": self.endpoints,
             "services": self.service_ready,
             "nodes": sorted(self.node_names),

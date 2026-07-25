@@ -73,7 +73,7 @@ check_static_config() {
     return
   fi
 
-  local plugin radius angle timeout rotate threshold disengage local_frame yaw_tol
+  local plugin radius angle timeout rotate threshold disengage braking closed_loop local_frame yaw_tol
   plugin="$(read_nav2_value "controller_server.ros__parameters.progress_checker.plugin" || true)"
   radius="$(read_nav2_value "controller_server.ros__parameters.progress_checker.required_movement_radius" || true)"
   angle="$(read_nav2_value "controller_server.ros__parameters.progress_checker.required_movement_angle" || true)"
@@ -81,6 +81,8 @@ check_static_config() {
   rotate="$(read_nav2_value "controller_server.ros__parameters.FollowPath.rotate_to_goal_heading" || true)"
   threshold="$(read_nav2_value "controller_server.ros__parameters.FollowPath.angular_dist_threshold" || true)"
   disengage="$(read_nav2_value "controller_server.ros__parameters.FollowPath.angular_disengage_threshold" || true)"
+  braking="$(read_nav2_value "controller_server.ros__parameters.FollowPath.terminal_rotation_braking_enabled" || true)"
+  closed_loop="$(read_nav2_value "controller_server.ros__parameters.FollowPath.closed_loop" || true)"
   local_frame="$(read_nav2_value "local_costmap.local_costmap.ros__parameters.global_frame" || true)"
   yaw_tol="$(read_nav2_value "controller_server.ros__parameters.goal_checker.yaw_goal_tolerance" || true)"
 
@@ -118,6 +120,14 @@ check_static_config() {
     fail "static FollowPath.angular_disengage_threshold=${disengage:-missing}, expected 0.075"
   fi
 
+  [[ "${braking}" == "true" ]] \
+    && pass "static FollowPath.terminal_rotation_braking_enabled=true" \
+    || fail "static FollowPath.terminal_rotation_braking_enabled=${braking:-missing}, expected true"
+
+  [[ "${closed_loop}" == "true" ]] \
+    && pass "static FollowPath.closed_loop=true" \
+    || fail "static FollowPath.closed_loop=${closed_loop:-missing}, expected true"
+
   [[ "${local_frame}" == "odom" ]] \
     && pass "static local_costmap.global_frame=odom" \
     || fail "static local_costmap.global_frame=${local_frame:-missing}, expected odom"
@@ -138,7 +148,7 @@ check_pose_progress_plugin_available() {
 }
 
 check_runtime_config() {
-  local lifecycle plugin angle rotate threshold disengage frame
+  local lifecycle plugin angle rotate threshold disengage braking closed_loop frame
   lifecycle="$(timeout 6 ros2 lifecycle get /controller_server 2>&1 || true)"
   if [[ "${lifecycle}" == *"active [3]"* ]]; then
     pass "controller_server active"
@@ -172,6 +182,16 @@ check_runtime_config() {
   [[ "${disengage}" == "0.075" ]] \
     && pass "runtime FollowPath.angular_disengage_threshold=${disengage}" \
     || warn "runtime angular_disengage_threshold unavailable or unexpected: ${disengage}"
+
+  braking="$(param_value /controller_server FollowPath.terminal_rotation_braking_enabled || true)"
+  [[ "${braking}" == "True" || "${braking}" == "true" ]] \
+    && pass "runtime FollowPath.terminal_rotation_braking_enabled=${braking}" \
+    || warn "runtime terminal_rotation_braking_enabled unavailable or unexpected: ${braking}"
+
+  closed_loop="$(param_value /controller_server FollowPath.closed_loop || true)"
+  [[ "${closed_loop}" == "True" || "${closed_loop}" == "true" ]] \
+    && pass "runtime FollowPath.closed_loop=${closed_loop}" \
+    || warn "runtime closed_loop unavailable or unexpected: ${closed_loop}"
 
   frame="$(param_value /local_costmap/local_costmap global_frame || true)"
   [[ "${frame}" == "odom" ]] \

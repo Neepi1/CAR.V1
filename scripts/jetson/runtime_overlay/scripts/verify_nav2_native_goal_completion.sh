@@ -10,6 +10,8 @@ set +e
 NAV2_PARAMS_FILE="${NAV2_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/nav2.yaml}"
 API_PARAMS_FILE="${API_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/robot_api_server.yaml}"
 API_CPP="${WORKSPACE_ROOT}/src/robot_api_server/src/robot_api_server_node.cpp"
+NAV_TO_POSE_BT="${WORKSPACE_ROOT}/src/robot_nav_config/behavior_trees/navigate_to_pose.xml"
+NAV_THROUGH_POSES_BT="${WORKSPACE_ROOT}/src/robot_nav_config/behavior_trees/navigate_through_poses.xml"
 DOCKING_VERIFY="${SCRIPT_DIR}/verify_goal_completion_semantics.sh"
 PREFIX="[nav2-native-goal]"
 FAILURES=0
@@ -50,7 +52,7 @@ require_file_text() {
   local label="$1"
   local file="$2"
   local text="$3"
-  if grep -Fq "$text" "$file"; then
+  if grep -Fq -- "$text" "$file"; then
     pass "$label"
   else
     fail "$label missing: $text"
@@ -61,7 +63,7 @@ reject_file_text() {
   local label="$1"
   local file="$2"
   local text="$3"
-  if grep -Fq "$text" "$file"; then
+  if grep -Fq -- "$text" "$file"; then
     fail "$label unexpectedly present: $text"
   else
     pass "$label"
@@ -71,10 +73,14 @@ reject_file_text() {
 check_static_nav2() {
   [[ -f "${NAV2_PARAMS_FILE}" ]] || { fail "missing NAV2 params: ${NAV2_PARAMS_FILE}"; return; }
 
-  local follow_plugin primary rotate goal_plugins goal_stateful goal_xy goal_yaw planner local_frame controller_plugins fallback transform_tol
+  local follow_plugin primary rotate rotate_once goal_xy_threshold goal_yaw_threshold
+  local goal_plugins goal_stateful goal_xy goal_yaw planner local_frame controller_plugins fallback transform_tol
   follow_plugin="$(read_yaml_value "${NAV2_PARAMS_FILE}" "controller_server.ros__parameters.FollowPath.plugin" || true)"
   primary="$(read_yaml_value "${NAV2_PARAMS_FILE}" "controller_server.ros__parameters.FollowPath.primary_controller" || true)"
   rotate="$(read_yaml_value "${NAV2_PARAMS_FILE}" "controller_server.ros__parameters.FollowPath.rotate_to_goal_heading" || true)"
+  rotate_once="$(read_yaml_value "${NAV2_PARAMS_FILE}" "controller_server.ros__parameters.FollowPath.rotate_to_heading_once" || true)"
+  goal_xy_threshold="$(read_yaml_value "${NAV2_PARAMS_FILE}" "controller_server.ros__parameters.FollowPath.goal_change_xy_threshold" || true)"
+  goal_yaw_threshold="$(read_yaml_value "${NAV2_PARAMS_FILE}" "controller_server.ros__parameters.FollowPath.goal_change_yaw_threshold" || true)"
   goal_plugins="$(read_yaml_value "${NAV2_PARAMS_FILE}" "controller_server.ros__parameters.goal_checker_plugins" || true)"
   goal_stateful="$(read_yaml_value "${NAV2_PARAMS_FILE}" "controller_server.ros__parameters.goal_checker.stateful" || true)"
   goal_xy="$(read_yaml_value "${NAV2_PARAMS_FILE}" "controller_server.ros__parameters.goal_checker.xy_goal_tolerance" || true)"
@@ -85,8 +91,8 @@ check_static_nav2() {
   fallback="$(read_yaml_value "${NAV2_PARAMS_FILE}" "controller_server.ros__parameters.FollowPathFallback.plugin" || true)"
   transform_tol="$(read_yaml_value "${NAV2_PARAMS_FILE}" "controller_server.ros__parameters.FollowPath.transform_tolerance" || true)"
 
-  [[ "${follow_plugin}" == "nav2_rotation_shim_controller::RotationShimController" ]] \
-    && pass "FollowPath uses RotationShimController" \
+  [[ "${follow_plugin}" == "robot_nav_config::GoalScopedRotationShimController" ]] \
+    && pass "FollowPath uses goal-scoped RotationShimController" \
     || fail "FollowPath.plugin=${follow_plugin:-missing}"
   [[ "${primary}" == "nav2_mppi_controller::MPPIController" ]] \
     && pass "RotationShim primary_controller preserves MPPI" \
@@ -94,12 +100,25 @@ check_static_nav2() {
   [[ "${rotate}" == "true" ]] \
     && pass "rotate_to_goal_heading=true" \
     || fail "rotate_to_goal_heading=${rotate:-missing}"
+  [[ "${rotate_once}" == "true" ]] \
+    && pass "rotate_to_heading_once=true" \
+    || fail "rotate_to_heading_once=${rotate_once:-missing}"
+  [[ "${goal_xy_threshold}" == "0.01" ]] \
+    && pass "goal_change_xy_threshold=${goal_xy_threshold}" \
+    || fail "goal_change_xy_threshold=${goal_xy_threshold:-missing}, expected 0.01"
+  [[ "${goal_yaw_threshold}" == "0.01" ]] \
+    && pass "goal_change_yaw_threshold=${goal_yaw_threshold}" \
+    || fail "goal_change_yaw_threshold=${goal_yaw_threshold:-missing}, expected 0.01"
   [[ "${goal_plugins}" == *"goal_checker"* ]] \
     && pass "goal_checker_plugins include goal_checker" \
     || fail "goal_checker_plugins=${goal_plugins:-missing}, expected goal_checker"
   [[ "${goal_stateful}" == "false" ]] \
     && pass "goal_checker.stateful=false" \
     || fail "goal_checker.stateful=${goal_stateful:-missing}"
+  require_file_text \
+    "RotationShim private PositionGoalChecker is non-stateful" \
+    "${NAV2_PARAMS_FILE}" \
+    '".position_checker.stateful": false'
   [[ "${goal_xy}" == "0.06" ]] \
     && pass "goal_checker.xy_goal_tolerance=${goal_xy}" \
     || fail "goal_checker.xy_goal_tolerance=${goal_xy:-missing}, expected 0.06"
@@ -121,6 +140,20 @@ check_static_nav2() {
   [[ "${transform_tol}" == "0.10" || "${transform_tol}" == "0.1" ]] \
     && pass "FollowPath.transform_tolerance unchanged (${transform_tol})" \
     || fail "FollowPath.transform_tolerance changed or missing: ${transform_tol}"
+  require_file_text \
+    "RateController BT plugin is registered" \
+    "${NAV2_PARAMS_FILE}" \
+    "- nav2_rate_controller_bt_node"
+}
+
+check_bt_replanning_rate() {
+  [[ -f "${NAV_TO_POSE_BT}" ]] || { fail "missing NavigateToPose BT: ${NAV_TO_POSE_BT}"; return; }
+  [[ -f "${NAV_THROUGH_POSES_BT}" ]] || { fail "missing NavigateThroughPoses BT: ${NAV_THROUGH_POSES_BT}"; return; }
+
+  require_file_text "NavigateToPose replans at 1 Hz" "${NAV_TO_POSE_BT}" 'RateController hz="1.0"'
+  require_file_text "NavigateThroughPoses replans at 1 Hz" "${NAV_THROUGH_POSES_BT}" 'RateController hz="1.0"'
+  reject_file_text "legacy 0.33 Hz NavigateToPose replanning remains absent" "${NAV_TO_POSE_BT}" 'RateController hz="0.33"'
+  reject_file_text "legacy 0.33 Hz NavigateThroughPoses replanning remains absent" "${NAV_THROUGH_POSES_BT}" 'RateController hz="0.33"'
 }
 
 check_static_api() {
@@ -158,16 +191,16 @@ check_static_api() {
 
 check_rotation_shim_available() {
   local prefix plugin_file
-  prefix="$(timeout 8 ros2 pkg prefix nav2_rotation_shim_controller 2>/dev/null || true)"
+  prefix="$(timeout 8 ros2 pkg prefix robot_nav_config 2>/dev/null || true)"
   if [[ -z "${prefix}" ]]; then
-    warn "runtime nav2_rotation_shim_controller package not visible; static checks still apply"
+    warn "runtime robot_nav_config package not visible; static checks still apply"
     return
   fi
-  plugin_file="$(find "${prefix}" -path '*nav2_rotation_shim_controller.xml' -print -quit 2>/dev/null || true)"
-  if [[ -n "${plugin_file}" ]] && grep -Fq "nav2_rotation_shim_controller::RotationShimController" "${plugin_file}"; then
-    pass "runtime RotationShimController plugin XML present"
+  plugin_file="$(find "${prefix}" -path '*robot_nav_config_controller_plugins.xml' -print -quit 2>/dev/null || true)"
+  if [[ -n "${plugin_file}" ]] && grep -Fq "robot_nav_config::GoalScopedRotationShimController" "${plugin_file}"; then
+    pass "runtime goal-scoped RotationShimController plugin XML present"
   else
-    fail "runtime RotationShimController plugin XML missing"
+    fail "runtime goal-scoped RotationShimController plugin XML missing"
   fi
   local runtime_rotate
   runtime_rotate="$(timeout 6 ros2 param get /controller_server FollowPath.rotate_to_goal_heading 2>&1 || true)"
@@ -176,9 +209,26 @@ check_rotation_shim_available() {
   else
     warn "runtime controller not yet restarted with N3 config: ${runtime_rotate}"
   fi
+  local runtime_rotate_once
+  runtime_rotate_once="$(timeout 6 ros2 param get /controller_server FollowPath.rotate_to_heading_once 2>&1 || true)"
+  if [[ "${runtime_rotate_once}" == *"True"* || "${runtime_rotate_once}" == *"true"* ]]; then
+    pass "runtime controller rotate_to_heading_once=true"
+  else
+    warn "runtime controller not yet restarted with goal-scoped config: ${runtime_rotate_once}"
+  fi
+  local runtime_position_stateful
+  runtime_position_stateful="$(timeout 6 ros2 param get /controller_server .position_checker.stateful 2>&1 || true)"
+  if [[ "${runtime_position_stateful}" == *"False"* || "${runtime_position_stateful}" == *"false"* ]]; then
+    pass "runtime RotationShim private PositionGoalChecker stateful=false"
+  elif [[ "${runtime_position_stateful}" == *"True"* || "${runtime_position_stateful}" == *"true"* ]]; then
+    fail "runtime RotationShim private PositionGoalChecker is still stateful: ${runtime_position_stateful}"
+  else
+    warn "runtime controller not available for private PositionGoalChecker check: ${runtime_position_stateful}"
+  fi
 }
 
 check_static_nav2
+check_bt_replanning_rate
 check_static_api
 check_rotation_shim_available
 

@@ -1,0 +1,38 @@
+planner_server:
+  ros__parameters:
+    expected_planner_frequency: 1.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "robot_nav_config::RangerMini3LatticePlanner"
+      tolerance: 0.05
+      allow_unknown: true
+      max_iterations: 1000000
+      max_on_approach_iterations: 1000
+      max_planning_time: 3.0
+      lattice_filepath: "__RANGER_LATTICE_FILE__"
+      cache_obstacle_heuristic: false
+      reverse_penalty: 2.1
+      change_penalty: 0.20
+      non_straight_penalty: 1.05
+      cost_penalty: 2.0
+      retrospective_penalty: 0.015
+      rotation_penalty: 3.0
+      # A clear, goal-aligned corridor is executed as startup spin plus a
+      # footprint-checked straight path. Blocked corridors remain stock Lattice
+      # plans, so the cheaper start spin does not enable mid-path spin segments.
+      direct_corridor_enabled: true
+      direct_corridor_minimum_length_m: 1.0
+      direct_corridor_goal_yaw_tolerance_rad: 0.20
+      direct_corridor_sample_step_m: 0.025
+      direct_corridor_max_cost: 0
+      analytic_expansion_ratio: 3.5
+      analytic_expansion_max_length: 4.05
+      lookup_table_size: 20.0
+      allow_reverse_expansion: true
+      smooth_path: true
+      smoother:
+        tolerance: 1.0e-10
+        max_iterations: 1000
+        w_data: 0.2
+        w_smooth: 0.3
+        do_refinement: true

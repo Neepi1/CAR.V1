@@ -235,11 +235,11 @@ phases:
         summary: Implement building-level elevator commissioning drafts, validation, immutable releases, rollback, and private internal-pose assets
         depends_on: [P3-003, P6-002]
         current_state:
-          - pure C++ map identity, keepout, draft validation, immutable publication, rollback, and internal-pose isolation cores are implemented with unit tests
+          - map save and identity stamping use manifest v2 plus a persistent globally monotonic asset epoch registry
           - every registry bind and lookup audits the maximum committed source-manifest epoch and rejects rollback or ambiguous source layout
           - valid elevator drafts and immutable releases bind both the server-resolved asset epoch and canonical digest
-          - the robot_api_server HTTP node adapter is intentionally not included until it can be separated from unrelated accumulated navigation and docking changes
-          - core publication and rollback are non-moving and do not authorize live floor switching
+          - activation journal and persistent integrity latch recover interrupted projection/keepout transactions; keepout repair requires the exact same map and unchanged non-keepout digest
+          - commissioning publication and rollback are non-moving and do not authorize live floor switching
         done_when:
           - incomplete drafts return structured validation issues
           - map identity binding is idempotent for an unchanged exact key/digest and consumes a never-reused global epoch for new or changed content

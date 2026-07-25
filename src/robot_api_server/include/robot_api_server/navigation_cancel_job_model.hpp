@@ -17,13 +17,13 @@ struct NavigationCancelJob
   std::string stop_stack_detail;
   std::string started_at;
   std::string finished_at;
-  bool stop_stack{true};
+  bool stop_stack{false};
   bool ok{true};
   bool action_available{false};
   bool active_goal_cancel_requested{false};
   bool cancel_all_requested{false};
   bool cancel_all_ok{true};
-  bool stop_stack_ok{true};
+  bool stop_stack_ok{false};
   bool zero_velocity_published{false};
 };
 

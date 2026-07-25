@@ -1,0 +1,49 @@
+{
+  "schema": "njrh.ranger_mini3_lattice_manifest.v2",
+  "artifact": "ranger_mini3_ackermann_0p05m_0p81m_16.json",
+  "artifact_sha256": "f7f0e4e10c3877b20da5b632457a3bcce39d342fd3414c2c3cd4af5af98acb99",
+  "config": "ranger_mini3_ackermann_0p05m_0p81m_16.config.json",
+  "config_sha256": "5322ca90b62468722c75a2189df643c5802dd50b5c0a6b9d7d5aba1e49751a91",
+  "artifact_date": "2026-07-21",
+  "generator": {
+    "upstream_repository": "https://github.com/ros-navigation/navigation2",
+    "upstream_tag": "1.1.20",
+    "upstream_commit": "a097086719c88f781aa59788eca29ac6ca5e56db",
+    "observed_commit": "a097086719c88f781aa59788eca29ac6ca5e56db",
+    "normalized_source_sha256": {
+      "constants.py": "9f618c72d2428df571271eefc193a1525377e6df85e9579b4e9a8e5e8521edb8",
+      "helper.py": "5638272e7ac6e1e8b0d76717d52f9d502b9561c0d05610652b52ce286263fed2",
+      "trajectory.py": "6e449fb3c5193aba86bc7b24e8bf90451fe0e0974a7b673237d1e17c8e5f3d9c",
+      "trajectory_generator.py": "a6a23118db8d4c38bf3161e8ee2d039af7d722f3b96dd6a941e34f3779033b59",
+      "lattice_generator.py": "49b4d7fd0044b6e479192c78306e5cf2621cb3821170d7fc0666538144cf8154"
+    },
+    "rtree_fallback": "linear bounding-box index; generation only"
+  },
+  "motion_contract": {
+    "platform": "AgileX Ranger Mini3",
+    "costmap_resolution_m": 0.05,
+    "minimum_turning_radius_m": 0.81,
+    "heading_count": 16,
+    "primitive_motion_mode": "dual_ackermann_bidirectional_plus_in_place_spin",
+    "allow_reverse_expansion": true,
+    "reverse_execution_scope": "terminal_goal_window_only_v1",
+    "reverse_admission_distance_m": 0.3,
+    "contains_spin_primitives": true,
+    "contains_lateral_primitives": false,
+    "spin_execution_owner": "GoalScopedRotationShimController for path-entry and final heading via robot_safety and ranger_base",
+    "mid_path_spin_execution": "not_admitted_v1",
+    "lateral_owner": "docking/API via robot_safety and ranger_base"
+  },
+  "artifact_statistics": {
+    "primitive_count": 104,
+    "spin_count": 32,
+    "straight_count": 16,
+    "left_turn_count": 28,
+    "right_turn_count": 28,
+    "generated_minimum_radius_m": 0.84721,
+    "generated_maximum_radius_m": 1.37794,
+    "minimum_primitive_length_m": 0.0,
+    "maximum_primitive_length_m": 0.57557,
+    "minimum_translation_primitive_length_m": 0.25
+  }
+}

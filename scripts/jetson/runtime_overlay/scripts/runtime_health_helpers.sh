@@ -60,6 +60,7 @@ services = data.get("services") or {}
 checks = {
     "local_state_endpoint": bool(summary.get("local_state_endpoint_ready")),
     "local_state_fastlio_endpoint": bool(summary.get("local_state_fastlio_endpoint_ready")),
+    "local_state_topic_ready": bool(summary.get("local_state_topic_ready")),
     "local_state_ready": bool(summary.get("local_state_ready")),
     "local_odom_fresh": bool(summary.get("local_odom_fresh")),
     "odom_base_tf_fresh": bool(summary.get("odom_base_tf_fresh")),
@@ -70,6 +71,8 @@ checks = {
     "local_costmap_fresh": bool(summary.get("local_costmap_fresh")),
     "global_costmap_fresh": bool(summary.get("global_costmap_fresh")),
     "map_fresh": bool(summary.get("map_fresh")),
+    "docking_observation_fresh": bool(summary.get("docking_observation_fresh")),
+    "docking_sensor_healthy": bool(summary.get("docking_sensor_healthy")),
     "global_localization_trigger_service": bool(summary.get("global_localization_trigger_service"))
         or bool(services.get("/global_localization/trigger")),
     "isaac_grid_search_trigger_service": bool(summary.get("isaac_grid_search_trigger_service"))

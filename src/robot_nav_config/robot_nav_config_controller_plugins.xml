@@ -1,0 +1,10 @@
+<library path="goal_scoped_rotation_shim_controller">
+  <class
+    name="robot_nav_config::GoalScopedRotationShimController"
+    type="robot_nav_config::GoalScopedRotationShimController"
+    base_class_type="nav2_core::Controller">
+    <description>
+      Humble-compatible RotationShim wrapper that arms startup alignment once per navigation goal.
+    </description>
+  </class>
+</library>

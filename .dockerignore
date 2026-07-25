@@ -1,0 +1,10 @@
+*
+!scripts
+scripts/*
+!scripts/jetson
+scripts/jetson/*
+!scripts/jetson/vendor
+scripts/jetson/vendor/*
+!scripts/jetson/vendor/orbbec
+scripts/jetson/vendor/orbbec/*
+!scripts/jetson/vendor/orbbec/*.deb

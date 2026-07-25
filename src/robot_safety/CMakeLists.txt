@@ -5,6 +5,7 @@ find_package(ament_cmake REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(robot_interfaces REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 
@@ -18,11 +19,13 @@ target_include_directories(motion_interlock_arbiter PUBLIC
 )
 
 add_executable(robot_safety_node src/robot_safety_node.cpp)
+target_link_libraries(robot_safety_node motion_interlock_arbiter)
 ament_target_dependencies(
   robot_safety_node
   geometry_msgs
   nav_msgs
   rclcpp
+  robot_interfaces
   sensor_msgs
   std_msgs
 )
@@ -30,13 +33,13 @@ ament_target_dependencies(
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)
 install(
-  TARGETS motion_interlock_arbiter
+  TARGETS motion_interlock_arbiter robot_safety_node
   EXPORT export_motion_interlock_arbiter
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
+  RUNTIME DESTINATION lib/${PROJECT_NAME}
   INCLUDES DESTINATION include
 )
-install(TARGETS robot_safety_node DESTINATION lib/${PROJECT_NAME})
 
 ament_export_targets(export_motion_interlock_arbiter HAS_LIBRARY_TARGET)
 ament_export_include_directories(include)

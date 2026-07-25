@@ -1,0 +1,8 @@
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Sequence name="navigate_to_predock_with_stable_path">
+      <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+      <FollowPath path="{path}" controller_id="FollowPath"/>
+    </Sequence>
+  </BehaviorTree>
+</root>

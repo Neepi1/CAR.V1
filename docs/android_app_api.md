@@ -27,6 +27,10 @@ GET  /api/v1/robot/pose
 GET  /api/v1/maps
 GET  /api/v1/maps/semantic_layer
 GET  /api/v1/maps/poses
+GET  /api/v1/elevator-config
+PUT  /api/v1/elevator-config/draft
+POST /api/v1/elevator-config/publish
+POST /api/v1/elevator-config/rollback
 GET  /api/v1/maps/filters/keepout
 GET  /api/v1/mapping/2d/map
 GET  /api/v1/openapi
@@ -76,11 +80,27 @@ Example floor switch body:
 
 Reserved navigation start and 3D mapping endpoints return `501` until `robot_mode_manager` or `robot_mission_manager` exposes formal ROS-native services/actions. 2D mapping is wired to the repository-owned `slam_toolbox` runtime chain, not to the test Web dashboard. Navigation goals are wired to Nav2 `NavigateToPose`; the App should send saved `pose_id` targets instead of publishing velocity commands.
 
-When `POST /api/v1/floors/switch` uses `"resume_navigation": true`, the car starts the floor navigation runtime for that `building_id` and `floor_id`: resolve the released `nav/nav_map.yaml`, start the occupancy localization stack, start the `robot_global_localization` wrapper, call `/floor_manager/switch_floor` best-effort with `resume_navigation=false`, wait for the localizer services/map/flatscan inputs, and send one bounded `/global_localization/trigger` request. The startup waits for the trigger wrapper to report a bridge-accepted `map -> odom` from `robot_localization_bridge` before starting standard Nav2 with the active floor filter masks. Local-costmap and safety-topic shell probes remain diagnostics and API goal-admission inputs after the runtime is up; they are not restored as high-frequency startup loops. The backend records that manual navigation selection in `maps_release/last_navigation_map.json`; the next boot uses only that recorded map plus the matching `current/manifest.json` to auto-resume navigation. If no valid last map exists, common services stay alive and Nav2 is not started. If the navigation resume child process exits during startup, `/api/v1/status` and `/api/v1/navigation/state` report navigation `failed` instead of staying in `starting`. The App still only requests the mode transition; it must not launch Nav2 or send task-navigation velocity commands.
+`POST /api/v1/floors/switch` is not a live cross-floor API yet. A request with
+`"resume_navigation": true` always returns `409
+LIVE_FLOOR_SWITCH_DISABLED` before map lookup, file mutation, ROS service calls,
+or process launch.
 
-Repeated `resume_navigation=true` for the same ready `map_id/building_id/floor_id` returns `state: "navigation_runtime_reused"` and keeps the existing runtime process alive. The API must not stop a healthy Nav2/localization stack just because the App page refreshed or sent the same floor request again.
+`"resume_navigation": false` is an offline selection operation only. It is
+accepted only after navigation, mapping, docking, API goal jobs, Nav2 goals,
+and the navigation runtime process have all stopped. The backend validates the
+selected bundle, clears the stale runtime-map context, and then projects that
+bundle into `maps_release/<building_id>/<floor_id>/current/` for a later
+controlled startup. It does not reload localization, start Nav2, or authorize
+motion; in particular, it does not start the occupancy localization stack.
+The App must not use this endpoint while the robot is riding or
+straddling an elevator doorway.
 
-When the request includes `map_id` or `map_name`, the backend activates that saved map into `maps_release/<building_id>/<floor_id>/current/` before floor switch or navigation resume. `current/` is a backend-owned runtime mirror; the App should edit saved map records through map APIs and must not write files under `current/` directly. Saving a new 2D map does not activate it; the App must explicitly select the saved `map_id` before navigation starts.
+`current/` is a backend-owned selection mirror; the App must edit saved map
+records through map APIs and must not write files under `current/` directly.
+Saving a new 2D map does not select or run it. Until the strict FloorSwitch
+transaction is connected and validated, there is no App-supported live
+cross-floor switch workflow. The reserved transaction contract is that startup waits for the trigger wrapper to report a bridge-accepted `map -> odom`;
+this contract is documented for the future live path and is not enabled here.
 
 Manual relocalization uses:
 
@@ -88,7 +108,7 @@ Manual relocalization uses:
 POST http://<robot-ip>:8080/api/v1/localization/trigger
 ```
 
-By default this endpoint returns success when `robot_localization_bridge` accepts the correction and starts publishing the updated `map -> odom`. It does not make the HTTP result depend on the post-relocalization Nav2/local-costmap settle barrier, so an accepted manual correction is not reported as failed only because a diagnostic settle window was not clean. Diagnostic tools may pass `"wait_for_settle": true` when they intentionally want the response to include and enforce the settle barrier.
+With gated AMCL active, this endpoint first waits for the explicit Isaac correction to finish, then waits for the bridge-owned post-Isaac AMCL refinement. The bridge requests bounded no-motion updates while the robot is stationary, rejects queued pre-seed AMCL poses, requires two consistent new-generation candidates, and finishes publishing the selected correction before HTTP success. This normally adds about one second after Isaac; the AMCL-refine failure bound is four seconds. The endpoint still does not make its result depend on the separate Nav2/local-costmap settle barrier, so an accepted localization correction is not reported as failed only because a diagnostic settle window was not clean. Diagnostic tools may pass `"wait_for_settle": true` when they intentionally want the response to include and enforce that additional barrier.
 
 ## Status / Battery
 
@@ -156,12 +176,13 @@ Relevant response fields:
 The App should use these lightweight business fields instead of inferring state from ROS nodes or topics:
 
 - Mapping: `mode == "MAPPING_2D" && mapping_active == true`.
+- Mapping transition: `mode_transition.active == true && mode_transition.owner == "mapping_start"`; show the current `mapping.start_job.phase` and keep navigation/mapping buttons disabled until the job finishes.
 - Navigation: `mode == "NAVIGATION" && navigation_active == true`.
 - Docking: `mode == "DOCKING" || docking.active == true || docking.state in ["accepted","nav_to_predock","fine_docking","docked","undocking","undocked","failed","canceled"]`.
 - Idle: `mode == "IDLE"`.
 - Error: `mode == "ERROR" || healthy == false`.
 
-The backend intentionally keeps this status lightweight. It is driven by official API transitions such as `/mapping/2d/start`, `/mapping/2d/stop`, `/mapping/2d/save`, `/floors/switch?resume_navigation=true`, `/navigation/goal`, and `/navigation/cancel`. Deep ROS checks remain backend diagnostics and should not be duplicated in the App. The API has a fixed worker pool instead of one thread per request, so the App should poll with a modest interval, for example `500ms..1000ms` while a task is active and slower while idle. Treat HTTP `503 {"error":"server busy"}` as a transient backend overload and retry with backoff instead of launching more parallel requests.
+The backend intentionally keeps this status lightweight. It is driven by official API transitions such as `/mapping/2d/start`, `/mapping/2d/stop`, `/mapping/2d/save`, offline `/floors/switch?resume_navigation=false`, `/navigation/goal`, and `/navigation/cancel`. Deep ROS checks remain backend diagnostics and should not be duplicated in the App. The API has a fixed worker pool instead of one thread per request, so the App should poll with a modest interval, for example `500ms..1000ms` while a task is active and slower while idle. Treat HTTP `503 {"error":"server busy"}` as a transient backend overload and retry with backoff instead of launching more parallel requests.
 
 `bms.soc` is the value the App should display as real battery percentage. The data path is Ranger CAN BMS frame decoded by `ranger_base_node` into `/battery_state`, then subscribed by `robot_api_server`; the App must not read CAN or ROS 2 DDS directly. Treat `soc_valid=false` as stale or unavailable power data. Use `bms.charging_contact`, `bms.charging_contact_reason`, and `bms.contact_snapshot` for dock-contact diagnostics; full batteries may report `current=0`, so App logic must not use current alone to decide whether undocking is allowed.
 
@@ -217,16 +238,27 @@ Start live `slam_toolbox` mapping before requesting live map images:
 POST http://<robot-ip>:8080/api/v1/mapping/2d/start
 ```
 
-If a navigation task is active, the backend cancels the task and publishes zero velocity before entering mapping mode. The App should not call `/api/v1/navigation/stop_runtime` before mapping; that endpoint is reserved for engineering recovery.
+The endpoint owns the complete navigation-to-mapping transition and returns `202 Accepted` without waiting for mode services to stop. In the background it cancels any active navigation task, publishes zero velocity, stops the navigation/localization mode services, clears the transient navigation map context, and then starts the mapping process. The App may call ordinary `/api/v1/navigation/cancel` first for its own UI flow, but it is not required and it must not call `/api/v1/navigation/stop_runtime` to assemble this transition itself.
+
+Poll `GET /api/v1/status` and inspect `mode_transition` plus `mapping.start_job`. Expected phases are `accepted`, `cancel_navigation`, `stop_navigation_runtime`, `clear_navigation_context`, `start_mapping_process`, and `finished`. Mapping is usable only after `mapping.active=true`, `mapping.state="running"`, and `mapping.live_map_available=true`. Navigation goals, docking requests, and navigation cancel/stop requests return `409` while mapping is active or starting.
 
 Successful response:
 
 ```json
 {
   "ok": true,
+  "accepted": true,
   "state": "starting",
   "map_topic": "/map",
-  "map_endpoint": "/api/v1/mapping/2d/map"
+  "map_endpoint": "/api/v1/mapping/2d/map",
+  "mapping_start": {
+    "id": 4,
+    "state": "running",
+    "phase": "accepted",
+    "navigation_was_active": true,
+    "navigation_cancel_ok": false,
+    "navigation_stop_ok": false
+  }
 }
 ```
 
@@ -285,6 +317,8 @@ Successful response includes:
   "map_id": "map_20260520T120000Z_012345abcd",
   "display_name": "test-17",
   "map_name": "test-17",
+  "asset_epoch": 17,
+  "asset_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "mapping_active": false,
   "runtime_map": {
     "yaml": ".../maps/test-17.yaml",
@@ -304,7 +338,7 @@ Successful response includes:
 }
 ```
 
-The Nav2 `PGM` and Isaac localizer `PNG` are generated from the same cached occupancy grid. The endpoint also creates neutral filter masks, `asset_report.json`, `poses.yaml`, and `manifest.json`. Runtime consumers do not use the business filename directly; activation copies fixed role files into `maps_release/<building_id>/<floor_id>/current/nav/nav_map.yaml` and `current/localizer/localizer_map.png`. The save response includes `requires_manual_navigation_selection:true`; call `/api/v1/floors/switch` with the returned `map_id` and `resume_navigation:true` to start navigation on that map.
+The Nav2 `PGM` and Isaac localizer `PNG` are generated from the same cached occupancy grid. The endpoint also creates neutral filter masks, `asset_report.json`, `poses.yaml`, and an atomic `njrh.map_manifest.v2` manifest. The server calculates the canonical `sha256:<64 lowercase hex>` digest and binds it to a persistent, globally monotonic positive `asset_epoch`; the App must treat both fields as opaque, server-managed identity evidence. It must never calculate, increment, reuse, or substitute either value. Runtime consumers do not use the business filename directly; offline selection copies fixed role files into `maps_release/<building_id>/<floor_id>/current/nav/nav_map.yaml` and `current/localizer/localizer_map.png`. The save response includes `requires_manual_navigation_selection:true`; after all motion runtimes are stopped, call `/api/v1/floors/switch` with the returned `map_id` and `resume_navigation:false` to select it. This does not start navigation; startup remains a separate controlled operation.
 
 List maps:
 
@@ -312,7 +346,7 @@ List maps:
 GET http://<robot-ip>:8080/api/v1/maps
 ```
 
-Use `floor_maps[]` as the real map list. Each item includes `map_id`, `display_name`, `map_name`, `building_id`, `floor_id`, `active`, `nav_map_yaml`, and `localizer_map_png`. The legacy `floors[]` array only tells the App which floor exists and which map is currently active.
+Use `floor_maps[]` as the real map list. Each item includes `map_id`, `display_name`, `map_name`, `building_id`, `floor_id`, `asset_epoch`, `asset_digest`, `active`, `nav_map_yaml`, and `localizer_map_png`. The legacy `floors[]` array only tells the App which floor exists and which map is currently active; its active identity fields are `active_asset_epoch` and `active_asset_digest`. Cache the epoch and digest only together with the exact `building_id/floor_id/map_id`; a digest match or epoch match by itself is not sufficient identity evidence.
 
 ## Map Delete
 
@@ -341,7 +375,158 @@ Successful response:
 }
 ```
 
-The endpoint refuses building-only or floor-only deletion. It does not stop active mapping/navigation stacks, so the App should stop mapping or leave navigation mode before deleting the map currently in use.
+The endpoint refuses building-only or floor-only deletion. It does not stop
+active mapping/navigation stacks, so the App should stop mapping or leave
+navigation mode before deleting the map currently in use. It also refuses a
+map referenced by the current elevator configuration with HTTP
+`409 ELEVATOR_CONFIG_MAP_IN_USE`; publish a reviewed elevator release that no
+longer references the map before retrying deletion.
+
+## Elevator Commissioning Configuration
+
+The App should implement elevator setup as a commissioning workflow, not by
+editing floor `poses.yaml`. For every elevator and served floor, collect:
+
+- exact `building_id`, `floor_id`, and `map_id`;
+- `hall_call`, `hall_wait`, `doorway`, `cabin`, and `exit` in map-frame metres
+  plus yaw;
+- threshold `left`, `right`, and `cabin_reference`;
+- optional advanced clearances, defaulting to `0.05 m`.
+
+Save the whole building draft:
+
+```text
+PUT http://<robot-ip>:8080/api/v1/elevator-config/draft
+Content-Type: application/json
+```
+
+```json
+{
+  "actor_id": "commissioning_app",
+  "configuration": {
+    "schema_version": 1,
+    "building_id": "B3",
+    "elevators": [{
+      "elevator_id": "elevator_1",
+      "display_name": "1号电梯",
+      "floors": [{
+        "floor_id": "F3",
+        "map_id": "map_f3",
+        "poses": {
+          "hall_call": {"x": -1.0, "y": 0.0, "yaw": 0.0},
+          "hall_wait": {"x": -0.8, "y": 0.0, "yaw": 0.0},
+          "doorway": {"x": 0.0, "y": 0.0, "yaw": 0.0},
+          "cabin": {"x": 0.8, "y": 0.0, "yaw": 3.14159},
+          "exit": {"x": -0.6, "y": 0.0, "yaw": 0.0}
+        },
+        "threshold": {
+          "left": [0.0, -0.6],
+          "right": [0.0, 0.6],
+          "cabin_reference": [1.0, 0.0],
+          "clearance_m": 0.05,
+          "jamb_clearance_m": 0.05
+        }
+      }]
+    }]
+  }
+}
+```
+
+The example is intentionally incomplete because a publishable elevator needs
+at least two floors. Draft save still returns `200` and structured `issues`;
+use `valid_for_publish` to drive the wizard's missing-field UI. On the first
+save omit `expected_draft_revision`; on every later save send the latest
+returned revision. A stale revision returns `409`. On a first valid binding,
+also omit `map_asset_epoch` and `map_asset_digest`: the server resolves the
+exact map and stamps both fields into the saved draft. The App must never
+invent, hash, increment, or copy those fields from another map.
+
+Read the active draft/current release:
+
+```text
+GET http://<robot-ip>:8080/api/v1/elevator-config?building_id=B3
+```
+
+Publish only after `valid_for_publish=true`:
+
+```json
+POST /api/v1/elevator-config/publish
+{
+  "building_id": "B3",
+  "expected_draft_revision": "draft-v1-...",
+  "expected_release_id": "elevator-config-000001-...",
+  "actor_id": "commissioning_app"
+}
+```
+
+Omit `expected_release_id` only for the first publication. Publishing always
+revalidates exact map ownership, required assets, map bounds, the indivisible
+map asset epoch/digest pair, five roles, threshold geometry, and the generated
+runtime topology.
+The successful response includes a new immutable `release_id`,
+`asset_published:true`, and `runtime_applied:false`.
+
+Saving a valid draft stamps the resolved positive `map_asset_epoch` and
+canonical `map_asset_digest` into every floor binding. The pair belongs to the
+exact `building_id/floor_id/map_id` and must be preserved unchanged during
+ordinary edits. If a map changes between review and publish, publish returns
+HTTP `422`; `issues[].code` identifies `MAP_ASSET_EPOCH_CHANGED`,
+`MAP_ASSET_DIGEST_CHANGED`, or both. Reload the map list, explicitly rebind the
+floor, save a new draft, and review it again. A draft saved while invalid never
+becomes publishable just because the map is later created or repaired: publish
+returns `422 DRAFT_REVIEW_REQUIRED`; PUT the complete configuration again with
+the old `expected_draft_revision`, review the new revision, and then publish.
+Both identity fields are server-managed. Only an explicit user-requested
+“rebind map” operation may remove both stale fields before PUT; the server then
+stamps the current pair and returns a new revision for review. Do not remove or
+rewrite either field during an unrelated edit. `GET /api/v1/elevator-config`
+includes
+`configuration_source: "draft"|"current"|null`. When a draft exists,
+`configuration` is the editable draft and can differ from
+`current_release_id`; do not mistake it for the selected runtime release.
+The backend accepts at most 2 MiB, 16 elevators, 64 floors per elevator, and
+128 total floor bindings per building document. Nav map YAML must name its
+digested PGM with one plain relative filename; path components such as `..`
+are rejected. Root `image`, `resolution`, and `origin` must each occur exactly
+once, and dimensions are read only from the authenticated PGM; nested or
+duplicate `image` keys cannot redirect validation. Unknown commissioning
+extension fields are preserved in the reviewed release.
+
+Rollback also requires the current release as a compare-and-swap guard:
+
+```json
+POST /api/v1/elevator-config/rollback
+{
+  "building_id": "B3",
+  "release_id": "elevator-config-000001-...",
+  "expected_release_id": "elevator-config-000002-...",
+  "actor_id": "commissioning_app"
+}
+```
+
+Rollback creates a third release from the selected historical content; it does
+not move the pointer backward or overwrite history. Rollback re-resolves every
+historical map binding and requires the exact stored epoch/digest pair. Drift
+returns HTTP `422 ROLLBACK_TARGET_INVALID` with
+`MAP_ASSET_EPOCH_CHANGED` and/or `MAP_ASSET_DIGEST_CHANGED` in `issues[]`; the
+App must not retry with locally edited identity fields.
+
+Internal elevator points live only in the release-private
+`elevator_internal_poses.yaml`. Ordinary semantic-point APIs hide legacy
+`type:elevator_internal`, reject writes/deletes in the reserved namespace, and
+ordinary navigation returns `ELEVATOR_INTERNAL_POSE_REQUIRES_MISSION`.
+Configuration publication does not switch floors, reload localization,
+start/stop Nav2, send a goal, or publish velocity. The App must not offer a
+"run elevator" button until the separate mission/elevator execution adapter
+and live atomic FloorSwitch are deployed and commissioned.
+
+On Linux the backend selects one immutable release with the atomic
+`.elevator_config/current` directory symlink. `elevators.yaml`,
+`elevator_internal_poses.yaml`, and `current.json` are compatibility views
+through that selector. A consumer needing both topology and internal poses
+must first fix one `release_id`, then read both files from that exact release;
+two independent opens across a publication can otherwise observe different
+generations.
 
 ## Semantic Points And Navigation
 
@@ -361,7 +546,7 @@ Read only the keepout layer:
 GET http://<robot-ip>:8080/api/v1/maps/filters/keepout?building_id=B1&floor_id=F1&map_id=map_20260520T120000Z_012345abcd
 ```
 
-Save or update App-authored keepout semantics:
+Replace the complete App-authored keepout layer:
 
 ```text
 POST http://<robot-ip>:8080/api/v1/maps/filters/keepout/save
@@ -373,13 +558,63 @@ Content-Type: application/json
   "building_id": "B1",
   "floor_id": "F1",
   "map_id": "map_20260520T120000Z_012345abcd",
-  "keepout": {
-    "lines": []
+  "keepout_lines": [
+    {
+      "id": "door_barrier_1",
+      "name": "door barrier",
+      "width_m": 0.6,
+      "points": [
+        {"x": 1.2, "y": 3.4},
+        {"x": 2.8, "y": 3.4}
+      ]
+    }
+  ],
+  "keepout_polygons": [],
+  "expected_revision": "keepout-v1-fnv64-0123456789abcdef",
+  "reload_filter": true
+}
+```
+
+This is full-layer replacement, not an append operation. Send `keepout_lines: []` and `keepout_polygons: []` to clear the layer. Line points and polygon vertices are map-frame metres; `width_m` is the full line width. The App must convert map-image touches with the map's resolution and complete origin `[x, y, yaw]`, including the image/map Y flip. Read `keepout_revision` from `GET /api/v1/maps/semantic_layer` (or `revision` from the keepout-only GET) and return it as `expected_revision`; HTTP `412 REVISION_CONFLICT` means another client changed the full layer and the App must reload before retrying.
+
+The backend validates and rasterizes every feature, then updates the canonical semantic/YAML/PGM assets, a last-written commit marker, the fixed active projections, and Nav2's current runtime staging copy. It rejects duplicate IDs, non-finite or degenerate geometry, self-intersecting polygons, out-of-map or non-free-cell features, excessive raster work, a layer that blocks the whole map, unmanaged legacy non-neutral masks, and semantic/PGM disagreement. A selected invalid managed mask fails startup closed rather than being replaced by neutral.
+
+For the map currently loaded by Nav2, a successful response is not just an HTTP write acknowledgement:
+
+```json
+{
+  "ok": true,
+  "persisted": true,
+  "outcome": "APPLIED",
+  "runtime_selected": true,
+  "runtime_effective": true,
+  "effective": true,
+  "effective_on_next_activation": false,
+  "revision": "keepout-v1-fnv64-...",
+  "mask": {
+    "width": 1029,
+    "height": 681,
+    "active_cells": 274,
+    "occupancy_digest": "occupancy-fnv64-..."
+  },
+  "runtime": {
+    "mask_server_active": true,
+    "filter_plugin_enabled": true,
+    "load_map_succeeded": true,
+    "mask_topic_matches": true,
+    "global_costmap_cleared": true,
+    "global_costmap_updated": true,
+    "global_costmap_content_matches": true,
+    "costmap_samples_checked": 8,
+    "costmap_samples_blocked": 8,
+    "costmap_samples_cleared": 0
   }
 }
 ```
 
-The server stores this JSON beside the map bundle as `filters/keepout_semantic_layer.json` and synchronizes it into `current/filters/` when that map is active. The Nav2 mask files remain `filters/keepout_mask.yaml` and `filters/keepout_mask.pgm`; the semantic JSON is the editable App overlay, not a replacement for the runtime costmap filter asset.
+For a map that is not currently loaded, the server persists the assets and returns `outcome: "SAVED_DEFERRED_INACTIVE"`, `runtime_selected: false`, and `effective_on_next_activation: true`. The App may display “saved; effective after this map is activated”, but must not display “navigation effective”. The App must reject any 2xx response that proves neither of these states.
+
+The server returns `409` without writing while mapping, docking, floor/map mutation, an API goal, or a Nav2 action goal is active, and while wheel odometry is not stably stopped. A map bound by the current elevator release is also immutable: keepout save returns `409 ELEVATOR_CONFIG_MAP_IN_USE`; publish a reviewed elevator release against the new map assets instead of mutating the bound map in place. It also returns non-2xx if the active runtime mask cannot be loaded and proven; the backend best-effort rolls back both asset files and the previous runtime mask. If rollback cannot be proven, `persisted`/`effective` are `null`, `integrity_degraded=true`, and new motion admission stays blocked until repair. No App workflow may cancel navigation or publish velocity to make a keepout edit succeed. Keepout save uses a dedicated 45-second client timeout because proof includes bounded ROS lifecycle, mask, and costmap waits.
 
 Read existing points from the car:
 
@@ -476,7 +711,11 @@ Content-Type: application/json
 }
 ```
 
-`PUT /api/v1/maps/poses/batch` is a replacement operation, not an append. Sending `"poses":[]` intentionally clears all App semantic points for that map. The backend writes the selected `maps/<map_id>/poses.yaml` and synchronizes `current/poses.yaml` when that map is active.
+`PUT /api/v1/maps/poses/batch` replaces all ordinary App semantic points, not
+the elevator module's private points. Sending `"poses":[]` clears ordinary
+points for that map; any legacy `type:elevator_internal` records are preserved
+and remain hidden. The backend writes the selected `maps/<map_id>/poses.yaml`
+and synchronizes `current/poses.yaml` when that map is active.
 
 Legacy save-or-update endpoint kept for existing App builds:
 
@@ -605,7 +844,7 @@ POST http://<robot-ip>:8080/api/v1/navigation/cancel
 }
 ```
 
-By default this endpoint cancels the current navigation task and keeps the resident navigation runtime alive. The car-side server publishes a zero burst into `/cmd_vel_api`, accepts a background cancel job, and returns `202 Accepted` quickly. The background job uses a short `/navigate_to_pose` action-server probe so a partly degraded Nav2 stack does not block cancellation for the generic service timeout; when `/navigate_to_pose` is available it cancels the cached API-started `NavigateToPose` goal handle, sends cancel-all to `/navigate_to_pose`, publishes another zero burst, and leaves Nav2 plus localization resident.
+By default this endpoint cancels the current navigation task and keeps the resident navigation runtime alive. The car-side server publishes a zero burst into `/cmd_vel_api`, accepts a background cancel job, and returns `202 Accepted` quickly. The background job uses a short `/navigate_to_pose` action-server probe so a partly degraded Nav2 stack does not block cancellation for the generic service timeout; when `/navigate_to_pose` is available it cancels the cached API-started `NavigateToPose` goal handle, sends cancel-all to `/navigate_to_pose`, publishes another zero burst, and leaves Nav2 plus localization resident. For this ordinary path, `navigation_cancel.navigation_stack_stopped` is `false`; it becomes `true` only when `stop_stack=true` was requested and the navigation stop command completed successfully.
 
 The endpoint is idempotent for task exit: if Nav2 is already partly down, it still publishes zero velocity and records the cancel job failure reason without tearing down localization.
 
@@ -665,7 +904,45 @@ Content-Type: application/json
 }
 ```
 
-The backend activates the requested map, starts or waits for the standard navigation runtime, cancels any cached API navigation goal without stopping the Nav2/localization stack, checks bridge `safe_for_goal_start`, and sends Nav2 to the pre-dock pose with the expected predock base yaw. The App may keep the existing body unchanged. If the map contains a manual pre-dock pose named `dock_id_predock`, `dock_id_pre_dock`, `dock_id_approach`, `predock_dock_id`, `pre_dock_dock_id`, or `approach_dock_id`, the backend uses it after checking yaw sanity only by default. Engineering tools may also pass `"predock_pose_id": "dock_main_predock"` or `"approach_pose_id": "dock_main_predock"`. A manual pre-dock point should normally be saved with the robot centered in front of the charger, about `0.6m..0.9m` away, but `docking_manual_predock_distance_check_enable` defaults to `false`, so short points such as `0.356m` are not rejected only because of distance. If no manual point exists, the backend falls back to the geometric offset from the saved dock contact pose. `/api/v1/docking/state` exposes `predock_pose_id`, `approach_source`, `expected_base_yaw_at_predock`, `expected_contact_yaw_at_predock`, `current_base_yaw_map`, `base_yaw_error`, `reverse_yaw_offset_applied`, and `predock_yaw_verified_by_nav2`. After Nav2 reports the pre-dock goal succeeded, or after Nav2 aborts while the robot is still inside the docking handoff window, the backend performs `PREDOCK_POSE_VERIFY`; if XY is acceptable but yaw is not, the docking-owned `PREDOCK_YAW_ALIGN_RECOVERY` can run before `/docking/start`. If XY or yaw is still not verified it fails with `DOCK_FAILED_PREDOCK_NAV_OUTSIDE_HANDOFF_WINDOW`, `PREDOCK_NATIVE_GOAL_VERIFY_FAILED`, or `PREDOCK_YAW_NOT_ALIGNED_AFTER_NAV2` and does not call `/docking/start`. GS2 fine docking is not called until the fine-entry path confirms `predock_pose_verified`, distance, lateral error, yaw error, GS2 freshness, staging handoff readiness, bridge `map->odom` smoothing completion in `FINE_DOCKING_BRIDGE_SETTLE`, and global-correction pause. If bridge smoothing does not settle within the bounded wait, the job fails with `DOCK_FAILED_FINE_LOCALIZATION_TRANSITION_TIMEOUT` before `/docking/start`. GS2 fine docking owns only the final low-speed alignment and charging-contact confirmation.
+The backend never activates a map from the docking endpoint. The requested
+`building_id/floor_id/map_id` must already equal the active manifest and the
+confirmed, ready runtime-map context; otherwise the request returns `409
+FLOOR_SWITCH_REQUIRED` before resolving a dock pose or starting a job. For that
+same already-loaded map, the backend starts or reuses the standard navigation
+runtime, cancels any cached API navigation goal without stopping the
+Nav2/localization stack, checks bridge `safe_for_goal_start`, and sends Nav2 to
+the pre-dock pose with the expected predock base yaw. If the map contains a
+manual pre-dock pose named `dock_id_predock`, `dock_id_pre_dock`,
+`dock_id_approach`, `predock_dock_id`, `pre_dock_dock_id`, or
+`approach_dock_id`, the backend uses it after checking yaw sanity only by
+default; this preserves checking yaw sanity only by default. Engineering tools
+may also pass `"predock_pose_id":
+"dock_main_predock"` or `"approach_pose_id": "dock_main_predock"`. A manual
+pre-dock point should normally be saved with the robot centered in front of the
+charger, about `0.6m..0.9m` away, but
+`docking_manual_predock_distance_check_enable` defaults to `false`, so short
+points such as `0.356m` are not rejected only because of distance. If no manual
+point exists, the backend falls back to the geometric offset from the saved
+dock contact pose. `/api/v1/docking/state` exposes `predock_pose_id`,
+`approach_source`, `expected_base_yaw_at_predock`,
+`expected_contact_yaw_at_predock`, `current_base_yaw_map`, `base_yaw_error`,
+`reverse_yaw_offset_applied`, and `predock_yaw_verified_by_nav2`. After Nav2
+reports the pre-dock goal succeeded, or after Nav2 aborts while the robot is
+still inside the docking handoff window, the backend performs
+`PREDOCK_POSE_VERIFY`; if XY is acceptable but yaw is not, the docking-owned
+`PREDOCK_YAW_ALIGN_RECOVERY` can run before `/docking/start`. If XY or yaw is
+still not verified it fails with
+`DOCK_FAILED_PREDOCK_NAV_OUTSIDE_HANDOFF_WINDOW`,
+`PREDOCK_NATIVE_GOAL_VERIFY_FAILED`, or
+`PREDOCK_YAW_NOT_ALIGNED_AFTER_NAV2` and does not call `/docking/start`. GS2
+fine docking is not called until the fine-entry path confirms
+`predock_pose_verified`, distance, lateral error, yaw error, GS2 freshness,
+staging handoff readiness, bridge `map->odom` smoothing completion in
+`FINE_DOCKING_BRIDGE_SETTLE`, and global-correction pause. If bridge smoothing
+does not settle within the bounded wait, the job fails with
+`DOCK_FAILED_FINE_LOCALIZATION_TRANSITION_TIMEOUT` before `/docking/start`.
+GS2 fine docking owns only the final low-speed alignment and charging-contact
+confirmation.
 
 Cancel docking:
 

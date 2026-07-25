@@ -6,6 +6,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(lifecycle_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(robot_interfaces REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(tf2 REQUIRED)
@@ -20,6 +21,7 @@ ament_target_dependencies(runtime_readiness_probe
   lifecycle_msgs
   nav_msgs
   rclcpp
+  robot_interfaces
   sensor_msgs
   std_msgs
   tf2
