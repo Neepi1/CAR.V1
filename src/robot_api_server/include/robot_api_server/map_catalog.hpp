@@ -42,8 +42,8 @@ public:
   std::vector<MapManifest> read_floor_map_manifests(
     const std::string & building_id,
     const std::string & floor_id,
-    bool migrate_legacy = true) const;
-  std::vector<MapManifest> read_all_map_manifests(bool migrate_legacy = true) const;
+    bool migrate_legacy = false) const;
+  std::vector<MapManifest> read_all_map_manifests(bool migrate_legacy = false) const;
 
   std::optional<MapManifest> find_map_by_id(const std::string & map_id) const;
   std::optional<MapManifest> find_floor_map_by_name(

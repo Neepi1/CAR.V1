@@ -1,0 +1,9 @@
+builtin_interfaces/Time stamp
+uint64 generation
+string mode
+string owner
+string mission_id
+string lease_id
+builtin_interfaces/Duration lease_remaining
+bool lease_active
+string transition_reason

@@ -1,0 +1,18 @@
+uint8 OP_BEGIN=0
+uint8 OP_COMMIT=1
+uint8 OP_ABORT=2
+
+string transaction_id
+string building_id
+string floor_id
+string map_id
+uint64 asset_epoch
+string asset_digest
+uint8 operation
+---
+bool success
+string message
+bool runtime_context_valid
+bool safe_for_goal_start
+uint64 accepted_asset_epoch
+uint64 explicit_relocalization_sequence

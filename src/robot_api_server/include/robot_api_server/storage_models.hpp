@@ -20,6 +20,11 @@ struct StoredPose
 
 struct MapManifest
 {
+  std::string schema;
+  std::uint64_t asset_epoch{0U};
+  std::string asset_digest_algorithm;
+  std::string asset_digest_contract;
+  std::string asset_digest;
   std::string map_id;
   std::string display_name;
   std::string safe_map_name;

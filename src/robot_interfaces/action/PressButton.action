@@ -1,0 +1,18 @@
+uint8 BUTTON_HALL_CALL=0
+uint8 BUTTON_TARGET_FLOOR=1
+
+string request_id
+string transaction_id
+string elevator_id
+uint8 button_kind
+string floor_id
+string direction
+---
+bool success
+bool contact_confirmed
+string failure_code
+string message
+---
+string stage
+float32 progress
+string detail

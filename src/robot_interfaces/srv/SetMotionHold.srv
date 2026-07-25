@@ -1,0 +1,18 @@
+uint8 OP_ACQUIRE=0
+uint8 OP_RELEASE=1
+
+string owner
+string transaction_id
+string reason
+uint8 operation
+---
+uint8 RESULT_OK=0
+uint8 RESULT_INVALID_REQUEST=1
+uint8 RESULT_CONFLICT=2
+uint8 RESULT_NOT_OWNER=3
+uint8 RESULT_STALE_LEASE=4
+
+bool success
+uint8 result_code
+string message
+robot_interfaces/MotionInterlockState state

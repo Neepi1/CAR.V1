@@ -1,4 +1,21 @@
+uint8 OP_SET=0
+uint8 OP_RELEASE=1
+
 string mode
+string owner
+string mission_id
+string lease_id
+builtin_interfaces/Duration lease_duration
+uint8 operation
 ---
+uint8 RESULT_OK=0
+uint8 RESULT_INVALID_REQUEST=1
+uint8 RESULT_UNSUPPORTED_MODE=2
+uint8 RESULT_LEASE_CONFLICT=3
+uint8 RESULT_STALE_LEASE=4
+uint8 RESULT_NOT_OWNER=5
+
 bool success
+uint8 result_code
 string message
+robot_interfaces/OperatingModeState state

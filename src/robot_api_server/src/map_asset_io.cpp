@@ -6,8 +6,11 @@
 #include <cctype>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
+
+#include <yaml-cpp/yaml.h>
 
 #include "robot_api_server/http_common.hpp"
 
@@ -335,6 +338,182 @@ std::optional<MapYamlInfo> read_nav_map_info(const fs::path & nav_map_yaml)
     return std::nullopt;
   }
   return info;
+}
+
+std::optional<MapYamlInfo> read_nav_map_info_exact(
+  const fs::path & nav_map_yaml,
+  const fs::path & exact_pgm_path)
+{
+  try {
+    constexpr std::uintmax_t kMaximumNavMapYamlBytes = 1024U * 1024U;
+    std::error_code size_error;
+    const auto size = fs::file_size(nav_map_yaml, size_error);
+    if (size_error || size > kMaximumNavMapYamlBytes ||
+      !fs::is_regular_file(nav_map_yaml))
+    {
+      return std::nullopt;
+    }
+
+    constexpr std::uintmax_t kMaximumPgmHeaderBytes = 1024U * 1024U;
+    std::ifstream pgm(exact_pgm_path, std::ios::binary);
+    if (!pgm) {
+      return std::nullopt;
+    }
+    std::string pgm_header(kMaximumPgmHeaderBytes, '\0');
+    pgm.read(
+      pgm_header.data(),
+      static_cast<std::streamsize>(pgm_header.size()));
+    pgm_header.resize(static_cast<std::size_t>(pgm.gcount()));
+    return read_nav_map_info_exact_content(
+      read_text_file(nav_map_yaml),
+      pgm_header,
+      exact_pgm_path.filename().string());
+  } catch (const std::exception &) {
+    return std::nullopt;
+  }
+}
+
+std::optional<MapYamlInfo> read_nav_map_info_exact_content(
+  const std::string & nav_map_yaml,
+  const std::string & nav_map_pgm_header,
+  const std::string & expected_pgm_filename)
+{
+  try {
+    constexpr std::size_t kMaximumNavMapYamlBytes = 1024U * 1024U;
+    constexpr std::size_t kMaximumPgmHeaderBytes = 1024U * 1024U;
+    if (nav_map_yaml.size() > kMaximumNavMapYamlBytes ||
+      nav_map_pgm_header.empty() ||
+      nav_map_pgm_header.size() > kMaximumPgmHeaderBytes ||
+      expected_pgm_filename.empty())
+    {
+      return std::nullopt;
+    }
+
+    const auto root = YAML::Load(nav_map_yaml);
+    if (!root || !root.IsMap()) {
+      return std::nullopt;
+    }
+
+    std::size_t image_count = 0U;
+    std::size_t resolution_count = 0U;
+    std::size_t origin_count = 0U;
+    YAML::Node image;
+    YAML::Node resolution;
+    YAML::Node origin;
+    for (const auto & entry : root) {
+      if (!entry.first.IsScalar()) {
+        return std::nullopt;
+      }
+      const auto key = entry.first.as<std::string>();
+      if (key == "image") {
+        ++image_count;
+        image = entry.second;
+      } else if (key == "resolution") {
+        ++resolution_count;
+        resolution = entry.second;
+      } else if (key == "origin") {
+        ++origin_count;
+        origin = entry.second;
+      }
+    }
+    if (image_count != 1U || resolution_count != 1U || origin_count != 1U ||
+      !image.IsScalar() || !resolution.IsScalar() ||
+      !origin.IsSequence() || origin.size() != 3U)
+    {
+      return std::nullopt;
+    }
+
+    const fs::path configured_image(image.as<std::string>());
+    if (configured_image.empty() || configured_image.is_absolute() ||
+      configured_image.has_parent_path() ||
+      configured_image.filename() != configured_image ||
+      configured_image == "." || configured_image == ".." ||
+      configured_image.filename() != fs::path(expected_pgm_filename))
+    {
+      return std::nullopt;
+    }
+
+    MapYamlInfo info;
+    info.resolution = resolution.as<double>();
+    for (std::size_t index = 0U; index < info.origin.size(); ++index) {
+      if (!origin[index].IsScalar()) {
+        return std::nullopt;
+      }
+      info.origin[index] = origin[index].as<double>();
+    }
+    if (!std::isfinite(info.resolution) || info.resolution <= 0.0 ||
+      !std::all_of(
+        info.origin.begin(), info.origin.end(),
+        [](const double value) {return std::isfinite(value);}))
+    {
+      return std::nullopt;
+    }
+
+    // Dimensions come from the descriptor-pinned PGM header returned by the
+    // same identity snapshot. Nested YAML image keys cannot redirect the read.
+    std::istringstream pgm(nav_map_pgm_header);
+    auto next_pgm_token = [&pgm]() -> std::optional<std::string> {
+        std::string token;
+        char c = '\0';
+        while (pgm.get(c)) {
+          if (std::isspace(static_cast<unsigned char>(c)) != 0) {
+            continue;
+          }
+          if (c == '#') {
+            std::string ignored;
+            std::getline(pgm, ignored);
+            continue;
+          }
+          token.push_back(c);
+          break;
+        }
+        while (pgm.get(c)) {
+          if (std::isspace(static_cast<unsigned char>(c)) != 0) {
+            break;
+          }
+          if (c == '#') {
+            std::string ignored;
+            std::getline(pgm, ignored);
+            break;
+          }
+          token.push_back(c);
+        }
+        return token.empty() ? std::nullopt :
+               std::optional<std::string>(std::move(token));
+      };
+    const auto magic = next_pgm_token();
+    const auto width = next_pgm_token();
+    const auto height = next_pgm_token();
+    if (!magic || (*magic != "P5" && *magic != "P2") ||
+      !width || !height)
+    {
+      return std::nullopt;
+    }
+    std::optional<std::pair<std::uint32_t, std::uint32_t>> dimensions;
+    try {
+      const auto parsed_width = std::stoull(*width);
+      const auto parsed_height = std::stoull(*height);
+      if (parsed_width == 0U || parsed_height == 0U ||
+        parsed_width > std::numeric_limits<std::uint32_t>::max() ||
+        parsed_height > std::numeric_limits<std::uint32_t>::max())
+      {
+        return std::nullopt;
+      }
+      dimensions = std::make_pair(
+        static_cast<std::uint32_t>(parsed_width),
+        static_cast<std::uint32_t>(parsed_height));
+    } catch (const std::exception &) {
+      return std::nullopt;
+    }
+    if (!dimensions) {
+      return std::nullopt;
+    }
+    info.width = dimensions->first;
+    info.height = dimensions->second;
+    return info;
+  } catch (const std::exception &) {
+    return std::nullopt;
+  }
 }
 
 std::string map_info_json(const std::optional<MapYamlInfo> & info)

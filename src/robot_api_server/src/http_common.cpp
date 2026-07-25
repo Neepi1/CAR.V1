@@ -70,6 +70,8 @@ std::string reason_phrase(const int status)
   switch (status) {
     case 200:
       return "OK";
+    case 201:
+      return "Created";
     case 202:
       return "Accepted";
     case 400:
@@ -82,6 +84,8 @@ std::string reason_phrase(const int status)
       return "Method Not Allowed";
     case 409:
       return "Conflict";
+    case 422:
+      return "Unprocessable Entity";
     case 500:
       return "Internal Server Error";
     case 501:

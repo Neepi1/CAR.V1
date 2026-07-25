@@ -1,10 +1,26 @@
 string mission_id
-string source_floor
-string target_floor
-string target_pose
+string building_id
+string expected_source_floor_id
+string expected_source_map_id
+string target_floor_id
+string target_map_id
+uint64 expected_asset_epoch
+string expected_asset_digest
+string target_pose_id
+string preferred_elevator_id
 ---
 bool success
+string failure_code
 string message
+string current_floor_id
+string current_map_id
+bool safety_hold_active
+uint64 current_asset_epoch
+string current_asset_digest
+bool runtime_context_valid
 ---
 string stage
 float32 progress
+string current_floor_id
+string current_map_id
+bool safety_hold_active

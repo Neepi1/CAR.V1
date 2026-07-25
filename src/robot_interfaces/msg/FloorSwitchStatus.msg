@@ -1,0 +1,33 @@
+builtin_interfaces/Time stamp
+uint64 generation
+string transaction_id
+string state
+string stage
+
+string requested_building_id
+string requested_floor_id
+string requested_map_id
+uint64 requested_asset_epoch
+string requested_asset_digest
+string selected_building_id
+string selected_floor_id
+string selected_map_id
+string pending_building_id
+string pending_floor_id
+string pending_map_id
+string active_building_id
+string active_floor_id
+string active_map_id
+
+bool active_context_valid
+uint64 asset_epoch
+string asset_digest
+bool nav_map_ready
+bool filters_ready
+bool localizer_ready
+bool bridge_ready
+bool amcl_ready
+bool costmaps_ready
+bool nav2_ready
+uint16 failure_code
+string detail

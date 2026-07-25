@@ -4,3 +4,12 @@ bool bridge_ready
 bool tf_unique
 string detail
 builtin_interfaces/Time stamp
+string building_id
+string map_id
+string asset_digest
+uint64 asset_epoch
+uint64 localizer_generation
+uint64 explicit_relocalization_sequence
+bool amcl_ready
+bool transition_active
+bool runtime_context_valid

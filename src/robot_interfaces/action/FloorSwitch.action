@@ -1,0 +1,40 @@
+string transaction_id
+string building_id
+string floor_id
+string map_id
+uint64 expected_asset_epoch
+string expected_asset_digest
+---
+uint16 NONE=0
+uint16 INVALID_GOAL=10
+uint16 TRANSACTION_CONFLICT=11
+uint16 ASSET_NOT_FOUND=20
+uint16 ASSET_IDENTITY_MISMATCH=21
+uint16 ASSET_BUNDLE_INVALID=22
+uint16 ASSET_DIGEST_MISMATCH=23
+uint16 MOTION_HOLD_UNPROVEN=30
+uint16 NAV_IDLE_UNPROVEN=31
+uint16 STOPPED_UNPROVEN=32
+uint16 EVIDENCE_STALE=33
+uint16 RUNTIME_CONTEXT_UNPROVEN=34
+uint16 LOCALIZER_RELOAD_UNPROVEN=40
+uint16 LIVE_FLOOR_SWITCH_DISABLED=41
+uint16 CANCELLED_BEFORE_MUTATION=90
+uint16 INTERNAL_ERROR=99
+
+bool success
+uint16 failure_code
+string message
+string active_building_id
+string active_floor_id
+string active_map_id
+uint64 asset_epoch
+string asset_digest
+uint64 explicit_relocalization_sequence
+bool runtime_context_valid
+bool recovery_required
+---
+string stage
+float32 progress
+string detail
+uint64 asset_epoch

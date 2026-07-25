@@ -189,17 +189,33 @@ phases:
     tasks:
       - id: P6-001
         package: robot_floor_manager
-        summary: Implement atomic floor switch: stop -> swap Nav2 map -> apply localizer assets -> trigger localization -> resume
+        summary: "Implement atomic floor switch: stop -> swap Nav2 map -> apply localizer assets -> trigger localization -> resume"
         depends_on: [P4-002, P5-003]
+        current_state:
+          - strict Action preflight and the ordered pure-C++ transaction core require an exact building/floor/map/asset_epoch/asset_digest identity
+          - a read-only authoritative source-bundle snapshot loader verifies registry, manifest v2, role paths, file identity, and canonical content digest without ROS or runtime mutation
+          - the snapshot loader is not connected to the Action adapter; live_floor_switch_enabled remains false
         done_when:
-          - floor switch service/action works
-          - floor switch log is generated
+          - zero, non-canonical, stale, or mismatched asset epoch/digest requests fail closed
+          - floor switch status and logs distinguish requested identity from proven active identity
+          - the exact read-only source snapshot is handed to a non-blocking atomic transaction adapter
+          - real localizer assets are demonstrably reloaded and a new target-localization generation, healthy target identity, unique TF ownership, and fresh target costmaps are proven before commit
+          - live floor switching remains disabled by default until the real localizer reload, TF, health, bridge-readiness, and safety evidence passes isolated integration and supervised hardware acceptance
       - id: P6-002
         package: robot_elevator_manager
         summary: Implement elevator state machine with mock mode and clear interfaces for real protocol integration
         depends_on: [P6-001, P1-003]
+        current_state:
+          - immutable release loading and route preparation pin the exact map asset epoch and canonical digest for every floor
+          - preparation is non-moving and has no ROS, goal, velocity, or floor-switch side effects
+          - real elevator mission execution remains gated by the disabled live FloorSwitch path
         done_when:
           - mock elevator flow works
+          - one immutable configuration release is pinned and verified before route preparation
+          - configuration, release manifest, topology, internal poses, and exact map asset epoch/digest bindings are cross-checked
+          - release loading rejects missing, zero, non-canonical, stale, or mismatched map asset identities
+          - runtime preparation has no ROS, motion, or floor-switch side effects
+          - real execution cannot be enabled before P6-001 supplies proven target localizer, TF, health, and atomic FloorSwitch evidence
       - id: P6-003
         package: robot_mode_manager
         summary: Implement NORMAL/RAMP/ELEVATOR_WAIT/ELEVATOR_RIDE/DOORWAY/RECOVERY mode switching and outputs to local perception/nav profiles
@@ -214,6 +230,27 @@ phases:
         done_when:
           - MissionTask action works
           - cross-floor mocked mission test passes
+      - id: P6-005
+        package: robot_api_server
+        summary: Implement building-level elevator commissioning drafts, validation, immutable releases, rollback, and private internal-pose assets
+        depends_on: [P3-003, P6-002]
+        current_state:
+          - pure C++ map identity, keepout, draft validation, immutable publication, rollback, and internal-pose isolation cores are implemented with unit tests
+          - every registry bind and lookup audits the maximum committed source-manifest epoch and rejects rollback or ambiguous source layout
+          - valid elevator drafts and immutable releases bind both the server-resolved asset epoch and canonical digest
+          - the robot_api_server HTTP node adapter is intentionally not included until it can be separated from unrelated accumulated navigation and docking changes
+          - core publication and rollback are non-moving and do not authorize live floor switching
+        done_when:
+          - incomplete drafts return structured validation issues
+          - map identity binding is idempotent for an unchanged exact key/digest and consumes a never-reused global epoch for new or changed content
+          - manifest v2 atomically records a positive asset epoch, sha256 algorithm, njrh-map-asset-bundle-v1 contract, and canonical digest
+          - publish revalidates exact floor maps, asset epoch/digest pairs, and generated topology
+          - rollback revalidates the historical epoch/digest bindings and creates a new auditable release instead of moving history backward
+          - ordinary pose and navigation APIs cannot access elevator internal poses
+          - configuration publication has no runtime motion or floor-switch side effects
+          - map bindings use the exact server-managed asset epoch and canonical SHA-256 digest accepted by FloorSwitch preflight
+          - publish and rollback reject any map asset epoch or digest drift and require a newly reviewed draft/release
+          - keepout assets of a map bound by the current release cannot be mutated in place
 
   - id: P7
     name: tests_docs_and_packaging

@@ -1,0 +1,6 @@
+robot_mode_manager:
+  ros__parameters:
+    min_lease_duration_sec: 0.20
+    max_lease_duration_sec: 30.0
+    heartbeat_period_sec: 0.20
+    recovery_owner: robot_mission_manager
