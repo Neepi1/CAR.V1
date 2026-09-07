@@ -1,5 +1,11 @@
 # Phase V1 Navigation Docking Validation
 
+> The original V1 probes predate near-field single-owner delegation. With
+> `docking_delegate_staging_motion_to_manager=true`, predock yaw/lateral values
+> are admission evidence and `robot_docking_manager` performs the physical
+> capture. Use `docs/docking_near_field_controller.md` as the active motion
+> contract; any API motion probe is rollback-only.
+
 Phase V1 is a validation-only layer for the current N2/D3/R0-R2 runtime
 contract. It does not change Nav2 plugins, controller parameters, TF
 tolerances, pointcloud QoS/DDS, FAST-LIO2, Ranger odom, EKF fusion, or the
@@ -16,13 +22,11 @@ The validation target is:
   by default, not on the post-relocalization settle barrier or AMCL
   post-Isaac refine; strict AMCL refine remains available only when the
   caller explicitly sets `amcl_refine=true` and `amcl_refine_required=true`;
-- predock yaw alignment is docking-owned and publishes only to
-  `/cmd_vel_docking`;
-- predock lateral capture is docking-owned, requests Ranger `side_slip`, and
-  publishes only bounded `linear.y` commands to `/cmd_vel_docking`;
-- fine docking entry requires predock yaw alignment, predock lateral capture,
-  post-predock settle, GS2 freshness, bridge `map->odom` smoothing completion,
-  and applied global-correction pause.
+- predock yaw/lateral residuals must be inside the manager capture envelope;
+- the manager publishes all near-field motion only to `/cmd_vel_docking` and
+  requests Ranger `spinning` or `side_slip` according to its monotonic phase;
+- fine docking entry requires post-predock settle, fresh dock observation,
+  bridge `map->odom` smoothing completion, and applied global-correction pause.
 - ordinary navigation final verification may perform at most one same-goal Nav2
   retry after bridge smoothing; API-owned velocity correction remains disabled.
 

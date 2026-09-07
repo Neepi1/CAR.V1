@@ -1,0 +1,46 @@
+{
+  "schema": "njrh.production_release_lock.v1",
+  "release_id": "car-v1-2026.07.25-candidate",
+  "release_state": "candidate",
+  "captured_at": "2026-07-25T00:00:00Z",
+  "source": {
+    "repository": "https://github.com/Neepi1/CAR.V1.git",
+    "commit": "b0ef442a54ad2af3d0e7a6a307630b6fe9b2351b",
+    "branch": "codex/elevator-config-management"
+  },
+  "platform": {
+    "architecture": "aarch64",
+    "l4t_release": "36",
+    "l4t_revision": "4.3",
+    "jetson_model": "NVIDIA Jetson Orin NX Engineering Reference Developer Kit Super",
+    "jetpack_version": "6.2.1+b38",
+    "l4t_core_version": "36.4.3-20250107174145",
+    "tnspec": "3767-303-0000-D.1-1-1-jetson-orin-nano-devkit-super-",
+    "compatible_spec": "3767-000-0000--1--jetson-orin-nano-devkit-super-",
+    "cpu_count": 8,
+    "minimum_memory_bytes": 15000000000
+  },
+  "golden_images": {
+    "base_image": {
+      "local_reference": "isaac_ros_dev-aarch64:latest",
+      "image_id": "sha256:80b6ec675107284658a40008ada248f1995fbd853ec493e80e4511fa57c29188"
+    },
+    "runtime_image": {
+      "local_reference": "njrh-car:latest",
+      "image_id": "sha256:2345545cf8b909d7b8fd0858af183fa0e801e59633b55f11c228b69b14253a3a"
+    }
+  },
+  "artifacts": {
+    "runtime_image": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "upstream_runtime": "0000000000000000000000000000000000000000000000000000000000000000",
+    "runtime_overlays": "0000000000000000000000000000000000000000000000000000000000000000",
+    "site_assets": ""
+  },
+  "runtime_contract": {
+    "ros_distro": "humble",
+    "rmw": "rmw_fastrtps_cpp",
+    "container_name": "NJRH-car",
+    "motion_state_after_deploy": "locked",
+    "base_image_fallback_allowed": false
+  }
+}

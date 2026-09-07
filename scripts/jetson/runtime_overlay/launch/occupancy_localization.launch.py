@@ -94,13 +94,15 @@ def generate_launch_description():
 
     localizer_container = ComposableNodeContainer(
         package="rclcpp_components",
-        executable="component_container_mt",
+        executable="component_container_isolated",
         name="occupancy_grid_localizer_container",
         namespace="",
         composable_node_descriptions=[occupancy_grid_localizer],
         output="screen",
         prefix=cpu_affinity_prefix("occupancy_grid_localizer"),
         arguments=["--ros-args", "--log-level", log_level],
+        respawn=True,
+        respawn_delay=0.5,
     )
 
     return LaunchDescription([

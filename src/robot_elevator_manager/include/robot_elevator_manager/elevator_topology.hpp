@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -25,10 +26,19 @@ struct DoorThreshold
 enum class PoseRole
 {
   kHallCall,
+  kLanding,
   kHallWait,
   kDoorway,
   kCabin,
   kExit,
+  kCabinPanel,
+};
+
+enum class PanelSide
+{
+  kUnknown,
+  kLeft,
+  kRight,
 };
 
 struct PoseBinding
@@ -42,7 +52,9 @@ struct FloorElevatorTopology
   std::string floor_id;
   std::string map_id;
   std::vector<PoseBinding> poses;
-  DoorThreshold threshold;
+  std::optional<DoorThreshold> threshold;
+  PanelSide hall_call_panel_side{PanelSide::kUnknown};
+  PanelSide cabin_panel_side{PanelSide::kUnknown};
 };
 
 struct ElevatorTopology
@@ -50,6 +62,7 @@ struct ElevatorTopology
   std::string elevator_id;
   std::string building_id;
   std::vector<FloorElevatorTopology> floors;
+  std::uint32_t schema_version{2U};
 };
 
 enum class TopologyIssueCode
@@ -66,6 +79,8 @@ enum class TopologyIssueCode
   kUnknownPoseRole,
   kDuplicatePoseId,
   kInvalidThreshold,
+  kMissingPanelSide,
+  kUnsupportedSchema,
 };
 
 struct TopologyIssue
@@ -88,6 +103,9 @@ struct ElevatorRoute
   std::string building_id;
   FloorElevatorTopology source;
   FloorElevatorTopology target;
+  // Untrusted/manual construction must not silently become executable v2.
+  // resolve_route() fills this only after validating the topology schema.
+  std::uint32_t schema_version{0U};
 };
 
 enum class RouteError
@@ -111,7 +129,9 @@ struct RouteResolution
 bool safe_asset_id(const std::string & value) noexcept;
 bool safe_pose_id(const std::string & value) noexcept;
 std::string to_string(PoseRole role);
-const std::vector<PoseRole> & required_pose_roles();
+std::string to_string(PanelSide side);
+std::optional<PanelSide> panel_side_from_string(const std::string & value);
+const std::vector<PoseRole> & required_pose_roles(std::uint32_t schema_version = 2U);
 TopologyValidation validate_topology(const ElevatorTopology & topology);
 std::optional<std::string> find_pose_id(
   const FloorElevatorTopology & floor,

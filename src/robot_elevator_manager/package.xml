@@ -4,7 +4,7 @@
 <package format="3">
   <name>robot_elevator_manager</name>
   <version>0.1.0</version>
-  <description>Fail-closed elevator topology, threshold geometry, and orchestration core.</description>
+  <description>Fail-closed versioned elevator topology and orchestration core.</description>
   <maintainer email="robot@example.com">robot team</maintainer>
   <license>Apache-2.0</license>
 

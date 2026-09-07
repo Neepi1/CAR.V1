@@ -35,7 +35,9 @@ with a terminal command when all of these conditions hold:
 
 - map-frame distance is at most `0.40 m`;
 - body-frame forward residual is at most `0.15 m`;
-- the lateral residual is at least `0.08 m`; and
+- the lateral residual is at least `0.06 m`; this commissioned threshold keeps
+  the observed `0.079 m` predock residual eligible instead of leaving MPPI to
+  repeat Ackermann corrections; and
 - either the residual is lateral-dominant or the remaining path has the
   configured hairpin length/cross-track evidence.
 
@@ -49,6 +51,14 @@ fresh `/ranger_mini3/nav_terminal_lateral_enable` or
 lifecycle publishers are activated and deactivated with the controller so an
 inactive plugin cannot leave a stale capability behind.
 
+Return-to-dock now selects the same `goal_checker` as ordinary pose-required
+navigation. Nav2 must reach both `0.06 m` XY and `0.05 rad` yaw at the
+commissioned predock pose before its action may succeed. The separate
+`DockStagingGoalChecker` remains compiled and registered only for compatibility
+and diagnostics; no active behavior tree selects it. If it is used during an
+explicit rollback, its reported scalar tolerance remains the largest inscribed
+circle of its asymmetric rectangle, never the circumscribed radius.
+
 MPPI itself remains Ackermann (`vy_max=0`). The narrow Y range in
 `velocity_smoother` exists only to carry a permitted terminal side-slip through
 the normal Nav2 command chain. The API's proactive near-goal cancellation is
@@ -57,6 +67,22 @@ disabled and remains only a post-abort fallback.
 This changes neither the 1 Hz planner rate nor the command chain. Commands still
 flow through `velocity_smoother`, `collision_monitor`, `robot_safety`, and
 `ranger_base`.
+
+Downstream `robot_safety` treats a fresh normal Nav2 command as an active
+stream even while the confirmed chassis mode is PARALLEL. Its idle mode-exit
+timer may publish zero only after that stream is stale; otherwise timer zeros
+would interrupt the bounded terminal side-slip and stretch it beyond the
+handoff timeout. The isolated regression is
+`robot_safety/test/run_isolated_normal_lateral_watchdog_smoke.sh`.
+
+This ordinary near-goal handoff is separate from the elevator-scoped profile.
+The elevator runtime selects a dedicated behavior tree, planner, and controller
+for landing/cabin transitions because those paths may begin with a larger
+lateral residual and may be rejected by the Ackermann global planner before
+ordinary `FollowPath` starts. See
+[`elevator_scoped_motion.md`](elevator_scoped_motion.md). The dedicated profile
+is not selectable by ordinary App navigation and does not widen this wrapper's
+0.40 m activation envelope.
 
 ## Rollback
 
@@ -77,9 +103,9 @@ After a full `njrh-runtime.service` restart:
 4. Confirm final yaw still converges at the target.
 5. Repeat with a genuinely different target and confirm startup rotation is
    armed again.
-6. For a pre-dock goal, confirm the final Nav2 spin reduces below `0.60rad/s`
-   near the target and does not end with `Failed to make progress` before the
-   docking staging handoff.
+6. For a pre-dock goal, confirm native Nav2 success occurs only after the live
+   pose is within `0.06 m` and `0.05 rad` of the commissioned predock pose, then
+   confirm the stopped-state handoff occurs before any docking-manager command.
 7. Place the robot at a safe 8--15 cm lateral residual inside the terminal
    envelope. Confirm the same `FollowPath` action remains active, lateral output
    reaches `/cmd_vel`, native Nav2 succeeds, and `/cmd_vel_api.linear.y` stays

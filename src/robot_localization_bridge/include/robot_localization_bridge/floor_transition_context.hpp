@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 
 namespace robot_localization_bridge
 {
@@ -27,6 +28,12 @@ struct FloorTransitionCommitEvidence
   std::uint64_t last_published_sequence{0U};
 };
 
+struct FloorTransitionPreMutationAbortEvidence
+{
+  FloorTransitionIdentity source;
+  bool source_assets_unchanged{false};
+};
+
 struct FloorTransitionContextSnapshot
 {
   bool transition_active{false};
@@ -50,6 +57,8 @@ enum class FloorTransitionDecisionCode
   kExplicitRelocalizationUnproven,
   kMapOdomUnsettled,
   kFailedLocked,
+  kStaleCommand,
+  kPreMutationUnproven,
 };
 
 struct FloorTransitionContextDecision
@@ -58,22 +67,36 @@ struct FloorTransitionContextDecision
   bool idempotent{false};
   FloorTransitionDecisionCode code{FloorTransitionDecisionCode::kInvalidRequest};
   std::string message;
+  std::uint64_t applied_sequence{0U};
   FloorTransitionContextSnapshot state;
 };
 
 class FloorTransitionContext
 {
 public:
+  FloorTransitionContextDecision seed_active_source(
+    const FloorTransitionIdentity & identity);
+
   FloorTransitionContextDecision begin(
     const FloorTransitionIdentity & identity,
+    const FloorTransitionIdentity & source,
     bool floor_pause_owned,
-    std::uint64_t current_explicit_relocalization_sequence);
+    std::uint64_t current_explicit_relocalization_sequence,
+    std::uint64_t command_sequence);
 
   FloorTransitionContextDecision commit(
     const FloorTransitionIdentity & identity,
-    const FloorTransitionCommitEvidence & evidence);
+    const FloorTransitionCommitEvidence & evidence,
+    std::uint64_t command_sequence);
 
-  FloorTransitionContextDecision abort(const FloorTransitionIdentity & identity);
+  FloorTransitionContextDecision abort(
+    const FloorTransitionIdentity & identity,
+    std::uint64_t command_sequence);
+
+  FloorTransitionContextDecision abort_pre_mutation(
+    const FloorTransitionIdentity & identity,
+    const FloorTransitionPreMutationAbortEvidence & evidence,
+    std::uint64_t command_sequence);
 
   bool candidate_allowed(bool explicit_trigger, bool corrections_paused) const;
   FloorTransitionContextSnapshot snapshot() const;
@@ -83,9 +106,16 @@ private:
     bool accepted,
     bool idempotent,
     FloorTransitionDecisionCode code,
-    const std::string & message) const;
+    const std::string & message,
+    std::uint64_t applied_sequence = 0U) const;
+
+  bool command_sequence_valid(
+    const FloorTransitionIdentity & identity,
+    std::uint64_t command_sequence,
+    FloorTransitionContextDecision & rejection);
 
   FloorTransitionContextSnapshot state_;
+  std::unordered_map<std::string, std::uint64_t> last_command_sequences_;
 };
 
 const char * to_string(FloorTransitionDecisionCode code) noexcept;

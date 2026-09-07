@@ -507,6 +507,7 @@ ensure_resident_overlay_helper_process() {
 
 ensure_resident_overlay_helper_process "floor_manager" "floor_manager" bash "${SCRIPT_DIR}/run_floor_manager.sh"
 ensure_resident_overlay_helper_process "robot_safety" "robot_safety" bash "${SCRIPT_DIR}/run_robot_safety.sh"
+ensure_resident_overlay_helper_process "mode_manager" "mode_manager" bash "${SCRIPT_DIR}/run_mode_manager.sh"
 echo "[runtime-overlay] local_perception helper disabled; local costmap/collision_monitor consume /scan for standard marking+clearing" >&2
 
 ros2 launch "${LAUNCH_FILE}" \

@@ -59,6 +59,15 @@ data = {
     "display_name": os.environ.get("NJRH_MAP_DISPLAY_NAME", ""),
     "building_id": os.environ.get("NJRH_MAP_CONTEXT_BUILDING_ID") or os.environ.get("NJRH_BUILDING_ID", ""),
     "floor_id": os.environ.get("NJRH_MAP_CONTEXT_FLOOR_ID") or os.environ.get("NJRH_FLOOR_ID", ""),
+    "asset_epoch": int(os.environ.get("NJRH_MAP_ASSET_EPOCH") or "0"),
+    "asset_digest": os.environ.get("NJRH_MAP_ASSET_DIGEST", ""),
+    "transaction_id": os.environ.get("NJRH_RUNTIME_TRANSACTION_ID", ""),
+    "localizer_generation": int(
+        os.environ.get("NJRH_RUNTIME_LOCALIZER_GENERATION") or "0"
+    ),
+    "explicit_relocalization_sequence": int(
+        os.environ.get("NJRH_RUNTIME_EXPLICIT_RELOCALIZATION_SEQUENCE") or "0"
+    ),
     "updated_at": time.time(),
 }
 for key, env_key in (

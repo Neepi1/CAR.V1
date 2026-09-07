@@ -15,6 +15,7 @@ PARAMS_FILE="${NJRH_AMCL_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/amcl_shadow.ya
 SEED_SERVICE="${NJRH_AMCL_SEED_SERVICE:-/robot_localization_bridge/seed_amcl_initial_pose}"
 AMCL_NODE_NAME="${NJRH_AMCL_NODE_NAME:-amcl}"
 AMCL_BIN="${NJRH_AMCL_BIN:-/opt/ros/humble/lib/nav2_amcl/amcl}"
+AMCL_LIFECYCLE_HELPER="${NJRH_AMCL_LIFECYCLE_HELPER:-${SCRIPT_DIR}/nav2_lifecycle_sequence.py}"
 SCAN_RELAY_IMPL="${NJRH_AMCL_SCAN_ADMISSION_IMPL:-cpp}"
 SCAN_RELAY_CPP_BIN="${NJRH_AMCL_SCAN_ADMISSION_CPP_BIN:-${NJRH_PROJECT_ROOT}/install/robot_localization_bridge/lib/robot_localization_bridge/amcl_scan_admission_node}"
 SCAN_RELAY_SCRIPT="${NJRH_AMCL_SCAN_ADMISSION_SCRIPT:-${SCRIPT_DIR}/amcl_scan_admission_relay.py}"
@@ -41,6 +42,7 @@ AMCL_NOMOTION_POSE_RECEIVED=false
 AMCL_NOMOTION_POSE_COUNT=0
 AMCL_NOMOTION_POSE_HEADER_AGE_MS=""
 AMCL_STATIC_STANDBY_ACCEPTED=false
+AMCL_STARTUP_EPOCH_SEC=""
 
 usage() {
   cat <<'USAGE'
@@ -128,6 +130,10 @@ print_config() {
   echo "NJRH_AMCL_LOG_FILE=${LOG_FILE}"
   echo "NJRH_AMCL_SEED_SERVICE=${SEED_SERVICE}"
   echo "NJRH_AMCL_BIN=${AMCL_BIN}"
+  echo "NJRH_AMCL_LIFECYCLE_HELPER=${AMCL_LIFECYCLE_HELPER}"
+  echo "NJRH_AMCL_LIFECYCLE_NODE_TIMEOUT_SEC=${NJRH_AMCL_LIFECYCLE_NODE_TIMEOUT_SEC:-${NJRH_AMCL_LIFECYCLE_TRANSITION_TIMEOUT_SEC:-12}}"
+  echo "NJRH_AMCL_LIFECYCLE_CHANGE_STATE_RESPONSE_TIMEOUT_SEC=${NJRH_AMCL_LIFECYCLE_CHANGE_STATE_RESPONSE_TIMEOUT_SEC:-5}"
+  echo "NJRH_AMCL_LIFECYCLE_HELPER_TIMEOUT_SEC=${NJRH_AMCL_LIFECYCLE_HELPER_TIMEOUT_SEC:-30}"
   echo "NJRH_AMCL_NOMOTION_PROBE=${NOMOTION_PROBE}"
   echo "AMCL_NOMOTION_UPDATE_RESPONSE_TIMEOUT_SEC=${AMCL_NOMOTION_UPDATE_RESPONSE_TIMEOUT_SEC:-${NJRH_AMCL_NOMOTION_UPDATE_RESPONSE_TIMEOUT_SEC:-5.0}}"
   echo "AMCL_NOMOTION_UPDATE_ACCEPT_RECEIVED_AFTER_CALL=${AMCL_NOMOTION_UPDATE_ACCEPT_RECEIVED_AFTER_CALL:-${NJRH_AMCL_NOMOTION_UPDATE_ACCEPT_RECEIVED_AFTER_CALL:-true}}"
@@ -264,9 +270,11 @@ first_process_pid() {
 }
 
 status_lifecycle_active() {
-  local state
-  state="$(amcl_lifecycle_state 2>/dev/null || true)"
-  [[ "${state}" == active* ]]
+  runtime_readiness_probe \
+    lifecycle-active \
+    "/${AMCL_NODE_NAME}" \
+    "${NJRH_AMCL_STATUS_LIFECYCLE_PROBE_TIMEOUT_SEC:-2}" \
+    >/dev/null 2>&1
 }
 
 amcl_pose_age_ms_once() {
@@ -366,7 +374,9 @@ write_amcl_runtime_status() {
   if [[ "${amcl_pid_alive}" == "true" && "${lifecycle_active}" == "true" ]]; then
     amcl_process_ready=true
   fi
-  if [[ "${start_result}" != "failed" && "${start_result}" != "stopped" ]]; then
+  if [[ "${start_result}" != "failed" &&
+        "${start_result}" != "stopped" &&
+        "${start_result}" != "starting" ]]; then
     local existing_seed_succeeded=""
     local existing_seed_response_ok=""
     local existing_static_standby=""
@@ -405,6 +415,7 @@ write_amcl_runtime_status() {
   local state="AMCL_FAILED"
   case "${effective_start_result}" in
     disabled) state="AMCL_DISABLED" ;;
+    starting) state="AMCL_STARTING" ;;
     ready) state="AMCL_READY" ;;
     degraded) state="AMCL_DEGRADED" ;;
     waiting_seed) state="AMCL_WAITING_SEED" ;;
@@ -436,6 +447,7 @@ write_amcl_runtime_status() {
     write_status_line AMCL_STATUS_AGE_MS "0"
     write_status_line AMCL_STATUS_STALE "false"
     write_status_line AMCL_STATUS_TTL_SEC "${NJRH_AMCL_RUNTIME_STATUS_TTL_SEC:-5.0}"
+    write_status_line AMCL_STARTUP_EPOCH_SEC "${AMCL_STARTUP_EPOCH_SEC}"
     write_status_line AMCL_MODE "${MODE}"
     write_status_line AMCL_STATE "${state}"
     write_status_line AMCL_START_RESULT "${effective_start_result}"
@@ -526,6 +538,8 @@ heartbeat_amcl_runtime_status() {
   fi
 
   local period_sec="${NJRH_AMCL_RUNTIME_STATUS_HEARTBEAT_SEC:-2.0}"
+  local heartbeat_startup_epoch
+  heartbeat_startup_epoch="$(date +%s)"
   echo "[runtime-overlay] AMCL status heartbeat started status_file=${STATUS_FILE} period_sec=${period_sec}" >&2
   while true; do
     load_existing_amcl_runtime_status
@@ -555,7 +569,39 @@ heartbeat_amcl_runtime_status() {
         write_amcl_runtime_status waiting_seed false false "resident AMCL is alive; waiting for initial pose seed"
       fi
     else
-      write_amcl_runtime_status failed false true "AMCL_HEARTBEAT_PROCESS_NOT_ALIVE"
+      local existing_start_result=""
+      local existing_startup_epoch=""
+      local existing_status_stamp=""
+      local existing_failure_reason=""
+      local startup_grace_sec="${NJRH_AMCL_STARTUP_HEARTBEAT_GRACE_SEC:-45}"
+      local startup_grace_int="${startup_grace_sec%.*}"
+      local effective_startup_epoch=""
+      local now_sec
+      existing_start_result="$(status_file_value "${STATUS_FILE}" AMCL_START_RESULT)"
+      existing_startup_epoch="$(status_file_value "${STATUS_FILE}" AMCL_STARTUP_EPOCH_SEC)"
+      existing_status_stamp="$(status_file_value "${STATUS_FILE}" AMCL_STATUS_STAMP_SEC)"
+      existing_failure_reason="$(status_file_value "${STATUS_FILE}" AMCL_FAILURE_REASON)"
+      now_sec="$(date +%s)"
+      [[ "${startup_grace_int}" =~ ^[0-9]+$ ]] || startup_grace_int=45
+      if [[ "${existing_start_result}" == "starting" &&
+            "${existing_startup_epoch}" =~ ^[0-9]+$ ]]; then
+        effective_startup_epoch="${existing_startup_epoch}"
+      elif [[ "${existing_failure_reason}" == "AMCL_HEARTBEAT_PROCESS_NOT_ALIVE" ||
+              ! "${existing_status_stamp}" =~ ^[0-9]+$ ||
+              "${existing_status_stamp}" -le "${heartbeat_startup_epoch}" ]]; then
+        effective_startup_epoch="${heartbeat_startup_epoch}"
+      fi
+      if [[ "${effective_startup_epoch}" =~ ^[0-9]+$ &&
+            $((now_sec - effective_startup_epoch)) -le "${startup_grace_int}" ]]; then
+        AMCL_STARTUP_EPOCH_SEC="${effective_startup_epoch}"
+        write_amcl_runtime_status starting false false "resident AMCL startup is still in progress"
+      elif [[ "${existing_start_result}" == "failed" &&
+              -n "${existing_failure_reason}" &&
+              "${existing_failure_reason}" != "AMCL_HEARTBEAT_PROCESS_NOT_ALIVE" ]]; then
+        write_amcl_runtime_status failed false true "${existing_failure_reason}"
+      else
+        write_amcl_runtime_status failed false true "AMCL_HEARTBEAT_PROCESS_NOT_ALIVE"
+      fi
     fi
     sleep "${period_sec}"
   done
@@ -786,98 +832,25 @@ wait_for_amcl_tf_broadcast_false() {
   return 1
 }
 
-request_amcl_lifecycle_transition() {
-  local transition_id="$1"
-  local transition_label="$2"
-  local timeout_sec="${3:-8}"
-  local output
-  output="$(timeout "${timeout_sec}" ros2 service call \
-    "/${AMCL_NODE_NAME}/change_state" \
-    lifecycle_msgs/srv/ChangeState \
-    "{transition: {id: ${transition_id}, label: ${transition_label}}}" 2>&1 || true)"
-  if grep -Eq 'success[=:][[:space:]]*(True|true)|success:[[:space:]]*true' <<<"${output}"; then
-    return 0
-  fi
-  if amcl_lifecycle_transition_state_reached "${transition_label}"; then
-    echo "[runtime-overlay] /${AMCL_NODE_NAME} lifecycle transition ${transition_label} response was not reliable, but state reached target" >&2
-    return 0
-  fi
-  echo "[runtime-overlay] /${AMCL_NODE_NAME} lifecycle transition ${transition_label} failed: ${output}" >&2
-  return 1
-}
-
-amcl_lifecycle_state() {
-  local state
-  state="$(timeout 5 ros2 lifecycle get "/${AMCL_NODE_NAME}" 2>/dev/null || true)"
-  if [[ "${state}" == active* || "${state}" == inactive* || "${state}" == unconfigured* ]]; then
-    printf '%s\n' "${state}"
-    return 0
-  fi
-
-  local output
-  output="$(timeout 10 ros2 service call \
-    "/${AMCL_NODE_NAME}/get_state" \
-    lifecycle_msgs/srv/GetState \
-    "{}" 2>&1 || true)"
-  if grep -Eq "label='active'|label:[[:space:]]*active" <<<"${output}"; then
-    printf 'active [3]\n'
-    return 0
-  fi
-  if grep -Eq "label='inactive'|label:[[:space:]]*inactive" <<<"${output}"; then
-    printf 'inactive [2]\n'
-    return 0
-  fi
-  if grep -Eq "label='unconfigured'|label:[[:space:]]*unconfigured" <<<"${output}"; then
-    printf 'unconfigured [1]\n'
-    return 0
-  fi
-  printf 'unknown\n'
-}
-
-amcl_lifecycle_transition_state_reached() {
-  local transition_label="$1"
-  local timeout_sec="${NJRH_AMCL_LIFECYCLE_POST_TRANSITION_STATE_WAIT_SEC:-3}"
-  local timeout_int="${timeout_sec%.*}"
-  [[ -n "${timeout_int}" ]] || timeout_int=3
-  (( timeout_int >= 1 )) || timeout_int=1
-  local deadline=$(( $(date +%s) + timeout_int ))
-  local state=""
-  while true; do
-    state="$(amcl_lifecycle_state 2>/dev/null || true)"
-    case "${transition_label}" in
-      configure)
-        [[ "${state}" == inactive* || "${state}" == active* ]] && return 0
-        ;;
-      activate)
-        [[ "${state}" == active* ]] && return 0
-        ;;
-    esac
-    [[ "$(date +%s)" -ge "${deadline}" ]] && break
-    sleep 0.2
-  done
-  return 1
-}
-
 activate_amcl_lifecycle() {
-  wait_for_amcl_node "${NJRH_AMCL_NODE_WAIT_SEC:-15}" || {
-    echo "[runtime-overlay] /${AMCL_NODE_NAME} did not appear after start" >&2
+  [[ -f "${AMCL_LIFECYCLE_HELPER}" ]] || {
+    echo "[runtime-overlay] AMCL lifecycle helper missing: ${AMCL_LIFECYCLE_HELPER}" >&2
     return 1
   }
 
-  local state
-  state="$(amcl_lifecycle_state)"
-  if [[ "${state}" != active* && "${state}" != inactive* ]]; then
-    request_amcl_lifecycle_transition 1 configure "${NJRH_AMCL_LIFECYCLE_TRANSITION_TIMEOUT_SEC:-8}" || return 1
-  fi
-  state="$(amcl_lifecycle_state)"
-  if [[ "${state}" != active* ]]; then
-    request_amcl_lifecycle_transition 3 activate "${NJRH_AMCL_LIFECYCLE_TRANSITION_TIMEOUT_SEC:-8}" || return 1
-  fi
-  state="$(amcl_lifecycle_state)"
-  if [[ "${state}" != active* ]]; then
-    echo "[runtime-overlay] /${AMCL_NODE_NAME} lifecycle is not active yet: ${state:-unknown}" >&2
+  local node_timeout_sec="${NJRH_AMCL_LIFECYCLE_NODE_TIMEOUT_SEC:-${NJRH_AMCL_LIFECYCLE_TRANSITION_TIMEOUT_SEC:-12}}"
+  local response_timeout_sec="${NJRH_AMCL_LIFECYCLE_CHANGE_STATE_RESPONSE_TIMEOUT_SEC:-5}"
+  local helper_timeout_sec="${NJRH_AMCL_LIFECYCLE_HELPER_TIMEOUT_SEC:-30}"
+  local output=""
+  if ! output="$(timeout --signal=TERM --kill-after=1s "${helper_timeout_sec}" \
+    python3 "${AMCL_LIFECYCLE_HELPER}" \
+    --per-node-timeout-sec "${node_timeout_sec}" \
+    --change-state-response-timeout-sec "${response_timeout_sec}" \
+    "/${AMCL_NODE_NAME}" 2>&1)"; then
+    echo "[runtime-overlay] /${AMCL_NODE_NAME} lifecycle activation failed via bounded client: ${output}" >&2
     return 1
   fi
+  [[ -z "${output}" ]] || printf '%s\n' "${output}" >&2
   wait_for_amcl_tf_broadcast_false || return 1
 }
 
@@ -1298,6 +1271,9 @@ start_amcl_node() {
     echo "[runtime-overlay] AMCL binary missing or not executable: ${AMCL_BIN}" >&2
     return 1
   }
+
+  AMCL_STARTUP_EPOCH_SEC="$(date +%s)"
+  write_amcl_runtime_status starting false false "resident AMCL startup is in progress"
 
   mkdir -p "${NJRH_RUNTIME_LOG_DIR}"
   local amcl_cpuset

@@ -18,6 +18,7 @@
 #include "nav_msgs/msg/odometry.hpp"
 #include "ranger_msgs/msg/motion_state.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "robot_docking_manager/near_field_docking_controller.hpp"
 #include "robot_interfaces/msg/dock_target_observation.hpp"
 #include "sensor_msgs/msg/battery_state.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
@@ -83,6 +84,11 @@ public:
   : Node("docking")
   {
     load_parameters();
+    near_field_controller_ =
+      std::make_unique<robot_docking_manager::NearFieldDockingController>(
+      near_field_control_config());
+    active_contact_timeout_s_ = contact_confirm_timeout_s_;
+    active_contact_backoff_distance_m_ = contact_retry_backoff_min_distance_m_;
 
     if (observation_backend_ == "gs2_scan") {
       scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
@@ -115,9 +121,10 @@ public:
         charging_detected_ = battery_indicates_charging(*msg);
         const auto contact = battery_charging_contact(*msg);
         charging_contact_detected_ = contact.contact;
-        if (charging_contact_detected_) {
-          update_dock_contact_latch(true, "charging_session", "bms_charging_observed", "");
-        }
+        // A standalone BMS sample must never create durable on-dock state.
+        // Successful docking writes the strong latch after stop confirmation;
+        // the API-side charging-session path additionally requires stable
+        // contact inside an active docking context.
         if (charging_detected_ && docking_is_active()) {
           begin_contact_stop("docked_charging_detected", contact.reason);
         }
@@ -275,7 +282,8 @@ private:
     gs2_acquire_distance_m_ = declare_parameter<double>("approach.gs2_acquire_distance_m", 0.28);
     final_target_distance_m_ = declare_parameter<double>("approach.final_target_distance_m", 0.05);
     undock_distance_m_ = declare_parameter<double>("undock.distance_m", 0.60);
-    undock_speed_mps_ = declare_parameter<double>("undock.speed_mps", 0.06);
+    undock_speed_mps_ = declare_parameter<double>("undock.speed_mps", 0.50);
+    undock_max_speed_mps_ = declare_parameter<double>("undock.max_speed_mps", 0.50);
     undock_min_clear_distance_m_ = declare_parameter<double>("undock.min_clear_distance_m", 0.45);
     undock_timeout_s_ = declare_parameter<double>("undock.timeout_s", 12.0);
     undock_odom_topic_ = declare_parameter<std::string>("undock.odom_topic", "/local_state/odometry");
@@ -330,7 +338,6 @@ private:
     use_yaw_fit_ = declare_parameter<bool>("detector.use_yaw_fit", false);
 
     kx_ = declare_parameter<double>("controller.kx", 0.45);
-    ky_ = declare_parameter<double>("controller.ky", 0.55);
     ky_lateral_ = declare_parameter<double>("controller.ky_lateral", 0.70);
     lateral_command_sign_ = declare_parameter<double>("controller.lateral_command_sign", -1.0);
     kyaw_ = declare_parameter<double>("controller.kyaw", 0.0);
@@ -341,24 +348,33 @@ private:
       declare_parameter<double>("controller.min_angular_speed_radps", 0.05);
     min_lateral_speed_mps_ = declare_parameter<double>("controller.min_lateral_speed_mps", 0.025);
     max_lateral_speed_mps_ = declare_parameter<double>("controller.max_lateral_speed_mps", 0.04);
-    lateral_priority_threshold_m_ = declare_parameter<double>("controller.lateral_priority_threshold_m", 0.020);
-    yaw_priority_threshold_rad_ = deg_to_rad(declare_parameter<double>("controller.yaw_priority_threshold_deg", 2.0));
     yaw_realign_enter_rad_ =
       deg_to_rad(declare_parameter<double>("controller.yaw_realign_enter_deg", 1.0));
     yaw_realign_stable_frames_required_ = std::max(
       1, static_cast<int>(declare_parameter<int>("controller.yaw_realign_stable_frames", 3)));
-    max_forward_while_lateral_mps_ = declare_parameter<double>("controller.max_forward_while_lateral_mps", 0.020);
+    yaw_realign_max_count_ = std::max(
+      0, static_cast<int>(declare_parameter<int>("controller.yaw_realign_max_count", 1)));
+    max_parallel_speed_mps_ = declare_parameter<double>(
+      "controller.max_parallel_speed_mps", max_linear_speed_mps_);
+    final_approach_window_m_ = declare_parameter<double>(
+      "controller.final_approach_window_m", 0.10);
+    final_lateral_lock_distance_m_ = declare_parameter<double>(
+      "controller.final_lateral_lock_distance_m", 0.06);
+    final_forward_speed_mps_ = declare_parameter<double>(
+      "controller.final_forward_speed_mps", 0.05);
     lock_lateral_during_final_insert_ =
       declare_parameter<bool>("controller.lock_lateral_during_final_insert", true);
-    yaw_spin_priority_enabled_ =
-      declare_parameter<bool>("controller.yaw_spin_priority_enabled", true);
-    max_command_steering_rad_ = declare_parameter<double>("controller.max_command_steering_rad", 0.35);
-    ackermann_wheelbase_m_ = declare_parameter<double>("controller.ackermann_wheelbase_m", 0.494);
     contact_crawl_speed_mps_ = declare_parameter<double>("controller.contact_crawl_speed_mps", 0.05);
     contact_final_slow_zone_m_ = std::max(
       0.0, declare_parameter<double>("controller.contact_final_slow_zone_m", 0.06));
     contact_final_crawl_speed_mps_ = std::max(
       0.0, declare_parameter<double>("controller.contact_final_crawl_speed_mps", 0.02));
+    contact_timeout_safety_factor_ = declare_parameter<double>(
+      "controller.contact_timeout_safety_factor", 1.5);
+    contact_timeout_margin_s_ = declare_parameter<double>(
+      "controller.contact_timeout_margin_s", 2.0);
+    contact_timeout_min_s_ = declare_parameter<double>(
+      "controller.contact_timeout_min_s", 3.0);
     contact_verify_max_distance_m_ = std::max(
       0.01, declare_parameter<double>("controller.contact_verify_max_distance_m", 0.12));
     contact_verify_retry_enabled_ =
@@ -367,6 +383,10 @@ private:
       0, static_cast<int>(declare_parameter<int>("controller.contact_retry_max_count", 2)));
     contact_retry_backoff_distance_m_ = std::max(
       0.05, declare_parameter<double>("controller.contact_retry_backoff_distance_m", 0.60));
+    contact_retry_backoff_min_distance_m_ = declare_parameter<double>(
+      "controller.contact_retry_backoff_min_distance_m", 0.20);
+    contact_retry_backoff_clearance_margin_m_ = declare_parameter<double>(
+      "controller.contact_retry_backoff_clearance_margin_m", 0.08);
     contact_retry_backoff_speed_mps_ = std::max(
       0.0, declare_parameter<double>("controller.contact_retry_backoff_speed_mps", 0.06));
     contact_retry_backoff_timeout_s_ = std::max(
@@ -392,6 +412,7 @@ private:
       declare_parameter<bool>("charging.full_soc_voltage_contact_enable", true);
 
     control_rate_hz_ = std::max(1.0, control_rate_hz_);
+    undock_max_speed_mps_ = std::max(0.0, undock_max_speed_mps_);
     contact_stop_feedback_max_age_s_ = std::max(0.05, contact_stop_feedback_max_age_s_);
     contact_stop_linear_speed_threshold_mps_ =
       std::max(0.0, contact_stop_linear_speed_threshold_mps_);
@@ -406,6 +427,59 @@ private:
     yaw_realign_enter_rad_ = std::max(yaw_soft_limit_rad_, yaw_realign_enter_rad_);
     min_angular_speed_radps_ = clamp(
       min_angular_speed_radps_, 0.0, max_angular_speed_radps_);
+    max_parallel_speed_mps_ = std::max(0.0, max_parallel_speed_mps_);
+    final_approach_window_m_ = std::max(0.015, final_approach_window_m_);
+    final_lateral_lock_distance_m_ = clamp(
+      final_lateral_lock_distance_m_, 0.0, final_approach_window_m_);
+    final_forward_speed_mps_ = clamp(
+      final_forward_speed_mps_, 0.0, max_linear_speed_mps_);
+    contact_timeout_safety_factor_ = std::max(1.0, contact_timeout_safety_factor_);
+    contact_timeout_margin_s_ = std::max(0.0, contact_timeout_margin_s_);
+    contact_timeout_min_s_ = std::max(0.0, contact_timeout_min_s_);
+    contact_confirm_timeout_s_ = std::max(contact_timeout_min_s_, contact_confirm_timeout_s_);
+    contact_retry_backoff_min_distance_m_ = clamp(
+      contact_retry_backoff_min_distance_m_, 0.0, contact_retry_backoff_distance_m_);
+    contact_retry_backoff_clearance_margin_m_ = std::max(
+      0.0, contact_retry_backoff_clearance_margin_m_);
+  }
+
+  robot_docking_manager::NearFieldControlConfig near_field_control_config() const
+  {
+    robot_docking_manager::NearFieldControlConfig config;
+    config.target_distance_m = final_target_distance_m_;
+    config.distance_tolerance_m = 0.015;
+    config.lateral_tolerance_m = lateral_soft_limit_m_;
+    config.yaw_exit_tolerance_rad = yaw_soft_limit_rad_;
+    config.yaw_reentry_threshold_rad = yaw_realign_enter_rad_;
+    config.yaw_stable_samples = yaw_realign_stable_frames_required_;
+    config.max_yaw_realignments = yaw_realign_max_count_;
+    config.k_forward = kx_;
+    config.k_lateral = ky_lateral_;
+    config.k_yaw = kyaw_;
+    config.lateral_command_sign = lateral_command_sign_;
+    config.lateral_deadband_m = lateral_deadband_m_;
+    config.yaw_deadband_rad = yaw_deadband_rad_;
+    config.min_forward_speed_mps = min_align_speed_mps_;
+    config.max_forward_speed_mps = max_linear_speed_mps_;
+    config.min_lateral_speed_mps = min_lateral_speed_mps_;
+    config.max_lateral_speed_mps = max_lateral_speed_mps_;
+    config.min_yaw_speed_radps = min_angular_speed_radps_;
+    config.max_yaw_speed_radps = max_angular_speed_radps_;
+    config.max_parallel_speed_mps = max_parallel_speed_mps_;
+    config.final_approach_window_m = final_approach_window_m_;
+    config.final_lateral_lock_distance_m = lock_lateral_during_final_insert_ ?
+      final_lateral_lock_distance_m_ : 0.0;
+    config.final_forward_speed_mps = final_forward_speed_mps_;
+    config.contact_cruise_speed_mps = contact_crawl_speed_mps_;
+    config.contact_final_zone_m = contact_final_slow_zone_m_;
+    config.contact_final_speed_mps = contact_final_crawl_speed_mps_;
+    config.contact_timeout_safety_factor = contact_timeout_safety_factor_;
+    config.contact_timeout_margin_sec = contact_timeout_margin_s_;
+    config.contact_timeout_min_sec = contact_timeout_min_s_;
+    config.retry_backoff_min_distance_m = contact_retry_backoff_min_distance_m_;
+    config.retry_backoff_clearance_margin_m = contact_retry_backoff_clearance_margin_m_;
+    config.retry_backoff_max_distance_m = contact_retry_backoff_distance_m_;
+    return config;
   }
 
   void start_docking()
@@ -421,7 +495,9 @@ private:
     reset_contact_stop_tracking();
     retries_ = 0;
     contact_retry_count_ = 0;
-    reset_yaw_alignment_tracking();
+    near_field_controller_->reset();
+    active_contact_timeout_s_ = contact_confirm_timeout_s_;
+    active_contact_backoff_distance_m_ = contact_retry_backoff_min_distance_m_;
     charging_detected_ = latest_battery_ && battery_indicates_charging(*latest_battery_);
     charging_contact_detected_ = latest_battery_ && battery_indicates_charging_contact(*latest_battery_);
     valid_detection_streak_ = 0;
@@ -449,7 +525,7 @@ private:
     reset_contact_tracking();
     reset_contact_backoff_tracking();
     reset_contact_stop_tracking();
-    reset_yaw_alignment_tracking();
+    near_field_controller_->reset();
     state_ = State::Idle;
     publish_zero();
     publish_reverse_enable(false);
@@ -468,7 +544,7 @@ private:
     reset_contact_tracking();
     reset_contact_backoff_tracking();
     reset_contact_stop_tracking();
-    reset_yaw_alignment_tracking();
+    near_field_controller_->reset();
     state_ = State::Failed;
     publish_zero();
     publish_reverse_enable(false);
@@ -515,7 +591,7 @@ private:
   void transition(State next, const std::string & status)
   {
     if (next == State::Align && state_ != State::Align) {
-      reset_yaw_alignment_tracking();
+      near_field_controller_->reset();
     }
     state_ = next;
     state_entered_time_ = now();
@@ -809,100 +885,102 @@ private:
     publish_zero();
   }
 
+  static const char * near_field_phase_text(
+    const robot_docking_manager::NearFieldPhase phase)
+  {
+    switch (phase) {
+      case robot_docking_manager::NearFieldPhase::YawCapture:
+        return "yaw_capture";
+      case robot_docking_manager::NearFieldPhase::VectorApproach:
+        return "vector_approach";
+      case robot_docking_manager::NearFieldPhase::FinalApproach:
+        return "final_approach";
+      case robot_docking_manager::NearFieldPhase::AlignmentBlocked:
+        return "alignment_blocked";
+    }
+    return "unknown";
+  }
+
   void handle_align(const Detection & detection)
   {
     if (!detection.valid) {
       transition(State::Acquire, "lost_dock_feature");
       return;
     }
-
-    const bool lateral_ok = std::abs(detection.lateral_y) <= lateral_soft_limit_m_;
-    const bool distance_ok = detection.distance_x <= final_target_distance_m_ + 0.015;
-    const bool yaw_ok = update_yaw_alignment_tracking(
-      detection.yaw_error, distance_ok, detection.sequence);
-    if (lateral_ok && yaw_ok && distance_ok) {
-      if (!capture_contact_start_odom()) {
-        publish_zero();
-        publish_status("contact_verify_waiting_for_fresh_odom");
-        return;
-      }
-      transition(State::ContactVerify, "contact_verify");
+    if (!use_crab_mode_) {
+      fail("near_field_docking_requires_parallel_mode");
       return;
     }
 
     if (std::abs(detection.lateral_y) > lateral_hard_limit_m_ ||
-      std::abs(detection.yaw_error) > yaw_hard_limit_rad_) {
+      std::abs(detection.yaw_error) > yaw_hard_limit_rad_)
+    {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 1000,
         "dock alignment outside hard limit: y=%.3f yaw=%.3fdeg",
         detection.lateral_y, detection.yaw_error * 180.0 / kPi);
     }
 
-    geometry_msgs::msg::Twist cmd;
-    const double distance_error = std::max(0.0, detection.distance_x - final_target_distance_m_);
-    cmd.linear.x = clamp(kx_ * distance_error, 0.0, max_linear_speed_mps_);
-    if (!distance_ok && distance_error > 0.0) {
-      cmd.linear.x = std::max(cmd.linear.x, std::min(min_align_speed_mps_, max_linear_speed_mps_));
+    const robot_docking_manager::NearFieldObservation observation{
+      true,
+      detection.sequence,
+      detection.distance_x,
+      detection.lateral_y,
+      detection.yaw_error};
+    const auto decision = near_field_controller_->step(observation);
+    if (decision.alignment_blocked) {
+      publish_zero();
+      fail(
+        "near_field_" +
+        (decision.reason.empty() ? std::string("alignment_blocked") : decision.reason));
+      return;
     }
 
-    const double lateral_error = apply_deadband(detection.lateral_y, lateral_deadband_m_);
-    const double yaw_error = apply_deadband(detection.yaw_error, yaw_deadband_rad_);
-    double desired_contact_vy = 0.0;
-    double pivot_compensation_vy = 0.0;
-    if (use_crab_mode_) {
-      if (yaw_spin_priority_enabled_ && !yaw_ok) {
-        publish_forced_mode(yaw_forced_mode_);
-        cmd.linear.x = 0.0;
-        cmd.linear.y = 0.0;
-        cmd.angular.z = yaw_alignment_command(detection.yaw_error);
-        publish_cmd(cmd);
-        publish_status(alignment_status(
-          detection, cmd, desired_contact_vy, pivot_compensation_vy,
-          std::abs(detection.yaw_error) <= yaw_soft_limit_rad_ ? "yaw_settle" : "yaw_realign",
-          yaw_forced_mode_));
+    if (decision.enter_contact_verify) {
+      if (!capture_contact_start_odom()) {
+        publish_zero();
+        publish_status("contact_verify_waiting_for_fresh_odom");
         return;
       }
-
-      publish_forced_mode(crab_forced_mode_);
-      const bool final_insert_locked = lock_lateral_during_final_insert_ && lateral_ok && yaw_ok;
-      if (final_insert_locked) {
-        cmd.linear.y = 0.0;
-        cmd.angular.z = 0.0;
-      } else {
-        desired_contact_vy = clamp(
-          lateral_command_sign_ * ky_lateral_ * lateral_error,
-          -max_lateral_speed_mps_,
-          max_lateral_speed_mps_);
-        if (std::abs(lateral_error) > 0.0 && std::abs(desired_contact_vy) < min_lateral_speed_mps_) {
-          desired_contact_vy = std::copysign(
-            std::min(min_lateral_speed_mps_, max_lateral_speed_mps_),
-            desired_contact_vy);
-        }
-        // Once yaw is inside the fine-docking tolerance, keep yaw locked and correct
-        // centerline only. Mixing angular.z with side-slip near the dock makes the
-        // forward contact point sweep an arc and can drive a lateral/yaw limit cycle.
-        cmd.angular.z = 0.0;
-        pivot_compensation_vy = 0.0;
-        cmd.linear.y = clamp(
-          desired_contact_vy + pivot_compensation_vy,
-          -max_lateral_speed_mps_,
-          max_lateral_speed_mps_);
-      }
-      if (!final_insert_locked && (!lateral_ok || !yaw_ok ||
-        std::abs(lateral_error) > lateral_priority_threshold_m_ ||
-        std::abs(yaw_error) > yaw_priority_threshold_rad_)) {
-        cmd.linear.x = std::min(cmd.linear.x, max_forward_while_lateral_mps_);
-      }
-    } else {
-      const double requested_wz = ky_ * lateral_error + kyaw_ * yaw_error;
-      cmd.angular.z = limit_yaw_rate_for_ackermann(cmd.linear.x, requested_wz);
+      active_contact_timeout_s_ = std::min(
+        contact_confirm_timeout_s_,
+        near_field_controller_->contact_timeout_sec(contact_verify_max_distance_m_));
+      std::ostringstream status;
+      status << "contact_verify"
+             << " timeout_s=" << std::fixed << std::setprecision(3)
+             << active_contact_timeout_s_
+             << " distance_budget_m=" << contact_verify_max_distance_m_;
+      transition(State::ContactVerify, status.str());
+      return;
     }
+
+    const bool spinning =
+      decision.mode == robot_docking_manager::NearFieldMotionMode::Spinning;
+    const std::string & forced_mode = spinning ? yaw_forced_mode_ : crab_forced_mode_;
+    publish_forced_mode(forced_mode);
+
+    geometry_msgs::msg::Twist cmd;
+    cmd.linear.x = decision.linear_x_mps;
+    cmd.linear.y = decision.linear_y_mps;
+    cmd.angular.z = decision.angular_z_radps;
     publish_cmd(cmd);
 
-    publish_status(alignment_status(
-      detection, cmd, desired_contact_vy, pivot_compensation_vy,
-      use_crab_mode_ ? "side_slip_align" : "ackermann_align",
-      use_crab_mode_ ? crab_forced_mode_ : release_forced_mode_));
+    std::ostringstream status;
+    status << "near_field_align"
+           << " phase=" << near_field_phase_text(decision.phase)
+           << " reason=" << decision.reason
+           << " forced_mode=" << forced_mode
+           << " cmd_vx=" << std::fixed << std::setprecision(3) << cmd.linear.x
+           << " cmd_vy=" << cmd.linear.y
+           << " cmd_wz=" << cmd.angular.z
+           << " yaw_realignments=" << decision.yaw_realignments
+           << "/" << yaw_realign_max_count_
+           << " yaw_stable_frames=" << decision.yaw_stable_samples
+           << "/" << yaw_realign_stable_frames_required_
+           << " distance_x=" << detection.distance_x
+           << " lateral_y=" << detection.lateral_y
+           << " yaw_deg=" << detection.yaw_error * 180.0 / kPi;
+    publish_status(status.str());
   }
 
   void begin_contact_stop(const std::string & success_status, const std::string & bms_reason)
@@ -926,7 +1004,7 @@ private:
 
     reset_contact_tracking();
     reset_contact_backoff_tracking();
-    reset_yaw_alignment_tracking();
+    near_field_controller_->reset();
     reset_contact_stop_tracking();
     state_ = State::ContactStopping;
     state_entered_time_ = stamp;
@@ -1132,7 +1210,7 @@ private:
       return;
     }
 
-    if ((now() - state_entered_time_).seconds() > contact_confirm_timeout_s_) {
+    if ((now() - state_entered_time_).seconds() > active_contact_timeout_s_) {
       begin_contact_retry("contact_wait_expired", "contact_verify_timeout");
       return;
     }
@@ -1158,6 +1236,7 @@ private:
            << " distance=" << std::fixed << std::setprecision(3)
            << traveled << "/" << contact_verify_max_distance_m_
            << " remaining=" << remaining
+           << " timeout_s=" << active_contact_timeout_s_
            << " final_slow_zone=" << bool_text(final_slow_zone)
            << " cmd_x=" << cmd.linear.x;
     publish_status(status.str());
@@ -1171,10 +1250,14 @@ private:
       return;
     }
 
+    const double attempted_contact_distance_m = have_contact_start_odom_ ?
+      contact_verify_traveled_m() : 0.0;
     ++contact_retry_count_;
     publish_zero();
     reset_contact_tracking();
     reset_contact_backoff_tracking();
+    active_contact_backoff_distance_m_ = near_field_controller_->retry_backoff_distance_m(
+      attempted_contact_distance_m);
     publish_forced_mode(release_forced_mode_);
     publish_reverse_enable(true);
 
@@ -1182,8 +1265,10 @@ private:
     status << "contact_retry_backoff phase=prepare"
            << " attempt=" << contact_retry_count_ << "/" << contact_retry_max_count_
            << " trigger=" << trigger
+           << " attempted_contact_distance=" << std::fixed << std::setprecision(3)
+           << attempted_contact_distance_m
            << " target_distance=" << std::fixed << std::setprecision(3)
-           << contact_retry_backoff_distance_m_;
+           << active_contact_backoff_distance_m_;
     transition(State::ContactBackoff, status.str());
   }
 
@@ -1198,7 +1283,7 @@ private:
 
     const auto stamp = now();
     const double elapsed = (stamp - state_entered_time_).seconds();
-    const double distance = contact_retry_backoff_distance_m_;
+    const double distance = active_contact_backoff_distance_m_;
     const double speed = clamp(contact_retry_backoff_speed_mps_, 0.0, max_linear_speed_mps_);
     if (distance <= 0.0 || speed <= 1.0e-3) {
       fail("contact_retry_backoff_failed_invalid_config");
@@ -1317,7 +1402,7 @@ private:
            << " phase=" << phase
            << " attempt=" << contact_retry_count_ << "/" << contact_retry_max_count_
            << " distance=" << std::fixed << std::setprecision(3)
-           << traveled << "/" << contact_retry_backoff_distance_m_
+           << traveled << "/" << active_contact_backoff_distance_m_
            << " lateral=" << lateral
            << " cmd_x=" << -clamp(contact_retry_backoff_speed_mps_, 0.0, max_linear_speed_mps_)
            << " cmd_count=" << contact_backoff_cmd_count_
@@ -1329,7 +1414,7 @@ private:
   void handle_undocking()
   {
     const auto stamp = now();
-    const double speed = clamp(undock_speed_mps_, 0.0, max_linear_speed_mps_);
+    const double speed = clamp(undock_speed_mps_, 0.0, undock_max_speed_mps_);
     const double elapsed = (stamp - state_entered_time_).seconds();
     const double distance = std::max(0.0, undock_distance_m_);
     if (speed <= 1.0e-3) {
@@ -1751,78 +1836,9 @@ private:
     last_undock_progress_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
   }
 
-  double apply_deadband(double value, double deadband) const
-  {
-    if (std::abs(value) <= deadband) {
-      return 0.0;
-    }
-    return std::copysign(std::abs(value) - deadband, value);
-  }
-
-  void reset_yaw_alignment_tracking()
-  {
-    yaw_realign_active_ = true;
-    yaw_alignment_stable_frames_ = 0;
-    last_yaw_alignment_observation_sequence_ = 0;
-  }
-
-  bool update_yaw_alignment_tracking(
-    const double yaw_error, const bool require_precise_exit,
-    const std::uint64_t observation_sequence)
-  {
-    const double absolute_yaw_error = std::abs(yaw_error);
-    if (observation_sequence != last_yaw_alignment_observation_sequence_) {
-      last_yaw_alignment_observation_sequence_ = observation_sequence;
-      if (absolute_yaw_error <= yaw_soft_limit_rad_) {
-        yaw_alignment_stable_frames_ = std::min(
-          yaw_alignment_stable_frames_ + 1, yaw_realign_stable_frames_required_);
-      } else {
-        yaw_alignment_stable_frames_ = 0;
-      }
-    }
-
-    if (!yaw_spin_priority_enabled_) {
-      yaw_realign_active_ = absolute_yaw_error > yaw_soft_limit_rad_;
-      return !yaw_realign_active_;
-    }
-
-    if (!yaw_realign_active_ &&
-      (absolute_yaw_error >= yaw_realign_enter_rad_ ||
-      (require_precise_exit &&
-      yaw_alignment_stable_frames_ < yaw_realign_stable_frames_required_)))
-    {
-      yaw_realign_active_ = true;
-    }
-    if (yaw_realign_active_ &&
-      yaw_alignment_stable_frames_ >= yaw_realign_stable_frames_required_)
-    {
-      yaw_realign_active_ = false;
-    }
-    return !yaw_realign_active_;
-  }
-
-  double yaw_alignment_command(const double yaw_error) const
-  {
-    if (std::abs(yaw_error) <= yaw_soft_limit_rad_) {
-      return 0.0;
-    }
-    const double controlled_error = apply_deadband(yaw_error, yaw_deadband_rad_);
-    const double requested = kyaw_ * controlled_error;
-    if (std::abs(requested) <= std::numeric_limits<double>::epsilon()) {
-      return 0.0;
-    }
-    return std::copysign(
-      clamp(std::abs(requested), min_angular_speed_radps_, max_angular_speed_radps_),
-      requested);
-  }
-
   bool battery_indicates_charging(const sensor_msgs::msg::BatteryState & msg) const
   {
-    return msg.power_supply_status == sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_CHARGING ||
-      msg.power_supply_status == sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_FULL ||
-      (std::isfinite(msg.current) && static_cast<double>(msg.current) > min_charging_current_a_) ||
-      (msg.present && voltage_in_contact_range(
-        msg.voltage, charging_contact_voltage_min_v_, charging_contact_voltage_max_v_));
+    return battery_charging_contact(msg).contact;
   }
 
   bool battery_indicates_charging_contact(const sensor_msgs::msg::BatteryState & msg) const
@@ -1836,7 +1852,11 @@ private:
       return {true, "power_supply_status=CHARGING"};
     }
     if (msg.power_supply_status == sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_FULL) {
-      return {true, "power_supply_status=FULL"};
+      const bool session_supports_full_contact =
+        docking_is_active() || state_ == State::Docked || dock_contact_latch_is_docked();
+      return session_supports_full_contact ?
+        BatteryContactEvaluation{true, "power_supply_status=FULL_with_docking_session"} :
+        BatteryContactEvaluation{false, "full_without_physical_contact_evidence"};
     }
     if (std::isfinite(msg.current) && static_cast<double>(msg.current) > min_charging_current_a_) {
       return {true, "current_above_threshold"};
@@ -1846,7 +1866,9 @@ private:
       return {true, "present_voltage_valid"};
     }
     const double soc = normalized_soc_percent(msg.percentage);
-    if (charging_full_soc_voltage_contact_enable_ && msg.present && std::isfinite(soc) &&
+    if (charging_full_soc_voltage_contact_enable_ &&
+      (docking_is_active() || state_ == State::Docked || dock_contact_latch_is_docked()) &&
+      msg.present && std::isfinite(soc) &&
       soc >= charging_full_soc_threshold_pct_ &&
       voltage_in_contact_range(msg.voltage, charging_contact_voltage_min_v_, charging_contact_voltage_max_v_)) {
       return {true, "full_soc_present_voltage_valid"};
@@ -1991,18 +2013,6 @@ private:
     }
   }
 
-  double limit_yaw_rate_for_ackermann(double vx, double requested_wz) const
-  {
-    double limited = clamp(requested_wz, -max_angular_speed_radps_, max_angular_speed_radps_);
-    if (vx <= 1.0e-3) {
-      return 0.0;
-    }
-    const double max_by_curvature =
-      std::abs(vx) * std::tan(std::max(0.01, max_command_steering_rad_)) * 2.0 /
-      std::max(0.1, ackermann_wheelbase_m_);
-    return clamp(limited, -max_by_curvature, max_by_curvature);
-  }
-
   void enter_docking_motion_mode() const
   {
     publish_reverse_enable(false);
@@ -2067,30 +2077,6 @@ private:
     return out.str();
   }
 
-  std::string alignment_status(
-    const Detection & detection,
-    const geometry_msgs::msg::Twist & cmd,
-    const double desired_contact_vy,
-    const double pivot_compensation_vy,
-    const std::string & phase,
-    const std::string & forced_mode) const
-  {
-    std::ostringstream out;
-    out << detection_status("aligning", detection)
-        << " phase=" << phase
-        << " forced_mode=" << forced_mode
-        << " cmd_vx=" << cmd.linear.x
-        << " cmd_vy=" << cmd.linear.y
-        << " cmd_wz=" << cmd.angular.z
-        << " yaw_realign_active=" << (yaw_realign_active_ ? "true" : "false")
-        << " yaw_stable_frames=" << yaw_alignment_stable_frames_
-        << "/" << yaw_realign_stable_frames_required_
-        << " desired_contact_vy=" << desired_contact_vy
-        << " pivot_comp_vy=" << pivot_compensation_vy
-        << " charge_contact_x=" << charge_contact_x_m_;
-    return out.str();
-  }
-
   void publish_status(const std::string & text) const
   {
     std_msgs::msg::String msg;
@@ -2150,7 +2136,8 @@ private:
   double gs2_acquire_distance_m_{0.28};
   double final_target_distance_m_{0.05};
   double undock_distance_m_{0.60};
-  double undock_speed_mps_{0.06};
+  double undock_speed_mps_{0.50};
+  double undock_max_speed_mps_{0.50};
   double undock_min_clear_distance_m_{0.45};
   double undock_timeout_s_{12.0};
   double undock_odom_timeout_s_{0.50};
@@ -2187,7 +2174,6 @@ private:
   double detection_filter_alpha_{0.25};
   bool use_yaw_fit_{false};
   double kx_{0.45};
-  double ky_{0.55};
   double ky_lateral_{0.70};
   double lateral_command_sign_{-1.0};
   double kyaw_{0.0};
@@ -2197,22 +2183,26 @@ private:
   double min_angular_speed_radps_{0.05};
   double min_lateral_speed_mps_{0.025};
   double max_lateral_speed_mps_{0.04};
-  double lateral_priority_threshold_m_{0.020};
-  double yaw_priority_threshold_rad_{deg_to_rad(2.0)};
   double yaw_realign_enter_rad_{deg_to_rad(1.0)};
   int yaw_realign_stable_frames_required_{3};
-  double max_forward_while_lateral_mps_{0.020};
+  int yaw_realign_max_count_{1};
+  double max_parallel_speed_mps_{0.15};
+  double final_approach_window_m_{0.10};
+  double final_lateral_lock_distance_m_{0.06};
+  double final_forward_speed_mps_{0.05};
   bool lock_lateral_during_final_insert_{true};
-  bool yaw_spin_priority_enabled_{true};
-  double max_command_steering_rad_{0.35};
-  double ackermann_wheelbase_m_{0.494};
   double contact_crawl_speed_mps_{0.05};
   double contact_final_slow_zone_m_{0.06};
   double contact_final_crawl_speed_mps_{0.02};
+  double contact_timeout_safety_factor_{1.5};
+  double contact_timeout_margin_s_{2.0};
+  double contact_timeout_min_s_{3.0};
   double contact_verify_max_distance_m_{0.12};
   bool contact_verify_retry_enabled_{true};
   int contact_retry_max_count_{2};
   double contact_retry_backoff_distance_m_{0.60};
+  double contact_retry_backoff_min_distance_m_{0.20};
+  double contact_retry_backoff_clearance_margin_m_{0.08};
   double contact_retry_backoff_speed_mps_{0.06};
   double contact_retry_backoff_timeout_s_{20.0};
   double contact_retry_backoff_command_settle_s_{0.5};
@@ -2228,11 +2218,10 @@ private:
 
   State state_{State::Idle};
   int retries_{0};
-  bool yaw_realign_active_{true};
-  int yaw_alignment_stable_frames_{0};
   std::uint64_t observation_sequence_{0};
-  std::uint64_t last_yaw_alignment_observation_sequence_{0};
   int contact_retry_count_{0};
+  double active_contact_timeout_s_{3.0};
+  double active_contact_backoff_distance_m_{0.20};
   int valid_detection_streak_{0};
   int contact_stop_stable_samples_{0};
   bool charging_detected_{false};
@@ -2292,6 +2281,7 @@ private:
   nav_msgs::msg::Odometry::SharedPtr latest_odom_;
   nav_msgs::msg::Odometry::SharedPtr latest_wheel_odom_;
   ranger_msgs::msg::MotionState::SharedPtr latest_motion_state_;
+  std::unique_ptr<robot_docking_manager::NearFieldDockingController> near_field_controller_;
 
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::Subscription<robot_interfaces::msg::DockTargetObservation>::SharedPtr

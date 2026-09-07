@@ -55,4 +55,5 @@ njrh_exec_affined robot_localization_bridge "${NODE_BIN}" --ros-args \
   -p "amcl_runtime_status_file:=${NJRH_AMCL_RUNTIME_STATUS_FILE:-/tmp/njrh_amcl_runtime_status.env}" \
   -p "amcl_initial_pose_topic:=${NJRH_AMCL_INITIAL_POSE_TOPIC:-/initialpose}" \
   -p "amcl_scan_admission_enabled:=${AMCL_SCAN_ADMISSION_ENABLED}" \
-  -p "amcl_scan_admission_status_topic:=${NJRH_AMCL_SCAN_ADMISSION_STATUS_TOPIC:-/amcl_scan_admission/status}"
+  -p "amcl_scan_admission_status_topic:=${NJRH_AMCL_SCAN_ADMISSION_STATUS_TOPIC:-/amcl_scan_admission/status}" \
+  -p "live_floor_transition_service_enabled:=${NJRH_LIVE_FLOOR_TRANSITION_ENABLED:-true}"

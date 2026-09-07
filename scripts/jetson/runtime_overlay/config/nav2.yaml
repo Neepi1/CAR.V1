@@ -26,12 +26,101 @@ planner_server:
   ros__parameters:
     use_sim_time: false
     expected_planner_frequency: 5.0
-    planner_plugins: ["GridBased"]
+    planner_plugins: ["GridBased", "ElevatorScoped", "ElevatorHallScoped", "ElevatorReverseEntryStagingScoped", "ElevatorReverseDockingScoped", "ElevatorCabinEntryDirect"]
     GridBased:
       plugin: "nav2_smac_planner/SmacPlanner2D"
       tolerance: 0.05
       downsample_costmap: false
       allow_unknown: true
+    ElevatorScoped:
+      plugin: "robot_nav_config::ElevatorScopedPlanner"
+      # Schema-v2 post-call source_landing only. Keep the bounded elevator
+      # envelope and commissioned motion order, but ignore costmap obstacles
+      # exactly like the later cabin-transit legs.
+      unchecked_direct_path: true
+      max_distance_m: 2.5
+      translation_step_m: 0.025
+      rotation_step_rad: 0.05
+      # Search parameters remain declared for plugin/profile compatibility,
+      # but unchecked_direct_path makes them inactive for this profile.
+      search_grid_step_m: 0.05
+      search_radius_m: 2.5
+      goal_connect_distance_m: 0.10
+      maximum_expansions: 60000
+      forward_cost: 1.0
+      reverse_cost: 1.35
+      lateral_cost: 1.15
+      mode_switch_cost: 0.20
+      soft_cost_weight: 0.35
+      clearance_preference_cost_ratio: 1.10
+      maximum_search_time_sec: 1.00
+    ElevatorHallScoped:
+      plugin: "robot_nav_config::ElevatorScopedPlanner"
+      # A clear hall route keeps startup spin -> forward -> final yaw. If that
+      # complete swept-footprint candidate is blocked, use the same bounded
+      # 16-heading search, including intermediate translations and rotations.
+      prefer_clear_startup_spin: true
+      max_distance_m: 2.5
+      translation_step_m: 0.025
+      rotation_step_rad: 0.05
+      search_grid_step_m: 0.05
+      search_radius_m: 2.5
+      goal_connect_distance_m: 0.10
+      maximum_expansions: 60000
+      forward_cost: 1.0
+      reverse_cost: 1.35
+      lateral_cost: 1.15
+      mode_switch_cost: 0.20
+      soft_cost_weight: 0.35
+      clearance_preference_cost_ratio: 1.10
+      maximum_search_time_sec: 1.00
+    ElevatorReverseEntryStagingScoped:
+      plugin: "robot_nav_config::ElevatorScopedPlanner"
+      # Source hall-call -> landing only: adopt the commissioned landing yaw,
+      # move laterally onto its longitudinal axis, then close the remaining
+      # forward/reverse residual. This post-call staging leg ignores costmap
+      # obstacles like the later cabin-transit legs; the sequence is retained.
+      reverse_entry_staging_sequence: true
+      unchecked_direct_path: true
+      max_distance_m: 2.5
+      translation_step_m: 0.025
+      rotation_step_rad: 0.05
+      search_grid_step_m: 0.05
+      search_radius_m: 2.5
+      goal_connect_distance_m: 0.10
+      maximum_expansions: 60000
+      forward_cost: 1.0
+      reverse_cost: 1.35
+      lateral_cost: 1.15
+      mode_switch_cost: 0.20
+      soft_cost_weight: 0.35
+      clearance_preference_cost_ratio: 1.10
+      maximum_search_time_sec: 1.00
+    ElevatorReverseDockingScoped:
+      plugin: "robot_nav_config::ElevatorScopedPlanner"
+      # Schema-v3 commissioned maneuver. The planner adopts the stored goal
+      # yaw first, then performs longitudinal and lateral stages in that body
+      # frame. A hard blockage is reported for wait/retry; it is never replaced
+      # with an uncommissioned weaving route inside the doorway or cabin.
+      reverse_docking_sequence: true
+      max_distance_m: 2.5
+      translation_step_m: 0.025
+      rotation_step_rad: 0.05
+      search_grid_step_m: 0.05
+      search_radius_m: 2.5
+      goal_connect_distance_m: 0.10
+      maximum_expansions: 60000
+      forward_cost: 1.0
+      reverse_cost: 1.35
+      lateral_cost: 1.15
+      mode_switch_cost: 0.20
+      soft_cost_weight: 0.35
+      clearance_preference_cost_ratio: 1.10
+      maximum_search_time_sec: 1.00
+    ElevatorCabinEntryDirect:
+      plugin: "robot_nav_config::ElevatorScopedPlanner"
+      unchecked_direct_path: true
+      max_distance_m: 2.5
 
 controller_server:
   ros__parameters:
@@ -42,21 +131,27 @@ controller_server:
     min_x_velocity_threshold: 0.01
     min_y_velocity_threshold: 0.0
     min_theta_velocity_threshold: 0.01
-    # Dynamic obstacles in building corridors should make the controller pause
-    # briefly, not abort the business goal on a single blocked MPPI cycle.
-    failure_tolerance: 3.0
+    # Keep the same FollowPath alive while a pedestrian-sized transient obstacle
+    # clears. This remains below the 12 s progress-checker bound, so a genuinely
+    # stuck robot still terminates without recovery spins or costmap clearing.
+    failure_tolerance: 10.0
     progress_checker_plugin: "progress_checker"
-    goal_checker_plugins: ["goal_checker"]
-    controller_plugins: ["FollowPath", "FollowPathFallback"]
+    goal_checker_plugins: ["goal_checker", "dock_staging_goal_checker"]
+    controller_plugins: ["FollowPath", "FollowPathFallback", "ElevatorFollowPath", "ElevatorHallFollowPath", "ElevatorReverseEntryStagingFollowPath", "ElevatorReverseDockingFollowPath", "ElevatorCabinEntryDirectFollowPath"]
     progress_checker:
-      # PoseProgressChecker counts legitimate in-place yaw progress during
-      # RotationShim startup alignment. Keep the linear progress radius below
-      # the ordinary point-goal tolerance so terminal creep is not
-      # misclassified as a no-progress failure on Ranger Mini 3.
-      plugin: "nav2_controller::PoseProgressChecker"
+      # Ordinary navigation retains the proven PoseProgressChecker limits.
+      # A fresh typed state from ElevatorScopedController selects the
+      # finer/longer limits needed for low-speed terminal corrections and
+      # pauses the timer only during explicit WAIT/REPLAN/TF-settle states.
+      plugin: "robot_nav_config::ElevatorAwareProgressChecker"
       required_movement_radius: 0.03
       required_movement_angle: 0.05
       movement_time_allowance: 12.0
+      elevator_required_movement_radius: 0.015
+      elevator_required_movement_angle: 0.015
+      elevator_movement_time_allowance: 20.0
+      elevator_progress_state_timeout: 0.50
+      elevator_progress_state_topic: /ranger_mini3/nav_elevator_scoped_progress_state
     goal_checker:
       plugin: "nav2_controller::SimpleGoalChecker"
       # Re-evaluate XY and yaw together on every tick. A latched XY gate can
@@ -65,10 +160,201 @@ controller_server:
       stateful: false
       xy_goal_tolerance: 0.06
       yaw_goal_tolerance: 0.05
+    dock_staging_goal_checker:
+      plugin: "robot_nav_config::DockStagingGoalChecker"
+      # Return-to-dock only. Nav2 owns the coarse route until the robot enters
+      # this commissioned approach-frame envelope; robot_docking_manager then
+      # owns yaw/lateral/longitudinal near-field motion after actual stop proof.
+      forward_capture_min_m: -0.40
+      forward_capture_max_m: 0.55
+      lateral_capture_max_m: 0.25
+      yaw_capture_max_rad: 3.141592653589793
     # Humble 1.1.20 creates RotationShim's private PositionGoalChecker under
     # this leading-dot parameter namespace. Keep XY live while terminal yaw is
     # closing so a transient in-tolerance sample cannot remain latched.
     ".position_checker.stateful": false
+    ElevatorFollowPath:
+      plugin: "robot_nav_config::ElevatorScopedController"
+      # Schema-v2 post-call source_landing only. It retains the commissioned
+      # elevator motion order while ignoring local-costmap clearance.
+      max_distance_m: 2.5
+      goal_xy_tolerance_m: 0.06
+      goal_yaw_tolerance_rad: 0.05
+      yaw_exit_tolerance_rad: 0.035
+      lateral_entry_m: 0.04
+      lateral_exit_m: 0.025
+      forward_entry_m: 0.04
+      forward_exit_m: 0.025
+      yaw_kp: 1.20
+      yaw_min_speed_radps: 0.08
+      yaw_max_speed_radps: 0.50
+      lateral_kp: 0.80
+      lateral_max_speed_mps: 0.40
+      forward_kp: 0.80
+      forward_max_speed_mps: 0.40
+      reverse_max_speed_mps: 0.40
+      settle_linear_speed_mps: 0.01
+      settle_angular_speed_radps: 0.02
+      settle_duration_sec: 0.30
+      total_timeout_sec: 60.0
+      # Backward-compatible name: this is now a WAIT_CLEAR notice threshold,
+      # not an action-abort deadline.
+      blocked_timeout_sec: 3.0
+      costmap_lookahead_m: 0.15
+      command_clearance_check_enabled: false
+      route_revision_enabled: false
+      route_revision_interval_sec: 0.5
+      route_revision_maximum_expansions: 60000
+      route_revision_time_limit_sec: 1.00
+      # A material map->odom correction changes the robot's map-relative
+      # start pose. Coalesce the correction burst, stop, and rebuild the
+      # remaining four-wheel-steer route once from the corrected pose.
+      localization_replan_enabled: false
+      localization_replan_translation_trigger_m: 0.08
+      localization_replan_yaw_trigger_rad: 0.08
+      localization_replan_stable_translation_m: 0.015
+      localization_replan_stable_yaw_rad: 0.015
+      localization_replan_stable_duration_sec: 0.60
+      lateral_permit_topic: /ranger_mini3/nav_terminal_lateral_enable
+      reverse_permit_topic: /ranger_mini3/nav_terminal_reverse_enable
+      progress_state_topic: /ranger_mini3/nav_elevator_scoped_progress_state
+    ElevatorHallFollowPath:
+      plugin: "robot_nav_config::ElevatorScopedController"
+      # Keep the same policy during local replanning if live obstacles differ
+      # from the global costmap used by ElevatorHallScoped.
+      prefer_clear_startup_spin: true
+      max_distance_m: 2.5
+      goal_xy_tolerance_m: 0.06
+      goal_yaw_tolerance_rad: 0.05
+      yaw_exit_tolerance_rad: 0.035
+      lateral_entry_m: 0.04
+      lateral_exit_m: 0.025
+      forward_entry_m: 0.04
+      forward_exit_m: 0.025
+      yaw_kp: 1.20
+      yaw_min_speed_radps: 0.08
+      yaw_max_speed_radps: 0.50
+      lateral_kp: 0.80
+      lateral_max_speed_mps: 0.40
+      forward_kp: 0.80
+      forward_max_speed_mps: 0.40
+      reverse_max_speed_mps: 0.40
+      settle_linear_speed_mps: 0.01
+      settle_angular_speed_radps: 0.02
+      settle_duration_sec: 0.30
+      total_timeout_sec: 60.0
+      # Backward-compatible name: this is now a WAIT_CLEAR notice threshold,
+      # not an action-abort deadline.
+      blocked_timeout_sec: 3.0
+      costmap_lookahead_m: 0.15
+      route_revision_enabled: true
+      route_revision_interval_sec: 0.5
+      route_revision_maximum_expansions: 60000
+      route_revision_time_limit_sec: 1.00
+      localization_replan_enabled: true
+      localization_replan_translation_trigger_m: 0.08
+      localization_replan_yaw_trigger_rad: 0.08
+      localization_replan_stable_translation_m: 0.015
+      localization_replan_stable_yaw_rad: 0.015
+      localization_replan_stable_duration_sec: 0.60
+      lateral_permit_topic: /ranger_mini3/nav_terminal_lateral_enable
+      reverse_permit_topic: /ranger_mini3/nav_terminal_reverse_enable
+      progress_state_topic: /ranger_mini3/nav_elevator_scoped_progress_state
+    ElevatorReverseEntryStagingFollowPath:
+      plugin: "robot_nav_config::ElevatorScopedController"
+      # Post-call source landing/entry staging ignores obstacle clearance but
+      # preserves yaw -> lateral -> longitudinal execution.
+      reverse_entry_staging_sequence: true
+      max_distance_m: 2.5
+      goal_xy_tolerance_m: 0.06
+      goal_yaw_tolerance_rad: 0.05
+      yaw_exit_tolerance_rad: 0.035
+      lateral_entry_m: 0.04
+      lateral_exit_m: 0.025
+      forward_entry_m: 0.04
+      forward_exit_m: 0.025
+      yaw_kp: 1.20
+      yaw_min_speed_radps: 0.08
+      yaw_max_speed_radps: 0.50
+      lateral_kp: 0.80
+      lateral_max_speed_mps: 0.40
+      forward_kp: 0.80
+      forward_max_speed_mps: 0.40
+      reverse_max_speed_mps: 0.40
+      settle_linear_speed_mps: 0.01
+      settle_angular_speed_radps: 0.02
+      settle_duration_sec: 0.30
+      total_timeout_sec: 60.0
+      blocked_timeout_sec: 3.0
+      costmap_lookahead_m: 0.15
+      command_clearance_check_enabled: false
+      route_revision_enabled: false
+      route_revision_interval_sec: 0.5
+      route_revision_maximum_expansions: 60000
+      route_revision_time_limit_sec: 1.00
+      localization_replan_enabled: false
+      localization_replan_translation_trigger_m: 0.08
+      localization_replan_yaw_trigger_rad: 0.08
+      localization_replan_stable_translation_m: 0.015
+      localization_replan_stable_yaw_rad: 0.015
+      localization_replan_stable_duration_sec: 0.60
+      lateral_permit_topic: /ranger_mini3/nav_terminal_lateral_enable
+      reverse_permit_topic: /ranger_mini3/nav_terminal_reverse_enable
+      progress_state_topic: /ranger_mini3/nav_elevator_scoped_progress_state
+    ElevatorReverseDockingFollowPath:
+      plugin: "robot_nav_config::ElevatorScopedController"
+      reverse_docking_sequence: true
+      max_distance_m: 2.5
+      goal_xy_tolerance_m: 0.06
+      goal_yaw_tolerance_rad: 0.05
+      yaw_exit_tolerance_rad: 0.035
+      lateral_entry_m: 0.04
+      lateral_exit_m: 0.025
+      forward_entry_m: 0.04
+      forward_exit_m: 0.025
+      yaw_kp: 1.20
+      yaw_min_speed_radps: 0.08
+      yaw_max_speed_radps: 0.50
+      lateral_kp: 0.80
+      lateral_max_speed_mps: 0.40
+      forward_kp: 0.80
+      forward_max_speed_mps: 0.40
+      reverse_max_speed_mps: 0.40
+      settle_linear_speed_mps: 0.01
+      settle_angular_speed_radps: 0.02
+      settle_duration_sec: 0.30
+      total_timeout_sec: 60.0
+      blocked_timeout_sec: 3.0
+      costmap_lookahead_m: 0.15
+      route_revision_enabled: true
+      route_revision_interval_sec: 0.5
+      route_revision_maximum_expansions: 60000
+      route_revision_time_limit_sec: 1.00
+      localization_replan_enabled: true
+      localization_replan_translation_trigger_m: 0.08
+      localization_replan_yaw_trigger_rad: 0.08
+      localization_replan_stable_translation_m: 0.015
+      localization_replan_stable_yaw_rad: 0.015
+      localization_replan_stable_duration_sec: 0.60
+      lateral_permit_topic: /ranger_mini3/nav_terminal_lateral_enable
+      reverse_permit_topic: /ranger_mini3/nav_terminal_reverse_enable
+      progress_state_topic: /ranger_mini3/nav_elevator_scoped_progress_state
+    ElevatorCabinEntryDirectFollowPath:
+      plugin: "robot_nav_config::ElevatorScopedController"
+      max_distance_m: 2.5
+      goal_xy_tolerance_m: 0.06
+      goal_yaw_tolerance_rad: 0.05
+      yaw_max_speed_radps: 0.50
+      lateral_max_speed_mps: 0.40
+      forward_max_speed_mps: 0.40
+      reverse_max_speed_mps: 0.40
+      total_timeout_sec: 60.0
+      command_clearance_check_enabled: false
+      route_revision_enabled: false
+      localization_replan_enabled: false
+      lateral_permit_topic: /ranger_mini3/nav_terminal_lateral_enable
+      reverse_permit_topic: /ranger_mini3/nav_terminal_reverse_enable
+      progress_state_topic: /ranger_mini3/nav_elevator_scoped_progress_state
     FollowPath:
       plugin: "robot_nav_config::GoalScopedRotationShimController"
       primary_controller: "nav2_mppi_controller::MPPIController"
@@ -101,7 +387,7 @@ controller_server:
       terminal_handoff_enabled: true
       terminal_handoff_max_distance_m: 0.40
       terminal_handoff_max_abs_forward_m: 0.15
-      terminal_handoff_minimum_abs_lateral_m: 0.08
+      terminal_handoff_minimum_abs_lateral_m: 0.06
       terminal_handoff_lateral_dominance_ratio: 1.20
       terminal_handoff_path_length_ratio: 1.80
       terminal_handoff_path_cross_track_m: 0.15
@@ -189,7 +475,10 @@ controller_server:
         collision_cost: 100000.0
         collision_margin_distance: 0.08
         near_goal_distance: 0.25
-        inflation_radius: 0.35
+        # Match the local inflation layer. The padded rectangular footprint has
+        # a 0.480 m circumscribed radius; adding the 0.08 m collision margin and
+        # rounding up to the 0.05 m costmap grid requires 0.60 m.
+        inflation_radius: 0.60
         cost_scaling_factor: 6.0
         inflation_layer_name: "local_inflation_layer"
       PathAlignCritic:
@@ -291,6 +580,8 @@ bt_navigator:
       - nav2_compute_path_to_pose_action_bt_node
       - nav2_compute_path_through_poses_action_bt_node
       - nav2_follow_path_action_bt_node
+      - nav2_recovery_node_bt_node
+      - nav2_wait_action_bt_node
       - nav2_pipeline_sequence_bt_node
       - nav2_rate_controller_bt_node
       - nav2_globally_updated_goal_condition_bt_node
@@ -322,10 +613,11 @@ velocity_smoother:
     smoothing_frequency: 30.0
     scale_velocities: false
     feedback: "OPEN_LOOP"
-    # MPPI remains Ackermann (vy_max=0). This narrow Y channel is used only
-    # when the Ranger terminal controller publishes a fresh lateral permit.
-    max_velocity: [1.20, 0.05, 0.70]
-    min_velocity: [-0.08, -0.05, -0.70]
+    # MPPI remains Ackermann (vy_max=0). The wider Y/reverse envelope is used
+    # only when an authorized elevator controller publishes fresh permits;
+    # ordinary controllers retain their own lower command limits.
+    max_velocity: [1.20, 0.40, 0.70]
+    min_velocity: [-0.40, -0.40, -0.70]
     max_accel: [0.55, 0.20, 0.90]
     max_decel: [-0.95, -0.30, -1.10]
     odom_topic: /local_state/odometry
@@ -423,7 +715,9 @@ local_costmap:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: true
         cost_scaling_factor: 6.0
-        inflation_radius: 0.35
+        # Cover the padded footprint's 0.480 m circumscribed radius plus the
+        # MPPI 0.08 m collision margin, rounded up to the 0.05 m grid.
+        inflation_radius: 0.60
       always_send_full_costmap: true
 
 collision_monitor:
@@ -437,23 +731,37 @@ collision_monitor:
     source_timeout: 1.5
     base_shift_correction: true
     stop_pub_timeout: 0.3
-    polygons: ["StopZone", "SlowZone"]
+    polygons: ["StopZone", "SlowZone", "FootprintApproach"]
     StopZone:
       type: "polygon"
-      points: [0.42, 0.22, 0.42, -0.22, -0.30, -0.22, -0.30, 0.22]
+      # Physical footprint (0.36 x 0.25 m half extents) + 0.03 m costmap
+      # padding + 0.08 m MPPI margin, rounded outward to the 0.05 m grid.
+      points: [0.50, 0.40, 0.50, -0.40, -0.50, -0.40, -0.50, 0.40]
       action_type: "stop"
-      max_points: 8
+      # Two adjacent scan returns stop the robot; one isolated return is treated
+      # as noise. The failed 2026-09-07 trace had two returns before MPPI failed.
+      max_points: 1
       visualize: false
       polygon_pub_topic: "collision_monitor/stop_zone"
       enabled: true
     SlowZone:
       type: "polygon"
-      points: [0.85, 0.45, 0.85, -0.45, -0.35, -0.45, -0.35, 0.45]
+      # The slowdown envelope must contain StopZone on every side.
+      points: [0.85, 0.45, 0.85, -0.45, -0.55, -0.45, -0.55, 0.45]
       action_type: "slowdown"
       slowdown_ratio: 0.65
       max_points: 12
       visualize: false
       polygon_pub_topic: "collision_monitor/slow_zone"
+      enabled: true
+    FootprintApproach:
+      type: "polygon"
+      action_type: "approach"
+      footprint_topic: "/local_costmap/published_footprint"
+      time_before_collision: 2.0
+      simulation_time_step: 0.1
+      max_points: 3
+      visualize: false
       enabled: true
     observation_sources: ["scan"]
     scan:

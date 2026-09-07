@@ -11,6 +11,93 @@ import pytest
 ROOT = Path(__file__).resolve().parents[3]
 
 
+def navigation_goal_execution_source() -> str:
+    return (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "mission"
+        / "navigation_goal_execution_module.cpp"
+    ).read_text(encoding="utf-8")
+
+
+def docking_configuration_source() -> str:
+    return (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "configuration"
+        / "docking_configuration_module.cpp"
+    ).read_text(encoding="utf-8")
+
+
+def docking_feature_source() -> str:
+    return (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "docking_feature_module.cpp"
+    ).read_text(encoding="utf-8")
+
+
+def navigation_configuration_source() -> str:
+    return (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "configuration"
+        / "navigation_configuration_module.cpp"
+    ).read_text(encoding="utf-8")
+
+
+def localization_configuration_source() -> str:
+    return (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "localization"
+        / "localization_configuration_module.cpp"
+    ).read_text(encoding="utf-8")
+
+
+def localization_feature_source() -> str:
+    return (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "localization"
+        / "localization_feature_module.cpp"
+    ).read_text(encoding="utf-8")
+
+
+def application_composition_source() -> str:
+    return (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "application"
+        / "composition"
+        / "application_composition_module.cpp"
+    ).read_text(encoding="utf-8")
+
+
 def local_costmap_config_block(nav2_yaml: str) -> str:
     start = nav2_yaml.index("local_costmap:\n  local_costmap:")
     end = nav2_yaml.index("\ncollision_monitor:", start)
@@ -33,7 +120,8 @@ def assert_nav2_local_costmap_frame_contract(nav2_yaml: str, local_costmap: str)
     assert "nav2_costmap_2d::VoxelLayer" not in local_costmap
     assert "combination_method: 0" in local_costmap
     assert "footprint_clearing_enabled: true" in local_costmap
-    assert 'plugin: "nav2_controller::PoseProgressChecker"' in nav2_yaml
+    assert 'plugin: "robot_nav_config::ElevatorAwareProgressChecker"' in nav2_yaml
+    assert 'plugin: "nav2_controller::PoseProgressChecker"' not in nav2_yaml
     assert 'plugin: "nav2_controller::SimpleProgressChecker"' not in nav2_yaml
     assert "required_movement_radius: 0.03" in nav2_yaml
     assert "required_movement_angle: 0.05" in nav2_yaml
@@ -68,14 +156,22 @@ def test_navigation_failure_observer_uses_ros2_rosout_log_type():
     assert "from rcl_interfaces.msg import Log" in script
     assert "from rosgraph_msgs.msg import Log" not in script
     assert "from nav2_msgs.msg import SpeedLimit" in script
-    assert "from nav_msgs.msg import OccupancyGrid, Path as NavPath" in script
+    assert "from nav_msgs.msg import OccupancyGrid, Odometry, Path as NavPath" in script
     assert '"/speed_limit"' in script
     assert '"/transformed_global_plan"' in script
     assert '"/local_costmap/costmap"' in script
     assert "cmd_frames.jsonl" in script
     assert "subscribes_tf\": False" in script
     assert "publishes_topics\": False" in script
-    assert "stores_full_costmap\": False" in script
+    assert '"stores_full_costmap": store_costmap_snapshots' in script
+    assert "--store-costmap-snapshots" in script
+    assert "--costmap-snapshot-period-sec" in script
+    assert "costmap_snapshots" in script
+    assert ".int8.bin.gz" in script
+    assert 'request.add_header("X-Robot-Token", api_token)' in script
+    assert "except KeyboardInterrupt:" in script
+    assert "if rclpy.ok():" in script
+    assert 'if "rcl_shutdown already called" not in str(exc):' in script
 
 
 def test_navigation_terminal_adjustment_observer_is_read_only_and_captures_handoff():
@@ -231,9 +327,13 @@ def test_initial_localization_wrapper_timeout_fallback_accepts_plain_tf_edge():
     assert 'wait_for_tf_transform "map" "odom" "${tf_timeout}"' in fallback
     assert "plain TF edge exists" in fallback
     assert "active bridge/map->odom ownership was already verified" in fallback
+    assert "baseline_explicit_sequence" in fallback
+    assert "wrapper-timeout fallback has no pre-trigger bridge sequence baseline" in fallback
+    assert "wait_for_bridge_relocalization_sequence_after" in fallback
+    assert "newer than baseline=" in fallback
 
 
-def test_resident_navigation_prewarms_localization_before_local_state_gate():
+def test_resident_navigation_prioritizes_localization_stack_before_held_nav2_prestart():
     script = (
         ROOT
         / "scripts"
@@ -242,11 +342,41 @@ def test_resident_navigation_prewarms_localization_before_local_state_gate():
         / "scripts"
         / "run_navigation_runtime_services.sh"
     ).read_text(encoding="utf-8")
-    local_state_index = script.index("ensure_common_local_state_ready_for_navigation_start || {")
+    source_index = script.index('navigation_start_source="${NJRH_NAVIGATION_START_SOURCE:-direct}"')
+    api_preflight_index = script.index(
+        'if [[ "${navigation_start_source}" == "api_resume" ]]; then',
+        source_index,
+    )
+    stable_gate_index = script.index(
+        'ensure_common_local_state_ready_for_navigation_start "stable" || {',
+        api_preflight_index,
+    )
     localization_index = script.index('bash "${SCRIPT_DIR}/run_occupancy_grid_localization.sh" &')
+    boot_fallback_index = script.index(
+        'ensure_common_local_state_ready_for_navigation_start "fresh" || {',
+        localization_index,
+    )
     held_prestart_index = script.index('env_flag_true "${NJRH_NAV2_HELD_PRESTART_AFTER_LOCAL_STATE:-true}"')
     localization_stack_index = script.index("ensure_localization_stack_ready_for_navigation || {")
-    assert localization_index < local_state_index < held_prestart_index < localization_stack_index
+    floor_context_index = script.index('log_startup_stage "floor_asset_context_verified"')
+    initial_background_index = script.index(
+        'if env_flag_true "${NJRH_INITIAL_GLOBAL_LOCALIZATION_BACKGROUND_START:-false}"; then'
+    )
+    initial_localization_index = script.index("wait_for_initial_global_localization || {")
+    lifecycle_activation_index = script.index("if ! activate_prestarted_nav2_lifecycle; then")
+    assert (
+        source_index
+        < api_preflight_index
+        < stable_gate_index
+        < localization_index
+        < boot_fallback_index
+        < localization_stack_index
+        < floor_context_index
+        < initial_background_index
+        < initial_localization_index
+        < held_prestart_index
+        < lifecycle_activation_index
+    )
 
 
 def test_nav2_helper_cleanup_does_not_kill_global_localization_wrapper():
@@ -343,10 +473,10 @@ def test_nav_defaults_are_fixed():
     assert 'feedback: "OPEN_LOOP"' in overlay_nav2
     assert "odom_duration: 0.2" in nav2
     assert "odom_duration: 0.2" in overlay_nav2
-    assert "max_velocity: [1.20, 0.05, 0.70]" in nav2
-    assert "max_velocity: [1.20, 0.05, 0.70]" in overlay_nav2
-    assert "min_velocity: [-0.08, -0.05, -0.70]" in nav2
-    assert "min_velocity: [-0.08, -0.05, -0.70]" in overlay_nav2
+    assert "max_velocity: [1.20, 0.40, 0.70]" in nav2
+    assert "max_velocity: [1.20, 0.40, 0.70]" in overlay_nav2
+    assert "min_velocity: [-0.40, -0.40, -0.70]" in nav2
+    assert "min_velocity: [-0.40, -0.40, -0.70]" in overlay_nav2
     assert "min_velocity: [0.0, 0.0, -1.00]" not in nav2
     assert "min_velocity: [0.0, 0.0, -1.00]" not in overlay_nav2
     assert "min_velocity: [-0.20, 0.0, -1.00]" not in nav2
@@ -365,12 +495,15 @@ def test_nav_defaults_are_fixed():
     assert "angular_dist_threshold: 1.20" not in overlay_nav2
     assert "angular_dist_threshold: 3.20" not in nav2
     assert "angular_dist_threshold: 3.20" not in overlay_nav2
-    assert 'plugin: "nav2_controller::PoseProgressChecker"' in nav2
+    assert 'plugin: "robot_nav_config::ElevatorAwareProgressChecker"' in nav2
+    assert 'plugin: "nav2_controller::PoseProgressChecker"' not in nav2
     assert 'plugin: "nav2_controller::SimpleProgressChecker"' not in nav2
     assert "required_movement_radius: 0.03" in nav2
     assert "required_movement_angle: 0.05" in nav2
     assert "movement_time_allowance: 12.0" in nav2
-    assert "movement_time_allowance: 20.0" not in nav2
+    assert "elevator_required_movement_radius: 0.015" in nav2
+    assert "elevator_required_movement_angle: 0.015" in nav2
+    assert "elevator_movement_time_allowance: 20.0" in nav2
     assert "rotate_to_goal_heading: true" in nav2
     assert "rotate_to_goal_heading: false" not in nav2
     for cfg in (nav2, overlay_nav2):
@@ -453,7 +586,10 @@ def test_nav_defaults_are_fixed():
         assert 'smoother_id="SavitzkyGolay"' not in bt_xml
         assert 'max_smoothing_duration="0.10"' not in bt_xml
         assert 'check_for_collisions="true"' not in bt_xml
-        assert '<FollowPath path="{path}" controller_id="FollowPath"/>' in bt_xml
+        assert (
+            '<FollowPath path="{path}" controller_id="FollowPath" '
+            'goal_checker_id="goal_checker"/>' in bt_xml
+        )
         assert '<Wait wait_duration="1.0"/>' not in bt_xml
         assert '<Wait wait_duration="5.0"/>' not in bt_xml
     assert re.search(
@@ -474,6 +610,8 @@ def test_nav_defaults_are_fixed():
         "nav2_compute_path_to_pose_action_bt_node",
         "nav2_compute_path_through_poses_action_bt_node",
         "nav2_follow_path_action_bt_node",
+        "nav2_recovery_node_bt_node",
+        "nav2_wait_action_bt_node",
         "nav2_pipeline_sequence_bt_node",
         "nav2_rate_controller_bt_node",
         "nav2_navigate_to_pose_action_bt_node",
@@ -488,14 +626,12 @@ def test_nav_defaults_are_fixed():
         "nav2_round_robin_node_bt_node",
         "nav2_remove_passed_goals_action_bt_node",
         "nav2_smooth_path_action_bt_node",
-        "nav2_recovery_node_bt_node",
         "nav2_clear_costmap_service_bt_node",
-        "nav2_wait_action_bt_node",
     ):
         assert unused_bt_plugin not in nav2
         assert unused_bt_plugin not in overlay_nav2
-    assert "failure_tolerance: 3.0" in nav2
-    assert "failure_tolerance: 3.0" in overlay_nav2
+    assert "failure_tolerance: 10.0" in nav2
+    assert "failure_tolerance: 10.0" in overlay_nav2
     assert "batch_size: 1200" in nav2
     assert "width: 10" in nav2
     assert "height: 10" in nav2
@@ -504,11 +640,18 @@ def test_nav_defaults_are_fixed():
     assert "repulsion_weight: 2.0" in nav2
     assert "critical_weight: 20.0" in nav2
     assert "collision_margin_distance: 0.08" in nav2
-    assert "inflation_radius: 0.35" in nav2
+    assert nav2.count("inflation_radius: 0.60") == 3
+    assert overlay_nav2.count("inflation_radius: 0.60") == 3
+    assert "inflation_radius: 0.35" not in nav2
+    assert "inflation_radius: 0.35" not in overlay_nav2
     assert 'inflation_layer_name: "local_inflation_layer"' in nav2
     assert "max_path_occupancy_ratio: 0.05" in nav2
     assert "source_timeout: 1.5" in nav2
     assert "stop_pub_timeout: 0.3" in nav2
+    assert 'polygons: ["StopZone", "SlowZone", "FootprintApproach"]' in nav2
+    assert 'points: [0.50, 0.40, 0.50, -0.40, -0.50, -0.40, -0.50, 0.40]' in nav2
+    assert 'footprint_topic: "/local_costmap/published_footprint"' in nav2
+    assert 'action_type: "approach"' in nav2
     assert "/local_state/odometry" in nav2
     assert "/cmd_vel_collision_checked" in nav2
     assert "collision_monitor" in nav2
@@ -536,7 +679,8 @@ def test_nav_defaults_are_fixed():
     assert "yaw_goal_tolerance: 0.0873" not in overlay_nav2
     assert "yaw_goal_tolerance: 0.15" not in nav2
     assert "yaw_goal_tolerance: 0.15" not in overlay_nav2
-    assert 'plugin: "nav2_controller::PoseProgressChecker"' in overlay_nav2
+    assert 'plugin: "robot_nav_config::ElevatorAwareProgressChecker"' in overlay_nav2
+    assert 'plugin: "nav2_controller::PoseProgressChecker"' not in overlay_nav2
     assert 'plugin: "nav2_controller::SimpleProgressChecker"' not in overlay_nav2
     assert "required_movement_angle: 0.05" in overlay_nav2
     assert "rotate_to_goal_heading: true" in overlay_nav2
@@ -545,7 +689,7 @@ def test_nav_defaults_are_fixed():
     assert "max_angular_accel: 1.2" in overlay_nav2
     assert "terminal_rotation_braking_enabled: true" in overlay_nav2
     assert "closed_loop: true" in overlay_nav2
-    assert 'goal_checker_plugins: ["goal_checker"]' in overlay_nav2
+    assert 'goal_checker_plugins: ["goal_checker", "dock_staging_goal_checker"]' in overlay_nav2
     assert "goal_checker:" in overlay_nav2
     assert "pose_goal_checker:" not in overlay_nav2
     assert "position_goal_checker:" not in overlay_nav2
@@ -577,9 +721,28 @@ def test_nav_defaults_are_fixed():
 
 
 def test_normal_navigation_terminal_speed_limit_matches_ranger_dynamics():
-    api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
-        encoding="utf-8"
-    )
+    execution_cpp = navigation_goal_execution_source()
+    navigation_config_cpp = navigation_configuration_source()
+    terminal_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "terminal_control"
+        / "navigation_terminal_control.cpp"
+    ).read_text(encoding="utf-8")
+    terminal_runtime_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "terminal_control"
+        / "navigation_terminal_runtime_module.cpp"
+    ).read_text(encoding="utf-8")
     api_cfg = (ROOT / "src" / "robot_api_server" / "config" / "robot_api_server.yaml").read_text(
         encoding="utf-8"
     )
@@ -600,24 +763,32 @@ def test_normal_navigation_terminal_speed_limit_matches_ranger_dynamics():
         assert "navigation_terminal_speed_limit_crawl_mps: 0.16" in cfg
         assert "navigation_terminal_speed_limit_final_mps: 0.08" in cfg
 
-    assert '#include "nav2_msgs/msg/speed_limit.hpp"' in api_cpp
-    assert "create_publisher<nav2_msgs::msg::SpeedLimit>" in api_cpp
-    assert "navigation_terminal_speed_limit_for_distance" in api_cpp
-    assert "publish_navigation_terminal_speed_limit_for_goal(target)" in api_cpp
-    assert "clear_navigation_terminal_speed_limit()" in api_cpp
-    assert "publish_navigation_terminal_speed_limit_value(navigation_terminal_speed_limit_far_mps_);" in api_cpp
-    assert "publish_navigation_terminal_speed_limit_value(0.0);" not in api_cpp
-    assert "msg.speed_limit = std::max(0.0, speed_limit_mps);" in api_cpp
-    assert "msg.speed_limit = 0.0" not in api_cpp
+    assert '#include "nav2_msgs/msg/speed_limit.hpp"' in terminal_runtime_cpp
+    assert "create_publisher<nav2_msgs::msg::SpeedLimit>" in terminal_runtime_cpp
+    assert "terminal_control_.speed_limit_for_distance(distance_m)" in terminal_runtime_cpp
+    assert "NavigationTerminalControl::speed_limit_for_distance" in terminal_cpp
+    assert "terminal_runtime_.publish_speed_limit_for_goal(target);" in execution_cpp
+    assert "terminal_runtime_.clear_speed_limit();" in execution_cpp
+    assert "publish_speed_limit_value(config_.speed_limit_far_mps);" in terminal_runtime_cpp
+    assert "publish_speed_limit_value(0.0);" not in terminal_runtime_cpp
+    assert "msg.speed_limit = std::max(0.0, speed_limit_mps);" in terminal_runtime_cpp
+    assert "msg.speed_limit = 0.0" not in terminal_runtime_cpp
 
 
 def test_docking_predock_nav_reuses_terminal_speed_limit_loop():
-    api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
-        encoding="utf-8"
-    )
-    predock_block = api_cpp[
-        api_cpp.index("StoredPose predock_speed_limit_target"):
-        api_cpp.index("if (nav2_predock_succeeded)")
+    executor_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_job_executor.cpp"
+    ).read_text(encoding="utf-8")
+    predock_block = executor_cpp[
+        executor_cpp.index("StoredPose predock_speed_limit_target"):
+        executor_cpp.index("if (nav2_predock_succeeded)")
     ]
 
     assert "predock_speed_limit_target.x = job.approach_x;" in predock_block
@@ -633,6 +804,18 @@ def test_nav2_terminal_reverse_is_leased_near_goal_and_hard_limited_by_safety():
     api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
         encoding="utf-8"
     )
+    execution_cpp = navigation_goal_execution_source()
+    docking_feature_cpp = docking_feature_source()
+    terminal_runtime_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "terminal_control"
+        / "navigation_terminal_runtime_module.cpp"
+    ).read_text(encoding="utf-8")
     safety_cpp = (ROOT / "src" / "robot_safety" / "src" / "robot_safety_node.cpp").read_text(
         encoding="utf-8"
     )
@@ -665,17 +848,17 @@ def test_nav2_terminal_reverse_is_leased_near_goal_and_hard_limited_by_safety():
         assert "allow_reverse: false" in config
         assert "normal_navigation_reverse_max_mps: 0.08" in config
 
-    assert "update_navigation_terminal_reverse_permit_for_goal" in api_cpp
-    assert api_cpp.count("update_navigation_terminal_reverse_permit_for_goal(") >= 5
-    assert "navigation_terminal_reverse_permit_enter_distance_m_" in api_cpp
-    assert "navigation_terminal_reverse_permit_exit_distance_m_" in api_cpp
-    assert "navigation_terminal_reverse_permit_refresh_period_sec_" in api_cpp
-    assert "navigation terminal reverse permit enabled" in api_cpp
-    assert "navigation terminal reverse permit cleared" in api_cpp
+    assert "update_navigation_terminal_reverse_permit_for_goal" in docking_feature_cpp
+    assert execution_cpp.count("terminal_runtime_.update_reverse_permit_for_goal(") >= 5
+    assert "config_.reverse_permit_enter_distance_m" in terminal_runtime_cpp
+    assert "config_.reverse_permit_exit_distance_m" in terminal_runtime_cpp
+    assert "config_.reverse_permit_refresh_period_sec" in terminal_runtime_cpp
+    assert "navigation terminal reverse permit enabled" in terminal_runtime_cpp
+    assert "navigation terminal reverse permit cleared" in terminal_runtime_cpp
 
     assert 'declare_parameter<double>("normal_navigation_reverse_max_mps", 0.08)' in safety_cpp
     assert "source == CommandSource::NORMAL" in safety_cpp
-    assert "-normal_navigation_reverse_max_mps_" in safety_cpp
+    assert "-navigation_limits.reverse_max_mps" in safety_cpp
     assert "return geometry_msgs::msg::Twist{};" in safety_cpp
 
     dynamic_test_text = dynamic_test.read_text(encoding="utf-8")
@@ -685,64 +868,85 @@ def test_nav2_terminal_reverse_is_leased_near_goal_and_hard_limited_by_safety():
 
 
 def test_fine_docking_yaw_retry_uses_fine_entry_tolerance():
-    api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
-        encoding="utf-8"
-    )
-    yaw_align_block = api_cpp[
-        api_cpp.index("PredockYawAlignResult run_predock_yaw_align("):
-        api_cpp.index("PredockLateralAlignResult run_predock_lateral_align(")
+    predock_control_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "predock_alignment"
+        / "predock_control_module.cpp"
+    ).read_text(encoding="utf-8")
+    yaw_align_block = predock_control_cpp[
+        predock_control_cpp.index("PredockYawAlignResult PredockControlModule::run_yaw_align("):
+        predock_control_cpp.index("PredockLateralAlignResult PredockControlModule::run_lateral_align(")
     ]
-    fine_retry_block = api_cpp[
-        api_cpp.index('fine_entry_failure_code == "FINE_DOCKING_REJECTED_YAW_TOO_LARGE"'):
-        api_cpp.index("record_fine_entry_check(", api_cpp.index('fine_entry_failure_code == "FINE_DOCKING_REJECTED_YAW_TOO_LARGE"'))
+    fine_retry_block = predock_control_cpp[
+        predock_control_cpp.index('fine_entry_failure_code == "FINE_DOCKING_REJECTED_YAW_TOO_LARGE"'):
+        predock_control_cpp.index(
+            "record_fine_entry(",
+            predock_control_cpp.index(
+                'fine_entry_failure_code == "FINE_DOCKING_REJECTED_YAW_TOO_LARGE"'
+            ),
+        )
     ]
 
-    assert "const double success_tolerance_rad = -1.0" in yaw_align_block
+    assert "const double success_tolerance_rad" in yaw_align_block
     assert "target_tolerance_rad" in yaw_align_block
     assert "initial_check.base_yaw_error_rad <= target_tolerance_rad" in yaw_align_block
     assert "result.final_error_rad <= target_tolerance_rad" in yaw_align_block
-    assert "fine_docking_entry_max_yaw_rad_" in fine_retry_block
-    assert "run_predock_yaw_align(\n        job_id,\n        fine_entry_check.expected_base_yaw,\n        fine_entry_check,\n        fine_docking_entry_max_yaw_rad_)" in fine_retry_block
+    assert "config_.fine_entry_max_yaw_rad" in fine_retry_block
+    assert "run_yaw_align(" in fine_retry_block
+    assert "fine_entry_check.expected_base_yaw" in fine_retry_block
+    assert "config_.fine_entry_max_yaw_rad" in fine_retry_block
 
 
 def test_predock_alignment_runs_once_after_bridge_settle_and_pause():
-    api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
-        encoding="utf-8"
-    )
-    yaw_align_block = api_cpp[
-        api_cpp.index("PredockYawAlignResult run_predock_yaw_align("):
-        api_cpp.index("PredockLateralAlignResult run_predock_lateral_align(")
+    predock_control_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "predock_alignment"
+        / "predock_control_module.cpp"
+    ).read_text(encoding="utf-8")
+    yaw_align_block = predock_control_cpp[
+        predock_control_cpp.index("PredockYawAlignResult PredockControlModule::run_yaw_align("):
+        predock_control_cpp.index("PredockLateralAlignResult PredockControlModule::run_lateral_align(")
     ]
-    initial_verify_start = api_cpp.index(
-        'set_docking_job_phase(job_id, "PREDOCK_POSE_VERIFY")'
+    handoff_start = predock_control_cpp.index(
+        "bool PredockControlModule::start_fine_docking_handoff("
     )
-    bridge_wait_start = api_cpp.index(
-        "if (!wait_for_bridge_smoothing_before_fine_docking(",
-        initial_verify_start,
+    bridge_wait_start = predock_control_cpp.index(
+        "if (!wait_for_bridge_smoothing(", handoff_start
     )
-    pre_bridge_block = api_cpp[initial_verify_start:bridge_wait_start]
-    post_bridge_verify_start = api_cpp.index(
-        'set_docking_job_phase(job_id, "PREDOCK_POSE_VERIFY_AFTER_BRIDGE_SETTLE")',
+    pre_bridge_block = predock_control_cpp[handoff_start:bridge_wait_start]
+    post_bridge_verify_start = predock_control_cpp.index(
+        'job_store_.set_phase(job_id, "PREDOCK_POSE_VERIFY_AFTER_BRIDGE_SETTLE")',
         bridge_wait_start,
     )
-    fine_entry_start = api_cpp.index(
-        'set_docking_job_phase(job_id, "FINE_DOCKING_ENTRY_CHECK")',
+    fine_entry_start = predock_control_cpp.index(
+        'job_store_.set_phase(job_id, "FINE_DOCKING_ENTRY_CHECK")',
         post_bridge_verify_start,
     )
-    post_bridge_block = api_cpp[bridge_wait_start:fine_entry_start]
+    post_bridge_block = predock_control_cpp[bridge_wait_start:fine_entry_start]
 
-    assert "run_predock_yaw_align(" not in pre_bridge_block
-    assert "ensure_predock_lateral_alignment(" not in pre_bridge_block
-    pause_call = (
-        'set_global_correction_paused_for_docking('
-        '\n        job_id, true, "docking_staging_alignment", pause_detail)'
-    )
+    assert "run_yaw_align(" not in pre_bridge_block
+    assert "ensure_lateral_alignment(" not in pre_bridge_block
+    pause_call = "ports_.set_global_correction_paused("
     assert pause_call in post_bridge_block
     assert post_bridge_block.index(pause_call) < post_bridge_block.index(
-        'set_docking_job_phase(job_id, "PREDOCK_POSE_VERIFY_AFTER_BRIDGE_SETTLE")'
+        'job_store_.set_phase(job_id, "PREDOCK_POSE_VERIFY_AFTER_BRIDGE_SETTLE")'
     )
-    assert "run_predock_yaw_align(" in post_bridge_block
-    assert "ensure_predock_lateral_alignment(" in post_bridge_block
+    assert "run_yaw_align(" in post_bridge_block
+    assert (
+        "std::min(config_.yaw_align_tolerance_rad, config_.fine_entry_max_yaw_rad)"
+        in post_bridge_block
+    )
+    assert "ensure_lateral_alignment(" in post_bridge_block
     assert "PREDOCK_YAW_ALIGN_MODE_SWITCH_TIMEOUT" in yaw_align_block
     assert "continuing predock yaw alignment" not in yaw_align_block
 
@@ -843,11 +1047,128 @@ def test_phase_n2_goal_completion_semantics_contracts():
     api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
         encoding="utf-8"
     )
-    docking_job_hpp = (
-        ROOT / "src" / "robot_api_server" / "include" / "robot_api_server" / "docking_job_model.hpp"
+    navigation_module_cpp = (
+        ROOT / "src" / "robot_api_server" / "src" / "features" / "navigation" / "navigation_module.cpp"
     ).read_text(encoding="utf-8")
-    docking_job_cpp = (ROOT / "src" / "robot_api_server" / "src" / "docking_job_model.cpp").read_text(
+    goal_executor_cpp = (
+        ROOT / "src" / "robot_api_server" / "src" / "features" / "navigation" / "mission"
+        / "navigation_goal_executor.cpp"
+    ).read_text(encoding="utf-8")
+    execution_cpp = navigation_goal_execution_source()
+    navigation_config_cpp = navigation_configuration_source()
+    localization_cpp = (
+        ROOT / "src" / "robot_api_server" / "src" / "features" / "localization"
+        / "localization_module.cpp"
+    ).read_text(encoding="utf-8")
+    navigation_cpp = "\n".join(
+        (api_cpp, navigation_config_cpp, navigation_module_cpp, goal_executor_cpp, execution_cpp)
+    )
+    terminal_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "terminal_control"
+        / "navigation_terminal_control.cpp"
+    ).read_text(encoding="utf-8")
+    completion_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "mission"
+        / "navigation_completion_policy.cpp"
+    ).read_text(encoding="utf-8")
+    bridge_wait_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "runtime"
+        / "navigation_bridge_wait.cpp"
+    ).read_text(encoding="utf-8")
+    goal_policy_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "mission"
+        / "navigation_goal_policy.cpp"
+    ).read_text(encoding="utf-8")
+    docking_job_hpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "include"
+        / "robot_api_server"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_job_model.hpp"
+    ).read_text(encoding="utf-8")
+    docking_job_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_job_model.cpp"
+    ).read_text(
         encoding="utf-8"
+    )
+    predock_policy_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "predock_alignment"
+        / "predock_alignment_policy.cpp"
+    ).read_text(encoding="utf-8")
+    docking_executor_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_job_executor.cpp"
+    ).read_text(encoding="utf-8")
+    predock_control_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "predock_alignment"
+        / "predock_control_module.cpp"
+    ).read_text(encoding="utf-8")
+    docking_runtime_cpp = (
+        ROOT / "src" / "robot_api_server" / "src" / "features" / "docking"
+        / "lifecycle" / "docking_runtime_module.cpp"
+    ).read_text(encoding="utf-8")
+    docking_execution_cpp = "\n".join(
+        (
+            api_cpp,
+            navigation_config_cpp,
+            execution_cpp,
+            docking_executor_cpp,
+            predock_control_cpp,
+            docking_runtime_cpp,
+        )
     )
     config = (ROOT / "src" / "robot_api_server" / "config" / "robot_api_server.yaml").read_text(
         encoding="utf-8"
@@ -875,15 +1196,15 @@ def test_phase_n2_goal_completion_semantics_contracts():
         "final_yaw_align_retry_count",
         "reposition_after_yaw_drift_retry_count",
     ):
-        assert token in api_cpp
+        assert token in navigation_cpp
 
-    assert 'navigation_default_goal_completion_policy", "pose_required"' in api_cpp
-    assert 'navigation_delivery_point_goal_completion_policy", "pose_required"' in api_cpp
-    assert 'navigation_position_only_nav2_yaw_mode", "approach_heading"' in api_cpp
-    assert "stored_pose_type_uses_delivery_default" in api_cpp
-    assert "resolve_nav2_goal_yaw_for_policy" in api_cpp
-    assert "nav2_goal_yaw_source" in api_cpp
-    assert "approach_heading" in api_cpp
+    assert '"navigation_default_goal_completion_policy", "pose_required"' in navigation_config_cpp
+    assert '"navigation_delivery_point_goal_completion_policy", "pose_required"' in navigation_config_cpp
+    assert '"navigation_position_only_nav2_yaw_mode", "approach_heading"' in navigation_config_cpp
+    assert "stored_pose_type_uses_delivery_default" in goal_policy_cpp
+    assert "resolve_nav2_goal_yaw(" in navigation_module_cpp
+    assert "nav2_goal_yaw_source" in navigation_module_cpp
+    assert "approach_heading" in goal_policy_cpp
     assert 'navigation_default_goal_completion_policy: "pose_required"' in config
     assert 'navigation_delivery_point_goal_completion_policy: "pose_required"' in config
     assert 'navigation_position_only_nav2_yaw_mode: "approach_heading"' in config
@@ -903,47 +1224,50 @@ def test_phase_n2_goal_completion_semantics_contracts():
     assert "api_final_yaw_align_fallback_enabled: true" in config
     assert "api_final_yaw_align_fallback_enabled: true" in overlay_config
 
-    assert "goal_completion_policy=dock_staging is reserved for /api/v1/docking/start" in api_cpp
-    assert "under position_only policy" in api_cpp
-    assert "manual localization correction accepted; post-settle not requested" in api_cpp
-    assert 'json_bool_value(body, "wait_for_settle", false)' in api_cpp
-    assert "post_relocalization_settle_requested" in api_cpp
-    assert "post_relocalization_settle_ok" in api_cpp
-    assert "run_reposition_after_yaw_drift" in api_cpp
-    assert "REPOSITION_AFTER_YAW_DRIFT" in api_cpp
-    assert "nav2_failed_yaw_aligning" in api_cpp
-    assert "navigation_pause_global_correction_during_final_yaw" in api_cpp
-    assert "waiting for bridge map->odom smoothing before final yaw alignment" in api_cpp
-    assert "bridge smoothing wait timed out before final yaw alignment" in api_cpp
-    assert "navigation_nav2_failed_near_goal_retry_enabled" in api_cpp
-    assert "nav2_failed_near_goal_retry_allowed" in api_cpp
-    assert "nav2_failed_near_goal_yaw_aligning" in api_cpp
-    assert "aligning yaw before same-goal retry" in api_cpp
-    assert "retry_nav2_after_nav2_failed_near_goal" in api_cpp
-    assert "near_goal_nav2_retry_attempted=true" in api_cpp
-    assert "global correction paused for final_yaw_align" in api_cpp
-    assert "global correction resumed after final_yaw_align" in api_cpp
-    assert "commercial_final_verify=true" in api_cpp
-    assert "degraded_final_pose_verify" in api_cpp
-    assert "Nav2 native goal completion succeeded but final yaw alignment fallback failed" not in api_cpp
-    assert '"failed_final_yaw_align"' not in api_cpp[api_cpp.index("void run_navigation_goal_job("):]
-    assert "navigation goal reached by commercial final verification" in api_cpp
-    assert "position_reached_yaw_warning" not in api_cpp
+    assert "goal_completion_policy=dock_staging is reserved for /api/v1/docking/start" in navigation_module_cpp
+    assert "under position_only policy" in goal_executor_cpp
+    assert "manual localization correction accepted; post-settle not requested" in localization_cpp
+    assert 'json_bool_value(body, "wait_for_settle", false)' in localization_cpp
+    assert "post_relocalization_settle_requested" in localization_cpp
+    assert "post_relocalization_settle_ok" in localization_cpp
+    assert "run_reposition_after_yaw_drift" in execution_cpp
+    assert "REPOSITION_AFTER_YAW_DRIFT" in execution_cpp
+    assert "nav2_failed_yaw_aligning" in goal_executor_cpp
+    assert "navigation_pause_global_correction_during_final_yaw" in navigation_config_cpp
+    assert "waiting for bridge map->odom smoothing before final yaw alignment" in execution_cpp
+    assert "bridge smoothing wait timed out before final yaw alignment" in bridge_wait_cpp
+    assert "navigation_nav2_failed_near_goal_retry_enabled" in navigation_cpp
+    assert "nav2_failed_near_goal_retry_allowed" in execution_cpp
+    assert "nav2_failed_near_goal_yaw_aligning" in goal_executor_cpp
+    assert "aligning yaw before same-goal retry" in goal_executor_cpp
+    assert "retry_nav2_after_nav2_failed_near_goal" in completion_cpp
+    assert "near_goal_nav2_retry_attempted=true" in goal_executor_cpp
+    assert "global correction paused for final_yaw_align" in execution_cpp
+    assert "global correction resumed after final_yaw_align" in execution_cpp
+    assert "commercial_final_verify=true" in goal_executor_cpp
+    assert "degraded_final_pose_verify" in goal_executor_cpp
+    assert "Nav2 native goal completion succeeded but final yaw alignment fallback failed" not in goal_executor_cpp
+    assert '"failed_final_yaw_align"' not in goal_executor_cpp
+    assert "navigation goal reached by commercial final verification" in goal_executor_cpp
+    assert "position_reached_yaw_warning" not in goal_executor_cpp
 
-    assert "ordinary_final_yaw_align_active_" in api_cpp
-    assert "predock_yaw_align_active_" in api_cpp
-    assert "predock_lateral_align_active_" in api_cpp
-    assert "PREDOCK_YAW_ALIGN_OWNER_CONFLICT" in api_cpp
-    assert "PREDOCK_LATERAL_ALIGN_OWNER_CONFLICT" in api_cpp
-    assert "STAGING_NAV2_EARLY_HANDOFF" in api_cpp
-    assert "predock native Nav2 early handoff to docking-owned yaw/lateral capture" in api_cpp
-    assert "predock Nav2 goal canceled for docking-owned final capture" in api_cpp
-    assert "docking request preempts ordinary final_yaw_align" in api_cpp
-    assert 'navigation_final_yaw_align_cmd_topic_ != "/cmd_vel_nav"' in api_cpp
-    assert 'navigation_final_yaw_align_cmd_topic_ != "/cmd_vel_api"' in api_cpp
-    assert 'navigation_final_yaw_align_cmd_topic_ = "/cmd_vel_api"' in api_cpp
-    assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel_collision_checked"' not in api_cpp
-    assert 'predock_yaw_align_cmd_topic_ != "/cmd_vel_docking"' in api_cpp
+    assert "ordinary_final_yaw_align_active_" in docking_execution_cpp
+    assert "predock_yaw_align_active_" in docking_execution_cpp
+    assert "predock_lateral_align_active_" in docking_execution_cpp
+    assert "PREDOCK_YAW_ALIGN_OWNER_CONFLICT" in docking_execution_cpp
+    assert "PREDOCK_LATERAL_ALIGN_OWNER_CONFLICT" in docking_execution_cpp
+    assert "STAGING_NAV2_EARLY_HANDOFF" in docking_execution_cpp
+    assert "predock native Nav2 early handoff to docking-owned yaw/lateral capture" in docking_execution_cpp
+    assert "predock Nav2 goal canceled for docking-owned final capture" in docking_execution_cpp
+    assert "docking request preempts ordinary final_yaw_align" in docking_execution_cpp
+    assert 'final_yaw_align_cmd_topic != "/cmd_vel_nav"' in docking_execution_cpp
+    assert 'final_yaw_align_cmd_topic != "/cmd_vel_api"' in docking_execution_cpp
+    assert 'final_yaw_align_cmd_topic = "/cmd_vel_api"' in docking_execution_cpp
+    assert (
+        'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel_collision_checked"'
+        not in docking_execution_cpp
+    )
+    assert 'config_.command_topic != "/cmd_vel_docking"' in docking_execution_cpp
     assert 'navigation_final_yaw_align_cmd_topic: "/cmd_vel_docking"' not in config
     assert 'navigation_final_yaw_align_cmd_topic: "/cmd_vel_collision_checked"' not in config
     assert 'predock_yaw_align_cmd_topic: "/cmd_vel_docking"' in config
@@ -982,18 +1306,21 @@ def test_phase_n2_goal_completion_semantics_contracts():
     ):
         assert token in docking_job_hpp
         assert token in docking_job_cpp
-        assert token in api_cpp
+        assert token in docking_execution_cpp or token in predock_policy_cpp
 
-    assert "global_correction_pause_applied" in api_cpp
-    assert "fine_docking_entry_require_predock_yaw_aligned_ && !predock_yaw_aligned" in api_cpp
-    assert "predock_pose_inside_handoff_window" in api_cpp
-    assert "predock_yaw_target_met" in api_cpp
-    assert "predock_lateral_target_met" in api_cpp
-    assert "fine_docking_retry_on_yaw_reject_" in api_cpp
-    assert "FINE_DOCKING_REJECTED_YAW_TOO_LARGE" in api_cpp
-    assert "PREDOCK_YAW_ALIGN" in api_cpp
-    assert "PREDOCK_LATERAL_ALIGN" in api_cpp
-    assert "RESTAGE_RETRY" in api_cpp
+    assert "global_correction_pause_applied" in docking_execution_cpp
+    assert (
+        "config_.fine_entry_require_predock_yaw_aligned && !yaw_aligned"
+        in docking_execution_cpp
+    )
+    assert "policy_.pose_inside_handoff_window(check)" in predock_control_cpp
+    assert "PredockAlignmentPolicy::yaw_target_met" in predock_policy_cpp
+    assert "PredockAlignmentPolicy::lateral_target_met" in predock_policy_cpp
+    assert "config_.fine_retry_on_yaw_reject" in predock_control_cpp
+    assert "FINE_DOCKING_REJECTED_YAW_TOO_LARGE" in docking_execution_cpp
+    assert "PREDOCK_YAW_ALIGN" in docking_execution_cpp
+    assert "PREDOCK_LATERAL_ALIGN" in docking_execution_cpp
+    assert "RESTAGE_RETRY" in docking_execution_cpp
     assert "docking_max_retries: 2" in config
     assert "docking_max_retries: 2" in overlay_config
 
@@ -1011,6 +1338,54 @@ def test_phase_n3_nav2_native_goal_completion_contracts():
     api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
         encoding="utf-8"
     )
+    navigation_module_cpp = (
+        ROOT / "src" / "robot_api_server" / "src" / "features" / "navigation" / "navigation_module.cpp"
+    ).read_text(encoding="utf-8")
+    goal_executor_cpp = (
+        ROOT / "src" / "robot_api_server" / "src" / "features" / "navigation" / "mission"
+        / "navigation_goal_executor.cpp"
+    ).read_text(encoding="utf-8")
+    execution_cpp = navigation_goal_execution_source()
+    navigation_cpp = "\n".join(
+        (api_cpp, navigation_module_cpp, goal_executor_cpp, execution_cpp)
+    )
+    docking_executor_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_job_executor.cpp"
+    ).read_text(encoding="utf-8")
+    predock_control_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "predock_alignment"
+        / "predock_control_module.cpp"
+    ).read_text(encoding="utf-8")
+    docking_runtime_cpp = (
+        ROOT / "src" / "robot_api_server" / "src" / "features" / "docking"
+        / "lifecycle" / "docking_runtime_module.cpp"
+    ).read_text(encoding="utf-8")
+    docking_execution_cpp = "\n".join(
+        (api_cpp, execution_cpp, docking_executor_cpp, predock_control_cpp, docking_runtime_cpp)
+    )
+    terminal_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "terminal_control"
+        / "navigation_terminal_control.cpp"
+    ).read_text(encoding="utf-8")
     config = (ROOT / "src" / "robot_api_server" / "config" / "robot_api_server.yaml").read_text(
         encoding="utf-8"
     )
@@ -1041,7 +1416,7 @@ def test_phase_n3_nav2_native_goal_completion_contracts():
         assert "max_angular_accel: 1.2" in params
         assert "terminal_rotation_braking_enabled: true" in params
         assert "closed_loop: true" in params
-        assert 'goal_checker_plugins: ["goal_checker"]' in params
+        assert 'goal_checker_plugins: ["goal_checker", "dock_staging_goal_checker"]' in params
         assert 'plugin: "nav2_controller::SimpleGoalChecker"' in params
         assert 'plugin: "nav2_controller::PositionGoalChecker"' not in params
         assert "goal_checker:" in params
@@ -1101,40 +1476,45 @@ def test_phase_n3_nav2_native_goal_completion_contracts():
         assert "fine_docking_entry_max_yaw_rad: 0.0349" in params
         assert 'navigation_final_yaw_align_cmd_topic: "/cmd_vel_docking"' not in params
 
-    assert "native_nav2_goal_completion" in api_cpp
-    assert "api_final_yaw_align_enabled" in api_cpp
-    assert "nav2_rotation_shim_enabled" in api_cpp
-    assert "navigation_behavior_tree_for_goal_completion_policy" not in api_cpp
-    assert "goal.behavior_tree = navigation_behavior_tree_for_goal_completion_policy(goal_completion_policy);" not in api_cpp
-    assert "commercial_final_verify=true" in api_cpp
-    assert "navigation goal reached by commercial final verification" in api_cpp
-    assert "navigation goal reached by Nav2 native completion" not in api_cpp
-    run_goal_block = api_cpp[
-        api_cpp.index("void run_navigation_goal_job("):api_cpp.index("HttpResponse handle_navigation_state()")
-    ]
+    assert "native_nav2_goal_completion" in navigation_module_cpp
+    assert "api_final_yaw_align_enabled" in navigation_module_cpp
+    assert "nav2_rotation_shim_enabled" in navigation_module_cpp
+    assert "navigation_behavior_tree_for_goal_completion_policy" not in navigation_cpp
+    assert "goal.behavior_tree = navigation_behavior_tree_for_goal_completion_policy(goal_completion_policy);" not in navigation_cpp
+    assert "commercial_final_verify=true" in goal_executor_cpp
+    assert "navigation goal reached by commercial final verification" in goal_executor_cpp
+    assert "navigation goal reached by Nav2 native completion" not in navigation_cpp
+    run_goal_block = goal_executor_cpp
     assert "final_yaw_align_allowed" in run_goal_block
     assert "nav2_failed_yaw_aligning" in run_goal_block
     assert '"nav2_failed"' not in run_goal_block
     assert "run_final_yaw_align(job_id, target, pose_check)" in run_goal_block
-    final_yaw_block = api_cpp[
-        api_cpp.index("FinalYawAlignResult run_final_yaw_align("):api_cpp.index(
-            "NavigationRepositionResult run_reposition_after_yaw_drift("
+    final_yaw_block = execution_cpp[
+        execution_cpp.index("FinalYawAlignResult NavigationGoalExecutionModule::run_final_yaw_align("):
+        execution_cpp.index(
+            "NavigationRepositionResult NavigationGoalExecutionModule::run_reposition_after_yaw_drift("
         )
     ]
-    assert "navigation_pause_global_correction_during_final_yaw_" in final_yaw_block
+    assert "config_.pause_global_correction_during_final_yaw" in final_yaw_block
     assert "wait_for_bridge_smoothing_before_final_yaw_align(job_id)" in final_yaw_block
     assert "bridge_smoothing_active_before_final_yaw" in final_yaw_block
-    assert "request_localization_bridge_correction_pause(" in final_yaw_block
-    assert "goal_completion_policy=dock_staging is reserved for /api/v1/docking/start" in api_cpp
-    assert "PREDOCK_YAW_ALIGN_RECOVERY" in api_cpp
-    assert "PREDOCK_LATERAL_ALIGN" in api_cpp
-    assert "PREDOCK_NATIVE_GOAL_VERIFY_FAILED" in api_cpp
-    assert "PREDOCK_YAW_NOT_ALIGNED_AFTER_NAV2" in api_cpp
-    assert 'predock_yaw_align_cmd_topic_ != "/cmd_vel_docking"' in api_cpp
-    assert "PREDOCK_YAW_ALIGN_OWNER_CONFLICT" in api_cpp
-    assert "PREDOCK_LATERAL_ALIGN_OWNER_CONFLICT" in api_cpp
-    assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel_safe"' not in api_cpp
-    assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel"' not in api_cpp
+    assert "ports_.request_bridge_correction_pause(" in final_yaw_block
+    assert "run_final_yaw_motion(" in final_yaw_block
+    assert "final yaw alignment stopped because xy drift=" in terminal_cpp
+    assert "final yaw aligned after actual angular velocity settled" in terminal_cpp
+    assert "goal_completion_policy=dock_staging is reserved for /api/v1/docking/start" in navigation_module_cpp
+    assert "PREDOCK_YAW_ALIGN_RECOVERY" in docking_execution_cpp
+    assert "PREDOCK_LATERAL_ALIGN" in docking_execution_cpp
+    assert "PREDOCK_NATIVE_GOAL_VERIFY_FAILED" in docking_execution_cpp
+    assert "PREDOCK_YAW_NOT_ALIGNED_AFTER_NAV2" in docking_execution_cpp
+    assert 'config_.command_topic != "/cmd_vel_docking"' in docking_execution_cpp
+    assert "PREDOCK_YAW_ALIGN_OWNER_CONFLICT" in docking_execution_cpp
+    assert "PREDOCK_LATERAL_ALIGN_OWNER_CONFLICT" in docking_execution_cpp
+    assert (
+        'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel_safe"'
+        not in docking_execution_cpp
+    )
+    assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel"' not in docking_execution_cpp
 
     assert "requires_nav2_rotation_shim_backport_or_upgrade`: false" in audit_text
     assert "RotationShimController is supported" in audit_text
@@ -1149,7 +1529,7 @@ def test_phase_n3_nav2_native_goal_completion_contracts():
     assert "api_final_yaw_align_used" in observe_script
     assert "final_yaw_handled_by_nav2" in observe_script
     assert "cmd_owner_conflict" in observe_script
-    assert "goal_checker_id=" not in pose_bt
+    assert 'goal_checker_id="goal_checker"' in pose_bt
     assert "position_goal_checker" not in pose_bt
     assert '<RateController hz="1.0">' in pose_bt
     assert not (ROOT / "src" / "robot_nav_config" / "behavior_trees" / "navigate_to_pose_position_only.xml").exists()
@@ -1159,9 +1539,57 @@ def test_phase_n4_post_nav2_final_verify_recovery_contracts():
     overlay = ROOT / "scripts" / "jetson" / "runtime_overlay"
     scripts_dir = overlay / "scripts"
     config_dir = overlay / "config"
-    api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
-        encoding="utf-8"
-    )
+    composition_cpp = application_composition_source()
+    goal_executor_cpp = (
+        ROOT / "src" / "robot_api_server" / "src" / "features" / "navigation" / "mission"
+        / "navigation_goal_executor.cpp"
+    ).read_text(encoding="utf-8")
+    execution_cpp = navigation_goal_execution_source()
+    navigation_config_cpp = navigation_configuration_source()
+    localization_cpp = (
+        ROOT / "src" / "robot_api_server" / "src" / "features" / "localization"
+        / "localization_module.cpp"
+    ).read_text(encoding="utf-8")
+    terminal_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "terminal_control"
+        / "navigation_terminal_control.cpp"
+    ).read_text(encoding="utf-8")
+    terminal_runtime_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "terminal_control"
+        / "navigation_terminal_runtime_module.cpp"
+    ).read_text(encoding="utf-8")
+    goal_job_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "mission"
+        / "navigation_goal_job.cpp"
+    ).read_text(encoding="utf-8")
+    bridge_wait_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "runtime"
+        / "navigation_bridge_wait.cpp"
+    ).read_text(encoding="utf-8")
     api_cfg = (ROOT / "src" / "robot_api_server" / "config" / "robot_api_server.yaml").read_text(
         encoding="utf-8"
     )
@@ -1185,7 +1613,12 @@ def test_phase_n4_post_nav2_final_verify_recovery_contracts():
         "final_verify_retry_reason",
         "final_verify_retry_goal_sent",
     ):
-        assert token in api_cpp
+        assert (
+            token in composition_cpp
+            or token in navigation_config_cpp
+            or token in goal_executor_cpp
+            or token in execution_cpp
+        )
 
     for params in (api_cfg, overlay_api_cfg):
         assert "navigation_goal_position_success_tolerance_m: 0.06" in params
@@ -1233,134 +1666,155 @@ def test_phase_n4_post_nav2_final_verify_recovery_contracts():
         assert "api_final_yaw_align_fallback_enabled: true" in params
         assert "navigation_final_yaw_align_enable: true" in params
 
-    run_goal_block = api_cpp[
-        api_cpp.index("void run_navigation_goal_job(") : api_cpp.index("HttpResponse handle_navigation_state()")
-    ]
+    run_goal_block = goal_executor_cpp
     assert "nav2_failed_near_goal_retry_allowed(" in run_goal_block
     assert "nav2_failed_near_goal_yaw_first_candidate()" in run_goal_block
     assert "!nav2_failed_near_goal_yaw_first_candidate()" in run_goal_block
     assert "nav2_failed_near_goal_yaw_aligning" in run_goal_block
     assert "run_post_nav2_final_verify_retry(job_id, target, retry_reason, retry_phase)" in run_goal_block
-    assert "publish_post_nav2_final_verify_reverse_permit(true)" in api_cpp
-    assert "publish_post_nav2_final_verify_reverse_permit(false)" in api_cpp
-    assert "run_post_nav2_terminal_lateral_correction(" in api_cpp
-    assert "terminal_lateral_correction_attempted=true" in api_cpp
-    assert "maybe_navigation_near_goal_stalled_handoff(" in api_cpp
-    assert "cancel_navigation_goal_for_api_handoff(" in api_cpp
+    assert "terminal_publish_reverse_permit(true)" in terminal_cpp
+    assert "terminal_publish_reverse_permit(false)" in terminal_cpp
+    assert "msg.data = enabled && config_.post_nav2_reverse_permit_enabled;" in terminal_runtime_cpp
+    assert "run_post_nav2_terminal_lateral_correction(" in execution_cpp
+    assert "terminal_lateral_correction_attempted=true" in goal_executor_cpp
+    assert "maybe_navigation_near_goal_stalled_handoff(" in execution_cpp
+    assert "ports_.cancel_goal_for_handoff(" in execution_cpp
     assert "near_goal_nav2_stalled_handoff=true" in run_goal_block
     assert "waiting_for_nav2_result_near_goal_watch" in run_goal_block
-    assert "post-Nav2 final verify retry handed off near goal before Nav2 result" in api_cpp
-    assert "publish_predock_lateral_forced_mode(predock_lateral_align_forced_mode_)" in api_cpp
-    assert "publish_final_yaw_align_command(twist)" in api_cpp
-    assert "direction_reversed" in api_cpp
-    assert "terminal lateral correction diverged after side-slip command" in api_cpp
-    assert "terminal lateral correction kept original side-slip direction after meaningful progress" in api_cpp
-    assert "reversal_min_progress_m" in api_cpp
-    assert 'declare_parameter<double>("post_nav2_final_verify_terminal_lateral_command_sign", 1.0)' in api_cpp
-    assert 'declare_parameter<double>("navigation_terminal_recovery_max_distance_m", 0.40)' in api_cpp
-    assert 'declare_parameter<double>("post_nav2_final_verify_terminal_lateral_timeout_sec", 20.0)' in api_cpp
-    assert 'declare_parameter<bool>("navigation_terminal_recovery_costmap_guard_enabled", true)' in api_cpp
-    assert "terminal_recovery_costmap_path_clear(" in api_cpp
-    assert "terminal recovery blocked by local costmap" in api_cpp
-    assert 'declare_parameter<double>("post_nav2_final_verify_terminal_lateral_trigger_m", 0.04)' in api_cpp
-    assert '"post_nav2_final_verify_terminal_settle_enabled", true' in api_cpp
-    handoff_block = api_cpp[
-        api_cpp.index("bool maybe_navigation_near_goal_stalled_handoff(") :
-        api_cpp.index("void update_post_nav2_bridge_wait_fields(")
+    assert "post-Nav2 final verify retry handed off near goal before Nav2 result" in execution_cpp
+    assert "terminal.lateral_forced_mode = inputs.lateral_forced_mode" in navigation_config_cpp
+    assert (
+        "docking_configuration.predock_control.lateral_align_forced_mode;"
+        in composition_cpp
+    )
+    assert "runtime.terminal_publish_motion_mode(config_.lateral_forced_mode)" in terminal_cpp
+    assert "terminal_publish_command(step.command)" in terminal_cpp
+    assert "direction_reversed" in terminal_cpp
+    assert "terminal lateral correction diverged after side-slip command" in terminal_cpp
+    assert "terminal lateral correction kept original side-slip direction after meaningful progress" in terminal_cpp
+    assert "reversal_min_progress_m" in terminal_cpp
+    assert '"post_nav2_final_verify_terminal_lateral_command_sign", 1.0' in navigation_config_cpp
+    assert '"navigation_terminal_recovery_max_distance_m", 0.40' in navigation_config_cpp
+    assert '"post_nav2_final_verify_terminal_lateral_timeout_sec", 20.0' in navigation_config_cpp
+    assert '"navigation_terminal_recovery_costmap_guard_enabled", true' in navigation_config_cpp
+    assert "NavigationTerminalControl::costmap_path_clear(" in terminal_cpp
+    assert "terminal recovery blocked by local costmap" in terminal_cpp
+    assert '"post_nav2_final_verify_terminal_lateral_trigger_m", 0.04' in navigation_config_cpp
+    assert '"post_nav2_final_verify_terminal_settle_enabled", true' in navigation_config_cpp
+    handoff_block = execution_cpp[
+        execution_cpp.index(
+            "bool NavigationGoalExecutionModule::maybe_navigation_near_goal_stalled_handoff("
+        ) : execution_cpp.index(
+            "void NavigationGoalExecutionModule::update_post_nav2_bridge_wait_fields("
+        )
     ]
     assert "post_nav2_terminal_lateral_correction_allowed(" in handoff_block
     assert "handoff requires executable terminal recovery" in handoff_block
-    assert "navigation_near_goal_stalled_handoff_distance_m" not in api_cpp
-    assert 'declare_parameter<double>("navigation_near_goal_stalled_handoff_min_wait_sec", 3.0)' in api_cpp
-    assert 'declare_parameter<double>("navigation_near_goal_stalled_handoff_stall_sec", 1.5)' in api_cpp
-    assert "terminal lateral correction reached strict settled pose gate" in api_cpp
-    assert "twist.linear.x" in api_cpp
-    assert "correcting_lateral" in api_cpp
-    assert "correcting_forward" in api_cpp
-    assert "correcting_yaw" in api_cpp
-    assert "terminal_pose_yaw_aligning" in api_cpp
-    assert "terminal_pose_lateral_correcting" in api_cpp
-    assert "terminal_pose_forward_correcting" in api_cpp
-    assert "terminal pose correction: yaw first" in api_cpp
-    assert "terminal pose correction: lateral second" in api_cpp
-    assert "terminal pose correction: forward/reverse third" in api_cpp
-    assert "terminal recovery axis-staged: lateral first, then forward only" in api_cpp
-    assert "twist.linear.x = 0.0;" in api_cpp
-    assert "twist.linear.y = 0.0;" in api_cpp
-    assert "terminal_lateral_candidate_before_salvage" in api_cpp
-    assert "!terminal_lateral_candidate_before_salvage" in api_cpp
-    assert "terminal pose correction skipped" in api_cpp
-    assert "needs_terminal_xy_correction" in api_cpp
-    assert "needs_terminal_yaw_correction" in api_cpp
-    assert "lateral_hysteresis_entry" in api_cpp
-    assert "post_nav2_final_verify_terminal_lateral_trigger_m_" in api_cpp
-    assert "post_nav2_final_verify_terminal_lateral_target_m_ * 0.5" in api_cpp
-    assert "lateral_abs > post_nav2_final_verify_terminal_lateral_target_m_" in api_cpp
-    assert "strict_terminal_pose_reached" in api_cpp
-    assert "wait_for_terminal_actual_stop(" in api_cpp
-    assert "terminal_pose_settling" in api_cpp
-    assert "settle_recheck_count" in api_cpp
-    assert "actual_motion_mode_code == 0" in api_cpp
+    assert "navigation_near_goal_stalled_handoff_distance_m" not in navigation_config_cpp
+    assert '"navigation_near_goal_stalled_handoff_min_wait_sec", 3.0' in navigation_config_cpp
+    assert '"navigation_near_goal_stalled_handoff_stall_sec", 1.5' in navigation_config_cpp
+    assert "terminal lateral correction reached strict settled pose gate" in terminal_cpp
+    assert "TerminalCorrectionAxis::kYaw" in terminal_cpp
+    assert "TerminalCorrectionAxis::kLateral" in terminal_cpp
+    assert "TerminalCorrectionAxis::kForward" in terminal_cpp
+    assert "terminal_pose_yaw_aligning" in terminal_cpp
+    assert "terminal_pose_lateral_correcting" in terminal_cpp
+    assert "terminal_pose_forward_correcting" in terminal_cpp
+    assert "terminal pose correction: yaw first" in terminal_cpp
+    assert "terminal pose correction: lateral second" in terminal_cpp
+    assert "terminal pose correction: forward/reverse third" in terminal_cpp
+    assert "terminal_lateral_candidate_before_salvage" in goal_executor_cpp
+    assert "!terminal_lateral_candidate_before_salvage" in goal_executor_cpp
+    assert "terminal pose correction skipped" in terminal_cpp
+    assert "needs_terminal_xy_correction" in terminal_cpp
+    assert "needs_terminal_yaw_correction" in terminal_cpp
+    assert "lateral_hysteresis_entry" in terminal_cpp
+    assert "config_.lateral_trigger_m" in terminal_cpp
+    assert "config_.lateral_target_m * 0.5" in terminal_cpp
+    assert "lateral_abs > config_.lateral_target_m" in terminal_cpp
+    assert "strict_terminal_pose_reached" in terminal_cpp
+    assert "terminal_wait_actual_stop(" in terminal_cpp
+    assert "terminal_pose_settling" in terminal_cpp
+    assert "settle_recheck_count" in terminal_cpp
+    assert "actual_motion_mode_code == 0" in terminal_runtime_cpp
     assert "terminal_pose_correction_pending" in run_goal_block
     assert "!terminal_pose_correction_pending" in run_goal_block
-    assert "terminal_lateral_correction_diagnostics" in api_cpp
-    terminal_allowed_block = api_cpp[
-        api_cpp.index("bool post_nav2_terminal_lateral_correction_allowed(") :
-        api_cpp.index("TerminalLateralCorrectionResult run_post_nav2_terminal_lateral_correction(")
+    assert "NavigationTerminalControl::lateral_correction_diagnostics" in goal_executor_cpp
+    terminal_allowed_block = execution_cpp[
+        execution_cpp.index(
+            "bool NavigationGoalExecutionModule::post_nav2_terminal_lateral_correction_allowed("
+        ) : execution_cpp.index(
+            "NavigationGoalExecutionModule::run_post_nav2_terminal_lateral_correction("
+        )
     ]
     assert "check.yaw_error_rad > navigation_final_yaw_tolerance_rad_" not in terminal_allowed_block
-    terminal_pose_block = api_cpp[
-        api_cpp.index("TerminalLateralCorrectionResult run_post_nav2_terminal_lateral_correction(") :
-        api_cpp.index("bool request_navigation_goal_cancel(")
+    correction_step_block = terminal_cpp[
+        terminal_cpp.index("TerminalCorrectionStep NavigationTerminalControl::correction_step(") :
+        terminal_cpp.index("TerminalCostmapCheck NavigationTerminalControl::costmap_path_clear(")
     ]
-    yaw_stage = terminal_pose_block[
-        terminal_pose_block.index("if (correcting_yaw)") :
-        terminal_pose_block.index("} else if (correcting_lateral)")
+    yaw_stage = correction_step_block[
+        correction_step_block.index("if (correcting_yaw)") :
+        correction_step_block.index("} else if (correcting_lateral)")
     ]
-    assert "twist.angular.z" in yaw_stage
-    assert "twist.linear.x =" not in yaw_stage
-    assert "twist.linear.y =" not in yaw_stage
-    lateral_stage = terminal_pose_block[
-        terminal_pose_block.index("} else if (correcting_lateral)") :
-        terminal_pose_block.index("} else if (correcting_forward)")
+    assert "command.angular.z" in yaw_stage
+    assert "command.linear.x =" not in yaw_stage
+    assert "command.linear.y =" not in yaw_stage
+    lateral_stage = correction_step_block[
+        correction_step_block.index("} else if (correcting_lateral)") :
+        correction_step_block.index("} else if (correcting_forward)")
     ]
-    assert "twist.linear.y" in lateral_stage
-    assert "twist.angular.z" not in lateral_stage
-    forward_stage = terminal_pose_block[
-        terminal_pose_block.index("} else if (correcting_forward)") :
-        terminal_pose_block.index("publish_final_yaw_align_command(twist);")
+    assert "command.linear.y" in lateral_stage
+    assert "command.angular.z" not in lateral_stage
+    forward_stage = correction_step_block[
+        correction_step_block.index("} else if (correcting_forward)") :
+        correction_step_block.index("return result;")
     ]
-    assert "twist.linear.x" in forward_stage
-    assert "twist.angular.z" not in forward_stage
+    assert "command.linear.x" in forward_stage
+    assert "command.angular.z" not in forward_stage
     assert "near_goal_nav2_retry_attempted=true" in run_goal_block
     assert "post_nav2_final_verify_retry_allowed(" in run_goal_block
     assert "post_nav2_final_verify_acceptance_slack_allowed(" in run_goal_block
     assert "wait_for_bridge_smoothing_before_final_verify(job_id)" in run_goal_block
-    final_verify_bridge_wait_block = api_cpp[
-        api_cpp.index("PostNav2BridgeWaitResult wait_for_bridge_smoothing_before_final_verify(") :
-        api_cpp.index("PostNav2BridgeWaitResult wait_for_bridge_smoothing_before_final_yaw_align(")
+    final_verify_bridge_wait_block = execution_cpp[
+        execution_cpp.index(
+            "NavigationGoalExecutionModule::wait_for_bridge_smoothing_before_final_verify("
+        ) : execution_cpp.index(
+            "NavigationGoalExecutionModule::wait_for_bridge_smoothing_before_final_yaw_align("
+        )
     ]
-    assert "request_amcl_nomotion_update_for_final_verify(" in final_verify_bridge_wait_block
-    assert "bridge_status_safe_for_final_pose_verify(" in final_verify_bridge_wait_block
-    assert "bridge_status_safe_for_goal_start(bridge, \"post-Nav2 final verification\"" not in final_verify_bridge_wait_block
-    final_verify_gate_block = api_cpp[
-        api_cpp.index("bool bridge_status_safe_for_final_pose_verify(") :
-        api_cpp.index("bool bridge_safe_for_goal_start(", api_cpp.index("bool bridge_status_safe_for_final_pose_verify("))
+    assert "bridge_wait_.wait_before_final_verify(job_id, *this)" in final_verify_bridge_wait_block
+    assert "request_amcl_nomotion_update_for_final_verify(" in execution_cpp
+    final_verify_wait_module_block = bridge_wait_cpp[
+        bridge_wait_cpp.index("NavigationBridgeWaitResult NavigationBridgeWait::wait_before_final_verify(") :
+        bridge_wait_cpp.index("NavigationBridgeWaitResult NavigationBridgeWait::wait_before_final_yaw_align(")
+    ]
+    assert "runtime.request_bridge_wait_nomotion_update(initial_bridge, nomotion_detail)" in final_verify_wait_module_block
+    assert "BridgeReadinessPurpose::kFinalPoseVerify" in final_verify_wait_module_block
+    assert "BridgeReadinessPurpose::kGoalStart" not in final_verify_wait_module_block
+    final_verify_gate_block = bridge_wait_cpp[
+        bridge_wait_cpp.index("BridgeReadinessDecision evaluate_bridge_readiness(") :
+        bridge_wait_cpp.index("NavigationBridgeWait::NavigationBridgeWait(")
     ]
     assert "amcl_static_pending_is_standby" in final_verify_gate_block
     assert "bridge.amcl_static_standby && bridge.amcl_not_moving_no_update_ok" in final_verify_gate_block
-    assert "bridge.amcl_input_enabled && bridge.amcl_correction_pending && !amcl_static_pending_is_standby" in final_verify_gate_block
+    assert re.search(
+        r"bridge\.amcl_input_enabled\s*&&\s*bridge\.amcl_correction_pending\s*&&\s*"
+        r"!amcl_static_pending_is_standby",
+        final_verify_gate_block,
+    )
     assert "AMCL static standby pending tolerated for final pose verify" in final_verify_gate_block
-    assert "std_srvs/srv/empty.hpp" in api_cpp
+    assert "std_srvs/srv/empty.hpp" in localization_cpp
     assert "run_final_yaw_align(job_id, target, pose_check)" in run_goal_block
-    final_yaw_block = api_cpp[
-        api_cpp.index("FinalYawAlignResult run_final_yaw_align(") :
-        api_cpp.index("NavigationRepositionResult run_reposition_after_yaw_drift(")
+    final_yaw_block = execution_cpp[
+        execution_cpp.index("FinalYawAlignResult NavigationGoalExecutionModule::run_final_yaw_align(") :
+        execution_cpp.index(
+            "NavigationRepositionResult NavigationGoalExecutionModule::run_reposition_after_yaw_drift("
+        )
     ]
-    assert "navigation_final_yaw_align_success_tolerance_rad_" in final_yaw_block
-    assert "result.final_yaw_error_rad <= navigation_final_yaw_align_success_tolerance_rad_" in final_yaw_block
-    assert "yaw_align_stop_threshold_rad(" in final_yaw_block
-    assert "reset_yaw_align_actual_stop_stability()" in final_yaw_block
+    assert "run_final_yaw_motion(" in final_yaw_block
+    assert "result.final_yaw_error_rad <= config_.final_yaw_success_tolerance_rad" in terminal_cpp
+    assert "yaw_stop_threshold(" in terminal_cpp
+    assert "terminal_reset_yaw_actual_stop_stability()" in terminal_cpp
     assert "final_pose_bridge_ready &&" in run_goal_block
     assert "final_pose_bridge_wait_detail=" in run_goal_block
     assert "run_reposition_after_yaw_drift(job_id, target)" not in run_goal_block
@@ -1376,9 +1830,12 @@ def test_phase_n4_post_nav2_final_verify_recovery_contracts():
         "navigation goal reached by commercial final verification"
     )
     assert "/cmd_vel_docking" not in run_goal_block
-    assert "post_nav2_final_verify_api_velocity_correction_enabled_" in api_cpp
+    assert (
+        "module.post_nav2_final_verify_api_velocity_correction_enabled ="
+        in navigation_config_cpp
+    )
     assert "publish_predock_yaw_align_command" not in run_goal_block
-    assert 'degraded ? "degraded" : "failed"' in api_cpp
+    assert 'degraded ? "degraded" : "failed"' in goal_job_cpp
 
     assert 'primary_controller: "nav2_mppi_controller::MPPIController"' in nav2_cfg
     assert 'plugin: "nav2_smac_planner/SmacPlanner2D"' in nav2_cfg
@@ -1386,8 +1843,8 @@ def test_phase_n4_post_nav2_final_verify_recovery_contracts():
     assert "max_odom_tf_age_ms: 100.0" in bridge_cfg
     for forbidden in ("PointCloud2", "FAST-LIO", "ranger_base_node", "ekf_node"):
         assert forbidden not in run_goal_block
-    assert "pkill -9" not in api_cpp + verify + observe
-    assert "killall -9" not in api_cpp + verify + observe
+    assert "pkill -9" not in composition_cpp + verify + observe
+    assert "killall -9" not in composition_cpp + verify + observe
 
     assert verify_path.exists()
     assert observe_path.exists()
@@ -1476,7 +1933,15 @@ def test_terminal_recovery_envelope_covers_observed_predock_residual():
 
 def test_manual_relocalization_keeps_amcl_post_isaac_refine_explicit():
     overlay = ROOT / "scripts" / "jetson" / "runtime_overlay"
-    api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
+    localization_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "localization"
+        / "localization_module.cpp"
+    ).read_text(
         encoding="utf-8"
     )
     api_cfg = (ROOT / "src" / "robot_api_server" / "config" / "robot_api_server.yaml").read_text(
@@ -1489,28 +1954,30 @@ def test_manual_relocalization_keeps_amcl_post_isaac_refine_explicit():
     overlay_bridge_cfg = (overlay / "config" / "localization_bridge.yaml").read_text(
         encoding="utf-8"
     )
+    bridge_cpp = (
+        ROOT / "src" / "robot_localization_bridge" / "src" / "localization_bridge_node.cpp"
+    ).read_text(encoding="utf-8")
 
-    trigger_block = api_cpp[
-        api_cpp.index("HttpResponse handle_trigger_localization") :
-        api_cpp.index("std::chrono::nanoseconds docking_navigation_start_timeout")
+    trigger_block = localization_cpp[
+        localization_cpp.index("HttpResponse handle_trigger_localization_body") :
+        localization_cpp.index("void handle_localization_result")
     ]
-    refine_wait_block = api_cpp[
-        api_cpp.index("bool wait_for_manual_relocalization_amcl_refine(") :
-        api_cpp.index("void set_docking_global_correction_pause_state(")
+    refine_wait_block = localization_cpp[
+        localization_cpp.index("bool wait_for_manual_relocalization_amcl_refine(") :
+        localization_cpp.index("bool wait_for_localization_result_after(")
     ]
-    bridge_status_block = api_cpp[
-        api_cpp.index("void handle_localization_bridge_status") :
-        api_cpp.index("BridgeStatusSnapshot bridge_status_snapshot")
+    bridge_status_block = localization_cpp[
+        localization_cpp.index("void handle_localization_bridge_status") :
+        localization_cpp.index("void handle_tf_static_message")
     ]
 
     assert "wait_for_manual_relocalization_amcl_refine(" in trigger_block
     assert "manual_relocalization_amcl_refine_requested" in trigger_block
     assert "manual_relocalization_amcl_refine_ok" in trigger_block
     assert "manual_relocalization_amcl_refine_detail" in trigger_block
-    assert 'json_bool_value(body, "amcl_refine", manual_relocalization_amcl_refine_enabled_)' in trigger_block
+    assert '"amcl_refine", config_.manual_amcl_refine_enabled' in trigger_block
     assert (
-        'json_bool_value(body, "amcl_refine_required", '
-        "manual_relocalization_amcl_refine_required_)"
+        '"amcl_refine_required", config_.manual_amcl_refine_required'
     ) in trigger_block
     assert "request_amcl_nomotion_update(" in refine_wait_block
     assert '"manual_relocalization_amcl_refine"' in refine_wait_block
@@ -1537,6 +2004,11 @@ def test_manual_relocalization_keeps_amcl_post_isaac_refine_explicit():
         assert "amcl_initial_pose_xy_covariance: 0.01" in cfg
         assert "amcl_initial_pose_yaw_covariance: 0.0076" in cfg
         assert "amcl_post_isaac_refine_enabled: true" in cfg
+        assert "amcl_post_isaac_refine_max_translation_m: 10.0" in cfg
+        assert "amcl_post_isaac_refine_max_yaw_rad: 0.872664626" in cfg
+
+    assert '"amcl_post_isaac_refine_max_translation_m", 10.0' in bridge_cpp
+    assert '"amcl_post_isaac_refine_max_yaw_rad", 0.872664626' in bridge_cpp
 
 
 def test_post_isaac_amcl_refine_cannot_preempt_the_unsettled_isaac_target():
@@ -1652,6 +2124,13 @@ def test_nav2_rotation_progress_scripts_contract():
 
     assert "progress_checker.plugin" in verify
     assert "progress_checker.required_movement_angle" in verify
+    assert "robot_nav_config::ElevatorAwareProgressChecker" in verify
+    assert "progress_checker.elevator_required_movement_radius" in verify
+    assert "progress_checker.elevator_required_movement_angle" in verify
+    assert "progress_checker.elevator_movement_time_allowance" in verify
+    assert "progress_checker.elevator_heartbeat_timeout" in verify
+    assert "progress_checker.elevator_heartbeat_topic" in verify
+    assert "for attempt in 1 2" in verify
     assert "FollowPath.rotate_to_goal_heading" in verify
     assert "FollowPath.angular_dist_threshold" in verify
     assert "FollowPath.angular_disengage_threshold" in verify
@@ -1715,6 +2194,9 @@ def test_runtime_health_guard_replaces_hot_readiness_probes():
     assert "--once" in guard
     assert "runtime_health_check()" in helpers
     assert '"local_state_topic_ready": bool(summary.get("local_state_topic_ready"))' in helpers
+    assert "runtime_health_local_state_diagnostic()" in helpers
+    assert 'emit("observer_stale", 42' in helpers
+    assert 'emit("odom_stamp_stale", 53' in helpers
     assert '"docking_sensor_healthy": bool(summary.get("docking_sensor_healthy"))' in helpers
     assert "runtime_health_fresh_tf_ready()" in helpers
     assert "runtime_health_topic_message_ready()" in helpers
@@ -1727,9 +2209,11 @@ def test_runtime_health_guard_replaces_hot_readiness_probes():
     assert 'start_common_process "runtime_health_guard"' in common
     assert "verify_docking_sensor_common_health_or_exit" in common
     assert "verify_robot_local_state_common_health_or_exit" in common
-    assert 'runtime_health_check "local_state_topic_ready"' in common
+    assert "runtime_health_local_state_diagnostic" in common
     assert "NJRH_COMMON_LOCAL_STATE_HEALTH_MAX_FAILURES:-3" in common
-    assert "robot_local_state endpoint or odometry freshness lost" in common
+    assert "runtime health observer degraded" in common
+    assert "does not authorize complete-chain recovery" in common
+    assert "robot_local_state fault confirmed" in common
     assert "systemd restarts the complete navigation chain" in common
     assert "start_runtime_health_guard_common()" in common
     assert 'health_file="$(runtime_health_file)"' in common
@@ -1779,6 +2263,177 @@ def test_runtime_health_guard_replaces_hot_readiness_probes():
     assert 'env RMW_FASTRTPS_PUBLICATION_MODE="${LOCAL_STATE_RMW_FASTRTPS_PUBLICATION_MODE}"' in local_state_runner
 
 
+def test_runtime_health_observer_failure_cannot_restart_the_complete_runtime():
+    scripts_root = ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts"
+    helpers = (scripts_root / "runtime_health_helpers.sh").read_text(encoding="utf-8")
+    common = (scripts_root / "run_common_services.sh").read_text(encoding="utf-8")
+
+    assert "runtime_health_local_state_diagnostic()" in helpers
+    assert "observer_stale" in helpers
+    assert "observer_graph_inconsistent" in helpers
+
+    match = re.search(
+        r"(?ms)^verify_robot_local_state_common_health_or_exit\(\) \{\n.*?^\}\n",
+        common,
+    )
+    assert match is not None
+    verifier = match.group(0)
+    assert "runtime_health_local_state_diagnostic" in verifier
+    assert "observer degraded" in verifier
+    assert "does not authorize complete-chain recovery" in verifier
+    assert 'runtime_health_check "local_state_topic_ready"' not in verifier
+
+    docking_match = re.search(
+        r"(?ms)^verify_docking_sensor_common_health_or_exit\(\) \{\n.*?^\}\n",
+        common,
+    )
+    assert docking_match is not None
+    docking_verifier = docking_match.group(0)
+    assert "runtime_health_available" in docking_verifier
+    assert "docking health observer unavailable/stale" in docking_verifier
+    assert "does not authorize complete-chain recovery" in docking_verifier
+    assert "docking manager remains fail-closed; common runtime stays alive" in docking_verifier
+    assert "return 1" not in docking_verifier
+    assert docking_verifier.index("runtime_health_available") < docking_verifier.index(
+        'runtime_health_check "docking_sensor_healthy"'
+    )
+
+    bash_candidates = []
+    if sys.platform == "win32":
+        bash_candidates.extend(
+            (
+                Path(r"C:\Program Files\Git\bin\bash.exe"),
+                Path(r"C:\Program Files\Git\usr\bin\bash.exe"),
+            )
+        )
+    discovered_bash = shutil.which("bash")
+    if discovered_bash:
+        bash_candidates.append(Path(discovered_bash))
+    bash = next((candidate for candidate in bash_candidates if candidate.exists()), None)
+    if bash is None:
+        pytest.skip("bash is required for the runtime-health recovery policy regression")
+
+    harness = f"""
+set -euo pipefail
+robot_local_state_common_health_failures=0
+runtime_health_observer_failures=0
+docking_sensor_common_health_failures=0
+docking_health_observer_failures=0
+DOCKING_SENSOR_BACKEND=orbbec_336l
+export NJRH_COMMON_LOCAL_STATE_HEALTH_MONITOR=true
+export NJRH_COMMON_LOCAL_STATE_HEALTH_MAX_FAILURES=3
+export NJRH_COMMON_DOCKING_SENSOR_HEALTH_MONITOR=true
+export NJRH_COMMON_DOCKING_SENSOR_HEALTH_MAX_FAILURES=3
+health_file="$(mktemp)"
+trap 'rm -f "${{health_file}}"' EXIT
+export NJRH_RUNTIME_HEALTH_FILE="${{health_file}}"
+helper_path="$1"
+if command -v cygpath >/dev/null 2>&1; then
+  helper_path="$(cygpath -u "${{helper_path}}")"
+fi
+source "${{helper_path}}"
+python_executable="$2"
+if command -v cygpath >/dev/null 2>&1; then
+  python_executable="$(cygpath -u "${{python_executable}}")"
+fi
+python3() {{
+  "${{python_executable}}" "$@"
+}}
+local_state_required_processes_running() {{
+  return 0
+}}
+direct_local_state_odom_ready_for_health_confirmation() {{
+  [[ "${{TEST_DIRECT_LOCAL_STATE_READY:-false}}" == "true" ]]
+}}
+{verifier}
+{docking_verifier}
+
+# A stale/missing observer is not evidence that robot_local_state failed. It
+# must never consume the real-fault retry budget or exit the common owner.
+printf '%s\n' '{{"updated_at":1,"summary":{{"local_state_endpoint_ready":true,"local_state_topic_ready":true,"local_odom_fresh":true}},"topics":{{"/local_state/odometry":{{"publishers":1,"last_received_at":1,"last_age_sec":0.03,"message_count":100}}}}}}' >"${{health_file}}"
+for _ in 1 2 3 4; do
+  verify_robot_local_state_common_health_or_exit
+done
+[[ "${{robot_local_state_common_health_failures}}" -eq 0 ]]
+
+# A fresh odometry callback wins over a temporarily inconsistent ROS graph
+# sample. This was the second false-restart shape seen under DDS load.
+now="$(python3 -c 'import time; print(time.time())')"
+printf '{{"updated_at":%s,"summary":{{"local_state_endpoint_ready":false,"local_state_topic_ready":false,"local_odom_fresh":false}},"topics":{{"/local_state/odometry":{{"publishers":0,"last_received_at":%s,"last_stamp_sec":%s,"last_age_sec":0.03,"message_count":100}}}}}}\n' "${{now}}" "${{now}}" "${{now}}" >"${{health_file}}"
+for _ in 1 2 3 4; do
+  verify_robot_local_state_common_health_or_exit
+done
+[[ "${{robot_local_state_common_health_failures}}" -eq 0 ]]
+
+# A fresh-but-empty health snapshot is not proof that robot_local_state failed
+# when an independent fresh-odom observer can still receive the canonical
+# stream. This is the startup false-restart shape captured on the Jetson.
+export TEST_DIRECT_LOCAL_STATE_READY=true
+now="$(python3 -c 'import time; print(time.time())')"
+printf '{{"updated_at":%s,"summary":{{"local_state_endpoint_ready":false,"local_state_topic_ready":false,"local_odom_fresh":false}},"topics":{{"/local_state/odometry":{{"publishers":0,"last_received_at":null,"last_stamp_sec":null,"last_age_sec":null,"message_count":0}}}}}}\n' "${{now}}" >"${{health_file}}"
+for _ in 1 2 3 4; do
+  verify_robot_local_state_common_health_or_exit
+done
+[[ "${{robot_local_state_common_health_failures}}" -eq 0 ]]
+
+# A fresh snapshot that proves a real local-state fault still fails closed,
+# but only after the independent fresh-odom confirmation also fails for the
+# configured consecutive confirmation budget.
+export TEST_DIRECT_LOCAL_STATE_READY=false
+now="$(python3 -c 'import time; print(time.time())')"
+printf '{{"updated_at":%s,"summary":{{"local_state_endpoint_ready":true,"local_state_topic_ready":false,"local_odom_fresh":false}},"topics":{{"/local_state/odometry":{{"publishers":1,"last_received_at":%s,"last_stamp_sec":1,"last_age_sec":10.0,"message_count":100}}}}}}\n' "${{now}}" "${{now}}" >"${{health_file}}"
+verify_robot_local_state_common_health_or_exit
+verify_robot_local_state_common_health_or_exit
+if verify_robot_local_state_common_health_or_exit; then
+  exit 31
+fi
+[[ "${{robot_local_state_common_health_failures}}" -eq 3 ]]
+
+# Recovery resets the genuine-fault counter.
+now="$(python3 -c 'import time; print(time.time())')"
+printf '{{"updated_at":%s,"summary":{{"local_state_endpoint_ready":true,"local_state_topic_ready":true,"local_odom_fresh":true}},"topics":{{"/local_state/odometry":{{"publishers":1,"last_received_at":%s,"last_stamp_sec":%s,"last_age_sec":0.03,"message_count":101}}}}}}\n' "${{now}}" "${{now}}" "${{now}}" >"${{health_file}}"
+verify_robot_local_state_common_health_or_exit
+[[ "${{robot_local_state_common_health_failures}}" -eq 0 ]]
+
+# An unavailable or stale observer cannot prove a docking-camera failure and
+# must not consume the real sensor-fault retry budget.
+printf '%s\n' '{{"updated_at":1,"summary":{{"docking_sensor_healthy":false}}}}' >"${{health_file}}"
+for _ in 1 2 3 4; do
+  verify_docking_sensor_common_health_or_exit
+done
+[[ "${{docking_sensor_common_health_failures}}" -eq 0 ]]
+
+# A fresh snapshot that explicitly reports an unhealthy docking stream is a
+# diagnostic alarm. Motion remains fail-closed in docking_manager, but camera
+# health alone must never kill Nav2/localization/the complete common runtime.
+now="$(python3 -c 'import time; print(time.time())')"
+printf '{{"updated_at":%s,"summary":{{"docking_sensor_healthy":false}}}}\n' "${{now}}" >"${{health_file}}"
+for _ in 1 2 3 4; do
+  verify_docking_sensor_common_health_or_exit
+done
+[[ "${{docking_sensor_common_health_failures}}" -eq 3 ]]
+
+# A subsequent fresh healthy snapshot resets the genuine sensor-fault count.
+now="$(python3 -c 'import time; print(time.time())')"
+printf '{{"updated_at":%s,"summary":{{"docking_sensor_healthy":true}}}}\n' "${{now}}" >"${{health_file}}"
+verify_docking_sensor_common_health_or_exit
+[[ "${{docking_sensor_common_health_failures}}" -eq 0 ]]
+"""
+    result = subprocess.run(
+        [
+            str(bash),
+            "-s",
+            str(scripts_root / "runtime_health_helpers.sh"),
+            sys.executable,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        input=harness,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_robot_description_includes_gs2_mount():
     sensors = (ROOT / "src" / "robot_description" / "config" / "sensors.yaml").read_text(encoding="utf-8")
     overlay_sensors = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "sensors.yaml").read_text(
@@ -1792,9 +2447,9 @@ def test_robot_description_includes_gs2_mount():
     assert "gs2_xyz: [0.36, 0.0, 0.290]" in sensors
     assert "gs2_rpy: [0.0, 0.0, 0.0]" in sensors
     assert "lidar_xyz: [0.3686, 0.0000, 0.85]" in sensors
-    assert "lidar_rpy: [0.0, -0.3490658503988659, -3.127692216127]" in sensors
+    assert "lidar_rpy: [0.0, -0.257374941072, 3.070994091224]" in sensors
     assert "imu_xyz: [0.3686, 0.0000, 0.85]" in sensors
-    assert "imu_rpy: [0.0, -0.3490658503988659, -3.127692216127]" in sensors
+    assert "imu_rpy: [0.0, -0.257374941072, 3.070994091224]" in sensors
     assert "charge_contact_xyz: [0.398, 0.0, 0.255]" in sensors
     assert "ranger_base_frame: ranger_base_link" in sensors
     assert "gs2_frame: gs2_link" in overlay_sensors
@@ -1803,10 +2458,12 @@ def test_robot_description_includes_gs2_mount():
     assert "gs2_x: 0.36" in overlay_sensors
     assert "gs2_z: 0.290" in overlay_sensors
     assert "lidar_x: 0.3686" in overlay_sensors
-    assert "lidar_yaw: -3.127692216127" in overlay_sensors
+    assert "lidar_pitch: -0.257374941072" in overlay_sensors
+    assert "lidar_yaw: 3.070994091224" in overlay_sensors
     assert "lidar_axis_yaw: 0.0" in overlay_sensors
     assert "imu_x: 0.3686" in overlay_sensors
-    assert "imu_yaw: -3.127692216127" in overlay_sensors
+    assert "imu_pitch: -0.257374941072" in overlay_sensors
+    assert "imu_yaw: 3.070994091224" in overlay_sensors
     assert "charge_contact_x: 0.398" in overlay_sensors
     assert '<link name="$(arg ranger_base_frame)"/>' in urdf
     assert '<link name="$(arg gs2_frame)"/>' in urdf
@@ -1864,8 +2521,10 @@ def test_docking_geometry_is_configured():
         assert "pre_dock_distance_m: 0.60" in cfg
         assert "allow_blind_approach: false" in cfg
         assert "final_target_distance_m: 0.34" in cfg
-        assert "distance_m: 0.60" in cfg
-        assert "speed_mps: 0.06" in cfg
+        undock = cfg[cfg.index("    undock:") : cfg.index("    contact_stop:")]
+        assert "distance_m: 0.60" in undock
+        assert "speed_mps: 0.50" in undock
+        assert "max_speed_mps: 0.50" in undock
         assert "min_clear_distance_m: 0.45" in cfg
         assert "timeout_s: 20.0" in cfg
         assert "odom_topic: /local_state/odometry" in cfg
@@ -1885,11 +2544,12 @@ def test_docking_geometry_is_configured():
         assert "feedback_timeout_s: 3.0" in cfg
         assert yaml_number(cfg, "motion_start_timeout_s") >= 5.0
         assert yaml_number(cfg, "no_progress_timeout_s") == 2.0
-        assert yaml_number(cfg, "speed_mps") == 0.06
+        assert yaml_number(undock, "speed_mps") == 0.50
+        assert yaml_number(undock, "max_speed_mps") == 0.50
         timeout_budget = (
-            yaml_number(cfg, "command_settle_s")
-            + yaml_number(cfg, "motion_start_timeout_s")
-            + yaml_number(cfg, "distance_m") / yaml_number(cfg, "speed_mps")
+            yaml_number(undock, "command_settle_s")
+            + yaml_number(undock, "motion_start_timeout_s")
+            + yaml_number(undock, "distance_m") / yaml_number(undock, "speed_mps")
             + 2.0
         )
         assert yaml_number(cfg, "timeout_s") >= timeout_budget
@@ -2150,7 +2810,7 @@ def test_robot_docking_manager_is_safety_chained_cpp():
     assert "/local_state/odometry" in readme
     assert "elapsed command time is not treated as distance" in readme
     assert "/ranger_mini3/docking_allow_reverse=true" in readme
-    assert "undock.speed_mps=0.06" in readme
+    assert "undock.speed_mps=0.50" in readme
     assert "undock.motion_start_timeout_s" in readme
     assert "undock.no_progress_timeout_s" in readme
     assert "robot_safety" in readme
@@ -2213,6 +2873,9 @@ def test_bms_docking_interlock_and_contact_slow_zone_contract():
     assert "bms_docking_contact_latched_" in safety_cpp
     assert "bms_interlock_reverse_session_seen_" in safety_cpp
     assert "fresh no-contact feedback" in safety_cpp
+    assert "try_release_bms_docking_interlock" in safety_cpp
+    assert 'try_release_bms_docking_interlock("battery_state")' in safety_cpp
+    assert 'try_release_bms_docking_interlock("reverse_disabled")' in safety_cpp
     assert "cmd.linear.x < -epsilon" in safety_cpp
     assert "reverse_allowed(CommandSource::DOCKING)" in safety_cpp
     for config in safety_configs:
@@ -2233,6 +2896,7 @@ def test_bms_docking_interlock_and_contact_slow_zone_contract():
     assert "dock_contact_max_age_sec:=0.25" in interlock_test
     assert "survives stale BMS" in interlock_test
     assert "fresh no-contact plus reverse-permit release clears the interlock" in interlock_test
+    assert "reverse-permit release plus later fresh no-contact clears the interlock" in interlock_test
     assert "explicit pure-reverse undock remains available" in interlock_test
     assert "systemctl" not in interlock_test
     assert 'prefix="/njrh_test/docking_contact_slow_zone/' in slow_zone_test
@@ -2348,6 +3012,20 @@ def test_orbbec_336l_docking_backend_is_safe_and_rollbackable():
     api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
         encoding="utf-8"
     )
+    docking_runtime_cpp = (
+        ROOT / "src" / "robot_api_server" / "src" / "features" / "docking"
+        / "lifecycle" / "docking_runtime_module.cpp"
+    ).read_text(encoding="utf-8")
+    predock_control_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "predock_alignment"
+        / "predock_control_module.cpp"
+    ).read_text(encoding="utf-8")
     readiness_cpp = (
         ROOT / "src" / "robot_bringup" / "src" / "runtime_readiness_probe.cpp"
     ).read_text(encoding="utf-8")
@@ -2425,6 +3103,8 @@ def test_orbbec_336l_docking_backend_is_safe_and_rollbackable():
     assert "missing ${required_key}" in common_runner
     assert "wait_for_fresh_header_topic_message" in common_runner
     assert '"/dock/target_observation"' in common_runner
+    assert 'start_common_process "orbbec_336l_depth" "camera336l"' in common_runner
+    assert 'start_common_process "orbbec_336l_depth" "orbbec_camera|camera336l"' not in common_runner
     assert 'robot_interfaces/msg/DockTargetObservation' in readiness_cpp
     assert "wait_for_fresh_stamped_topic_typed<robot_interfaces::msg::DockTargetObservation>" in readiness_cpp
     assert 'gs2)' in common_runner
@@ -2464,8 +3144,8 @@ def test_orbbec_336l_docking_backend_is_safe_and_rollbackable():
     assert "calibrated visual handoff boundary" in manager_cpp
     assert 'fail("contact_verify_failed_stale_odom")' in manager_cpp
     assert 'docking_observation_backend:=target_observation' in api_runner
-    assert 'docking_observation_backend_ == "target_observation"' in api_cpp
-    assert "DOCK_TARGET_OBSERVATION_TIMEOUT" in api_cpp
+    assert 'config_.observation_backend == "target_observation"' in docking_runtime_cpp
+    assert "DOCK_TARGET_OBSERVATION_TIMEOUT" in predock_control_cpp
 
     assert 'config.count("docking_camera_x")' in static_tf
     assert '"camera336l_depth_optical_frame"' in static_tf
@@ -2594,7 +3274,7 @@ def test_undock_motion_start_state_machine_publishes_before_waiting():
     assert "no_progress_timeout_s=" in node
     assert "publish_undock_reverse_command(speed, stamp)" in node
     assert "publish_reverse_enable(true)" in node[node.index("void publish_undock_reverse_command") :]
-    assert "speed_mps: 0.06" in (
+    assert "speed_mps: 0.50" in (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "docking.yaml"
     ).read_text(encoding="utf-8")
     assert yaml_number(nav2, "vx_min") >= -0.08
@@ -2603,12 +3283,66 @@ def test_undock_motion_start_state_machine_publishes_before_waiting():
     assert "CASE_DOCKING_MANAGER_WAITING_FIRST_MOTION_WITH_CMD" in diagnose
 
 
+def test_undock_uses_dedicated_half_meter_per_second_speed_envelope():
+    node = (
+        ROOT / "src" / "robot_docking_manager" / "src" / "docking_manager_node.cpp"
+    ).read_text(encoding="utf-8")
+    configs = [
+        (ROOT / "src" / "robot_nav_config" / "config" / "docking.yaml").read_text(
+            encoding="utf-8"
+        ),
+        (
+            ROOT
+            / "scripts"
+            / "jetson"
+            / "runtime_overlay"
+            / "config"
+            / "docking.yaml"
+        ).read_text(encoding="utf-8"),
+    ]
+    diagnose = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "diagnose_undock_logic_and_no_motion.sh"
+    ).read_text(encoding="utf-8")
+
+    assert 'declare_parameter<double>("undock.speed_mps", 0.50)' in node
+    assert 'declare_parameter<double>("undock.max_speed_mps", 0.50)' in node
+    undock_handler = node[
+        node.index("void handle_undocking()") : node.index(
+            "void publish_undock_reverse_command", node.index("void handle_undocking()")
+        )
+    ]
+    assert "clamp(undock_speed_mps_, 0.0, undock_max_speed_mps_)" in undock_handler
+    assert "clamp(undock_speed_mps_, 0.0, max_linear_speed_mps_)" not in undock_handler
+    assert 'speed = scalar(undock, "speed_mps")' in diagnose
+    assert 'max_speed = scalar(undock, "max_speed_mps")' in diagnose
+    assert 'read("static_audit.md")' in diagnose
+    assert "expected_reverse_tokens" in diagnose
+    assert '"-0.06" not in mode_status_text' not in diagnose
+    assert '"robot_safety requires fresh docking reverse permit"' in diagnose
+    assert '"reverse_allowed(CommandSource::DOCKING)" in safety_cpp' in diagnose
+
+    for config in configs:
+        undock = config[config.index("    undock:") : config.index("    contact_stop:")]
+        assert yaml_number(undock, "speed_mps") == pytest.approx(0.50)
+        assert yaml_number(undock, "max_speed_mps") == pytest.approx(0.50)
+        assert yaml_number(config, "max_linear_speed_mps") == pytest.approx(0.15)
+
+
 def test_bms_charging_contact_truth_table_for_full_dock_contact():
     package_root = ROOT / "src" / "robot_api_server"
-    bms_header = (package_root / "include" / "robot_api_server" / "bms_contact.hpp").read_text(
+    bms_header = (
+        package_root / "include" / "robot_api_server" / "features" / "power" / "bms_contact.hpp"
+    ).read_text(
         encoding="utf-8"
     )
-    bms_cpp = (package_root / "src" / "bms_contact.cpp").read_text(encoding="utf-8")
+    bms_cpp = (package_root / "src" / "features" / "power" / "bms_contact.cpp").read_text(
+        encoding="utf-8"
+    )
 
     assert "struct BatteryContactEvaluation" in bms_header
     assert "normalized_soc_percent" in bms_header
@@ -2644,7 +3378,36 @@ def test_bms_charging_contact_truth_table_for_full_dock_contact():
 def test_navigation_goal_pre_undock_gate_observability_contract():
     package_root = ROOT / "src" / "robot_api_server"
     node_cpp = (package_root / "src" / "robot_api_server_node.cpp").read_text(encoding="utf-8")
-    bms_cpp = (package_root / "src" / "bms_contact.cpp").read_text(encoding="utf-8")
+    dock_contact_header = (
+        package_root / "include" / "robot_api_server" / "features" / "docking"
+        / "lifecycle" / "dock_contact_interlock_module.hpp"
+    ).read_text(encoding="utf-8")
+    dock_contact_cpp = (
+        package_root / "src" / "features" / "docking" / "lifecycle"
+        / "dock_contact_interlock_module.cpp"
+    ).read_text(encoding="utf-8")
+    pre_navigation_undock_header = (
+        package_root / "include" / "robot_api_server" / "features" / "docking"
+        / "lifecycle" / "pre_navigation_undock_module.hpp"
+    ).read_text(encoding="utf-8")
+    pre_navigation_undock_cpp = (
+        package_root / "src" / "features" / "docking" / "lifecycle"
+        / "pre_navigation_undock_module.cpp"
+    ).read_text(encoding="utf-8")
+    navigation_cpp = (
+        package_root / "src" / "features" / "navigation" / "navigation_module.cpp"
+    ).read_text(encoding="utf-8")
+    goal_executor_cpp = (
+        package_root / "src" / "features" / "navigation" / "mission"
+        / "navigation_goal_executor.cpp"
+    ).read_text(encoding="utf-8")
+    execution_cpp = navigation_goal_execution_source()
+    api_gateway_cpp = (
+        package_root / "src" / "infrastructure" / "http" / "api_gateway_module.cpp"
+    ).read_text(encoding="utf-8")
+    bms_cpp = (package_root / "src" / "features" / "power" / "bms_contact.cpp").read_text(
+        encoding="utf-8"
+    )
     script = (
         ROOT
         / "scripts"
@@ -2654,21 +3417,25 @@ def test_navigation_goal_pre_undock_gate_observability_contract():
         / "verify_pre_navigation_undock_gate.sh"
     ).read_text(encoding="utf-8")
 
-    assert "GET /api/v1/navigation/pre_goal_check" in node_cpp
-    assert "handle_navigation_pre_goal_check" in node_cpp
-    assert "struct PreNavigationDockCheck" in node_cpp
-    assert "pre_navigation_dock_check_snapshot" in node_cpp
-    assert "pre_navigation_dock_check_json" in node_cpp
-    assert "api_bms_charging_contact" in node_cpp
-    assert "api_bms_charging_contact_reason" in node_cpp
-    assert "final_is_docked_or_charging" in node_cpp
-    assert "final_auto_undock_required" in node_cpp
-    assert "can_auto_undock" in node_cpp
-    assert "auto_undock_reason" in node_cpp
-    assert "docking_status_charging" in node_cpp
-    assert "docking_status_docked" in node_cpp
-    assert "runtime_docking_state_docked" in node_cpp
-    assert "bms_charging_contact:" in node_cpp
+    assert "GET /api/v1/navigation/pre_goal_check" in api_gateway_cpp
+    assert "handle_pre_goal_check" in navigation_cpp
+    assert "struct PreNavigationDockCheck" in dock_contact_header
+    assert "PreNavigationDockCheck snapshot()" in dock_contact_header
+    assert "pre_navigation_check_json" in dock_contact_header
+    assert "api_bms_charging_contact" in dock_contact_cpp
+    assert "api_bms_charging_contact_reason" in dock_contact_cpp
+    assert "final_is_docked_or_charging" in dock_contact_cpp
+    assert "final_auto_undock_required" in dock_contact_cpp
+    assert "can_auto_undock" in dock_contact_cpp
+    assert "auto_undock_reason" in dock_contact_cpp
+    assert "docking_status_charging" in dock_contact_cpp
+    assert "docking_status_docked" in dock_contact_cpp
+    assert "runtime_docking_state_docked" in dock_contact_cpp
+    assert "bms_charging_contact:" in dock_contact_cpp
+    assert "class PreNavigationUndockModule" in pre_navigation_undock_header
+    assert "bool run_if_needed(" in pre_navigation_undock_header
+    assert "auto_undock_before_navigation" in pre_navigation_undock_cpp
+    assert "post-undock navigation readiness failed, " in pre_navigation_undock_cpp
 
     assert "POWER_SUPPLY_STATUS_CHARGING" in bms_cpp
     assert "POWER_SUPPLY_STATUS_FULL" in bms_cpp
@@ -2676,65 +3443,64 @@ def test_navigation_goal_pre_undock_gate_observability_contract():
     assert "present_voltage_valid" in bms_cpp
     assert "full_soc_present_voltage_valid" in bms_cpp
 
-    goal_block = node_cpp[
-        node_cpp.index("HttpResponse handle_navigation_goal") : node_cpp.index(
-            "bool undock_before_navigation_if_needed"
+    goal_block = navigation_cpp[
+        navigation_cpp.index("HttpResponse handle_goal(") : navigation_cpp.index(
+            "void refresh_runtime_state"
         )
     ]
     assert "const bool by_pose_id = !pose_id.empty();" in goal_block
     assert '"navigation_goal"' in goal_block
-    assert "pre_navigation_dock_check_payload" in goal_block
+    assert "dock_payload" in goal_block
     assert "undock_before_navigation_if_needed(" not in goal_block
     assert "bridge_safe_for_goal_start(\"navigation goal\"" not in goal_block
     assert "pre_navigation_undock" in goal_block
     assert "pre_navigation_undock_detail" in goal_block
-    assert "pre_navigation_dock_check" in goal_block
+    assert "pre_goal_dock_snapshot" in goal_block
     assert "navigation_goal_error_response" in goal_block
 
-    precheck_block = node_cpp[
-        node_cpp.index("HttpResponse handle_navigation_pre_goal_check") : node_cpp.index(
-            "HttpResponse navigation_goal_error_response"
+    precheck_block = navigation_cpp[
+        navigation_cpp.index("HttpResponse handle_pre_goal_check") : navigation_cpp.index(
+            "HttpResponse handle_goal("
         )
     ]
     assert "read_only" in precheck_block
-    assert "find_floor_catalog_pose(*map_catalog_, building_id, floor_id, pose_id)" in precheck_block
-    assert "map_catalog_->find_map_by_id(map_id)" in precheck_block
-    assert 'query_number_value(request, "x")' in precheck_block
-    assert 'query_number_value(request, "theta")' in precheck_block
-    assert "navigation_goal_admission_snapshot()" in precheck_block
+    assert "find_floor_catalog_pose(" in precheck_block
+    assert "maps_module_.catalog().find_map_by_id(map_id)" in precheck_block
+    assert 'query_number_value("x")' in precheck_block
+    assert 'query_number_value("theta")' in precheck_block
+    assert "goal_admission_snapshot()" in precheck_block
     assert "start_pre_navigation_undock" not in precheck_block
     assert "async_send_goal" not in precheck_block
     assert "call_undock_service_with_charging_retry" not in precheck_block
-    assert "navigation_lifecycle_snapshot()" not in goal_block
+    assert "lifecycle_snapshot()" not in goal_block
     assert "async_send_goal(goal)" not in goal_block
-    assert "run_navigation_goal_job_guarded" in goal_block
+    assert "ports_.run_goal_job(" in goal_block
     assert "queued controlled undock in navigation background job" in goal_block
     assert "goal-start readiness will be checked in navigation background job" in goal_block
-    assert "pre_navigation_dock_check]() {" in goal_block
+    assert "dock](const std::uint64_t job_id)" in goal_block
 
-    pre_send_block = node_cpp[
-        node_cpp.index("bool run_navigation_goal_pre_send_sequence") : node_cpp.index(
-            "void run_navigation_goal_job_guarded"
+    pre_send_block = goal_executor_cpp[
+        goal_executor_cpp.index("bool NavigationGoalExecutor::run_pre_send_sequence") : goal_executor_cpp.index(
+            "void NavigationGoalExecutor::run_guarded"
         )
     ]
     assert "undock_before_navigation_if_needed(" in pre_send_block
     assert "navigation requires successful undock first" in pre_send_block
     assert "navigation requires post-undock localization readiness before goal start" in pre_send_block
-    assert "wait_for_navigation_goal_start_readiness(job_id, readiness_detail)" in pre_send_block
-    assert "navigation_goal_job_.pre_navigation_relocalization_succeeded = false;" in pre_send_block
-    readiness_block = node_cpp[
-        node_cpp.index("bool wait_for_navigation_goal_start_readiness") : node_cpp.index(
-            "bool run_navigation_goal_pre_send_sequence"
+    assert "wait_for_goal_start_readiness(job_id, readiness_detail)" in pre_send_block
+    assert "job.pre_navigation_relocalization_succeeded = false;" in pre_send_block
+    readiness_block = goal_executor_cpp[
+        goal_executor_cpp.index("bool NavigationGoalExecutor::wait_for_goal_start_readiness") : goal_executor_cpp.index(
+            "bool NavigationGoalExecutor::run_pre_send_sequence"
         )
     ]
     assert "bridge_safe_for_goal_start(\"navigation goal\"" in readiness_block
     assert '"waiting_for_goal_start_readiness"' in readiness_block
     assert '"failed_goal_start_readiness"' in readiness_block
-    goal_send_block = node_cpp[
-        node_cpp.index("bool send_initial_navigation_goal_to_nav2") : node_cpp.index(
-            "void run_navigation_goal_job("
-        )
-    ]
+    goal_send_start = execution_cpp.index(
+        "bool NavigationGoalExecutionModule::send_initial_navigation_goal_to_nav2"
+    )
+    goal_send_block = execution_cpp[goal_send_start:]
     assert "async_send_goal(goal)" in goal_send_block
     assert '"sending_nav2_goal"' in goal_send_block
     assert '"failed_send_nav2_goal"' in goal_send_block
@@ -2748,7 +3514,37 @@ def test_navigation_goal_pre_undock_gate_observability_contract():
 
 def test_phase25_docked_motion_interlock_contract():
     api_root = ROOT / "src" / "robot_api_server"
-    api_cpp = (api_root / "src" / "robot_api_server_node.cpp").read_text(encoding="utf-8")
+    entry_cpp = (api_root / "src" / "robot_api_server_node.cpp").read_text(encoding="utf-8")
+    composition_cpp = application_composition_source()
+    safety_state_cpp = (
+        api_root / "src" / "features" / "safety" / "safety_state.cpp"
+    ).read_text(encoding="utf-8")
+    docking_feature_cpp = docking_feature_source()
+    execution_cpp = navigation_goal_execution_source()
+    dock_contact_header = (
+        api_root / "include" / "robot_api_server" / "features" / "docking"
+        / "lifecycle" / "dock_contact_interlock_module.hpp"
+    ).read_text(encoding="utf-8")
+    dock_contact_cpp = (
+        api_root / "src" / "features" / "docking" / "lifecycle"
+        / "dock_contact_interlock_module.cpp"
+    ).read_text(encoding="utf-8")
+    dock_contact_contract = dock_contact_header + dock_contact_cpp
+    pre_navigation_undock_cpp = (
+        api_root / "src" / "features" / "docking" / "lifecycle"
+        / "pre_navigation_undock_module.cpp"
+    ).read_text(encoding="utf-8")
+    navigation_module_cpp = (
+        api_root / "src" / "features" / "navigation" / "navigation_module.cpp"
+    ).read_text(encoding="utf-8")
+    navigation_executor_cpp = (
+        api_root
+        / "src"
+        / "features"
+        / "navigation"
+        / "mission"
+        / "navigation_goal_executor.cpp"
+    ).read_text(encoding="utf-8")
     api_cfg = (api_root / "config" / "robot_api_server.yaml").read_text(encoding="utf-8")
     overlay_api_cfg = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "robot_api_server.yaml"
@@ -2793,33 +3589,40 @@ def test_phase25_docked_motion_interlock_contract():
     assert "/cmd_vel" in verify_script
     assert "/lidar_points" not in verify_script
 
-    assert "struct DockContactLatchSnapshot" in api_cpp
-    assert "docking_contact_latch_file" in api_cpp
-    assert "read_dock_contact_latch" in api_cpp
-    assert "update_dock_contact_latch" in api_cpp
-    assert "dock_latch_indicates_docked" in api_cpp
-    assert "dock_contact_snapshot" in api_cpp
-    assert "dock_contact_latch:" in api_cpp
-    assert "DOCKED_OR_CHARGING_CONTACT" in api_cpp
-    assert "blocked_by_docked_contact" in api_cpp
-    assert "auto_undock_required" in api_cpp
-    assert "safety" in api_cpp
-    assert "normal_motion_blocked_reason" in api_cpp
-    assert "pre_navigation dock gate" in api_cpp
-    assert "pre_navigation_dock_check" in api_cpp
-    assert "start_pre_navigation_undock" in api_cpp
-    assert "NavigateToPose::Goal goal" in api_cpp
-    goal_block = api_cpp[
-        api_cpp.index("HttpResponse handle_navigation_goal") : api_cpp.index(
-            "bool undock_before_navigation_if_needed"
-        )
+    assert "struct DockContactLatchSnapshot" in dock_contact_header
+    assert "docking_contact_latch_file" in docking_configuration_source()
+    assert "read_latch" in dock_contact_contract
+    assert "update_latch" in dock_contact_contract
+    assert "dock_latch_indicates_docked" in dock_contact_contract
+    assert "dock_contact_snapshot" in dock_contact_cpp
+    assert "dock_contact_latch:" in dock_contact_cpp
+    assert "DOCKED_OR_CHARGING_CONTACT" in execution_cpp
+    assert "blocked_by_docked_contact" in execution_cpp
+    assert "final_auto_undock_required" in dock_contact_cpp
+    assert "safety_feature_module_" in composition_cpp
+    assert "normal_motion_blocked_reason" in safety_state_cpp
+    assert "pre_navigation dock gate" in navigation_module_cpp
+    assert "pre_navigation_check_json" in dock_contact_contract
+    assert "PreNavigationUndockModule" in docking_feature_cpp
+    assert "normal_motion_blocked_reason" not in entry_cpp
+    assert "PreNavigationUndockModule" not in entry_cpp
+    assert "auto_undock_before_navigation" in pre_navigation_undock_cpp
+    assert "NavigateToPose::Goal goal" in navigation_module_cpp
+    pre_send_block = navigation_executor_cpp[
+        navigation_executor_cpp.index("bool NavigationGoalExecutor::run_pre_send_sequence") :
+        navigation_executor_cpp.index("void NavigationGoalExecutor::run_guarded")
     ]
-    assert goal_block.index("undock_before_navigation_if_needed(") < goal_block.index(
-        "NavigateToPose::Goal goal"
+    guarded_block = navigation_executor_cpp[
+        navigation_executor_cpp.index("void NavigationGoalExecutor::run_guarded") :
+        navigation_executor_cpp.index("void NavigationGoalExecutor::run(")
+    ]
+    assert "undock_before_navigation_if_needed(" in pre_send_block
+    assert guarded_block.index("run_pre_send_sequence(") < guarded_block.index(
+        "send_initial_navigation_goal_to_nav2("
     )
-    gate_block = api_cpp[
-        api_cpp.index("PreNavigationDockCheck pre_navigation_dock_check_snapshot") : api_cpp.index(
-            "std::string bms_charging_contact_snapshot_json"
+    gate_block = dock_contact_cpp[
+        dock_contact_cpp.index("  PreNavigationDockCheck snapshot()") : dock_contact_cpp.index(
+            "  std::string bms_snapshot_json"
         )
     ]
     assert "current_robot_pose_snapshot" not in gate_block
@@ -2875,6 +3678,24 @@ def test_phase26_persistent_docked_latch_contract():
     api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
         encoding="utf-8"
     )
+    dock_contact_header = (
+        ROOT / "src" / "robot_api_server" / "include" / "robot_api_server"
+        / "features" / "docking" / "lifecycle" / "dock_contact_interlock_module.hpp"
+    ).read_text(encoding="utf-8")
+    dock_contact_cpp = (
+        ROOT / "src" / "robot_api_server" / "src" / "features" / "docking"
+        / "lifecycle" / "dock_contact_interlock_module.cpp"
+    ).read_text(encoding="utf-8")
+    docking_http_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_http_module.cpp"
+    ).read_text(encoding="utf-8")
     docking_cpp = (
         ROOT / "src" / "robot_docking_manager" / "src" / "docking_manager_node.cpp"
     ).read_text(encoding="utf-8")
@@ -2900,33 +3721,35 @@ def test_phase26_persistent_docked_latch_contract():
     )
     verify_script = verify_script_path.read_text(encoding="utf-8")
     set_latch_script = set_latch_script_path.read_text(encoding="utf-8")
-    bms_cpp = (ROOT / "src" / "robot_api_server" / "src" / "bms_contact.cpp").read_text(
+    bms_cpp = (
+        ROOT / "src" / "robot_api_server" / "src" / "features" / "power" / "bms_contact.cpp"
+    ).read_text(
         encoding="utf-8"
     )
 
-    assert "latched_docked" in api_cpp
-    assert "docked_state_class" in api_cpp
-    assert "DOCKED_CONFIRMED" in api_cpp
-    assert "DOCKED_LATCHED" in api_cpp
-    assert "DOCKED_CANDIDATE" not in api_cpp or "current_robot_pose_snapshot" not in api_cpp[
-        api_cpp.index("PreNavigationDockCheck pre_navigation_dock_check_snapshot") : api_cpp.index(
-            "std::string bms_charging_contact_snapshot_json"
+    assert "latched_docked" in dock_contact_header + dock_contact_cpp
+    assert "docked_state_class" in dock_contact_header + dock_contact_cpp
+    assert "DOCKED_CONFIRMED" in dock_contact_cpp
+    assert "DOCKED_LATCHED" in dock_contact_cpp
+    assert "DOCKED_CANDIDATE" not in dock_contact_cpp or "current_robot_pose_snapshot" not in dock_contact_cpp[
+        dock_contact_cpp.index("  PreNavigationDockCheck snapshot()") : dock_contact_cpp.index(
+            "  std::string bms_snapshot_json"
         )
     ]
-    assert "docked_evidence" in api_cpp
-    assert "docked_warnings" in api_cpp
-    assert "handle_docking_confirm_docked" in api_cpp
-    assert "handle_docking_clear_latch" in api_cpp
-    assert '"/api/v1/docking/confirm_docked"' in api_cpp
-    assert '"/api/v1/docking/clear_docked_latch"' in api_cpp
-    assert "sent_velocity" in api_cpp
-    assert "maintenance_only" in api_cpp
-    assert "fs::rename" in api_cpp
-    assert ".tmp" in api_cpp
+    assert "docked_evidence" in dock_contact_header + dock_contact_cpp
+    assert "docked_warnings" in dock_contact_header + dock_contact_cpp
+    assert "handle_confirm_docked" in docking_http_cpp
+    assert "handle_clear_latch" in docking_http_cpp
+    assert '"/api/v1/docking/confirm_docked"' in docking_http_cpp
+    assert '"/api/v1/docking/clear_docked_latch"' in docking_http_cpp
+    assert "sent_velocity" in docking_http_cpp
+    assert "maintenance_only" in docking_http_cpp
+    assert "fs::rename" in dock_contact_cpp
+    assert ".tmp" in dock_contact_cpp
 
-    gate_block = api_cpp[
-        api_cpp.index("PreNavigationDockCheck pre_navigation_dock_check_snapshot") : api_cpp.index(
-            "std::string bms_charging_contact_snapshot_json"
+    gate_block = dock_contact_cpp[
+        dock_contact_cpp.index("  PreNavigationDockCheck snapshot()") : dock_contact_cpp.index(
+            "  std::string bms_snapshot_json"
         )
     ]
     assert "current_robot_pose_snapshot" not in gate_block
@@ -2965,9 +3788,11 @@ def test_phase26_persistent_docked_latch_contract():
 
 
 def test_phase_d2_bms_dock_contact_latch_expiry_contract():
-    api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
-        encoding="utf-8"
-    )
+    composition_cpp = application_composition_source()
+    dock_contact_cpp = (
+        ROOT / "src" / "robot_api_server" / "src" / "features" / "docking"
+        / "lifecycle" / "dock_contact_interlock_module.cpp"
+    ).read_text(encoding="utf-8")
     api_cfg = (ROOT / "src" / "robot_api_server" / "config" / "robot_api_server.yaml").read_text(
         encoding="utf-8"
     )
@@ -2978,18 +3803,48 @@ def test_phase_d2_bms_dock_contact_latch_expiry_contract():
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "verify_dock_contact_latch_gate.sh"
     )
     verify_script = verify_script_path.read_text(encoding="utf-8")
+    power_module_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "power"
+        / "power_module.cpp"
+    ).read_text(encoding="utf-8")
+    power_feature_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "power"
+        / "power_feature_module.cpp"
+    ).read_text(encoding="utf-8")
+    power_configuration_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "power"
+        / "power_configuration_module.cpp"
+    ).read_text(encoding="utf-8")
 
-    for text in (api_cpp, api_cfg, overlay_api_cfg):
+    for text in (docking_configuration_source(), api_cfg, overlay_api_cfg):
         assert "dock_contact_latch_bms_ttl_sec" in text
-        assert "dock_contact_latch_bms_require_contact_sec" in text
         assert "dock_contact_latch_bms_clear_no_contact_sec" in text
         assert "dock_contact_latch_allow_bms_stale_auto_undock" in text
         assert "dock_contact_latch_clear_when_live_undocked_no_contact" in text
         assert "dock_contact_latch_max_age_warn_sec" in text
+    for text in (power_configuration_cpp, api_cfg, overlay_api_cfg):
+        assert "dock_contact_latch_bms_require_contact_sec" in text
+    assert "dock_contact_latch_bms_require_contact_sec" not in docking_configuration_source()
+    assert "dock_contact_latch_bms_require_contact_sec" not in composition_cpp
 
-    gate_block = api_cpp[
-        api_cpp.index("PreNavigationDockCheck pre_navigation_dock_check_snapshot") : api_cpp.index(
-            "std::string bms_charging_contact_snapshot_json"
+    gate_block = dock_contact_cpp[
+        dock_contact_cpp.index("  PreNavigationDockCheck snapshot()") : dock_contact_cpp.index(
+            "  std::string bms_snapshot_json"
         )
     ]
     assert "check.strong_live_docked" in gate_block
@@ -3001,20 +3856,23 @@ def test_phase_d2_bms_dock_contact_latch_expiry_contract():
     assert "check.live_bms_charging_contact_stable" in gate_block
     assert "check.bms.contact ||" not in gate_block
 
-    handle_bms_block = api_cpp[
-        api_cpp.index("void handle_bms_state") : api_cpp.index("void handle_localization_result")
+    handle_bms_block = power_module_cpp[
+        power_module_cpp.index("void handle_state") : power_module_cpp.index(
+            "BmsChargingContactSnapshot snapshot() const"
+        )
     ]
-    assert "maybe_update_bms_dock_contact_latch" in api_cpp
-    assert "contact_stable_duration_sec >= dock_contact_latch_bms_require_contact_sec_" in handle_bms_block
+    assert "on_bms_contact_evidence" in power_feature_cpp
+    assert "current.contact_stable_duration_sec >= config.contact_stable_required_sec" in handle_bms_block
+    assert "ports.on_contact_evidence(contact, contact_stable, contact_stable_duration_sec)" in handle_bms_block
     assert 'update_dock_contact_latch(\n        true,\n        "bms"' not in handle_bms_block
-    assert "runtime.navigation_active && navigation_goal_job_running()" in api_cpp
+    assert "runtime.navigation_active && ports_.navigation_goal_running()" in dock_contact_cpp
 
-    assert "dock_contact_latch_age_sec" in api_cpp
-    assert "dock_contact_latch_stale" in api_cpp
-    assert "dock_contact_latch_contradicted_by_live_state" in api_cpp
-    assert "dock_contact_latch_auto_cleared" in api_cpp
-    assert "strong_live_docked" in api_cpp
-    assert "latch_valid_for_auto_undock" in api_cpp
+    assert "dock_contact_latch_age_sec" in dock_contact_cpp
+    assert "dock_contact_latch_stale" in dock_contact_cpp
+    assert "dock_contact_latch_contradicted_by_live_state" in dock_contact_cpp
+    assert "dock_contact_latch_auto_cleared" in dock_contact_cpp
+    assert "strong_live_docked" in dock_contact_cpp
+    assert "latch_valid_for_auto_undock" in dock_contact_cpp
     assert "navigation_relocalize_before_goal_always: false" in api_cfg
     assert "navigation_relocalize_before_goal_always: false" in overlay_api_cfg
 
@@ -3031,6 +3889,14 @@ def test_phase_d2_bms_dock_contact_latch_expiry_contract():
 def test_phase_d23_full_charge_charging_session_dock_gate_contract():
     api_cpp_path = ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp"
     api_cpp = api_cpp_path.read_text(encoding="utf-8")
+    dock_contact_cpp = (
+        ROOT / "src" / "robot_api_server" / "src" / "features" / "docking"
+        / "lifecycle" / "dock_contact_interlock_module.cpp"
+    ).read_text(encoding="utf-8")
+    bms_contact_cpp = (
+        ROOT / "src" / "robot_api_server" / "src" / "features" / "power"
+        / "bms_contact.cpp"
+    ).read_text(encoding="utf-8")
     docking_cpp = (
         ROOT / "src" / "robot_docking_manager" / "src" / "docking_manager_node.cpp"
     ).read_text(encoding="utf-8")
@@ -3050,44 +3916,48 @@ def test_phase_d23_full_charge_charging_session_dock_gate_contract():
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "localization_bridge.yaml"
     ).read_text(encoding="utf-8")
 
-    gate_block = api_cpp[
-        api_cpp.index("PreNavigationDockCheck pre_navigation_dock_check_snapshot") : api_cpp.index(
-            "std::string bms_charging_contact_snapshot_json"
+    gate_block = dock_contact_cpp[
+        dock_contact_cpp.index("  PreNavigationDockCheck snapshot()") : dock_contact_cpp.index(
+            "  std::string bms_snapshot_json"
         )
     ]
-    bms_latch_block = api_cpp[
-        api_cpp.index("void maybe_update_bms_dock_contact_latch") : api_cpp.index("void handle_bms_state")
+    bms_latch_block = dock_contact_cpp[
+        dock_contact_cpp.index("  void on_bms_contact_evidence(") : dock_contact_cpp.index(
+            "  void copy_latch_fields"
+        )
     ]
-    update_latch_block = api_cpp[
-        api_cpp.index("void update_dock_contact_latch") : api_cpp.index("bool bms_latch_write_allowed_by_runtime")
+    update_latch_block = dock_contact_cpp[
+        dock_contact_cpp.index("  void update_latch(") : dock_contact_cpp.index(
+            "  bool bms_latch_write_allowed_by_runtime"
+        )
     ]
 
-    assert "charging_session" in api_cpp
+    assert "charging_session" in dock_contact_cpp
     assert '"charging_session"' in bms_latch_block
     assert "bms_charging_observed:" in bms_latch_block
     assert '"bms"' not in bms_latch_block
     assert 'update_dock_contact_latch(true, "charging_session", "bms_charging_observed", "")' in docking_cpp
 
-    assert "latch_source_is_charging_session" in api_cpp
-    assert "source_charging_session" in api_cpp
-    assert "dock_latch_source_strength" in api_cpp
-    assert "dock_contact_latch_source_strength" in api_cpp
-    assert "charging_session_latched" in api_cpp
-    assert "charging_session_age_sec" in api_cpp
-    assert "charging_session_last_confirmed_at" in api_cpp
+    assert "latch_source_is_charging_session" in dock_contact_cpp
+    assert "source_charging_session" in dock_contact_cpp
+    assert "dock_latch_source_strength" in dock_contact_cpp
+    assert "dock_contact_latch_source_strength" in dock_contact_cpp
+    assert "charging_session_latched" in dock_contact_cpp
+    assert "charging_session_age_sec" in dock_contact_cpp
+    assert "charging_session_last_confirmed_at" in dock_contact_cpp
 
     assert "full_charge_idle_on_dock" in gate_block
     assert "bms_soc_full" in gate_block
     assert "bms_current_idle" in gate_block
     assert "strong_session_latch" in gate_block
     assert "SOC=100" not in gate_block
-    assert "normalized_soc_percent" in api_cpp
+    assert "normalized_soc_percent" in bms_contact_cpp
     assert '"DOCKED_CHARGE_IDLE"' in gate_block
     assert '"UNCERTAIN_ON_DOCK"' in gate_block
     assert '"CONFIRMED_UNDOCKED"' in gate_block
     assert '"CONFIRMED_DOCKED"' in gate_block
     assert '"DOCKED_CHARGING"' in gate_block
-    assert "dock_occupancy_state:" in api_cpp
+    assert "dock_occupancy_state:" in dock_contact_cpp
     assert "check.final_auto_undock_required = check.final_is_docked_or_charging" in gate_block
 
     assert "check.dock_latch.source_bms" in gate_block
@@ -3104,9 +3974,9 @@ def test_phase_d23_full_charge_charging_session_dock_gate_contract():
     assert "stale_charging_session_latch_cleared_live_undocked_no_contact" not in gate_block
     assert "latch_source_is_docking_evidence(check.dock_latch.source)" in gate_block
     assert "latch_source_is_manual_evidence(check.dock_latch.source)" in gate_block
-    assert "BMS no_contact" not in api_cpp
-    assert update_latch_block.index("const auto previous = read_dock_contact_latch();") < update_latch_block.index(
-        "if (have_last_dock_contact_latch_write_"
+    assert "BMS no_contact" not in dock_contact_cpp
+    assert update_latch_block.index("const auto previous = read_latch();") < update_latch_block.index(
+        "if (have_last_write_"
     )
     assert "previous.latched_docked == docked" in update_latch_block
     assert "previous.source == source" in update_latch_block
@@ -3129,7 +3999,7 @@ def test_phase_d23_full_charge_charging_session_dock_gate_contract():
         "final_auto_undock_required",
         "auto_undock_reason",
     ]:
-        assert field in api_cpp
+        assert field in dock_contact_cpp
 
     assert verify_script_path.exists()
     for option in [
@@ -3152,11 +4022,11 @@ def test_phase_d23_full_charge_charging_session_dock_gate_contract():
     assert "SmacPlanner2D" in nav2_cfg
     assert "transform_tolerance: 0.10" in nav2_cfg
     assert "max_odom_tf_age_ms: 100.0" in bridge_cfg
-    assert "PointCloud2" not in api_cpp
-    assert "FAST-LIO" not in api_cpp
+    assert "PointCloud2" not in dock_contact_cpp
+    assert "FAST-LIO" not in dock_contact_cpp
     assert "ranger_base_node" not in gate_block
-    assert "pkill -9" not in api_cpp + verify_script
-    assert "killall -9" not in api_cpp + verify_script
+    assert "pkill -9" not in api_cpp + dock_contact_cpp + verify_script
+    assert "killall -9" not in api_cpp + dock_contact_cpp + verify_script
 
     bash = shutil.which("bash")
     if bash:
@@ -5065,6 +5935,9 @@ def test_orbbec_driver_is_image_owned_and_usb_reenumeration_is_dynamic():
     assert "hesai_ros_driver" not in stop_navigation
     assert "robot_api_server" not in stop_navigation
     assert "robot_safety" not in stop_navigation
+    assert "run_floor_manager.sh" not in stop_navigation
+    assert "robot_floor_manager/floor_manager_node" not in stop_navigation
+    assert "floor_manager_node --ros-args" not in stop_navigation
     assert (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "prepare_localizer_map.py").exists()
     assert (ROOT / "src" / "robot_hesai_jt128" / "src" / "pointcloud_axis_remap_node.cpp").exists()
     assert (ROOT / "src" / "robot_hesai_jt128" / "src" / "pointcloud_downsample_node.cpp").exists()
@@ -5118,6 +5991,26 @@ def test_orbbec_driver_is_image_owned_and_usb_reenumeration_is_dynamic():
     assert "free_thresh: 0.196" in neutral_speed_yaml
     assert neutral_keepout_pgm.endswith("254\n")
     assert neutral_speed_pgm.endswith("254\n")
+
+
+def test_foreground_nav2_lifecycle_waits_for_current_held_launch_ready():
+    resident_runtime = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_navigation_runtime_services.sh"
+    ).read_text(encoding="utf-8")
+    foreground_lifecycle_activation = resident_runtime[
+        resident_runtime.index("activate_prestarted_nav2_lifecycle()") :
+        resident_runtime.index("wait_for_prestarted_nav2_launch_hold_ready()")
+    ]
+
+    assert foreground_lifecycle_activation.index(
+        "ensure_navigation_layer_alive || return 1"
+    ) < foreground_lifecycle_activation.index(
+        "wait_for_prestarted_nav2_launch_hold_ready || return 1"
+    ) < foreground_lifecycle_activation.index(
+        'log_startup_stage "nav2_lifecycle_activation_started"'
+    ) < foreground_lifecycle_activation.index(
+        'run_nav2_lifecycle_sequence "${timeout_sec}" "${nodes[@]}"'
+    )
 
 
 def test_commercial_runtime_architecture_contract_is_documented():
@@ -5237,12 +6130,24 @@ def test_commercial_runtime_architecture_contract_is_documented():
     assert "LOCAL_STATE_ENDPOINT_NOT_READY" in resident_runtime
     assert "LOCAL_STATE_ODOM_NOT_FRESH" in resident_runtime
     assert "ODOM_BASE_TF_NOT_FRESH" in resident_runtime
+    assert "LOCAL_STATE_ODOM_TF_NOT_STABLE" in resident_runtime
+    assert "wait_for_stable_local_state_observations" in resident_runtime
     assert 'log_startup_stage "common_local_state_ready"' in resident_runtime
     resident_main_startup_flow = resident_runtime[
         resident_runtime.index('write_runtime_map_context "starting" "false" "resident navigation runtime starting"') :
     ]
-    assert resident_main_startup_flow.index("run_occupancy_grid_localization.sh") < resident_main_startup_flow.index(
-        "ensure_common_local_state_ready_for_navigation_start"
+    api_preflight_index = resident_main_startup_flow.index(
+        'if [[ "${navigation_start_source}" == "api_resume" ]]; then'
+    )
+    localization_index = resident_main_startup_flow.index("run_occupancy_grid_localization.sh")
+    boot_fallback_index = resident_main_startup_flow.index(
+        'ensure_common_local_state_ready_for_navigation_start "fresh"',
+        localization_index,
+    )
+    assert api_preflight_index < localization_index < boot_fallback_index
+    assert (
+        'ensure_common_local_state_ready_for_navigation_start "stable"'
+        in resident_main_startup_flow[api_preflight_index:localization_index]
     )
     assert "NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION:-false" in resident_runtime
     assert "NJRH_NAV2_HELD_PRESTART_AFTER_LOCAL_STATE:-true" in resident_runtime
@@ -5252,39 +6157,25 @@ def test_commercial_runtime_architecture_contract_is_documented():
     assert "NJRH_RUNTIME_STARTUP_ELAPSED_SEC" in resident_runtime
     assert 'log_startup_stage "localization_stack_ready"' in resident_runtime
     assert 'log_startup_stage "initial_global_localization_ready"' in resident_runtime
-    assert "trigger_output_reports_startup_service_race()" in resident_runtime
-    assert "trigger_output_reports_transient_stale_bridge_timeout()" in resident_runtime
-    assert "trigger_output_reports_fresh_localization_retry_required()" in resident_runtime
-    assert "trigger_output_reports_transient_map_to_odom_timeout()" in resident_runtime
-    assert "trigger_output_reports_transient_localization_result_timeout()" in resident_runtime
+    assert "trigger_output_reports_retryable_before_dispatch()" in resident_runtime
     assert "NJRH_INITIAL_LOCALIZATION_REQUIRE_RESULT_PUBLISHER:-false" in resident_runtime
     assert "skipping /localization_result publisher pre-gate" in resident_runtime
     assert "NJRH_INITIAL_LOCALIZATION_FLATSCAN_WAIT_SEC:-5" in resident_runtime
     assert "NJRH_INITIAL_LOCALIZATION_FLATSCAN_REPAIR_WAIT_SEC:-20" in resident_runtime
-    assert "isaac_triggered_pose_stale_ms" in resident_runtime
+    assert "isaac_triggered_pose_stale_ms" not in resident_runtime
     assert "NJRH_GLOBAL_LOCALIZATION_TRIGGER_ATTEMPT_TIMEOUT:-75" in resident_runtime
     assert "NJRH_GLOBAL_LOCALIZATION_TRIGGER_CALL_TIMEOUT:-90" in resident_runtime
     assert "call_global_localization_trigger.py" in resident_runtime
     assert "if rclpy.ok():" in trigger_client
     assert "rclpy.shutdown()" in trigger_client
     assert "ros2 service call \\\n      /global_localization/trigger" not in resident_runtime
-    assert "NJRH_FLOOR_MANAGER_SWITCH_CALL_TIMEOUT:-0.2" in resident_runtime
+    assert "NJRH_FLOOR_MANAGER_SWITCH_CALL_TIMEOUT" not in resident_runtime
+    assert "floor_manager source preflight is not repeated during runtime startup" in resident_runtime
     assert "global localization trigger attempt=" in resident_runtime
-    assert "hit startup service race; retrying" in resident_runtime
-    assert "could not reach service; retrying" in resident_runtime
-    assert "saw transient stale Isaac result; retrying for fresh result" in resident_runtime
-    fresh_retry_block = resident_runtime[
-        resident_runtime.index("trigger_output_reports_transient_stale_bridge_timeout()") :
-        resident_runtime.index(
-            "trigger_output_reports_fresh_localization_retry_required()",
-            resident_runtime.index("trigger_output_reports_transient_stale_bridge_timeout()"),
-        )
-    ]
-    assert "failure_code=FRESH_LOCALIZATION_RETRY_REQUIRED" in fresh_retry_block
-    assert "failure_code=BRIDGE_ACCEPT_TIMEOUT" in fresh_retry_block
-    assert "return 0" in fresh_retry_block
-    assert "transient stale map->odom during startup; retrying" in resident_runtime
-    assert "transient localization result timeout during startup; retrying" in resident_runtime
+    assert "proved Isaac was not dispatched; retrying" in resident_runtime
+    assert "retrying for fresh result" not in resident_runtime
+    assert "transient stale map->odom during startup; retrying" not in resident_runtime
+    assert "transient localization result timeout during startup; retrying" not in resident_runtime
     assert "NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION:-false" in resident_runtime
     assert "NJRH_NAV2_LIFECYCLE_HOLD" in resident_runtime
     assert '"nav2_layer_prestarted"' in resident_runtime
@@ -5379,7 +6270,10 @@ def test_commercial_runtime_architecture_contract_is_documented():
     assert "prestarting resident AMCL warmup before initial global localization" in resident_runtime
     assert "deferring resident AMCL warmup until after initial global localization" in resident_runtime
     assert "NJRH_INITIAL_GLOBAL_LOCALIZATION_BACKGROUND_START:-false" in resident_runtime
-    assert "initial global localization trigger will run after localization stack and floor context are ready" in resident_runtime
+    assert (
+        "initial global localization trigger is starting after full localization-stack "
+        "and floor-context readiness"
+    ) in resident_runtime
     assert (
         "NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION="
         '"${NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION:-false}"'
@@ -5392,8 +6286,8 @@ def test_commercial_runtime_architecture_contract_is_documented():
     assert resident_runtime_main_flow.index("start_amcl_resident_background_if_enabled_for_navigation") < resident_runtime_main_flow.index(
         "start_initial_global_localization_background"
     )
-    assert resident_runtime_main_flow.index("start_initial_global_localization_background") < resident_runtime_main_flow.index(
-        "ensure_localization_stack_ready_for_navigation"
+    assert resident_runtime_main_flow.index("ensure_localization_stack_ready_for_navigation") < resident_runtime_main_flow.index(
+        "start_initial_global_localization_background"
     )
     assert resident_runtime_main_flow.index("wait_for_initial_global_localization") < resident_runtime_main_flow.index(
         "start_amcl_readiness_background_if_enabled_for_navigation"
@@ -5417,6 +6311,16 @@ def test_commercial_runtime_architecture_contract_is_documented():
     assert "wait_for_amcl_resident_background_if_running" in resident_amcl_background_block
     assert "complete_amcl_readiness_with_retries_for_navigation" in resident_amcl_background_block
     assert "AMCL readiness completed in background" in resident_amcl_background_block
+    assert "continuing into bounded complete-readiness retries" in resident_amcl_background_block
+    assert "maintain_amcl_readiness_background_for_navigation()" in resident_runtime
+    assert "AMCL readiness background is not running and status is not ready" in resident_runtime
+    resident_supervision_loop = resident_runtime[
+        resident_runtime.index("while true; do", resident_runtime.index("resident navigation runtime launched")) :
+    ]
+    assert "maintain_amcl_readiness_background_for_navigation" in resident_supervision_loop
+    assert resident_supervision_loop.index(
+        "maintain_amcl_readiness_background_for_navigation"
+    ) < resident_supervision_loop.index("AMCL runtime status heartbeat exited")
     assert "AMCL readiness completion attempt=" in resident_runtime
     assert "AMCL_READINESS_TIMEOUT" in resident_runtime
     assert "NJRH_NAV2_EXTERNAL_LIFECYCLE_BRINGUP:-true" in resident_runtime
@@ -5425,9 +6329,10 @@ def test_commercial_runtime_architecture_contract_is_documented():
     assert 'log_startup_stage "nav2_layer_ready"' in resident_runtime
     assert 'log_startup_stage "amcl_tracking_ready"' in resident_runtime
     assert "Nav2 activation, and AMCL tracking readiness" in resident_runtime
-    assert "resident Nav2 layer failed startup; localization layer remains running" in resident_runtime
+    assert "resident Nav2 layer failed startup; tearing down the incomplete navigation runtime" in resident_runtime
     assert "stop_navigation_layer_after_failure()" in resident_runtime
     assert "sweeping standard Nav2 stack after resident Nav2" in resident_runtime
+    assert "stopping the localization layer so a later /navigation/start begins from a clean process set" in resident_runtime
     assert "stop_existing_standard_nav_stack" in resident_runtime
     assert 'navigation_pid=""' in resident_runtime
     nav2_startup_failure_block = resident_runtime[
@@ -5435,6 +6340,7 @@ def test_commercial_runtime_architecture_contract_is_documented():
         resident_runtime.index('else', resident_runtime.index('if ! wait_for_nav2_layer_ready; then'))
     ]
     assert 'stop_navigation_layer_after_failure "startup failure"' in nav2_startup_failure_block
+    assert "exit 1" in nav2_startup_failure_block
     assert 'terminate_child "${navigation_pid}" "resident Nav2 layer"\n  navigation_pid=""' not in nav2_startup_failure_block
     resident_runtime_main = resident_runtime[
         resident_runtime.index('write_runtime_map_context "starting" "false" "resident navigation runtime starting"') :
@@ -5452,7 +6358,7 @@ def test_commercial_runtime_architecture_contract_is_documented():
         "wait_for_amcl_readiness_background_if_running"
     )
     assert resident_runtime_main.index("wait_for_amcl_readiness_background_if_running") < resident_runtime_main.index(
-        'write_runtime_map_context "ready" "true"'
+        'commit_runtime_ready_context "${ready_context_message}"'
     )
     assert "resident_navigation_ready" in resident_runtime
     assert "localization stack ready for initial relocalization" in resident_runtime
@@ -5485,6 +6391,50 @@ def test_runtime_readiness_probe_has_process_timeout_guard():
     assert "exit_probe(ok ? 0 : 1)" in probe_cpp
     assert "Fast DDS" in probe_cpp
     assert "rclcpp::shutdown()" not in probe_cpp
+
+
+def test_api_navigation_resume_uses_a_stable_local_state_gate_without_changing_boot_source():
+    probe_cpp = (
+        ROOT / "src" / "robot_bringup" / "src" / "runtime_readiness_probe.cpp"
+    ).read_text(encoding="utf-8")
+    helpers = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "nav_runtime_helpers.sh"
+    ).read_text(encoding="utf-8")
+    common = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "run_common_services.sh"
+    ).read_text(encoding="utf-8")
+    api_cpp = (
+        ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp"
+    ).read_text(encoding="utf-8")
+
+    assert "stable-local-state" in probe_cpp
+    assert "required_consecutive_good" in probe_cpp
+    assert "stable local_state ready:" in probe_cpp
+    stable_probe = probe_cpp.split("bool wait_for_stable_local_state", 1)[1].split(
+        "bool wait_for_transformable_scan", 1
+    )[0]
+    assert "TransformListener" not in stable_probe
+    assert stable_probe.count(
+        "create_subscription<nav_msgs::msg::Odometry>"
+    ) == 1
+    assert stable_probe.count(
+        "create_subscription<tf2_msgs::msg::TFMessage>"
+    ) == 1
+    assert '"/tf"' in stable_probe
+    assert "wait_for_stable_local_state_observations()" in helpers
+    assert "runtime_readiness_probe stable-local-state" in helpers
+    assert 'NJRH_NAVIGATION_START_SOURCE="systemd_autostart"' in common
+    assert '::setenv("NJRH_NAVIGATION_START_SOURCE", "api_resume", 1);' in api_cpp
 
 
 def test_ranger_chassis_readiness_uses_one_dds_participant():
@@ -6026,7 +6976,10 @@ def test_project_runtime_helpers_are_wired():
     assert "load_filter_masks" in floor_manager_code
     assert 'floor_root / "current"' in floor_manager_code
     assert "install/robot_floor_manager/lib/robot_floor_manager/floor_manager_node" in overlay_floor_manager
-    assert "colcon build --packages-select robot_interfaces robot_floor_manager" in overlay_floor_manager
+    assert (
+        "colcon build --packages-select robot_map_asset_identity "
+        "robot_interfaces robot_floor_manager"
+    ) in overlay_floor_manager
     assert "--flat-map-name" in overlay_promote_floor
     assert "robot_map_toolkit/scripts/map_toolkit_cli.py" in overlay_promote_floor
     assert "local_costmap_debug.launch.py" in overlay_local_costmap_debug
@@ -6265,8 +7218,9 @@ def test_runtime_overlay_cpu_affinity_policy_is_wired():
         ("NJRH_CPUSET_TF_STATE", "2"),
         ("NJRH_CPUSET_NAV_CONTROL", "3"),
         ("NJRH_CPUSET_NAV_PLANNING", "3,5"),
+        ("NJRH_CPUSET_NAVIGATION_RUNTIME_OWNER", "0-7"),
         ("NJRH_CPUSET_LIDAR_PERCEPTION", "4,5"),
-        ("NJRH_CPUSET_LIDAR_DRIVER", "4"),
+        ("NJRH_CPUSET_LIDAR_DRIVER", "4,6"),
         ("NJRH_CPUSET_LIDAR_PIPELINE", "5"),
         ("NJRH_CPUSET_LOCALIZATION", "6"),
         ("NJRH_CPUSET_MAPPING_FRONTEND", "6,7"),
@@ -6299,11 +7253,13 @@ def test_runtime_overlay_cpu_affinity_policy_is_wired():
     assert 'NJRH_CPUSET_FASTLIO_MAPPING="${NJRH_CPUSET_FASTLIO_MAPPING:-${NJRH_CPUSET_MAPPING_BACKEND}}"' in affinity_cfg
     assert 'NJRH_CPUSET_FASTLIO_ODOM_BRIDGE="${NJRH_CPUSET_FASTLIO_ODOM_BRIDGE:-${NJRH_CPUSET_TF_STATE}}"' in affinity_cfg
     assert 'NJRH_CPUSET_FASTLIO_DESKEW="${NJRH_CPUSET_FASTLIO_DESKEW:-${NJRH_CPUSET_MAPPING_FRONTEND}}"' in affinity_cfg
-    assert 'NJRH_CPUSET_SLAM_TOOLBOX_MAPPING="${NJRH_CPUSET_SLAM_TOOLBOX_MAPPING:-${NJRH_CPUSET_MAPPING_BACKEND}}"' in affinity_cfg
+    assert '"${NJRH_CPUSET_SLAM_TOOLBOX_MAPPING}" == "${NJRH_CPUSET_MAPPING_BACKEND}"' in affinity_cfg
+    assert 'export NJRH_CPUSET_SLAM_TOOLBOX_MAPPING="3,7"' in affinity_cfg
     assert 'NJRH_CPUSET_PGO_MAPPING="${NJRH_CPUSET_PGO_MAPPING:-${NJRH_CPUSET_MAPPING_BACKEND}}"' in affinity_cfg
     assert "njrh_exec_affined()" in affinity_helper
     assert "njrh_run_affined()" in affinity_helper
     assert "njrh_start_affined_background()" in affinity_helper
+    assert "njrh_apply_affinity_to_current_process()" in affinity_helper
     assert "taskset -c" in affinity_helper
     assert "taskset -pc" in affinity_helper
     assert 'for task_path in /proc/"${pid}"/task/*' in affinity_helper
@@ -6333,109 +7289,436 @@ def test_runtime_overlay_cpu_affinity_policy_is_wired():
     assert "robot_local_perception PointCloud2 obstacle pipeline has been removed" in retired_local_perception
 
 
+def test_api_navigation_resume_resets_inherited_owner_cpu_affinity():
+    scripts_dir = ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts"
+    affinity_helper = (scripts_dir / "cpu_affinity.sh").read_text(encoding="utf-8")
+    runtime = (scripts_dir / "run_navigation_runtime_services.sh").read_text(
+        encoding="utf-8"
+    )
+
+    helper_match = re.search(
+        r"(?ms)^njrh_apply_affinity_to_current_process\(\) \{\n.*?^\}\n",
+        affinity_helper,
+    )
+    assert helper_match is not None
+    helper = helper_match.group(0)
+
+    assert 'command -v taskset' in helper
+    assert 'taskset -pc "${cpuset}" "${pid}"' in helper
+    assert '"/proc/${pid}/status"' in helper
+    assert "return 1" in helper
+    assert (
+        "njrh_apply_affinity_to_current_process navigation_runtime_owner"
+        in runtime
+    )
+    affinity_index = runtime.index(
+        "njrh_apply_affinity_to_current_process navigation_runtime_owner"
+    )
+    assert affinity_index < runtime.index('[[ -n "${floor_id}" ]]')
+    assert affinity_index < runtime.index("resolve_floor_assets_if_needed")
+    assert affinity_index < runtime.index(
+        "cleanup_stale_amcl_runtime_status_owner"
+    )
+    assert affinity_index < runtime.index('log_startup_stage "script_start"')
+    assert (
+        "navigation runtime owner could not leave its inherited CPU affinity"
+        in runtime
+    )
+
+    bash_candidates = []
+    if sys.platform == "win32":
+        bash_candidates.extend(
+            (
+                Path(r"C:\Program Files\Git\bin\bash.exe"),
+                Path(r"C:\Program Files\Git\usr\bin\bash.exe"),
+            )
+        )
+    discovered_bash = shutil.which("bash")
+    if discovered_bash:
+        bash_candidates.append(Path(discovered_bash))
+    bash = next((candidate for candidate in bash_candidates if candidate.exists()), None)
+    if bash is None:
+        pytest.skip("bash is required for the current-process affinity regression")
+
+    harness = f"""
+set -euo pipefail
+NJRH_CPU_AFFINITY_ENABLED=true
+MOCK_TASKSET_FAIL=0
+njrh_affinity_truthy() {{
+  case "${{1:-}}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}}
+njrh_cpuset_for() {{
+  printf '%s\n' "0-7"
+}}
+taskset() {{
+  [[ "${{MOCK_TASKSET_FAIL}}" -eq 0 ]]
+}}
+awk() {{
+  printf '%s\n' "0-7"
+}}
+{helper}
+
+njrh_apply_affinity_to_current_process navigation_runtime_owner
+MOCK_TASKSET_FAIL=1
+if njrh_apply_affinity_to_current_process navigation_runtime_owner; then
+  exit 91
+fi
+"""
+    result = subprocess.run(
+        [str(bash), "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_robot_api_server_directory_layout_matches_domain_taxonomy():
+    package_root = ROOT / "src" / "robot_api_server"
+    source_root = package_root / "src"
+    include_root = package_root / "include" / "robot_api_server"
+    test_root = package_root / "test"
+
+    expected_source_directories = {
+        "application",
+        "application/composition",
+        "application/routing",
+        "application/runtime_configuration",
+        "application/runtime_mode",
+        "application/subscriptions",
+        "features",
+        "features/system_status",
+        "features/maps",
+        "features/maps/catalog_activation",
+        "features/maps/poses",
+        "features/maps/keepout",
+        "features/mapping",
+        "features/mapping/runtime",
+        "features/localization",
+        "features/floor_switch",
+        "features/navigation",
+        "features/navigation/configuration",
+        "features/navigation/runtime",
+        "features/navigation/mission",
+        "features/navigation/terminal_control",
+        "features/elevator",
+        "features/elevator/configuration",
+        "features/elevator/execution",
+        "features/power",
+        "features/docking",
+        "features/docking/configuration",
+        "features/docking/lifecycle",
+        "features/docking/predock_alignment",
+        "features/safety",
+        "features/teleop",
+        "infrastructure",
+        "infrastructure/http",
+        "infrastructure/process",
+    }
+    actual_source_directories = {
+        path.relative_to(source_root).as_posix()
+        for path in source_root.rglob("*")
+        if path.is_dir()
+    }
+
+    assert actual_source_directories == expected_source_directories
+    assert {
+        path.name for path in source_root.iterdir() if path.is_file() and path.suffix == ".cpp"
+    } == {"robot_api_server_node.cpp"}
+    assert not any(path.is_file() for path in include_root.iterdir())
+    assert not any(
+        path.is_file() and path.suffix in {".cpp", ".hpp", ".py"}
+        for path in test_root.iterdir()
+    )
+    assert all((source_root / directory / "README.md").is_file() for directory in expected_source_directories)
+
+
 def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     package_root = ROOT / "src" / "robot_api_server"
     cmake = (package_root / "CMakeLists.txt").read_text(encoding="utf-8")
     package_xml = (package_root / "package.xml").read_text(encoding="utf-8")
-    api_time_header = (package_root / "include" / "robot_api_server" / "api_time_utils.hpp").read_text(
+    include_root = package_root / "include" / "robot_api_server"
+    source_root = package_root / "src"
+    application_subscriptions_include = include_root / "application" / "subscriptions"
+    application_subscriptions_source = source_root / "application" / "subscriptions"
+    application_routing_include = include_root / "application" / "routing"
+    application_routing_source = source_root / "application" / "routing"
+    application_runtime_configuration_include = (
+        include_root / "application" / "runtime_configuration"
+    )
+    application_runtime_configuration_source = (
+        source_root / "application" / "runtime_configuration"
+    )
+    application_runtime_mode_include = include_root / "application" / "runtime_mode"
+    application_runtime_mode_source = source_root / "application" / "runtime_mode"
+    docking_configuration_include = include_root / "features" / "docking" / "configuration"
+    docking_configuration_source = source_root / "features" / "docking" / "configuration"
+    docking_lifecycle_include = include_root / "features" / "docking" / "lifecycle"
+    docking_lifecycle_source = source_root / "features" / "docking" / "lifecycle"
+    map_catalog_include = include_root / "features" / "maps" / "catalog_activation"
+    map_catalog_source = source_root / "features" / "maps" / "catalog_activation"
+    map_keepout_include = include_root / "features" / "maps" / "keepout"
+    map_keepout_source = source_root / "features" / "maps" / "keepout"
+    map_poses_include = include_root / "features" / "maps" / "poses"
+    map_poses_source = source_root / "features" / "maps" / "poses"
+    mapping_include = include_root / "features" / "mapping"
+    mapping_source = source_root / "features" / "mapping"
+    floor_switch_include = include_root / "features" / "floor_switch"
+    floor_switch_source = source_root / "features" / "floor_switch"
+    localization_include = include_root / "features" / "localization"
+    localization_source = source_root / "features" / "localization"
+    navigation_runtime_include = include_root / "features" / "navigation" / "runtime"
+    navigation_runtime_source = source_root / "features" / "navigation" / "runtime"
+    navigation_module_cpp = (
+        source_root / "features" / "navigation" / "navigation_module.cpp"
+    ).read_text(encoding="utf-8")
+    goal_executor_cpp = (
+        source_root / "features" / "navigation" / "mission" / "navigation_goal_executor.cpp"
+    ).read_text(encoding="utf-8")
+    power_include = include_root / "features" / "power"
+    power_source = source_root / "features" / "power"
+    safety_include = include_root / "features" / "safety"
+    safety_source = source_root / "features" / "safety"
+    system_status_include = include_root / "features" / "system_status"
+    system_status_source = source_root / "features" / "system_status"
+    teleop_include = include_root / "features" / "teleop"
+    teleop_source = source_root / "features" / "teleop"
+    http_include = include_root / "infrastructure" / "http"
+    http_source = source_root / "infrastructure" / "http"
+    process_include = include_root / "infrastructure" / "process"
+    process_source = source_root / "infrastructure" / "process"
+    api_time_header = (map_catalog_include / "api_time_utils.hpp").read_text(
         encoding="utf-8"
     )
-    api_time_cpp = (package_root / "src" / "api_time_utils.cpp").read_text(encoding="utf-8")
-    bms_header = (package_root / "include" / "robot_api_server" / "bms_contact.hpp").read_text(
+    api_time_cpp = (map_catalog_source / "api_time_utils.cpp").read_text(encoding="utf-8")
+    bms_header = (power_include / "bms_contact.hpp").read_text(
         encoding="utf-8"
     )
-    bms_cpp = (package_root / "src" / "bms_contact.cpp").read_text(encoding="utf-8")
-    docking_job_header = (
-        package_root / "include" / "robot_api_server" / "docking_job_model.hpp"
+    bms_cpp = (power_source / "bms_contact.cpp").read_text(encoding="utf-8")
+    power_module_header = (power_include / "power_module.hpp").read_text(encoding="utf-8")
+    power_module_cpp = (power_source / "power_module.cpp").read_text(encoding="utf-8")
+    power_configuration_header = (
+        power_include / "power_configuration_module.hpp"
     ).read_text(encoding="utf-8")
-    docking_job_cpp = (package_root / "src" / "docking_job_model.cpp").read_text(encoding="utf-8")
-    docking_status_header = (
-        package_root / "include" / "robot_api_server" / "docking_status_utils.hpp"
+    power_configuration_cpp = (
+        power_source / "power_configuration_module.cpp"
     ).read_text(encoding="utf-8")
-    docking_status_cpp = (package_root / "src" / "docking_status_utils.cpp").read_text(
+    docking_job_header = (docking_lifecycle_include / "docking_job_model.hpp").read_text(
         encoding="utf-8"
     )
-    file_utils_header = (package_root / "include" / "robot_api_server" / "file_utils.hpp").read_text(
+    docking_job_cpp = (docking_lifecycle_source / "docking_job_model.cpp").read_text(encoding="utf-8")
+    docking_status_header = (docking_lifecycle_include / "docking_status_utils.hpp").read_text(
         encoding="utf-8"
     )
-    file_utils_cpp = (package_root / "src" / "file_utils.cpp").read_text(encoding="utf-8")
-    floor_asset_header = (
-        package_root / "include" / "robot_api_server" / "floor_asset_resolver.hpp"
-    ).read_text(encoding="utf-8")
-    floor_asset_cpp = (package_root / "src" / "floor_asset_resolver.cpp").read_text(encoding="utf-8")
-    http_header = (package_root / "include" / "robot_api_server" / "http_common.hpp").read_text(
+    docking_status_cpp = (docking_lifecycle_source / "docking_status_utils.cpp").read_text(
         encoding="utf-8"
     )
-    http_cpp = (package_root / "src" / "http_common.cpp").read_text(encoding="utf-8")
-    localization_result_header = (
-        package_root / "include" / "robot_api_server" / "localization_result_model.hpp"
+    docking_status_module_cpp = (
+        docking_lifecycle_source / "docking_status_module.cpp"
     ).read_text(encoding="utf-8")
-    localization_result_cpp = (
-        package_root / "src" / "localization_result_model.cpp"
+    docking_runtime_header = (
+        docking_lifecycle_include / "docking_runtime_module.hpp"
     ).read_text(encoding="utf-8")
-    storage_header = (package_root / "include" / "robot_api_server" / "storage_models.hpp").read_text(
+    docking_runtime_cpp = (
+        docking_lifecycle_source / "docking_runtime_module.cpp"
+    ).read_text(encoding="utf-8")
+    docking_correction_pause_header = (
+        docking_lifecycle_include / "docking_correction_pause_module.hpp"
+    ).read_text(encoding="utf-8")
+    docking_correction_pause_cpp = (
+        docking_lifecycle_source / "docking_correction_pause_module.cpp"
+    ).read_text(encoding="utf-8")
+    pre_navigation_undock_header = (
+        docking_lifecycle_include / "pre_navigation_undock_module.hpp"
+    ).read_text(encoding="utf-8")
+    pre_navigation_undock_cpp = (
+        docking_lifecycle_source / "pre_navigation_undock_module.cpp"
+    ).read_text(encoding="utf-8")
+    docking_predock_pose_resolver_header = (
+        docking_configuration_include / "docking_predock_pose_resolver.hpp"
+    ).read_text(encoding="utf-8")
+    docking_predock_pose_resolver_cpp = (
+        docking_configuration_source / "docking_predock_pose_resolver.cpp"
+    ).read_text(encoding="utf-8")
+    file_utils_header = (map_catalog_include / "file_utils.hpp").read_text(
         encoding="utf-8"
     )
-    storage_cpp = (package_root / "src" / "storage_models.cpp").read_text(encoding="utf-8")
-    map_asset_header = (package_root / "include" / "robot_api_server" / "map_asset_io.hpp").read_text(
+    file_utils_cpp = (map_catalog_source / "file_utils.cpp").read_text(encoding="utf-8")
+    floor_asset_header = (map_catalog_include / "floor_asset_resolver.hpp").read_text(
         encoding="utf-8"
     )
-    map_asset_cpp = (package_root / "src" / "map_asset_io.cpp").read_text(encoding="utf-8")
-    map_asset_writer_header = (
-        package_root / "include" / "robot_api_server" / "map_asset_writer.hpp"
-    ).read_text(encoding="utf-8")
-    map_asset_writer_cpp = (package_root / "src" / "map_asset_writer.cpp").read_text(encoding="utf-8")
-    map_catalog_header = (
-        package_root / "include" / "robot_api_server" / "map_catalog.hpp"
-    ).read_text(encoding="utf-8")
-    map_catalog_cpp = (package_root / "src" / "map_catalog.cpp").read_text(encoding="utf-8")
-    manifest_io_header = (package_root / "include" / "robot_api_server" / "map_manifest_io.hpp").read_text(
+    floor_asset_cpp = (map_catalog_source / "floor_asset_resolver.cpp").read_text(encoding="utf-8")
+    http_header = (http_include / "http_common.hpp").read_text(encoding="utf-8")
+    http_cpp = (http_source / "http_common.cpp").read_text(encoding="utf-8")
+    http_server_header = (http_include / "http_server.hpp").read_text(encoding="utf-8")
+    http_server_cpp = (http_source / "http_server.cpp").read_text(encoding="utf-8")
+    api_gateway_header = (http_include / "api_gateway_module.hpp").read_text(
         encoding="utf-8"
     )
-    manifest_io_cpp = (package_root / "src" / "map_manifest_io.cpp").read_text(encoding="utf-8")
-    navigation_cancel_header = (
-        package_root / "include" / "robot_api_server" / "navigation_cancel_job_model.hpp"
-    ).read_text(encoding="utf-8")
-    navigation_cancel_cpp = (package_root / "src" / "navigation_cancel_job_model.cpp").read_text(
+    api_gateway_cpp = (http_source / "api_gateway_module.cpp").read_text(
         encoding="utf-8"
     )
-    poses_io_header = (package_root / "include" / "robot_api_server" / "poses_io.hpp").read_text(
+    api_gateway_configuration_header = (
+        http_include / "api_gateway_configuration_module.hpp"
+    ).read_text(encoding="utf-8")
+    api_gateway_configuration_cpp = (
+        http_source / "api_gateway_configuration_module.cpp"
+    ).read_text(encoding="utf-8")
+    websocket_transport_header = (http_include / "websocket_transport.hpp").read_text(
         encoding="utf-8"
     )
-    poses_io_cpp = (package_root / "src" / "poses_io.cpp").read_text(encoding="utf-8")
-    runtime_context_header = (
-        package_root / "include" / "robot_api_server" / "runtime_map_context_io.hpp"
-    ).read_text(encoding="utf-8")
-    runtime_context_cpp = (package_root / "src" / "runtime_map_context_io.cpp").read_text(encoding="utf-8")
-    runtime_map_lookup_header = (
-        package_root / "include" / "robot_api_server" / "runtime_map_lookup.hpp"
-    ).read_text(encoding="utf-8")
-    runtime_map_lookup_cpp = (package_root / "src" / "runtime_map_lookup.cpp").read_text(encoding="utf-8")
-    robot_pose_header = (
-        package_root / "include" / "robot_api_server" / "robot_pose_model.hpp"
-    ).read_text(encoding="utf-8")
-    robot_pose_cpp = (package_root / "src" / "robot_pose_model.cpp").read_text(encoding="utf-8")
-    runtime_process_header = (
-        package_root / "include" / "robot_api_server" / "runtime_process_utils.hpp"
-    ).read_text(encoding="utf-8")
-    runtime_process_cpp = (package_root / "src" / "runtime_process_utils.cpp").read_text(encoding="utf-8")
-    semantic_header = (
-        package_root / "include" / "robot_api_server" / "semantic_layer_io.hpp"
-    ).read_text(encoding="utf-8")
-    semantic_cpp = (package_root / "src" / "semantic_layer_io.cpp").read_text(encoding="utf-8")
-    subscription_api_header = (
-        package_root / "include" / "robot_api_server" / "subscription_api.hpp"
-    ).read_text(encoding="utf-8")
-    subscription_api_cpp = (package_root / "src" / "subscription_api.cpp").read_text(encoding="utf-8")
-    subscription_header = (
-        package_root / "include" / "robot_api_server" / "subscription_manager.hpp"
-    ).read_text(encoding="utf-8")
-    subscription_cpp = (package_root / "src" / "subscription_manager.cpp").read_text(encoding="utf-8")
-    tf_pose_header = (package_root / "include" / "robot_api_server" / "tf_pose_utils.hpp").read_text(
+    websocket_transport_cpp = (http_source / "websocket_transport.cpp").read_text(
         encoding="utf-8"
     )
-    tf_pose_cpp = (package_root / "src" / "tf_pose_utils.cpp").read_text(encoding="utf-8")
-    node_cpp = (package_root / "src" / "robot_api_server_node.cpp").read_text(encoding="utf-8")
+    localization_result_header = (localization_include / "localization_result_model.hpp").read_text(
+        encoding="utf-8"
+    )
+    localization_result_cpp = (localization_source / "localization_result_model.cpp").read_text(
+        encoding="utf-8"
+    )
+    storage_header = (map_catalog_include / "storage_models.hpp").read_text(encoding="utf-8")
+    storage_cpp = (map_catalog_source / "storage_models.cpp").read_text(encoding="utf-8")
+    map_asset_header = (map_catalog_include / "map_asset_io.hpp").read_text(
+        encoding="utf-8"
+    )
+    map_asset_cpp = (map_catalog_source / "map_asset_io.cpp").read_text(encoding="utf-8")
+    map_asset_writer_header = (mapping_include / "map_asset_writer.hpp").read_text(encoding="utf-8")
+    map_asset_writer_cpp = (mapping_source / "map_asset_writer.cpp").read_text(encoding="utf-8")
+    mapping_module_cpp = (mapping_source / "mapping_module.cpp").read_text(encoding="utf-8")
+    mapping_runtime_cpp = (
+        mapping_source / "runtime" / "mapping_process_runtime.cpp"
+    ).read_text(encoding="utf-8")
+    map_catalog_header = (map_catalog_include / "map_catalog.hpp").read_text(encoding="utf-8")
+    map_catalog_cpp = (map_catalog_source / "map_catalog.cpp").read_text(encoding="utf-8")
+    manifest_io_header = (map_catalog_include / "map_manifest_io.hpp").read_text(encoding="utf-8")
+    manifest_io_cpp = (map_catalog_source / "map_manifest_io.cpp").read_text(encoding="utf-8")
+    navigation_cancel_header = (navigation_runtime_include / "navigation_cancel_job_model.hpp").read_text(
+        encoding="utf-8"
+    )
+    navigation_cancel_cpp = (navigation_runtime_source / "navigation_cancel_job_model.cpp").read_text(
+        encoding="utf-8"
+    )
+    navigation_goal_job_cpp = (
+        source_root / "features" / "navigation" / "mission" / "navigation_goal_job.cpp"
+    ).read_text(encoding="utf-8")
+    navigation_terminal_cpp = (
+        source_root
+        / "features"
+        / "navigation"
+        / "terminal_control"
+        / "navigation_terminal_control.cpp"
+    ).read_text(encoding="utf-8")
+    poses_io_header = (map_poses_include / "poses_io.hpp").read_text(encoding="utf-8")
+    poses_io_cpp = (map_poses_source / "poses_io.cpp").read_text(encoding="utf-8")
+    runtime_context_header = (floor_switch_include / "runtime_map_context_io.hpp").read_text(
+        encoding="utf-8"
+    )
+    runtime_context_cpp = (floor_switch_source / "runtime_map_context_io.cpp").read_text(encoding="utf-8")
+    runtime_map_lookup_header = (map_catalog_include / "runtime_map_lookup.hpp").read_text(
+        encoding="utf-8"
+    )
+    runtime_map_lookup_cpp = (map_catalog_source / "runtime_map_lookup.cpp").read_text(encoding="utf-8")
+    robot_pose_header = (system_status_include / "robot_pose_model.hpp").read_text(encoding="utf-8")
+    robot_pose_cpp = (system_status_source / "robot_pose_model.cpp").read_text(encoding="utf-8")
+    system_status_module_header = (system_status_include / "system_status_module.hpp").read_text(
+        encoding="utf-8"
+    )
+    system_status_module_cpp = (system_status_source / "system_status_module.cpp").read_text(
+        encoding="utf-8"
+    )
+    system_status_wiring_header = (
+        system_status_include / "system_status_wiring.hpp"
+    ).read_text(encoding="utf-8")
+    system_status_wiring_cpp = (
+        system_status_source / "system_status_wiring.cpp"
+    ).read_text(encoding="utf-8")
+    safety_state_header = (safety_include / "safety_state.hpp").read_text(encoding="utf-8")
+    safety_state_cpp = (safety_source / "safety_state.cpp").read_text(encoding="utf-8")
+    safety_adapter_header = (safety_include / "safety_ros_adapter.hpp").read_text(encoding="utf-8")
+    safety_adapter_cpp = (safety_source / "safety_ros_adapter.cpp").read_text(encoding="utf-8")
+    safety_configuration_header = (
+        safety_include / "safety_configuration_module.hpp"
+    ).read_text(encoding="utf-8")
+    safety_configuration_cpp = (
+        safety_source / "safety_configuration_module.cpp"
+    ).read_text(encoding="utf-8")
+    safety_module_header = (safety_include / "safety_module.hpp").read_text(encoding="utf-8")
+    safety_module_cpp = (safety_source / "safety_module.cpp").read_text(encoding="utf-8")
+    teleop_header = (teleop_include / "teleop_session.hpp").read_text(encoding="utf-8")
+    teleop_cpp = (teleop_source / "teleop_session.cpp").read_text(encoding="utf-8")
+    teleop_module_header = (teleop_include / "teleop_module.hpp").read_text(
+        encoding="utf-8"
+    )
+    teleop_module_cpp = (teleop_source / "teleop_module.cpp").read_text(
+        encoding="utf-8"
+    )
+    teleop_configuration_header = (
+        teleop_include / "teleop_configuration_module.hpp"
+    ).read_text(encoding="utf-8")
+    teleop_configuration_cpp = (
+        teleop_source / "teleop_configuration_module.cpp"
+    ).read_text(encoding="utf-8")
+    runtime_process_header = (process_include / "runtime_process_utils.hpp").read_text(encoding="utf-8")
+    runtime_process_cpp = (process_source / "runtime_process_utils.cpp").read_text(encoding="utf-8")
+    semantic_header = (map_keepout_include / "semantic_layer_io.hpp").read_text(encoding="utf-8")
+    semantic_cpp = (map_keepout_source / "semantic_layer_io.cpp").read_text(encoding="utf-8")
+    subscription_api_header = (application_subscriptions_include / "subscription_api.hpp").read_text(
+        encoding="utf-8"
+    )
+    subscription_api_cpp = (application_subscriptions_source / "subscription_api.cpp").read_text(
+        encoding="utf-8"
+    )
+    subscription_header = (application_subscriptions_include / "subscription_manager.hpp").read_text(
+        encoding="utf-8"
+    )
+    subscription_cpp = (application_subscriptions_source / "subscription_manager.cpp").read_text(
+        encoding="utf-8"
+    )
+    subscription_module_header = (
+        application_subscriptions_include / "subscription_module.hpp"
+    ).read_text(encoding="utf-8")
+    subscription_module_cpp = (
+        application_subscriptions_source / "subscription_module.cpp"
+    ).read_text(encoding="utf-8")
+    subscription_configuration_header = (
+        application_subscriptions_include / "subscription_configuration_module.hpp"
+    ).read_text(encoding="utf-8")
+    subscription_configuration_cpp = (
+        application_subscriptions_source / "subscription_configuration_module.cpp"
+    ).read_text(encoding="utf-8")
+    runtime_configuration_header = (
+        application_runtime_configuration_include / "runtime_configuration_module.hpp"
+    ).read_text(encoding="utf-8")
+    runtime_configuration_cpp = (
+        application_runtime_configuration_source / "runtime_configuration_module.cpp"
+    ).read_text(encoding="utf-8")
+    runtime_mode_header = (
+        application_runtime_mode_include / "runtime_mode_coordinator.hpp"
+    ).read_text(encoding="utf-8")
+    runtime_mode_cpp = (
+        application_runtime_mode_source / "runtime_mode_coordinator.cpp"
+    ).read_text(encoding="utf-8")
+    application_router_header = (
+        application_routing_include / "application_router_module.hpp"
+    ).read_text(encoding="utf-8")
+    application_router_cpp = (
+        application_routing_source / "application_router_module.cpp"
+    ).read_text(encoding="utf-8")
+    application_router_wiring_cpp = (
+        application_routing_source / "application_router_wiring.cpp"
+    ).read_text(encoding="utf-8")
+    tf_pose_header = (localization_include / "tf_pose_utils.hpp").read_text(encoding="utf-8")
+    tf_pose_cpp = (localization_source / "tf_pose_utils.cpp").read_text(encoding="utf-8")
+    entry_cpp = (package_root / "src" / "robot_api_server_node.cpp").read_text(encoding="utf-8")
+    composition_cpp = application_composition_source()
+    node_cpp = "\n".join(
+        path.read_text(encoding="utf-8")
+        for root, suffix in ((source_root, "*.cpp"), (include_root, "*.hpp"))
+        for path in sorted(root.rglob(suffix))
+    )
     config = (package_root / "config" / "robot_api_server.yaml").read_text(encoding="utf-8")
     launch = (package_root / "launch" / "robot_api_server.launch.py").read_text(encoding="utf-8")
     readme = (package_root / "README.md").read_text(encoding="utf-8")
@@ -6447,6 +7730,12 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     ).read_text(encoding="utf-8")
     overlay_supervisor_script = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_robot_api_server_supervised.sh"
+    ).read_text(encoding="utf-8")
+    systemd_runtime_script = (
+        ROOT / "scripts" / "jetson" / "njrh_systemd_runtime.sh"
+    ).read_text(encoding="utf-8")
+    container_runtime_script = (
+        ROOT / "scripts" / "jetson" / "njrh_container.sh"
     ).read_text(encoding="utf-8")
     floor_navigation_script = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_floor_navigation.sh"
@@ -6500,30 +7789,83 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     lifecycle_doc = (ROOT / "docs" / "runtime_service_lifecycle.md").read_text(encoding="utf-8")
 
     assert "add_executable(robot_api_server_node" in cmake
-    assert "src/api_time_utils.cpp" in cmake
-    assert "src/bms_contact.cpp" in cmake
-    assert "src/docking_job_model.cpp" in cmake
-    assert "src/docking_status_utils.cpp" in cmake
-    assert "src/file_utils.cpp" in cmake
-    assert "src/floor_asset_resolver.cpp" in cmake
-    assert "src/http_common.cpp" in cmake
-    assert "src/localization_result_model.cpp" in cmake
-    assert "src/map_asset_io.cpp" in cmake
-    assert "src/map_asset_writer.cpp" in cmake
-    assert "src/map_catalog.cpp" in cmake
-    assert "src/map_manifest_io.cpp" in cmake
-    assert "src/navigation_cancel_job_model.cpp" in cmake
-    assert "src/poses_io.cpp" in cmake
-    assert "src/runtime_map_context_io.cpp" in cmake
-    assert "src/runtime_map_lookup.cpp" in cmake
-    assert "src/robot_pose_model.cpp" in cmake
-    assert "src/runtime_process_utils.cpp" in cmake
-    assert "src/semantic_layer_io.cpp" in cmake
-    assert "src/storage_models.cpp" in cmake
-    assert "src/subscription_api.cpp" in cmake
-    assert "src/subscription_manager.cpp" in cmake
-    assert "src/tf_pose_utils.cpp" in cmake
+    assert "src/features/maps/catalog_activation/api_time_utils.cpp" in cmake
+    assert "src/features/power/bms_contact.cpp" in cmake
+    assert "src/features/power/power_module.cpp" in cmake
+    assert "src/features/docking/lifecycle/docking_job_model.cpp" in cmake
+    assert "src/features/docking/lifecycle/docking_runtime_module.cpp" in cmake
+    assert "src/features/docking/lifecycle/docking_correction_pause_module.cpp" in cmake
+    assert "src/features/docking/lifecycle/docking_status_utils.cpp" in cmake
+    assert "src/features/maps/catalog_activation/file_utils.cpp" in cmake
+    assert "src/features/maps/catalog_activation/floor_asset_resolver.cpp" in cmake
+    assert "src/infrastructure/http/http_common.cpp" in cmake
+    assert "src/infrastructure/http/api_gateway_module.cpp" in cmake
+    assert "src/infrastructure/http/http_server.cpp" in cmake
+    assert "src/features/localization/localization_result_model.cpp" in cmake
+    assert "src/features/maps/catalog_activation/map_asset_io.cpp" in cmake
+    assert "src/features/mapping/map_asset_writer.cpp" in cmake
+    assert "src/features/maps/catalog_activation/map_catalog.cpp" in cmake
+    assert "src/features/maps/catalog_activation/map_manifest_io.cpp" in cmake
+    assert "src/features/navigation/runtime/navigation_cancel_job_model.cpp" in cmake
+    assert "src/features/maps/poses/poses_io.cpp" in cmake
+    assert "src/features/floor_switch/runtime_map_context_io.cpp" in cmake
+    assert "src/features/maps/catalog_activation/runtime_map_lookup.cpp" in cmake
+    assert "src/features/system_status/robot_pose_model.cpp" in cmake
+    assert "src/features/system_status/system_status_module.cpp" in cmake
+    assert "src/features/system_status/system_status_wiring.cpp" in cmake
+    assert "src/infrastructure/process/runtime_process_utils.cpp" in cmake
+    assert "src/features/maps/keepout/semantic_layer_io.cpp" in cmake
+    assert "src/features/maps/catalog_activation/storage_models.cpp" in cmake
+    assert "src/application/runtime_configuration/runtime_configuration_module.cpp" in cmake
+    assert "src/application/routing/application_router_module.cpp" in cmake
+    assert "src/application/routing/application_router_wiring.cpp" in cmake
+    assert "src/application/subscriptions/subscription_api.cpp" in cmake
+    assert "src/application/subscriptions/subscription_configuration_module.cpp" in cmake
+    assert "src/application/subscriptions/subscription_manager.cpp" in cmake
+    assert "src/application/subscriptions/subscription_module.cpp" in cmake
+    assert "src/application/runtime_mode/runtime_mode_coordinator.cpp" in cmake
+    assert "src/features/localization/tf_pose_utils.cpp" in cmake
     assert "target_include_directories(robot_api_server_node PRIVATE include)" in cmake
+    assert '#include "robot_api_server/application/runtime_mode/runtime_mode_coordinator.hpp"' in node_cpp
+    assert "class RuntimeModeCoordinator" in runtime_mode_header
+    assert "RuntimeModeSnapshot snapshot() const" in runtime_mode_header
+    assert "try_begin_transition" in runtime_mode_header
+    assert "RuntimeModeCoordinator::accept_docking" in runtime_mode_cpp
+    assert "RuntimeModeCoordinator::finish_docking" in runtime_mode_cpp
+    assert 'snapshot.mode = "ERROR"' in runtime_mode_cpp
+    assert 'snapshot.mode = "DOCKING"' in runtime_mode_cpp
+    assert 'snapshot.mode = "MAPPING_2D"' in runtime_mode_cpp
+    assert 'snapshot.mode = "NAVIGATION"' in runtime_mode_cpp
+    assert "RuntimeModeCoordinator runtime_mode_;" in node_cpp
+    assert "runtime_mode_mutex_" not in composition_cpp
+    assert "mode_transition_mutex_" not in composition_cpp
+    assert "class DockingRuntimeModule" in docking_runtime_header
+    assert "DockingObservationSnapshot observation_snapshot() const" in docking_runtime_header
+    assert "create_client<std_srvs::srv::Trigger>" in docking_runtime_cpp
+    assert "create_subscription<robot_interfaces::msg::DockTargetObservation>" in docking_runtime_cpp
+    assert "create_subscription<sensor_msgs::msg::LaserScan>" in docking_runtime_cpp
+    assert "prepare_child_process" in docking_runtime_cpp
+    assert "std::unique_ptr<DockingRuntimeModule> runtime_;" in node_cpp
+    assert "docking_manager_pid_" not in composition_cpp
+    assert "docking_target_observation_mutex_" not in composition_cpp
+    assert "predock_yaw_align_cmd_pub_" not in composition_cpp
+    assert "docking_undock_client_" not in composition_cpp
+    assert "class DockingCorrectionPauseModule" in docking_correction_pause_header
+    assert "bool set_paused(" in docking_correction_pause_header
+    assert "bool release_stale_if_needed(" in docking_correction_pause_header
+    assert "DockingCorrectionPauseModule::set_paused" in docking_correction_pause_cpp
+    assert "DockingCorrectionPauseModule::release_stale_if_needed" in docking_correction_pause_cpp
+    assert "std::unique_ptr<DockingCorrectionPauseModule> correction_pause_;" in node_cpp
+    assert "set_global_correction_paused_for_docking" not in composition_cpp
+    assert "release_stale_docking_fine_pause_if_needed" not in composition_cpp
+    assert "class DockingPredockPoseResolver" in docking_predock_pose_resolver_header
+    assert "std::optional<StoredPose> resolve(" in docking_predock_pose_resolver_header
+    assert "bool validate(" in docking_predock_pose_resolver_header
+    assert "DockingPredockPoseResolver::resolve" in docking_predock_pose_resolver_cpp
+    assert "DockingPredockPoseResolver::validate" in docking_predock_pose_resolver_cpp
+    assert "std::unique_ptr<configuration::DockingPredockPoseResolver> predock_pose_resolver_;" in node_cpp
+    assert "resolve_docking_predock_pose" not in composition_cpp
+    assert "validate_manual_docking_predock_pose" not in composition_cpp
     assert "geometry_msgs" in cmake
     assert "lifecycle_msgs" in cmake
     assert "nav_msgs" in cmake
@@ -6537,7 +7879,7 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "<depend>robot_interfaces</depend>" in package_xml
     assert "<depend>sensor_msgs</depend>" in package_xml
     assert "<depend>tf2_msgs</depend>" in package_xml
-    assert '#include "robot_api_server/api_time_utils.hpp"' in node_cpp
+    assert '#include "robot_api_server/features/maps/catalog_activation/api_time_utils.hpp"' in node_cpp
     assert "utc_timestamp_compact" in api_time_header
     assert "utc_timestamp_iso8601" in api_time_header
     assert "wall_time_seconds" in api_time_header
@@ -6548,11 +7890,11 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "safe_pose_id(prefix)" in api_time_cpp
     assert "fixed_hex(fnv1a64(seed), 8)" in api_time_cpp
     assert "fixed_hex(fnv1a64(seed), 10)" in api_time_cpp
-    assert "std::string utc_timestamp_compact() const" not in node_cpp
-    assert "std::string utc_timestamp_iso8601() const" not in node_cpp
-    assert "double wall_time_seconds() const" not in node_cpp
-    assert "std::string generated_current_pose_id" not in node_cpp
-    assert '#include "robot_api_server/file_utils.hpp"' in node_cpp
+    assert "std::string utc_timestamp_compact() const" not in composition_cpp
+    assert "std::string utc_timestamp_iso8601() const" not in composition_cpp
+    assert "double wall_time_seconds() const" not in composition_cpp
+    assert "std::string generated_current_pose_id" not in composition_cpp
+    assert '#include "robot_api_server/features/maps/catalog_activation/file_utils.hpp"' in node_cpp
     assert "read_text_file" in file_utils_header
     assert "read_optional_text_file" in file_utils_header
     assert "read_binary_file" in file_utils_header
@@ -6567,12 +7909,12 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert 'out << "image: " << image_file' in file_utils_cpp
     assert "fs::copy_file(source, target" in file_utils_cpp
     assert "write_binary_file(path, payload)" in file_utils_cpp
-    assert "std::string read_text_file(const fs::path" not in node_cpp
-    assert "std::string read_optional_text_file(const fs::path" not in node_cpp
-    assert "void write_text_file(const fs::path" not in node_cpp
-    assert "void write_pgm_file(" not in node_cpp
-    assert "std::string yaml_with_image_file" not in node_cpp
-    assert '#include "robot_api_server/floor_asset_resolver.hpp"' in node_cpp
+    assert "std::string read_text_file(const fs::path" not in composition_cpp
+    assert "std::string read_optional_text_file(const fs::path" not in composition_cpp
+    assert "void write_text_file(const fs::path" not in composition_cpp
+    assert "void write_pgm_file(" not in composition_cpp
+    assert "std::string yaml_with_image_file" not in composition_cpp
+    assert '#include "robot_api_server/features/maps/catalog_activation/floor_asset_resolver.hpp"' in node_cpp
     assert "struct FloorAssetPaths" in floor_asset_header
     assert "resolve_floor_asset_paths" in floor_asset_header
     assert "poses_yaml_path" in floor_asset_header
@@ -6583,20 +7925,20 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "fs::path poses_yaml_path" in floor_asset_cpp
     assert "current_poses" in floor_asset_cpp
     assert "find_floor_pose(path, pose_id)" in floor_asset_cpp
-    assert "struct FloorAssetPaths" not in node_cpp
-    assert "bool resolve_floor_asset_paths" not in node_cpp
-    assert "fs::path poses_yaml_path" not in node_cpp
-    assert "std::optional<StoredPose> find_floor_pose" not in node_cpp
-    assert '#include "robot_api_server/navigation_cancel_job_model.hpp"' in node_cpp
+    assert "struct FloorAssetPaths" not in composition_cpp
+    assert "bool resolve_floor_asset_paths" not in composition_cpp
+    assert "fs::path poses_yaml_path" not in composition_cpp
+    assert "std::optional<StoredPose> find_floor_pose" not in composition_cpp
+    assert '#include "robot_api_server/features/navigation/runtime/navigation_cancel_job_model.hpp"' in node_cpp
     assert "struct NavigationCancelJob" in navigation_cancel_header
     assert "navigation_cancel_job_json" in navigation_cancel_header
     assert "std::string navigation_cancel_job_json" in navigation_cancel_cpp
     assert "cancel_all_detail" in navigation_cancel_cpp
     assert '"navigation_stack_stopped\\\":" << (' not in navigation_cancel_cpp
     assert "job.stop_stack && job.stop_stack_ok" in navigation_cancel_cpp
-    assert "struct NavigationCancelJob" not in node_cpp
-    assert "std::string navigation_cancel_job_json(const NavigationCancelJob" not in node_cpp
-    assert '#include "robot_api_server/docking_job_model.hpp"' in node_cpp
+    assert "struct NavigationCancelJob" not in composition_cpp
+    assert "std::string navigation_cancel_job_json(const NavigationCancelJob" not in composition_cpp
+    assert '#include "robot_api_server/features/docking/lifecycle/docking_job_model.hpp"' in node_cpp
     assert "struct DockingJob" in docking_job_header
     assert "docking_job_json" in docking_job_header
     assert "std::string docking_job_json" in docking_job_cpp
@@ -6615,12 +7957,25 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "post_fine_docking_relocalization_required" in docking_job_cpp
     assert "active_navigation_cancel_detail" in docking_job_cpp
     assert "approach_distance_m" in docking_job_cpp
-    assert "struct DockingJob" not in node_cpp
-    assert "std::string docking_job_json(const DockingJob" not in node_cpp
-    assert "socket(AF_INET, SOCK_STREAM" in node_cpp
-    assert "Sec-WebSocket-Accept" in node_cpp
-    assert "websocket_accept_key" in node_cpp
-    assert '#include "robot_api_server/http_common.hpp"' in node_cpp
+    assert "struct DockingJob" not in composition_cpp
+    assert "std::string docking_job_json(const DockingJob" not in composition_cpp
+    assert "socket(AF_INET, SOCK_STREAM" in http_server_cpp
+    assert "socket(AF_INET, SOCK_STREAM" not in composition_cpp
+    assert "class HttpServer" in http_server_header
+    assert "HttpServerCallbacks" in http_server_header
+    assert "active_connections() const" in http_server_header
+    assert "callbacks_.route(*request, peer_is_loopback(client_fd))" in http_server_cpp
+    assert "class ApiGatewayModule" in api_gateway_header
+    assert "class ApiGatewayConfigurationModule" in api_gateway_configuration_header
+    assert "max_http_connections" in api_gateway_configuration_cpp
+    assert "ApiGatewayConfigurationModule::declare_parameters" in node_cpp
+    assert "std::unique_ptr<HttpServer> server_" in api_gateway_header
+    assert "std::unique_ptr<ApiGatewayModule> api_gateway_module_" in node_cpp
+    assert "dependencies.api_gateway->active_connections()" in node_cpp
+    assert "std::unique_ptr<HttpServer>" not in composition_cpp
+    assert "Sec-WebSocket-Accept" in websocket_transport_cpp
+    assert "websocket_accept_key" in websocket_transport_cpp
+    assert '#include "robot_api_server/infrastructure/http/http_common.hpp"' in node_cpp
     assert "struct HttpRequest" in http_header
     assert "struct HttpResponse" in http_header
     assert "struct WebSocketFrame" in http_header
@@ -6630,9 +7985,9 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "websocket_accept_key" in http_cpp
     assert "json_string_value" in http_cpp
     assert "json_object_array_value" in http_cpp
-    assert "struct HttpRequest" not in node_cpp
-    assert "std::optional<HttpRequest> parse_http_request" not in node_cpp
-    assert '#include "robot_api_server/storage_models.hpp"' in node_cpp
+    assert "struct HttpRequest" not in composition_cpp
+    assert "std::optional<HttpRequest> parse_http_request" not in composition_cpp
+    assert '#include "robot_api_server/features/maps/catalog_activation/storage_models.hpp"' in node_cpp
     assert "struct StoredPose" in storage_header
     assert "struct MapManifest" in storage_header
     assert "struct RuntimeMapContext" in storage_header
@@ -6644,11 +7999,11 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "safe_file_stem_from_display_name" in storage_cpp
     assert "fnv1a64" in storage_cpp
     assert "fixed_hex" in storage_cpp
-    assert "struct StoredPose" not in node_cpp
-    assert "struct MapManifest" not in node_cpp
-    assert "bool safe_pose_id" not in node_cpp
-    assert "bool safe_asset_id" not in node_cpp
-    assert '#include "robot_api_server/map_asset_io.hpp"' in node_cpp
+    assert "struct StoredPose" not in composition_cpp
+    assert "struct MapManifest" not in composition_cpp
+    assert "bool safe_pose_id" not in composition_cpp
+    assert "bool safe_asset_id" not in composition_cpp
+    assert '#include "robot_api_server/features/maps/catalog_activation/map_asset_io.hpp"' in node_cpp
     assert "encode_grayscale_png" in map_asset_header
     assert "read_pgm_dimensions" in map_asset_header
     assert "read_nav_map_info" in map_asset_header
@@ -6659,9 +8014,9 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "read_pgm_dimensions" in map_asset_cpp
     assert "read_nav_map_info" in map_asset_cpp
     assert "map_info_json" in map_asset_cpp
-    assert "std::optional<MapYamlInfo> read_nav_map_info" not in node_cpp
-    assert "std::optional<std::pair<std::uint32_t, std::uint32_t>> read_pgm_dimensions" not in node_cpp
-    assert '#include "robot_api_server/map_asset_writer.hpp"' in node_cpp
+    assert "std::optional<MapYamlInfo> read_nav_map_info" not in composition_cpp
+    assert "std::optional<std::pair<std::uint32_t, std::uint32_t>> read_pgm_dimensions" not in composition_cpp
+    assert '#include "robot_api_server/features/mapping/map_asset_writer.hpp"' in node_cpp
     assert "occupancy_to_gray" in map_asset_writer_header
     assert "occupancy_grid_to_image_pixels" in map_asset_writer_header
     assert "map_yaml_text" in map_asset_writer_header
@@ -6672,10 +8027,10 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert '"keepout_mask", "speed_mask", "binary_mask"' in map_asset_writer_cpp
     assert "robot_api_server_slam_toolbox_save" in map_asset_writer_cpp
     assert "254U" in map_asset_writer_cpp
-    assert "std::uint8_t occupancy_to_gray" not in node_cpp
-    assert "std::vector<std::uint8_t> occupancy_grid_to_image_pixels" not in node_cpp
-    assert "std::string map_yaml_text" not in node_cpp
-    assert '#include "robot_api_server/map_catalog.hpp"' in node_cpp
+    assert "std::uint8_t occupancy_to_gray" not in composition_cpp
+    assert "std::vector<std::uint8_t> occupancy_grid_to_image_pixels" not in composition_cpp
+    assert "std::string map_yaml_text" not in composition_cpp
+    assert '#include "robot_api_server/features/maps/catalog_activation/map_catalog.hpp"' in node_cpp
     assert "class MapCatalog" in map_catalog_header
     assert "LegacyMigrationCallback" in map_catalog_header
     assert "floor_root_path" in map_catalog_header
@@ -6691,13 +8046,13 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "MapCatalog::find_map_by_id" in map_catalog_cpp
     assert "MapCatalog::active_floor_map" in map_catalog_cpp
     assert "MapCatalog::unique_active_map_manifest" in map_catalog_cpp
-    assert "std::vector<MapManifest> read_floor_map_manifests" not in node_cpp
-    assert "std::vector<MapManifest> read_all_map_manifests" not in node_cpp
-    assert "std::optional<MapManifest> find_map_by_id" not in node_cpp
-    assert "std::optional<MapManifest> active_floor_map" not in node_cpp
-    assert "std::optional<MapManifest> unique_active_map_manifest" not in node_cpp
-    assert "fs::path floor_root_path" not in node_cpp
-    assert '#include "robot_api_server/map_manifest_io.hpp"' in node_cpp
+    assert "std::vector<MapManifest> read_floor_map_manifests" not in composition_cpp
+    assert "std::vector<MapManifest> read_all_map_manifests" not in composition_cpp
+    assert "std::optional<MapManifest> find_map_by_id" not in composition_cpp
+    assert "std::optional<MapManifest> active_floor_map" not in composition_cpp
+    assert "std::optional<MapManifest> unique_active_map_manifest" not in composition_cpp
+    assert "fs::path floor_root_path" not in composition_cpp
+    assert '#include "robot_api_server/features/maps/catalog_activation/map_manifest_io.hpp"' in node_cpp
     assert "fill_manifest_paths" in manifest_io_header
     assert "map_manifest_json" in manifest_io_header
     assert "read_map_manifest" in manifest_io_header
@@ -6709,11 +8064,11 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "contains a duplicate object key" in manifest_io_cpp
     assert "JsonScalarKind::kString" in manifest_io_cpp
     assert "JsonScalarKind::kBoolean" in manifest_io_cpp
-    assert "std::optional<MapManifest> read_map_manifest" not in node_cpp
-    assert "void write_map_manifest" not in node_cpp
-    assert "std::string map_manifest_json" not in node_cpp
-    assert "void fill_manifest_paths" not in node_cpp
-    assert '#include "robot_api_server/runtime_map_context_io.hpp"' in node_cpp
+    assert "std::optional<MapManifest> read_map_manifest" not in composition_cpp
+    assert "void write_map_manifest" not in composition_cpp
+    assert "std::string map_manifest_json" not in composition_cpp
+    assert "void fill_manifest_paths" not in composition_cpp
+    assert '#include "robot_api_server/features/floor_switch/runtime_map_context_io.hpp"' in node_cpp
     assert "write_runtime_map_context_file" in runtime_context_header
     assert "read_runtime_map_context_file" in runtime_context_header
     assert "njrh.runtime_map_context.v1" in runtime_context_cpp
@@ -6722,10 +8077,10 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "safe_asset_id(*map_id)" in runtime_context_cpp
     assert "write_runtime_map_context_file(" in node_cpp
     assert "read_runtime_map_context_file(" in node_cpp
-    assert "njrh.runtime_map_context.v1" not in node_cpp
+    assert "njrh.runtime_map_context.v1" not in composition_cpp
     assert "double updated_at_sec{0.0};" in storage_header
     assert 'context.updated_at_sec = json_number_value(text, "updated_at").value_or(0.0);' in runtime_context_cpp
-    assert '#include "robot_api_server/runtime_map_lookup.hpp"' in node_cpp
+    assert '#include "robot_api_server/features/maps/catalog_activation/runtime_map_lookup.hpp"' in node_cpp
     assert "safe_map_name" in runtime_map_lookup_header
     assert "runtime_map_asset_paths" in runtime_map_lookup_header
     assert "newest_png_in_directory" in runtime_map_lookup_header
@@ -6739,10 +8094,11 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "name.empty() || name == \".\"" in runtime_map_lookup_cpp
     assert "name.find(\"..\")" in runtime_map_lookup_cpp
     assert "localizer_map.png" in runtime_map_lookup_cpp
-    assert "std::optional<fs::path> resolve_mapping_2d_png" not in node_cpp
-    assert "std::optional<fs::path> newest_png_in_directory" not in node_cpp
-    assert "std::vector<fs::path> runtime_map_asset_paths" not in node_cpp
-    assert '#include "robot_api_server/runtime_process_utils.hpp"' in node_cpp
+    assert "std::optional<fs::path> resolve_mapping_2d_png" not in composition_cpp
+    assert "std::optional<fs::path> newest_png_in_directory" not in composition_cpp
+    assert "std::vector<fs::path> runtime_map_asset_paths" not in composition_cpp
+    assert '#include "robot_api_server/infrastructure/process/runtime_process_utils.hpp"' in docking_runtime_cpp
+    assert '#include "robot_api_server/infrastructure/process/runtime_process_utils.hpp"' not in composition_cpp
     assert "prepare_child_process" in runtime_process_header
     assert "read_proc_cmdline" in runtime_process_header
     assert "process_group_has_live_process" in runtime_process_header
@@ -6756,13 +8112,13 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "std::vector<pid_t> list_proc_pids" in runtime_process_header
     assert "fs::directory_options::skip_permission_denied" in runtime_process_cpp
     assert "catch (const std::ios_base::failure &)" in runtime_process_cpp
-    assert 'for (const pid_t pid : list_proc_pids())' in node_cpp
-    assert 'fs::directory_iterator("/proc")' not in node_cpp
-    assert "void set_close_on_exec" not in node_cpp
-    assert "void close_inherited_fds" not in node_cpp
-    assert "std::string read_proc_cmdline" not in node_cpp
-    assert "bool process_group_has_live_process" not in node_cpp
-    assert '#include "robot_api_server/semantic_layer_io.hpp"' in node_cpp
+    assert 'for (const pid_t process_id : list_proc_pids())' in mapping_runtime_cpp
+    assert 'fs::directory_iterator("/proc")' not in composition_cpp
+    assert "void set_close_on_exec" not in composition_cpp
+    assert "void close_inherited_fds" not in composition_cpp
+    assert "std::string read_proc_cmdline" not in composition_cpp
+    assert "bool process_group_has_live_process" not in composition_cpp
+    assert '#include "robot_api_server/features/maps/keepout/semantic_layer_io.hpp"' in node_cpp
     assert "keepout_semantic_json_path" in semantic_header
     assert "json_raw_or_null" in semantic_header
     assert "keepout_semantic_payload_json" in semantic_header
@@ -6771,10 +8127,25 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert 'json_object_value(semantic_json, "keepout")' in semantic_cpp
     assert "keepout_mask_yaml" in semantic_cpp
     assert "keepout_payload" in semantic_cpp
-    assert "std::string json_raw_or_null" not in node_cpp
-    assert "std::string keepout_semantic_payload_json" not in node_cpp
-    assert "std::string keepout_filter_json" not in node_cpp
-    assert '#include "robot_api_server/subscription_api.hpp"' in node_cpp
+    assert "std::string json_raw_or_null" not in composition_cpp
+    assert "std::string keepout_semantic_payload_json" not in composition_cpp
+    assert "std::string keepout_filter_json" not in composition_cpp
+    assert '#include "robot_api_server/application/subscriptions/subscription_module.hpp"' in node_cpp
+    assert "class SubscriptionConfigurationModule" in subscription_configuration_header
+    assert "subscription_default_ttl_ms" in subscription_configuration_cpp
+    assert "SubscriptionConfigurationModule::declare_parameters" in node_cpp
+    assert "class RuntimeConfigurationModule" in runtime_configuration_header
+    assert "navigate_to_pose_status_topic" in runtime_configuration_cpp
+    assert "RuntimeConfigurationModule::declare_parameters" in node_cpp
+    assert "class ApplicationRouterModule" in application_router_header
+    assert "HttpResponse ApplicationRouterModule::route" in application_router_cpp
+    assert "make_application_router_ports" in application_router_wiring_cpp
+    assert '#include "robot_api_server/application/routing/application_router_module.hpp"' in node_cpp
+    assert "HttpResponse route(" not in composition_cpp
+    assert '#include "robot_api_server/application/subscriptions/subscription_api.hpp"' not in composition_cpp
+    assert '#include "robot_api_server/application/subscriptions/subscription_api.hpp"' in subscription_module_cpp
+    assert "class SubscriptionModule" in subscription_module_header
+    assert "std::optional<HttpResponse> handle_http" in subscription_module_header
     assert "safe_client_id" in subscription_api_header
     assert "subscription_ttl_ms_from_body" in subscription_api_header
     assert "subscription_resources_from_body" in subscription_api_header
@@ -6785,12 +8156,12 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "std::clamp(static_cast<int>(*ttl), 1000, max_ttl_ms)" in subscription_api_cpp
     assert "json_string_array_value(body, \"resources\")" in subscription_api_cpp
     assert "std::sort(resources.begin(), resources.end())" in subscription_api_cpp
-    assert "bool safe_client_id" not in node_cpp
-    assert "int subscription_ttl_ms_from_body" not in node_cpp
-    assert "std::vector<std::string> subscription_resources_from_body" not in node_cpp
-    assert "std::pair<std::string, std::string> subscription_client_id_from_body" not in node_cpp
-    assert "std::string resource_list_json" not in node_cpp
-    assert '#include "robot_api_server/poses_io.hpp"' in node_cpp
+    assert "bool safe_client_id" not in composition_cpp
+    assert "int subscription_ttl_ms_from_body" not in composition_cpp
+    assert "std::vector<std::string> subscription_resources_from_body" not in composition_cpp
+    assert "std::pair<std::string, std::string> subscription_client_id_from_body" not in composition_cpp
+    assert "std::string resource_list_json" not in composition_cpp
+    assert '#include "robot_api_server/features/maps/poses/poses_io.hpp"' in node_cpp
     assert "poses_json_array" in poses_io_header
     assert "read_floor_poses" in poses_io_header
     assert "write_floor_poses" in poses_io_header
@@ -6799,11 +8170,12 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert 'yaml << "poses:\\n"' in poses_io_cpp
     assert "json_string(pose.id)" in poses_io_cpp
     assert "normalize_angle(pose.yaw)" in poses_io_cpp
-    assert "std::vector<StoredPose> read_floor_poses" not in node_cpp
-    assert "void write_floor_poses" not in node_cpp
-    assert "std::string poses_json_array" not in node_cpp
-    assert "void apply_pose_yaml_field" not in node_cpp
-    assert '#include "robot_api_server/subscription_manager.hpp"' in node_cpp
+    assert "std::vector<StoredPose> read_floor_poses" not in composition_cpp
+    assert "void write_floor_poses" not in composition_cpp
+    assert "std::string poses_json_array" not in composition_cpp
+    assert "void apply_pose_yaml_field" not in composition_cpp
+    assert '#include "robot_api_server/application/subscriptions/subscription_manager.hpp"' not in composition_cpp
+    assert '#include "robot_api_server/application/subscriptions/subscription_manager.hpp"' in subscription_module_cpp
     assert "class SubscriptionManager" in subscription_header
     assert "validate_resources" in subscription_header
     assert "snapshot_json" in subscription_header
@@ -6811,10 +8183,10 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "SubscriptionManager::acquire" in subscription_cpp
     assert "SubscriptionManager::expire" in subscription_cpp
     assert "json_string(resource)" in subscription_cpp
-    assert "class SubscriptionManager" not in node_cpp
-    assert "std::map<std::string, std::map<std::string, Clock::time_point>> leases_" not in node_cpp
-    assert '#include "robot_api_server/tf_pose_utils.hpp"' in node_cpp
-    assert '#include "robot_api_server/tf_pose_utils.hpp"' in poses_io_cpp
+    assert "class SubscriptionManager" not in composition_cpp
+    assert "std::map<std::string, std::map<std::string, Clock::time_point>> leases_" not in composition_cpp
+    assert '#include "robot_api_server/features/localization/tf_pose_utils.hpp"' in node_cpp
+    assert '#include "robot_api_server/features/localization/tf_pose_utils.hpp"' in poses_io_cpp
     assert "normalized_frame_id" in tf_pose_header
     assert "normalize_angle" in tf_pose_header
     assert "stamp_to_seconds" in tf_pose_header
@@ -6825,54 +8197,59 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "static_cast<double>(stamp.sec)" in tf_pose_cpp
     assert "std::min(lhs, rhs)" in tf_pose_cpp
     assert "siny_cosp" in tf_pose_cpp
-    assert "std::string normalized_frame_id(std::string frame) const" not in node_cpp
-    assert "double normalize_angle(const double angle) const" not in node_cpp
-    assert "double stamp_to_seconds(const builtin_interfaces::msg::Time" not in node_cpp
-    assert "double older_nonzero_stamp(const double lhs" not in node_cpp
-    assert "double quaternion_yaw(const double x" not in node_cpp
-    assert '#include "robot_api_server/docking_status_utils.hpp"' in node_cpp
+    assert "std::string normalized_frame_id(std::string frame) const" not in composition_cpp
+    assert "double normalize_angle(const double angle) const" not in composition_cpp
+    assert "double stamp_to_seconds(const builtin_interfaces::msg::Time" not in composition_cpp
+    assert "double older_nonzero_stamp(const double lhs" not in composition_cpp
+    assert "double quaternion_yaw(const double x" not in composition_cpp
+    assert '#include "robot_api_server/features/docking/lifecycle/docking_status_utils.hpp"' in node_cpp
     assert "docking_status_is_success" in docking_status_header
     assert "docking_status_is_failure" in docking_status_header
     assert "docking_status_is_undocking" in docking_status_header
     assert "docking_status_is_undocked" in docking_status_header
     assert "docking_status_is_undock_failed" in docking_status_header
     assert "docking_status_is_stopped" in docking_status_header
-    assert 'starts_with(status, "docked")' in docking_status_cpp
-    assert 'starts_with(status, "charging")' in docking_status_cpp
-    assert 'starts_with(status, "undocking")' in docking_status_cpp
-    assert 'starts_with(status, "undocked")' in docking_status_cpp
-    assert 'starts_with(status, "undock_failed")' in docking_status_cpp
-    assert 'status.find("stopped")' in docking_status_cpp
-    assert "bool docking_status_is_success(const std::string & status) const" not in node_cpp
-    assert "bool docking_status_is_failure(const std::string & status) const" not in node_cpp
-    assert "bool docking_status_is_undocking(const std::string & status) const" not in node_cpp
-    assert "bool docking_status_is_undocked(const std::string & status) const" not in node_cpp
-    assert "bool docking_status_is_stopped(const std::string & status) const" not in node_cpp
+    assert 'starts_with(code, "docked")' in docking_status_cpp
+    assert 'starts_with(code, "charging")' in docking_status_cpp
+    assert 'starts_with(leading_status_code(status), "undocking")' in docking_status_cpp
+    assert 'starts_with(leading_status_code(status), "undocked")' in docking_status_cpp
+    assert 'starts_with(leading_status_code(status), "undock_failed")' in docking_status_cpp
+    assert 'starts_with(leading_status_code(status), "stopped")' in docking_status_cpp
+    assert "bool docking_status_is_success(const std::string & status) const" not in composition_cpp
+    assert "bool docking_status_is_failure(const std::string & status) const" not in composition_cpp
+    assert "bool docking_status_is_undocking(const std::string & status) const" not in composition_cpp
+    assert "bool docking_status_is_undocked(const std::string & status) const" not in composition_cpp
+    assert "bool docking_status_is_stopped(const std::string & status) const" not in composition_cpp
     assert "configure_runtime_permissions" in node_cpp
-    assert "robot_api_server refuses to run as root" not in node_cpp
-    assert "NJRH_ALLOW_ROOT_API_SERVER" not in node_cpp
+    assert "robot_api_server refuses to run as root" not in composition_cpp
+    assert "NJRH_ALLOW_ROOT_API_SERVER" not in composition_cpp
     assert "::umask(0002)" in node_cpp
     assert "geometry_msgs::msg::Twist" in node_cpp
     assert "sensor_msgs::msg::BatteryState" in node_cpp
-    assert "sensor_msgs::msg::LaserScan" in node_cpp
+    assert "sensor_msgs::msg::LaserScan" in docking_runtime_cpp
+    assert "sensor_msgs::msg::LaserScan" not in composition_cpp
     assert "tf2_msgs::msg::TFMessage" in node_cpp
-    assert "/ws/v1/teleop" in node_cpp
-    assert "/cmd_vel_api" in node_cpp
-    assert "std_msgs::msg::Bool" in node_cpp
+    assert "/ws/v1/teleop" in teleop_module_cpp
+    assert "/cmd_vel_api" in teleop_configuration_cpp
+    assert "std_msgs::msg::Bool" in teleop_module_cpp
     assert "robot_interfaces::srv::SwitchFloor" in node_cpp
     assert "robot_interfaces::srv::TriggerLocalization" in node_cpp
     assert "geometry_msgs::msg::PoseWithCovarianceStamped" in node_cpp
-    assert "/api/v1/status" in node_cpp
-    assert "bms_state_topic" in node_cpp
-    assert "teleop_stop_on_charging" in node_cpp
-    assert "teleop_charging_current_min_a" in node_cpp
-    assert "bms_charging_contact_voltage_min_v" in node_cpp
-    assert "bms_charging_contact_voltage_max_v" in node_cpp
-    assert "bms_full_soc_threshold_pct" in node_cpp
-    assert "bms_full_soc_voltage_contact_enable" in node_cpp
-    assert "battery_indicates_charging" in node_cpp
-    assert "battery_charging_contact" in node_cpp
-    assert '#include "robot_api_server/bms_contact.hpp"' in node_cpp
+    assert "/api/v1/status" in system_status_module_cpp
+    assert "create_subscription<sensor_msgs::msg::BatteryState>" not in composition_cpp
+    assert "teleop_stop_on_charging" in teleop_configuration_cpp
+    assert "class TeleopConfigurationModule" in teleop_configuration_header
+    assert "TeleopConfigurationModule::declare_parameters" in node_cpp
+    assert "teleop_charging_current_min_a" in power_configuration_cpp
+    assert "bms_charging_contact_voltage_min_v" in power_configuration_cpp
+    assert "bms_charging_contact_voltage_max_v" in power_configuration_cpp
+    assert "bms_full_soc_threshold_pct" in power_configuration_cpp
+    assert "bms_full_soc_voltage_contact_enable" in power_configuration_cpp
+    assert "battery_indicates_charging" not in composition_cpp
+    assert "battery_charging_contact" not in composition_cpp
+    assert '#include "robot_api_server/features/power/bms_contact.hpp"' in node_cpp
+    assert '#include "robot_api_server/features/power/power_configuration_module.hpp"' in node_cpp
+    assert '#include "robot_api_server/features/power/power_module.hpp"' in node_cpp
     assert "BatteryContactEvaluation" in bms_header
     assert "evaluate_battery_charging_contact" in bms_cpp
     assert "POWER_SUPPLY_STATUS_CHARGING" in bms_cpp
@@ -6880,20 +8257,24 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "present_voltage_valid" in bms_cpp
     assert "full_soc_present_voltage_valid" in bms_cpp
     assert "current_above_threshold" in bms_cpp
-    assert "bms_charging_contact_active" in node_cpp
-    assert "teleop_charging_guard_active" in node_cpp
-    assert "charging detected; teleop command stopped" in node_cpp
-    assert "\\\"bms\\\"" in node_cpp
-    assert "\\\"soc\\\"" in node_cpp
-    assert "\\\"soc_valid\\\"" in node_cpp
-    assert "\\\"power_supply_status\\\"" in node_cpp
-    assert "\\\"power_supply_health\\\"" in node_cpp
-    assert "\\\"power_supply_technology\\\"" in node_cpp
-    assert "\\\"present\\\"" in node_cpp
-    assert "\\\"charging_contact\\\"" in node_cpp
-    assert "\\\"charging_contact_reason\\\"" in node_cpp
-    assert "\\\"inferred_docked\\\"" in node_cpp
-    assert '#include "robot_api_server/robot_pose_model.hpp"' in node_cpp
+    assert "class PowerModule" in power_module_header
+    assert "class PowerConfigurationModule" in power_configuration_header
+    assert "PowerConfigurationModule::declare_parameters" in node_cpp
+    assert "create_subscription<sensor_msgs::msg::BatteryState>" in power_module_cpp
+    assert "dependencies_.power->charging_contact_active()" in node_cpp
+    assert "charging_guard_active" in teleop_module_cpp
+    assert "charging detected; teleop command stopped" in teleop_module_cpp
+    assert "\\\"bms\\\"" in system_status_module_cpp
+    assert "\\\"soc\\\"" in system_status_module_cpp
+    assert "\\\"soc_valid\\\"" in system_status_module_cpp
+    assert "\\\"power_supply_status\\\"" in system_status_module_cpp
+    assert "\\\"power_supply_health\\\"" in system_status_module_cpp
+    assert "\\\"power_supply_technology\\\"" in system_status_module_cpp
+    assert "\\\"present\\\"" in system_status_module_cpp
+    assert "\\\"charging_contact\\\"" in system_status_module_cpp
+    assert "\\\"charging_contact_reason\\\"" in system_status_module_cpp
+    assert "\\\"inferred_docked\\\"" in system_status_module_cpp
+    assert '#include "robot_api_server/features/system_status/robot_pose_model.hpp"' in node_cpp
     assert "struct RobotPoseSnapshot" in robot_pose_header
     assert "struct RobotPoseMapIdentity" in robot_pose_header
     assert "no_fresh_map_robot_pose_json" in robot_pose_header
@@ -6903,11 +8284,15 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "no fresh map-frame robot pose" in robot_pose_cpp
     assert "\\\"age_sec\\\":null" in robot_pose_cpp
     assert "\\\"map_id\\\":" in robot_pose_cpp
-    assert "struct RobotPoseSnapshot" not in node_cpp
-    assert "std::string no_fresh_map_robot_pose_json()" not in node_cpp
-    assert "std::string no_fresh_map_robot_pose_json(const std::string & detail)" not in node_cpp
-    assert "/api/v1/robot/pose" in node_cpp
-    assert "handle_robot_pose" in node_cpp
+    assert "struct RobotPoseSnapshot" not in composition_cpp
+    assert "std::string no_fresh_map_robot_pose_json()" not in composition_cpp
+    assert "std::string no_fresh_map_robot_pose_json(const std::string & detail)" not in composition_cpp
+    assert "class SystemStatusModule" in system_status_module_header
+    assert "struct SystemStatusWiringDependencies" in system_status_wiring_header
+    assert "make_system_status_module_ports" in system_status_wiring_cpp
+    assert "/api/v1/robot/pose" in system_status_module_cpp
+    assert "handle_robot_pose" in system_status_module_cpp
+    assert "handle_robot_pose" not in composition_cpp
     assert "wait_for_current_robot_pose" in node_cpp
     assert "robot_pose_freshness_sec" in node_cpp
     assert "TfChainFreshnessSnapshot" in node_cpp
@@ -6917,7 +8302,7 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert '"navigation goal"' in node_cpp
     assert '"docking predock navigation"' in node_cpp
     assert '"docking fine docking"' in node_cpp
-    assert '#include "robot_api_server/localization_result_model.hpp"' in node_cpp
+    assert '#include "robot_api_server/features/localization/localization_result_model.hpp"' in node_cpp
     assert "localization_result_topic" in node_cpp
     assert "handle_localization_result" in node_cpp
     assert "trigger_localization_and_wait_for_result" in node_cpp
@@ -6928,20 +8313,20 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "localization_result seq=" in localization_result_cpp
     assert "no new map-frame " in localization_result_cpp
     assert "because no newer result arrived after trigger" in localization_result_cpp
-    assert "struct LocalizationResultSnapshot" not in node_cpp
+    assert "struct LocalizationResultSnapshot" not in composition_cpp
     assert '#include "lifecycle_msgs/srv/get_state.hpp"' in node_cpp
     assert "navigation_relocalize_before_goal" in node_cpp
     assert "navigation_relocalize_before_goal_always" in node_cpp
     assert "navigation_relocalize_before_goal_required" in node_cpp
     assert "navigation_relocalize_wait_sec" in node_cpp
-    assert "navigation_goal_relocalization_decision" in node_cpp
+    assert "force_pre_navigation_relocalization" in node_cpp
     assert "force_relocalize" in node_cpp
-    assert "confirmed runtime map context and fresh map-frame pose" in node_cpp
-    assert "target floor differs from confirmed runtime map context" not in node_cpp
+    assert "goal_admission_snapshot" in node_cpp
+    assert "target floor differs from confirmed runtime map context" not in composition_cpp
     assert "requested pose target does not match confirmed runtime map context" in node_cpp
-    assert "if (navigation_relocalize_before_goal_ && !pre_navigation_undock)" not in node_cpp
+    assert "if (navigation_relocalize_before_goal_ && !pre_navigation_undock)" not in composition_cpp
     assert "navigation_lifecycle_check_timeout_sec" in node_cpp
-    assert "navigation_lifecycle_snapshot" in node_cpp
+    assert "lifecycle_snapshot" in node_cpp
     assert "navigation lifecycle inactive" in node_cpp
     assert "force_relocalize is no longer executed inside normal navigation goals" in node_cpp
     assert 'bridge_safe_for_goal_start("navigation goal"' in node_cpp
@@ -6958,11 +8343,11 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "docking_manual_predock_min_distance_m" in node_cpp
     assert "docking_manual_predock_max_distance_m" in node_cpp
     assert "docking_manual_predock_max_yaw_error_rad" in node_cpp
-    assert "validate_manual_docking_predock_pose" in node_cpp
-    assert "manual predock pose" in node_cpp
-    assert "failed docking sanity check" in node_cpp
-    assert "distance_check=disabled" in node_cpp
-    assert "heading aligned to the charger" in node_cpp
+    assert "predock_pose_resolver_->validate" in node_cpp
+    assert "manual predock pose" in docking_predock_pose_resolver_cpp
+    assert "failed docking sanity check" in docking_predock_pose_resolver_cpp
+    assert "distance_check=disabled" in docking_predock_pose_resolver_cpp
+    assert "heading aligned to the charger" in docking_predock_pose_resolver_cpp
     assert "docking_relocalize_recent_result_max_age_sec" in node_cpp
     assert "undock_relocalize_after_success" in node_cpp
     assert "undock_relocalize_wait_sec" in node_cpp
@@ -6978,25 +8363,26 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "post-predock localization pose is outside approach tolerance" in node_cpp
     assert "predock_pose_id" in node_cpp
     assert "approach_pose_id" in node_cpp
-    assert "manual_predock_explicit" in node_cpp
-    assert "manual_predock_auto_id" in node_cpp
-    assert "manual_predock_auto_unique_type" in node_cpp
-    assert "dock_predock" in node_cpp
-    assert "dock_approach" in node_cpp
+    assert "manual_predock_explicit" in docking_predock_pose_resolver_cpp
+    assert "manual_predock_auto_id" in docking_predock_pose_resolver_cpp
+    assert "manual_predock_auto_unique_type" in docking_predock_pose_resolver_cpp
+    assert "dock_predock" in docking_predock_pose_resolver_cpp
+    assert "dock_approach" in docking_predock_pose_resolver_cpp
     assert "computed_from_dock_pose" in node_cpp
-    assert "multiple dock_predock poses found" in node_cpp
+    assert "multiple dock_predock poses found" in docking_predock_pose_resolver_cpp
     assert "relocalize_after_fine_docking" in node_cpp
-    assert "docking_after_fine:" in node_cpp
-    assert "relocalized after fine docking" in node_cpp
-    assert 'status.find("not_found")' in docking_status_cpp
-    assert "post_undock_relocalization_requested" in node_cpp
-    assert "post_undock_relocalization_succeeded" in node_cpp
+    assert "docking_after_fine:" in docking_status_module_cpp
+    assert "relocalized after fine docking" in docking_status_module_cpp
+    assert 'starts_with(code, "not_found_")' in docking_status_cpp
+    assert 'code.find("_not_found")' in docking_status_cpp
+    assert "post_undock_relocalization_requested" in docking_status_module_cpp
+    assert "post_undock_relocalization_succeeded" in docking_status_module_cpp
     assert "post_predock_relocalization_requested" in node_cpp
     assert "post_predock_relocalization_succeeded" in node_cpp
     assert "docking_cancel_active_goal_before_predock" in node_cpp
     assert "docking canceled before GS2 fine docking start" in node_cpp
     assert "docking_stop_service_wait_sec" in node_cpp
-    assert "docking_stop_client_->wait_for_service(docking_stop_service_wait())" in node_cpp
+    assert "stop_client_->wait_for_service(stop_service_wait())" in node_cpp
     assert "runtime_map_context_file" in node_cpp
     assert "confirmed_runtime_map_manifest" in node_cpp
     assert "unique_active_map_manifest" in node_cpp
@@ -7033,36 +8419,37 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "keepout_semantic_layer.json" in semantic_cpp
     assert "/api/v1/navigation/goal" in node_cpp
     assert "/api/v1/navigation/cancel" in node_cpp
-    assert "handle_navigation_goal" in node_cpp
-    assert "handle_navigation_cancel" in node_cpp
+    assert "HttpResponse handle_goal" in navigation_module_cpp
+    assert "HttpResponse handle_cancel" in navigation_module_cpp
     assert "NavigateToPose" in node_cpp
     assert "navigate_to_pose_action" in node_cpp
-    assert "navigate_action_mutex_" in node_cpp
-    assert "active_nav_goal_handle_" in node_cpp
-    assert "struct NavigationGoalJob" in node_cpp
-    assert "navigation_goal_job_json_locked" in node_cpp
+    assert "std::mutex action_mutex_;" in node_cpp
+    assert "GoalHandle::SharedPtr active_goal_handle_;" in node_cpp
+    assert '#include "robot_api_server/features/navigation/mission/navigation_goal_job.hpp"' in node_cpp
+    assert "struct NavigationGoalJob" not in composition_cpp
+    assert "mission_runtime_.json()" in node_cpp
     assert "navigation_goal_id" in node_cpp
-    assert "run_navigation_goal_job" in node_cpp
+    assert "NavigationGoalExecutor::run" in goal_executor_cpp
     assert "run_final_yaw_align" in node_cpp
-    assert "publish_final_yaw_align_command" in node_cpp
-    assert "navigation_final_yaw_cmd_pub_" in node_cpp
+    assert "runtime.terminal_publish_command(command)" in node_cpp
+    assert "geometry_msgs::msg::Twist>::SharedPtr command_pub_" in node_cpp
     assert "navigation_goal_position_success_tolerance_m" in node_cpp
     assert "navigation_final_yaw_align_enable" in node_cpp
     assert "navigation_final_yaw_align_trigger_rad" in node_cpp
     assert "navigation_final_yaw_align_kp" in node_cpp
     assert "navigation_final_yaw_align_max_xy_drift_m" in node_cpp
     assert "navigation_final_yaw_align_cmd_topic" in node_cpp
-    assert 'navigation_final_yaw_align_cmd_topic_ != "/cmd_vel_nav"' in node_cpp
-    assert 'navigation_final_yaw_align_cmd_topic_ != "/cmd_vel_api"' in node_cpp
-    assert 'navigation_final_yaw_align_cmd_topic_ = "/cmd_vel_api"' in node_cpp
-    assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel_safe"' not in node_cpp
-    assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel"' not in node_cpp
-    assert "final_pose_auditing" in node_cpp
-    assert "position_reached_yaw_aligning" in node_cpp
-    assert "final_pose_verifying" in node_cpp
-    assert "final_pose_verified" in node_cpp
-    assert "failed_final_pose_verify" in node_cpp
-    assert "blocked_by_safety" in node_cpp
+    assert 'final_yaw_align_cmd_topic != "/cmd_vel_nav"' in node_cpp
+    assert 'final_yaw_align_cmd_topic != "/cmd_vel_api"' in node_cpp
+    assert 'final_yaw_align_cmd_topic = "/cmd_vel_api"' in node_cpp
+    assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel_safe"' not in composition_cpp
+    assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel"' not in composition_cpp
+    assert "final_pose_auditing" in goal_executor_cpp
+    assert "position_reached_yaw_aligning" in goal_executor_cpp
+    assert "final_pose_verifying" in navigation_terminal_cpp
+    assert "final_pose_verified" in goal_executor_cpp
+    assert "failed_final_pose_verify" in goal_executor_cpp
+    assert "blocked_by_safety" in navigation_terminal_cpp
     assert "goal_completion_policy" in node_cpp
     assert "position_only" in node_cpp
     assert "pose_required" in node_cpp
@@ -7073,119 +8460,125 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "yaw_align_failed" in node_cpp
     assert "REPOSITION_AFTER_YAW_DRIFT" in node_cpp
     assert "run_reposition_after_yaw_drift" in node_cpp
-    assert "navigation goal reached by commercial final verification" in node_cpp
-    assert "commercial_final_verify=true" in node_cpp
-    assert "degraded_final_pose_verify" in node_cpp
-    assert "under position_only policy" in node_cpp
-    assert "bool position_reached = pose_check.position_reached;" in node_cpp
-    assert "bool position_reached = nav2_succeeded" not in node_cpp
-    run_goal_block = node_cpp[node_cpp.index("void run_navigation_goal_job("):node_cpp.index("HttpResponse handle_navigation_state()")]
+    assert "navigation goal reached by commercial final verification" in goal_executor_cpp
+    assert "commercial_final_verify=true" in goal_executor_cpp
+    assert "degraded_final_pose_verify" in goal_executor_cpp
+    assert "under position_only policy" in goal_executor_cpp
+    assert "bool position_reached = pose_check.position_reached;" in goal_executor_cpp
+    assert "bool position_reached = nav2_succeeded" not in goal_executor_cpp
+    run_goal_block = goal_executor_cpp
     assert "Nav2 reported success but read-only final pose verification failed" not in run_goal_block
-    assert '"failed_final_pose_verify"' in node_cpp
+    assert '"failed_final_pose_verify"' in goal_executor_cpp
     assert '"nav2_failed"' not in run_goal_block
-    assert '"position_not_reached"' not in node_cpp[node_cpp.index("void run_navigation_goal_job("):]
-    assert "final_yaw_align_blocked" in node_cpp
-    assert "final_yaw_align_attempted" in node_cpp
-    assert "final_yaw_align_blocked_reason" in node_cpp
-    assert "final_yaw_align_duration_sec" in node_cpp
-    assert "final_yaw_align_target_yaw_rad" in node_cpp
-    assert "final_yaw_align_initial_yaw_error_rad" in node_cpp
-    assert "final_yaw_align_final_yaw_error_rad" in node_cpp
-    assert "final_yaw_align_observed_xy_drift_m" in node_cpp
-    assert "final_yaw_align_bypass_collision_monitor" in node_cpp
-    assert "final_pose_verify_reason" in node_cpp
+    assert '"position_not_reached"' not in goal_executor_cpp
+    assert "final_yaw_align_blocked" in navigation_goal_job_cpp
+    assert "final_yaw_align_attempted" in navigation_goal_job_cpp
+    assert "final_yaw_align_blocked_reason" in navigation_goal_job_cpp
+    assert "final_yaw_align_duration_sec" in navigation_goal_job_cpp
+    assert "final_yaw_align_target_yaw_rad" in navigation_goal_job_cpp
+    assert "final_yaw_align_initial_yaw_error_rad" in navigation_goal_job_cpp
+    assert "final_yaw_align_final_yaw_error_rad" in navigation_goal_job_cpp
+    assert "final_yaw_align_observed_xy_drift_m" in navigation_goal_job_cpp
+    assert "final_yaw_align_bypass_collision_monitor" in navigation_goal_job_cpp
+    assert "final_pose_verify_reason" in navigation_goal_job_cpp
     assert "request_navigation_goal_cancel" in node_cpp
     assert "navigation_goal_cancel_requested" in node_cpp
     assert "exception sending navigation goal" in node_cpp
     assert "async_cancel_goal" in node_cpp
     assert "async_cancel_all_goals" in node_cpp
-    assert "exception canceling cached goal handle" in node_cpp
-    assert "exception canceling navigation goals" in node_cpp
+    assert "cancel_goal_and_prove_terminal" in node_cpp
+    assert "exact goal terminal state is unknown" in node_cpp
+    assert "cancel_all_goals_with_evidence" in node_cpp
+    assert "late cancel-all outcome is unknown" in node_cpp
     assert "navigation_cancel_action_wait_sec" in node_cpp
-    assert "navigation_cancel_action_wait()" in node_cpp
-    assert "unhandled API exception" in node_cpp
-    assert "log_http_request" in node_cpp
-    assert "::listen(server_fd_, 64)" in node_cpp
-    assert "SO_RCVTIMEO" in node_cpp
-    assert "SO_SNDTIMEO" in node_cpp
-    assert "failed to send full HTTP response" in node_cpp
+    assert "cancel_action_wait_" in node_cpp
+    assert "unhandled API exception" in http_server_cpp
+    assert "log_http_request" in api_gateway_cpp
+    assert "log_http_request" not in composition_cpp
+    assert "::listen(local_server_fd, 64)" in http_server_cpp
+    assert "SO_RCVTIMEO" in http_server_cpp
+    assert "SO_SNDTIMEO" in http_server_cpp
+    assert "failed to send full HTTP response" in http_server_cpp
     assert "Taking data from action client but no ready event" in node_cpp
     assert "continuing after transient action client executor exception" in node_cpp
     assert "SingleThreadedExecutor executor" in node_cpp
-    assert "set_close_on_exec(server_fd_)" in node_cpp
+    assert "set_close_on_exec(local_server_fd)" in http_server_cpp
     assert "prepare_child_process(" in node_cpp
     assert "timed out waiting for navigation stop command" in node_cpp
-    assert "publish_teleop_zero_burst" in node_cpp
+    assert "teleop->publish_zero_burst()" in node_cpp
     assert "zero_velocity_published" in node_cpp
     assert "action_available" in node_cpp
     assert "cancel_all_detail" in node_cpp
     assert "navigation_stop_command" in node_cpp
-    assert "stop_navigation_runtime_stack" in node_cpp
+    assert "stop_runtime_stack" in node_cpp
     assert "cancel_requested" in node_cpp
     assert "navigation_stack_stopped" in navigation_cancel_cpp
     assert "stop_stack" in node_cpp
     assert "read_floor_poses" in node_cpp
     assert "write_floor_poses" in node_cpp
-    assert "/api/v1/subscriptions/acquire" in node_cpp
-    assert "/api/v1/subscriptions/release" in node_cpp
-    assert "/api/v1/subscriptions/heartbeat" in node_cpp
-    assert "set_subscription_resource_active" in node_cpp
-    assert "Safety and floor health are process-level health inputs" in node_cpp
-    assert "set_status_subscriptions_active(true);" in node_cpp
+    assert "/api/v1/subscriptions/acquire" in subscription_module_cpp
+    assert "/api/v1/subscriptions/release" in subscription_module_cpp
+    assert "/api/v1/subscriptions/heartbeat" in subscription_module_cpp
+    assert "set_resource_active" in subscription_module_cpp
+    assert "Status and safety/floor inputs are process-resident" in subscription_module_cpp
+    assert "subscriptions->handle_http(request)" in node_cpp
+    assert "status->ensure_floor_status_subscription_active();" in node_cpp
+    assert "create_subscription<std_msgs::msg::String>" in system_status_module_cpp
     assert "rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local()" in node_cpp
-    assert "refresh_navigation_resume_runtime_state(false);" in node_cpp
-    assert 'if (mode_transition_owner_snapshot() != "mapping_start")' in node_cpp
-    assert "runtime_mode_snapshot().mapping_active ||" in node_cpp
-    assert "void refresh_navigation_resume_runtime_state(const bool probe_lifecycle = false)" in node_cpp
-    assert "http_worker_loop" in node_cpp
-    assert "http_client_queue_" in node_cpp
-    assert ".detach()" not in node_cpp
-    assert "live_map resource is not acquired" in node_cpp
-    assert "subscription_manager_->release(websocket_client_id" in node_cpp
-    assert "subscription_client_id_from_body" in node_cpp
+    assert "refresh_runtime_state(false);" in node_cpp
+    assert 'transition_owner() != "mapping_start"' in node_cpp
+    assert "runtime.mapping_active ||" in node_cpp
+    assert "void refresh_runtime_state(bool probe_lifecycle = false);" in node_cpp
+    assert "worker_loop" in http_server_cpp
+    assert "client_queue_" in http_server_cpp
+    assert ".detach()" not in (node_cpp + http_server_cpp)
+    assert "live_map resource is not acquired" in mapping_module_cpp
+    assert "ports_.release_subscriptions(websocket_client_id" in teleop_module_cpp
+    assert "subscription_client_id_from_body" in subscription_module_cpp
+    assert "subscription_client_id_from_body" not in composition_cpp
     assert "clientId" in subscription_api_cpp
-    assert "lease_id" in node_cpp
+    assert "lease_id" in subscription_module_cpp
     assert "http:compat-default" in subscription_api_cpp
-    assert "resources_for_client(client_id)" in node_cpp
-    assert "\\\"refreshed\\\":false" in node_cpp
-    assert "/api/v1/mapping/2d/map" in node_cpp
-    assert "image/png" in node_cpp
-    assert "nav_msgs::msg::OccupancyGrid" in node_cpp
-    assert "encode_grayscale_png" in node_cpp
-    assert "handle_start_mapping_2d" in node_cpp
-    assert "handle_stop_mapping_2d" in node_cpp
-    assert "handle_save_mapping_2d" in node_cpp
-    assert "clear_runtime_map_context();" in node_cpp
-    start_mapping_section = node_cpp[
-        node_cpp.index("HttpResponse handle_start_mapping_2d()"):
-        node_cpp.index("HttpResponse handle_stop_mapping_2d()")
+    assert "resources_for_client(client_id)" in subscription_module_cpp
+    assert "\\\"refreshed\\\":false" in subscription_module_cpp
+    assert "/api/v1/mapping/2d/map" in mapping_module_cpp
+    assert "image/png" in mapping_module_cpp
+    assert "nav_msgs::msg::OccupancyGrid" in mapping_module_cpp
+    assert "encode_grayscale_png" in mapping_module_cpp
+    assert "handle_start_mapping_2d" in mapping_module_cpp
+    assert "handle_stop_mapping_2d" in mapping_module_cpp
+    assert "handle_save_mapping_2d" in mapping_module_cpp
+    assert "ports_.clear_runtime_map_context();" in mapping_module_cpp
+    start_mapping_section = mapping_module_cpp[
+        mapping_module_cpp.index("HttpResponse handle_start_mapping_2d("):
+        mapping_module_cpp.index("HttpResponse handle_stop_mapping_2d()")
     ]
-    assert "cancel_navigation_task_for_mode_switch" not in start_mapping_section
-    assert "stop_navigation_runtime_stack" not in start_mapping_section
+    assert "ports_.cancel_navigation" not in start_mapping_section
+    assert "ports_.stop_navigation_runtime" not in start_mapping_section
     assert "run_mapping_start_job_guarded" in start_mapping_section
-    assert "mapping_start_worker_" in start_mapping_section
+    assert "start_worker_" in start_mapping_section
     assert "cannot start 2D mapping while navigation runtime is active; stop navigation runtime first" not in start_mapping_section
-    mapping_start_worker_section = node_cpp[
-        node_cpp.index("void run_mapping_start_job("):
-        node_cpp.index("void run_mapping_start_job_guarded(")
+    mapping_start_worker_section = mapping_module_cpp[
+        mapping_module_cpp.index("void run_mapping_start_job("):
+        mapping_module_cpp.index("void run_mapping_start_job_guarded(")
     ]
-    assert "cancel_navigation_task_for_mode_switch" in mapping_start_worker_section
-    assert "stop_navigation_runtime_stack" in mapping_start_worker_section
-    assert "clear_runtime_map_context();" in mapping_start_worker_section
-    assert "start_mapping_2d_process" in mapping_start_worker_section
-    assert mapping_start_worker_section.index("cancel_navigation_task_for_mode_switch") < mapping_start_worker_section.index("stop_navigation_runtime_stack")
-    assert mapping_start_worker_section.index("stop_navigation_runtime_stack") < mapping_start_worker_section.index("clear_runtime_map_context();")
-    assert mapping_start_worker_section.index("clear_runtime_map_context();") < mapping_start_worker_section.index("start_mapping_2d_process")
+    assert "ports_.cancel_navigation()" in mapping_start_worker_section
+    assert "ports_.stop_navigation_runtime()" in mapping_start_worker_section
+    assert "ports_.clear_runtime_map_context();" in mapping_start_worker_section
+    assert "process_runtime_.start" in mapping_start_worker_section
+    assert mapping_start_worker_section.index("ports_.cancel_navigation()") < mapping_start_worker_section.index("ports_.stop_navigation_runtime()")
+    assert mapping_start_worker_section.index("ports_.stop_navigation_runtime()") < mapping_start_worker_section.index("ports_.clear_runtime_map_context();")
+    assert mapping_start_worker_section.index("ports_.clear_runtime_map_context();") < mapping_start_worker_section.index("process_runtime_.start")
     assert "navigation goals are unavailable while 2D mapping is active or starting" in node_cpp
     assert "navigation cancel/stop is unavailable while 2D mapping is active or starting" in node_cpp
     assert "docking is unavailable while 2D mapping is active or starting" in node_cpp
-    assert "mapping_start_job_json_locked" in node_cpp
-    assert "cancel_navigation_task_for_mode_switch" in node_cpp
-    assert 'if (!runtime_mode_snapshot().navigation_active)' in node_cpp
-    assert "requires_manual_navigation_selection" in node_cpp
+    assert "start_job_.json()" in mapping_module_cpp
+    assert "cancel_task_for_mode_switch" in node_cpp
+    assert "navigation->module().cancel_task_for_mode_switch" in node_cpp
+    assert "requires_manual_navigation_selection" in mapping_module_cpp
     assert "write_last_navigation_map_selection" in node_cpp
     assert "njrh.last_navigation_map.v1" in node_cpp
-    assert "2D map saved and activated" not in node_cpp
+    assert "2D map saved and activated" not in composition_cpp
     assert "handle_delete_map" in node_cpp
     assert "runtime_map_asset_paths" in runtime_map_lookup_cpp
     assert "MapManifest" in node_cpp
@@ -7194,9 +8587,9 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "floor_maps" in node_cpp
     assert "map_info" in node_cpp
     assert "read_nav_map_info" in node_cpp
-    assert "read_pgm_dimensions" not in node_cpp
+    assert "read_pgm_dimensions" not in composition_cpp
     assert "manifest.json" in node_cpp
-    assert "maps/<map_id>" not in node_cpp
+    assert "maps/<map_id>" not in composition_cpp
     assert "\"maps\"" in map_catalog_cpp
     assert "\"current\"" in map_catalog_cpp
     assert "activate_map_manifest" in node_cpp
@@ -7209,58 +8602,58 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "legacy_" in node_cpp
     assert "write_neutral_filter_assets" in map_asset_writer_cpp
     assert "robot_api_server_slam_toolbox_save" in map_asset_writer_cpp
-    assert "terminate_mapping_2d_process_groups_locked" in node_cpp
-    assert "discover_mapping_2d_process_groups" in node_cpp
-    assert "terminate_mapping_2d_residual_processes" in node_cpp
-    assert "discover_mapping_2d_residual_processes" in node_cpp
-    assert "mapping_was_active" in node_cpp
-    assert "stopped_groups" in node_cpp
-    stop_mapping_section = node_cpp[
-        node_cpp.index("HttpResponse handle_stop_mapping_2d()"):
-        node_cpp.index("bool navigation_resume_process_running_locked()")
+    assert "MappingProcessRuntime::terminate_process_groups_locked" in mapping_runtime_cpp
+    assert "discover_mapping_process_groups" in mapping_runtime_cpp
+    assert "terminate_residual_processes" in mapping_runtime_cpp
+    assert "discover_mapping_residual_processes" in mapping_runtime_cpp
+    assert "mapping_was_active" in mapping_module_cpp
+    assert "stopped_groups" in mapping_module_cpp
+    stop_mapping_section = mapping_module_cpp[
+        mapping_module_cpp.index("HttpResponse handle_stop_mapping_2d()"):
+        mapping_module_cpp.index("void refresh_mapping_2d_runtime_state()")
     ]
     assert 'set_mapping_runtime_state(true, "stopping"' not in stop_mapping_section
-    mapping_residual_section = node_cpp[
-        node_cpp.index("bool is_mapping_2d_residual_process_command"):
-        node_cpp.index("std::set<pid_t> discover_mapping_2d_process_groups")
+    mapping_residual_section = mapping_runtime_cpp[
+        mapping_runtime_cpp.index("bool is_mapping_2d_residual_process_command"):
+        mapping_runtime_cpp.index("bool is_safe_mapping_lidar_rps_xps_path")
     ]
-    assert '"fastlio_mapping"' not in mapping_residual_section
-    assert '"laser_mapping"' not in mapping_residual_section
-    assert '"run_fastlio_tf.sh"' not in mapping_residual_section
     assert '"fastlio_mapping_odom_bridge.py"' in mapping_residual_section
     assert '"/mapping/fastlio_odometry"' in mapping_residual_section
     assert '"/tf_slam2d"' in mapping_residual_section
-    assert '"ros2 run fast_lio fastlio_mapping"' not in mapping_residual_section
-    private_fastlio_section = node_cpp[
-        node_cpp.index("bool is_private_slam2d_fastlio_process"):
-        node_cpp.index("bool is_mapping_2d_residual_process_command")
+    assert "return is_private_slam2d_fastlio_process(cmdline, environ);" in mapping_residual_section
+    private_fastlio_section = mapping_runtime_cpp[
+        mapping_runtime_cpp.index("bool is_private_slam2d_fastlio_process"):
+        mapping_runtime_cpp.index("bool is_mapping_2d_residual_process_command")
     ]
     assert '"ros2 run fast_lio fastlio_mapping"' in private_fastlio_section
     assert '"fast_lio/lib/fast_lio/fastlio_mapping"' in private_fastlio_section
     assert '"fastlio_mapping --ros-args"' in private_fastlio_section
     assert "NJRH_SLAM2D_PRIVATE_FASTLIO=1" in private_fastlio_section
     assert '"fastlio_odom_bridge_node"' not in mapping_residual_section
-    assert '"nav_cloud_preprocessor"' not in mapping_residual_section
-    assert '"pointcloud_to_laserscan_node"' not in mapping_residual_section
+    assert 'cmdline.find("nav_cloud_preprocessor")' in mapping_residual_section
+    assert 'cmdline.find("pointcloud_to_laserscan_node")' in mapping_residual_section
+    assert 'environ.find("NJRH_SLAM2D_MAPPING_PIPELINE=1")' in mapping_residual_section
     assert '"scan_republisher_node"' not in mapping_residual_section
     assert "mapping_2d_start_command" in node_cpp
     assert "navigation_resume_command" in node_cpp
     assert "handle_resume_floor_navigation" in node_cpp
     assert "run_navigation_runtime_services.sh" in node_cpp
     assert "run_projected_map.sh" in node_cpp
-    assert "jt128_slam_toolbox_mapping.launch.py" in node_cpp
-    assert "run_navigation_cancel_job_guarded" in node_cpp
-    assert "navigation cancel worker exception" in node_cpp
-    assert "run_docking_job_guarded" in node_cpp
+    assert "jt128_slam_toolbox_mapping.launch.py" in mapping_runtime_cpp
+    assert "run_cancel_job_guarded" in navigation_module_cpp
+    assert "navigation cancel worker exception" in navigation_module_cpp
+    assert "job_executor_->run_guarded(job_id)" in node_cpp
     assert "docking worker exception" in node_cpp
-    assert "live slam_toolbox /map" in node_cpp
+    assert "live slam_toolbox /map" in mapping_module_cpp
     assert "newest_png_in_directory" in runtime_map_lookup_cpp
     assert "resolve_mapping_2d_png" in runtime_map_lookup_cpp
-    assert "/api/v1/safety/stop" in node_cpp
-    assert "/api/v1/safety/resume" in node_cpp
+    assert "/api/v1/safety/stop" not in composition_cpp
+    assert "/api/v1/safety/resume" not in composition_cpp
+    assert "/api/v1/safety/stop" in safety_module_cpp
+    assert "/api/v1/safety/resume" in safety_module_cpp
     assert "/api/v1/floors/switch" in node_cpp
     assert "/api/v1/localization/trigger" in node_cpp
-    assert "endpoint is reserved but not wired to a ROS-native service/action yet" in node_cpp
+    assert "endpoint is reserved but not wired to a ROS-native service/action yet" in application_router_cpp
     assert "api_token" in config
     assert "max_http_connections: 16" in config
     assert "max_http_connections: 16" in overlay_config
@@ -7347,14 +8740,14 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert 'declare_parameter<double>("navigation_auto_undock_timeout_sec", 28.0)' in node_cpp
     assert "docking_undock_charging_retry_sec: 3.0" in config
     assert "mapping_2d_live_map_topic: \"/map\"" in config
-    assert "refresh_mapping_2d_runtime_state();" in node_cpp
-    assert "recover_mapping_2d_process_locked" in node_cpp
-    assert "set_mapping_live_map_cache_active(true)" in node_cpp
-    assert "live_map_mapping_cache_active_" in node_cpp
-    assert "live_map_page_subscription_active_" in node_cpp
-    assert "2D mapping process discovered" in node_cpp
-    assert "\\\"live_map_available\\\"" in node_cpp
-    assert "\\\"live_map_age_sec\\\"" in node_cpp
+    assert "refresh_mapping_2d_runtime_state();" in mapping_module_cpp
+    assert "MappingProcessRuntime::recover_process_locked" in mapping_runtime_cpp
+    assert "set_mapping_live_map_cache_active(true)" in mapping_module_cpp
+    assert "live_map_mapping_cache_active_" in mapping_module_cpp
+    assert "live_map_page_subscription_active_" in mapping_module_cpp
+    assert "2D mapping process discovered" in mapping_module_cpp
+    assert "\\\"live_map_available\\\"" in mapping_module_cpp
+    assert "\\\"live_map_age_sec\\\"" in mapping_module_cpp
     assert "scan_topic: \"/scan\"" in config
     assert "tf_topic: \"/tf\"" in config
     assert "subscription_default_ttl_ms: 10000" in config
@@ -7368,21 +8761,57 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "teleop_watchdog_timeout_sec: 0.5" in config
     assert "teleop_socket_idle_timeout_sec: 5.0" in config
     assert "teleop_repeat_rate_hz: 20.0" in config
-    assert "on_teleop_repeat_timer" in node_cpp
-    assert "teleop_session_active()" in node_cpp
-    assert "charging_contact.contact && teleop_stop_on_charging_ && teleop_session_active()" in node_cpp
-    assert "if (!teleop_session_active())" in node_cpp
-    assert "store_teleop_command(twist)" in node_cpp
-    assert "clear_teleop_command()" in node_cpp
-    assert "set_socket_receive_timeout(client_fd, teleop_socket_idle_timeout_sec_)" in node_cpp
-    assert "json_nested_number_value(payload, \"linear\", \"x\")" in node_cpp
-    assert "json_nested_number_value(payload, \"angular\", \"z\")" in node_cpp
-    assert "json_number_value(payload, \"linearX\")" in node_cpp
-    assert "json_number_value(payload, \"angularZ\")" in node_cpp
-    assert "if (payload_length > 4096U)" in node_cpp
-    assert "if (masked && !recv_exact(client_fd, mask, sizeof(mask)))" in node_cpp
-    assert "if (masked) {" in node_cpp
-    assert "if (!masked || payload_length > 4096U)" not in node_cpp
+    assert "on_repeat_timer" in teleop_module_cpp
+    assert "teleop_session_.session_active()" in teleop_module_cpp
+    assert "active && config_.stop_on_charging && teleop_session_.session_active()" in teleop_module_cpp
+    assert "if (!teleop_session_.session_active())" in teleop_module_cpp
+    assert "store_teleop_command(twist)" in teleop_module_cpp
+    assert "clear_command()" in teleop_module_cpp
+    assert "set_socket_receive_timeout(client_fd, config_.socket_idle_timeout_sec)" in teleop_module_cpp
+    assert "TeleopSessionState teleop_session_" in teleop_module_cpp
+    assert "TeleopSessionState teleop_session_" not in composition_cpp
+    assert "teleop_mutex_" not in composition_cpp
+    assert "payload, \"linear\", \"x\"" in teleop_cpp
+    assert "payload, \"angular\", \"z\"" in teleop_cpp
+    assert "json_number_value(payload, \"linearX\")" in teleop_cpp
+    assert "json_number_value(payload, \"angularZ\")" in teleop_cpp
+    assert "class TeleopSessionState" in teleop_header
+    assert "repeat_decision" in teleop_cpp
+    assert "if (payload_length > 4096U)" in websocket_transport_cpp
+    assert "if (masked && !recv_exact(" in websocket_transport_cpp
+    assert "if (masked) {" in websocket_transport_cpp
+    assert "if (!masked || payload_length > 4096U)" not in websocket_transport_cpp
+    assert "read_websocket_frame" in websocket_transport_header
+    assert "src/features/teleop/teleop_session.cpp" in cmake
+    assert "src/features/teleop/teleop_configuration_module.cpp" in cmake
+    assert "src/features/teleop/teleop_module.cpp" in cmake
+    assert "src/infrastructure/http/api_gateway_configuration_module.cpp" in cmake
+    assert "src/infrastructure/http/websocket_transport.cpp" in cmake
+    assert "test_teleop_session" in cmake
+    assert "test_teleop_configuration_module" in cmake
+    assert "test_teleop_module" in cmake
+    assert "test_websocket_transport" in cmake
+    assert "class SafetyRosAdapter" in safety_adapter_header
+    assert "Final command arbitration" in safety_adapter_header
+    assert "reliable().transient_local()" in safety_adapter_cpp
+    assert "evaluate_hard_block" in safety_state_header
+    assert 'snapshot.status == "COMMAND_STALE"' in safety_state_cpp
+    assert "class SafetyConfigurationModule" in safety_configuration_header
+    assert "safety_estop_topic" in safety_configuration_cpp
+    assert "class SafetyModule" in safety_module_header
+    assert "dependencies_.safety->hard_blocked(detail)" in node_cpp
+    assert "SafetyRosAdapterOptions safety_options" not in composition_cpp
+    assert "safety_adapter_->hard_block_decision()" not in composition_cpp
+    assert "latest_safety_status_" not in composition_cpp
+    assert "latest_motion_allowed_" not in composition_cpp
+    assert "src/features/safety/safety_configuration_module.cpp" in cmake
+    assert "src/features/safety/safety_module.cpp" in cmake
+    assert "src/features/safety/safety_ros_adapter.cpp" in cmake
+    assert "src/features/safety/safety_state.cpp" in cmake
+    assert "test_safety_configuration_module" in cmake
+    assert "test_safety_module" in cmake
+    assert "test_safety_state" in cmake
+    assert "test_safety_ros_adapter" in cmake
     assert "/safety/estop" in config
     assert "/floor_manager/switch_floor" in config
     assert "/global_localization/trigger" in config
@@ -7475,7 +8904,14 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "teleop_max_linear_x_mps: 1.00" in overlay_config
     assert "teleop_socket_idle_timeout_sec: 5.0" in overlay_config
     assert "teleop_repeat_rate_hz: 20.0" in overlay_config
-    assert "ROBOT_API_TOKEN" in overlay_script
+    assert 'std::getenv("ROBOT_API_TOKEN")' in api_gateway_cpp
+    assert 'std::getenv("ROBOT_API_TOKEN")' not in composition_cpp
+    assert 'api_token:="${ROBOT_API_TOKEN}"' not in overlay_script
+    assert "ROBOT_API_TOKEN" not in overlay_script
+    assert '"-e" "ROBOT_API_TOKEN"' in systemd_runtime_script
+    assert 'ROBOT_API_TOKEN=${ROBOT_API_TOKEN' not in systemd_runtime_script
+    assert '-e "ROBOT_API_TOKEN"' in container_runtime_script
+    assert "ROBOT_API_TOKEN='${ROBOT_API_TOKEN" not in container_runtime_script
     assert 'export AMENT_TRACE_SETUP_FILES="${AMENT_TRACE_SETUP_FILES:-}"' in overlay_script
     assert 'export AMENT_PYTHON_EXECUTABLE="${AMENT_PYTHON_EXECUTABLE:-/usr/bin/python3}"' in overlay_script
     assert overlay_script.index("AMENT_TRACE_SETUP_FILES") < overlay_script.index('source "${SCRIPT_DIR}/common_env.sh"')
@@ -7484,6 +8920,12 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert 'pkill -TERM -f "${pattern}"' in overlay_supervisor_script
     assert 'pkill -KILL -f "${pattern}"' in overlay_supervisor_script
     assert "ros2 run robot_api_server robot_api_server_node" in overlay_supervisor_script
+    assert "refusing isolated restart" in overlay_supervisor_script
+    assert "ROBOT_API_SERVER_RESTART_DELAY_SEC" not in overlay_supervisor_script
+    assert 'kill -TERM "${PPID}"' in overlay_supervisor_script
+    assert "verify_robot_api_server_common_health_or_exit" in (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_common_services.sh"
+    ).read_text(encoding="utf-8")
     assert (
         "colcon build --packages-select robot_map_asset_identity robot_interfaces "
         "robot_elevator_manager robot_api_server"
@@ -7534,7 +8976,11 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "bridge_status did not report has_map_to_odom before wrapper timeout fallback" in resident_runtime_script
     assert 'wait_for_fresh_tf_transform "map" "odom" "${tf_timeout}" "${max_tf_age_sec}"' in resident_runtime_script
     assert (
-        'initial_localization_ready_from_bridge_after_wrapper_failure "${bridge_timeout}" "${tf_timeout}"'
+        'initial_localization_ready_from_bridge_after_wrapper_failure \\\n'
+        '      "${bridge_timeout}" \\\n'
+        '      "${tf_timeout}" \\\n'
+        '      "${wrapper_code:-none}" \\\n'
+        '      "${baseline_explicit_sequence}"'
     ) in resident_runtime_script
     assert "map->odom ready owner=robot_localization_bridge" in resident_runtime_script
     assert "bridge_status.has_map_to_odom=true was not observed" in resident_runtime_script
@@ -7551,10 +8997,8 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "NJRH_GLOBAL_LOCALIZATION_TRIGGER_CALL_TIMEOUT:-90" in resident_runtime_script
     assert "resident_navigation_start:${NJRH_BUILDING_ID}/${NJRH_FLOOR_ID}" in resident_runtime_script
     assert "resident localization layer already owns map/localizer loading" in resident_runtime_script
-    assert (
-        "payload=\"{building_id: '${NJRH_BUILDING_ID}', floor_id: '${NJRH_FLOOR_ID}', "
-        "resume_navigation: false}\""
-    ) in resident_runtime_script
+    assert "floor_manager source preflight is not repeated during runtime startup" in resident_runtime_script
+    assert "/floor_manager/switch_floor" not in resident_runtime_script
     assert "resume_navigation: true}" not in resident_runtime_script
     resident_runtime_startup = resident_runtime_script.split('if resident_navigation_ready; then', 1)[1]
     assert "ensure_localization_stack_ready_for_navigation ||" in resident_runtime_startup
@@ -7564,12 +9008,20 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "start_initial_global_localization_background()" in resident_runtime_script
     assert "wait_for_initial_global_localization()" in resident_runtime_script
     assert "NJRH_INITIAL_GLOBAL_LOCALIZATION_BACKGROUND_START:-false" in resident_runtime_script
-    assert "initial global localization trigger will run after localization stack and floor context are ready" in resident_runtime_script
-    assert resident_runtime_startup.index("start_initial_global_localization_background") < resident_runtime_startup.index(
+    assert (
+        "initial global localization trigger is starting after full "
+        "localization-stack and floor-context readiness"
+    ) in resident_runtime_script
+    assert resident_runtime_startup.index(
         "ensure_localization_stack_ready_for_navigation"
-    )
-    assert resident_runtime_startup.index("/floor_manager/switch_floor") < resident_runtime_startup.index(
+    ) < resident_runtime_startup.index('log_startup_stage "floor_asset_context_verified"')
+    assert resident_runtime_startup.index(
+        'log_startup_stage "floor_asset_context_verified"'
+    ) < resident_runtime_startup.index("start_initial_global_localization_background")
+    assert resident_runtime_startup.index(
         "wait_for_initial_global_localization"
+    ) < resident_runtime_startup.index(
+        'start_resident_navigation_layer "true" "nav2_layer_prestarted_held"'
     )
     assert "existing resident navigation context matches selected floor" in resident_runtime_script
     assert 'NJRH_NAV2_REUSE_READY_STACK:-false' in overlay_nav2_script
@@ -7596,6 +9048,10 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert 'DeclareLaunchArgument("log_level", default_value="info")' in occupancy_localization_launch
     assert 'arguments=["--ros-args", "--log-level", log_level]' in occupancy_localization_launch
     assert "PythonExpression" in occupancy_localization_launch
+    assert 'executable="component_container_isolated"' in occupancy_localization_launch
+    assert 'executable="component_container_mt"' not in occupancy_localization_launch
+    assert "respawn=True" in occupancy_localization_launch
+    assert "respawn_delay=0.5" in occupancy_localization_launch
     assert 'ensure_map_server_active "${NAV2_MAP_YAML}" "${MAP_SERVER_READY_TIMEOUT}"' not in occupancy_localization_script
     assert "localization pointcloud startup probe disabled" in occupancy_localization_script
     assert "standard_nav_stack_ready()" in overlay_nav2_script
@@ -7695,7 +9151,7 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "startup waits for the trigger wrapper to report a bridge-accepted `map -> odom`" in app_doc
     assert "run_occupancy_grid_localization.sh" in resident_runtime_script
     assert "run_nav2_navigation.sh" in resident_runtime_script
-    assert "/floor_manager/switch_floor" in resident_runtime_script
+    assert "/floor_manager/switch_floor" not in resident_runtime_script
     assert "global_localization_node" in global_localization_script
     assert "global_localization_node.py" not in global_localization_script
     assert "GLOBAL_LOCALIZATION_PARAMS_FILE" in global_localization_script
@@ -7727,7 +9183,7 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "map_odom_publish_gap_ms" in global_localization_node
     assert "map_to_odom_bridge_publish_healthy" in global_localization_node
     assert "map_to_odom_ready(latest)" in global_localization_node
-    assert "failure_code=FRESH_LOCALIZATION_RETRY_REQUIRED" in global_localization_node
+    assert "draining pre-arm localization_result inside the same trigger transaction" in global_localization_node
     assert "failure_code=BRIDGE_ACCEPT_TIMEOUT" in global_localization_node
     assert "failure_code=MAP_TO_ODOM_TIMEOUT" in global_localization_node
     assert "done.wait" not in global_localization_node
@@ -7808,7 +9264,7 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "wait_for_tf_transform()" in nav_runtime_helpers
     assert "lookupTransform(target, source, tf2::TimePointZero" in runtime_probe_cpp
     assert "buffer.can_transform" not in nav_runtime_helpers
-    assert "refresh_navigation_resume_runtime_state" in node_cpp
+    assert "refresh_runtime_state" in node_cpp
     assert "navigation runtime process exited before ready" in node_cpp
     assert 'context && !context->confirmed && context->state == "failed"' in node_cpp
     assert "navigation runtime failed before ready" in node_cpp
@@ -7826,14 +9282,20 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert '\\"external_runtime\\":' in node_cpp
     assert "navigation_runtime_reused" in node_cpp
     assert "reused" in node_cpp
-    assert node_cpp.index("existing_resume_process_running") < node_cpp.index("terminate_navigation_resume_process_locked();")
+    assert node_cpp.index("existing_resume_process_running") < node_cpp.index(
+        "process_runtime_.terminate_managed_process();"
+    )
     assert 'context->confirmed && context->state == "ready"' in node_cpp
     assert "action_server_is_ready" in node_cpp
     assert "navigation runtime ready" in node_cpp
     assert "const bool pre_nav_resume = request->resume_navigation" not in floor_manager_code
     assert "if (request->resume_navigation)" in floor_manager_code
     assert "LEGACY_RESUME_NAVIGATION_DISABLED" in floor_manager_code
-    assert 'floor assets selected for next navigation: ' in floor_manager_code
+    assert (
+        "floor source preflight verified; API activation is still required: "
+        in floor_manager_code
+    )
+    assert 'publish_status("switching:" + map_key)' not in floor_manager_code
     assert "create_client<nav2_msgs::srv::ClearEntireCostmap>" in floor_manager_code
     assert "create_client<std_srvs::srv::Empty>" not in floor_manager_code
     assert resident_runtime_script.index("run_occupancy_grid_localization.sh") < resident_runtime_script.index(
@@ -7841,8 +9303,8 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     )
     assert resident_runtime_script.index(
         'sleep "${NJRH_NAV_LOCALIZATION_START_SETTLE_SEC:-0.1}"'
-    ) < resident_runtime_script.index("/floor_manager/switch_floor")
-    assert resident_runtime_startup.index("/floor_manager/switch_floor") < resident_runtime_startup.index(
+    ) < resident_runtime_script.index('log_startup_stage "floor_asset_context_verified"')
+    assert resident_runtime_startup.index('log_startup_stage "floor_asset_context_verified"') < resident_runtime_startup.index(
         "wait_for_initial_global_localization"
     )
     assert resident_runtime_startup.index("wait_for_initial_global_localization") < resident_runtime_startup.index(
@@ -7851,18 +9313,19 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert resident_runtime_startup.index("wait_for_initial_global_localization") < resident_runtime_startup.index(
         'sleep "${NJRH_NAV_RUNTIME_READY_MARK_DELAY_SEC:-0.0}"'
     )
-    assert "dashboard_server" not in node_cpp
-    assert "patch_dashboard_runtime" not in node_cpp
-    assert "system(" not in node_cpp
-    assert "popen(" not in node_cpp
+    assert "dashboard_server" not in composition_cpp
+    assert "patch_dashboard_runtime" not in composition_cpp
+    assert "system(" not in composition_cpp
+    assert "popen(" not in composition_cpp
     assert "/api/v1/docking/undock" in node_cpp
-    assert "handle_docking_undock" in node_cpp
+    assert "handle_undock" in node_cpp
     assert "undock_before_navigation_if_needed" in node_cpp
-    assert "start_pre_navigation_undock" in node_cpp
-    assert "wait_for_pre_navigation_undock" in node_cpp
+    assert "class PreNavigationUndockModule" in pre_navigation_undock_header
+    assert "bool PreNavigationUndockModule::start" in pre_navigation_undock_cpp
+    assert "bool PreNavigationUndockModule::wait_for_completion" in pre_navigation_undock_cpp
     assert "call_undock_service_with_charging_retry" in node_cpp
-    assert "TriggerServiceObservation" in node_cpp
-    assert "call_docking_trigger_service_observed" in node_cpp
+    assert "DockingUndockServiceObservation" in node_cpp
+    assert "call_trigger_service_observed" in node_cpp
     assert "docking_service_success" in node_cpp
     assert "docking_service_message" in node_cpp
     assert "docking_status_at_request" in node_cpp
@@ -7870,14 +9333,14 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "undock_started_observed" in node_cpp
     assert "undock_cmd_count_observed" in node_cpp
     assert "undock_failure_reason" in node_cpp
-    assert "service_success_without_undocking_status_observed_yet" in node_cpp
+    assert "service_success_without_undocking_status_observed_yet" in pre_navigation_undock_cpp
     assert "already running; no new /docking/undock service call" in node_cpp
-    assert "complete_post_undock_relocalization" in node_cpp
-    assert "relocalize_after_undock" in node_cpp
-    assert "undock_after_success" in node_cpp
+    assert "complete_post_undock_relocalization" in docking_status_module_cpp
+    assert "relocalize_after_undock" in docking_status_module_cpp
+    assert "undock_after_success" in docking_status_module_cpp
     assert "waiting for docking manager charging state before undock" in node_cpp
     assert "pre_navigation_undock" in node_cpp
-    assert "docking_undock_client_" in node_cpp
+    assert "undock_client_" in node_cpp
     assert "docking_status_is_undocked" in node_cpp
     assert "undock requires docked state or live charging contact" in node_cpp
 
@@ -8002,7 +9465,38 @@ def test_robot_safety_node_exports_stateful_final_cmd_vel_contract():
     overlay_config_text = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "robot_safety.yaml"
     ).read_text(encoding="utf-8")
+    lateral_watchdog_wrapper = (
+        ROOT
+        / "src"
+        / "robot_safety"
+        / "test"
+        / "run_isolated_normal_lateral_watchdog_smoke.sh"
+    ).read_text(encoding="utf-8")
+    lateral_watchdog_smoke = (
+        ROOT
+        / "src"
+        / "robot_safety"
+        / "test"
+        / "isolated_normal_lateral_watchdog_smoke.py"
+    ).read_text(encoding="utf-8")
     api_node = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(encoding="utf-8")
+    navigation_terminal_runtime_cpp = (
+        ROOT / "src" / "robot_api_server" / "src" / "features" / "navigation"
+        / "terminal_control" / "navigation_terminal_runtime_module.cpp"
+    ).read_text(encoding="utf-8")
+    docking_runtime_cpp = (
+        ROOT / "src" / "robot_api_server" / "src" / "features" / "docking"
+        / "lifecycle" / "docking_runtime_module.cpp"
+    ).read_text(encoding="utf-8")
+    teleop_module_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "teleop"
+        / "teleop_module.cpp"
+    ).read_text(encoding="utf-8")
     docking_node = (
         ROOT / "src" / "robot_docking_manager" / "src" / "docking_manager_node.cpp"
     ).read_text(encoding="utf-8")
@@ -8064,13 +9558,12 @@ def test_robot_safety_node_exports_stateful_final_cmd_vel_contract():
     assert 'declare_parameter<double>("zero_cmd_priority_epsilon", 0.0001)' in node_script
     assert 'declare_parameter<double>("zero_cmd_priority_burst_sec", 0.25)' in node_script
     assert "rclcpp::QoS(rclcpp::KeepLast(cmd_vel_qos_depth_)).reliable()" in node_script
-    assert "const auto command_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable();" in api_node
-    assert "create_publisher<geometry_msgs::msg::Twist>(teleop_cmd_topic_, command_qos)" in api_node
-    assert (
-        "create_publisher<geometry_msgs::msg::Twist>(navigation_final_yaw_align_cmd_topic_, command_qos)"
-        in api_node
-    )
-    assert "create_publisher<geometry_msgs::msg::Twist>(predock_yaw_align_cmd_topic_, command_qos)" in api_node
+    assert "command_pub_ = node_.create_publisher<geometry_msgs::msg::Twist>" in navigation_terminal_runtime_cpp
+    assert "config_.command_topic, rclcpp::QoS(rclcpp::KeepLast(1)).reliable()" in navigation_terminal_runtime_cpp
+    assert "create_publisher<geometry_msgs::msg::Twist>" in teleop_module_cpp
+    assert "config_.cmd_topic, command_qos" in teleop_module_cpp
+    assert "config_.command_topic, command_qos" in docking_runtime_cpp
+    assert "predock_yaw_align_cmd_pub_" not in api_node
     assert "cmd_vel_topic_, rclcpp::QoS(rclcpp::KeepLast(1)).reliable()" in docking_node
     assert "rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local()" in ranger_core
     assert "cmd_qos = QoSProfile(depth=1)" in cmd_vel_stop_latency
@@ -8122,6 +9615,12 @@ def test_robot_safety_node_exports_stateful_final_cmd_vel_contract():
     assert "mode_exit_guard releasing stale lateral motion_mode" in node_script
     assert "mode_exit_guard probing DUAL_ACKERMAN" in node_script
     assert "std::max(std::abs(cmd.linear.x), mode_exit_guard_probe_speed_mps_)" in node_script
+    assert "bool normal_command_fresh() const" in node_script
+    assert "actual_motion_mode_is_lateral() && !normal_command_fresh()" in node_script
+    assert "ROS_DOMAIN_ID=182" in lateral_watchdog_wrapper
+    assert "/lateral_guard_test/output" in lateral_watchdog_wrapper
+    assert "fresh normal lateral stream was interrupted by safety-timer zeros" in lateral_watchdog_smoke
+    assert "stale normal lateral stream did not produce watchdog zero" in lateral_watchdog_smoke
     assert 'declare_parameter<std::string>("api_cmd_vel_in_topic", "/cmd_vel_api")' in node_script
     assert 'declare_parameter<bool>("enable_api_cmd_priority", true)' in node_script
     assert 'declare_parameter<std::string>("docking_cmd_vel_in_topic", "/cmd_vel_docking")' in node_script
@@ -8200,6 +9699,9 @@ def test_floor_manager_package_and_asset_contracts_exist():
     config = (package_root / "config" / "floor_manager.yaml").read_text(encoding="utf-8")
     map_toolkit = (ROOT / "src" / "robot_map_toolkit" / "scripts" / "map_toolkit_cli.py").read_text(encoding="utf-8")
     interfaces_cmake = (ROOT / "src" / "robot_interfaces" / "CMakeLists.txt").read_text(encoding="utf-8")
+    switch_floor_srv = (
+        ROOT / "src" / "robot_interfaces" / "srv" / "SwitchFloor.srv"
+    ).read_text(encoding="utf-8")
     assert (package_root / "launch" / "floor_manager.launch.py").exists()
     assert "add_executable(floor_manager_node src/floor_manager_node.cpp)" in cmake
     assert "lifecycle_msgs" in cmake
@@ -8227,6 +9729,18 @@ def test_floor_manager_package_and_asset_contracts_exist():
     assert "poses.yaml" in node_cpp
     assert "require_filter_assets: true" in config
     assert "srv/SwitchFloor.srv" in interfaces_cmake
+    assert "string map_id" in switch_floor_srv
+    assert "uint64 expected_asset_epoch" in switch_floor_srv
+    assert "string expected_asset_digest" in switch_floor_srv
+    assert "string selected_map_id" in switch_floor_srv
+    assert "uint64 asset_epoch" in switch_floor_srv
+    assert "string asset_digest" in switch_floor_srv
+    assert "FloorAssetSnapshotLoader" in node_cpp
+    assert "selected_map_id_ = assets.map_id" not in node_cpp
+    assert 'publish_status(success ? "idle" : ("failed:" + message))' in node_cpp
+    assert 'publish_status("switching:" + map_key)' not in node_cpp
+    assert "floor source preflight verified; API activation is still required" in node_cpp
+    assert "test_floor_manager_exact_selection" in cmake
     assert "action/FloorSwitch.action" in interfaces_cmake
     assert "msg/FloorSwitchStatus.msg" in interfaces_cmake
     assert "REQUIRED_RELATIVE_ASSETS" in map_toolkit
@@ -8235,30 +9749,251 @@ def test_floor_manager_package_and_asset_contracts_exist():
     assert "localizer/localizer_params.yaml" in map_toolkit
 
 
+def test_live_floor_switch_retries_only_proven_pre_dispatch_localization_failures():
+    floor_root = ROOT / "src" / "robot_floor_manager"
+    policy_header = (
+        floor_root
+        / "include"
+        / "robot_floor_manager"
+        / "floor_transition_reconciliation.hpp"
+    ).read_text(encoding="utf-8")
+    policy_source = (
+        floor_root / "src" / "floor_transition_reconciliation.cpp"
+    ).read_text(encoding="utf-8")
+    floor_node = (floor_root / "src" / "floor_manager_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    policy_test = (
+        floor_root / "test" / "test_floor_transition_reconciliation.cpp"
+    ).read_text(encoding="utf-8")
+
+    assert "classify_explicit_localization_failure" in policy_header
+    for code in (
+        "LOCALIZER_POST_RELOAD_NOT_READY",
+        "LOCALIZER_OPERATION_BUSY",
+        "LOCALIZER_INPUT_NOT_FRESH",
+        "ISAAC_SERVICE_UNAVAILABLE",
+        "BRIDGE_FORCE_ACCEPT_UNAVAILABLE",
+        "BRIDGE_FORCE_ACCEPT_TIMEOUT",
+    ):
+        assert code in policy_source
+        assert code in policy_test
+    for code in (
+        "FRESH_LOCALIZATION_RETRY_REQUIRED",
+        "ISAAC_DISPATCH_TIMEOUT",
+        "LOCALIZATION_RESULT_TIMEOUT",
+        "BRIDGE_ACCEPT_TIMEOUT",
+        "MAP_TO_ODOM_TIMEOUT",
+    ):
+        assert code not in policy_source
+        assert code in policy_test
+    assert "dispatch_state=not_dispatched" in policy_source
+    assert "MAP_TO_ODOM_WRONG_OWNER" in policy_test
+    assert "TF_HISTORY_MISSING" in policy_test
+
+    trigger_body = floor_node.split(
+        "bool trigger_localization(const FloorAssets & assets, std::string & error)", 1
+    )[1].split("\n  bool clear_costmap(", 1)[0]
+    deadline_index = trigger_body.index("const auto deadline =")
+    retry_loop_index = trigger_body.index(
+        "while (!shutting_down_.load() && !cancel_requested_.load())"
+    )
+    assert deadline_index < retry_loop_index
+    assert trigger_body.count("const auto deadline =") == 1
+    assert "classify_explicit_localization_failure(error)" in trigger_body
+    assert "retryable explicit localization failure kept inside floor transaction" in trigger_body
+    assert "std::chrono::milliseconds(50)" in trigger_body
+    assert "s total retry budget after " in trigger_body
+
+
+def test_floor_switch_pause_handoff_is_transaction_scoped_and_level_triggered():
+    action = (
+        ROOT / "src" / "robot_interfaces" / "action" / "FloorSwitch.action"
+    ).read_text(encoding="utf-8")
+    floor_header = (
+        ROOT
+        / "src"
+        / "robot_floor_manager"
+        / "include"
+        / "robot_floor_manager"
+        / "floor_transition_executor.hpp"
+    ).read_text(encoding="utf-8")
+    floor_source = (
+        ROOT / "src" / "robot_floor_manager" / "src" / "floor_transition_executor.cpp"
+    ).read_text(encoding="utf-8")
+    floor_node = (
+        ROOT / "src" / "robot_floor_manager" / "src" / "floor_manager_node.cpp"
+    ).read_text(encoding="utf-8")
+    api_source = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "elevator"
+        / "execution"
+        / "elevator_ros_runtime_port.cpp"
+    ).read_text(encoding="utf-8")
+    api_cmake = (
+        ROOT / "src" / "robot_api_server" / "CMakeLists.txt"
+    ).read_text(encoding="utf-8")
+
+    assert "string transaction_id" in action.split("---")[-1]
+    assert "uint64 stage_sequence" in action.split("---")[-1]
+    assert "bool caller_pause_handoff_ready" in action.split("---")[-1]
+    assert "floor_transition_caller_pause_handoff_ready" in floor_header
+    assert "FloorTransitionState::kReportingBeginReady ||" in floor_source
+    assert "FloorTransitionState::kVerifyingPauseHandoff" in floor_source
+    assert "feedback->transaction_id = request.transaction_id" in floor_node
+    assert "feedback->stage_sequence = output.effect.sequence" in floor_node
+    assert "feedback->caller_pause_handoff_ready" in floor_node
+    assert "FloorSwitchHandoffTracker floor_handoff_tracker_" in api_source
+    assert "feedback->stage == kVerifyPauseHandoffStage" in api_source
+    assert "floor_handoff_tracker_.snapshot().ready" in api_source
+    assert "src/features/floor_switch/floor_switch_handoff_tracker.cpp" in api_cmake
+    assert "test_floor_switch_handoff_tracker" in api_cmake
+
+
+def test_floor_switch_cold_start_nav_idle_requires_stable_action_graph():
+    floor_root = ROOT / "src" / "robot_floor_manager"
+    evidence_header = (
+        floor_root
+        / "include"
+        / "robot_floor_manager"
+        / "floor_transition_evidence_tracker.hpp"
+    ).read_text(encoding="utf-8")
+    evidence_source = (
+        floor_root / "src" / "floor_transition_evidence_tracker.cpp"
+    ).read_text(encoding="utf-8")
+    floor_node = (floor_root / "src" / "floor_manager_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    floor_config = (floor_root / "config" / "floor_manager.yaml").read_text(
+        encoding="utf-8"
+    )
+    floor_test = (
+        floor_root / "test" / "test_floor_transition_evidence_tracker.cpp"
+    ).read_text(encoding="utf-8")
+    runtime_launcher = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "run_floor_manager.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "observe_nav_graph_ready" in evidence_header
+    assert "cold_start_proves_idle" in evidence_source
+    assert "nav_graph_ready_ &&" in evidence_source
+    assert "nav_active_.received_steady_sec < 0.0" in evidence_source
+    assert "action_server_is_ready()" in floor_node
+    assert "count_publishers(navigate_to_pose_status_topic_) > 0U" in floor_node
+    assert 'declare_parameter<double>("nav_idle_bootstrap_grace_sec", 2.0)' in floor_node
+    assert "nav_idle_bootstrap_grace_sec: 2.0" in floor_config
+    assert "NJRH_NAV_IDLE_BOOTSTRAP_GRACE_SEC:-2.0" in runtime_launcher
+    assert "ProvesColdStartIdleAfterStableActionServerWithoutStatus" in floor_test
+    assert "Any later active status overrides" in floor_test
+    assert "Losing the action server invalidates" in floor_test
+
+
+def test_manual_live_floor_switch_http_wraps_only_the_strict_action():
+    api_root = ROOT / "src" / "robot_api_server"
+    entry_source = (api_root / "src" / "robot_api_server_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    floor_switch_source = (
+        api_root / "src" / "features" / "floor_switch" / "floor_switch_module.cpp"
+    ).read_text(
+        encoding="utf-8"
+    )
+    transaction_source = (
+        api_root / "src" / "features" / "floor_switch" / "floor_switch_http_transaction.cpp"
+    ).read_text(encoding="utf-8")
+    api_cmake = (api_root / "CMakeLists.txt").read_text(encoding="utf-8")
+    overlay_config = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "robot_api_server.yaml"
+    ).read_text(encoding="utf-8")
+
+    for method, endpoint in (
+        ("POST", "/api/v1/floor-switch/start"),
+        ("GET", "/api/v1/floor-switch/state"),
+        ("POST", "/api/v1/floor-switch/cancel"),
+    ):
+        assert f'request.method == "{method}" && request.path == "{endpoint}"' in floor_switch_source
+        assert endpoint not in entry_source
+    live_body = floor_switch_source.split(
+        "HttpResponse handle_live_start", 1
+    )[1].split("HttpResponse handle_live_state", 1)[0]
+    assert "live_client_->async_send_goal" in live_body
+    assert "goal.expected_asset_epoch = manifest->asset_epoch" in live_body
+    assert "goal.expected_asset_digest = manifest->asset_digest" in live_body
+    assert "startNavigation" not in live_body
+    assert "handle_offline_switch(" not in live_body
+    assert "activate_map_manifest" not in live_body
+    assert 'live_floor_switch_action: "/floor_manager/floor_switch"' in overlay_config
+    assert "FLOOR_SWITCH_TRANSACTION_BUSY" in transaction_source
+    assert "FLOOR_SWITCH_RECOVERY_REQUIRED" in transaction_source
+    assert "runtime_context_valid" in transaction_source
+    assert "src/features/floor_switch/floor_switch_http_transaction.cpp" in api_cmake
+    assert "test_floor_switch_http_transaction" in api_cmake
+
+
 def test_p6_floor_transition_negative_interlock_contract():
     api_root = ROOT / "src" / "robot_api_server"
-    api_code = (api_root / "src" / "robot_api_server_node.cpp").read_text(encoding="utf-8")
+    entry_code = (api_root / "src" / "robot_api_server_node.cpp").read_text(encoding="utf-8")
+    floor_switch_code = (
+        api_root / "src" / "features" / "floor_switch" / "floor_switch_module.cpp"
+    ).read_text(encoding="utf-8")
+    docking_http_code = (
+        api_root
+        / "src"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_http_module.cpp"
+    ).read_text(encoding="utf-8")
+    maps_code = (api_root / "src" / "features" / "maps" / "maps_module.cpp").read_text(
+        encoding="utf-8"
+    )
+    feature_code = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((api_root / "src" / "features").rglob("*.cpp"))
+    )
     api_cmake = (api_root / "CMakeLists.txt").read_text(encoding="utf-8")
     api_config = (api_root / "config" / "robot_api_server.yaml").read_text(encoding="utf-8")
     overlay_api_config = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "robot_api_server.yaml"
     ).read_text(encoding="utf-8")
     interlock_header = (
-        api_root / "include" / "robot_api_server" / "floor_runtime_interlock.hpp"
+        api_root
+        / "include"
+        / "robot_api_server"
+        / "features"
+        / "floor_switch"
+        / "floor_runtime_interlock.hpp"
     ).read_text(encoding="utf-8")
     interlock_source = (
-        api_root / "src" / "floor_runtime_interlock.cpp"
+        api_root / "src" / "features" / "floor_switch" / "floor_runtime_interlock.cpp"
     ).read_text(encoding="utf-8")
     interlock_test = (
-        api_root / "test" / "test_floor_runtime_interlock.cpp"
+        api_root / "test" / "features" / "floor_switch" / "test_floor_runtime_interlock.cpp"
+    ).read_text(encoding="utf-8")
+    floor_http_smoke = (
+        api_root / "test" / "features" / "floor_switch" / "floor_runtime_http_smoke.py"
     ).read_text(encoding="utf-8")
 
-    assert "robot_interfaces/msg/floor_switch_status.hpp" in api_code
-    assert "robot_interfaces/msg/localization_health.hpp" in api_code
-    assert "create_subscription<robot_interfaces::msg::FloorSwitchStatus>" in api_code
-    assert "create_subscription<robot_interfaces::msg::LocalizationHealth>" in api_code
-    assert "FLOOR_TRANSITION_BLOCKED" in api_code
-    assert "floor_runtime_negative_interlock_enabled" in api_code
+    assert "robot_interfaces/msg/floor_switch_status.hpp" in floor_switch_code
+    assert "robot_interfaces/msg/localization_health.hpp" in floor_switch_code
+    assert "create_subscription<robot_interfaces::msg::FloorSwitchStatus>" in floor_switch_code
+    assert "create_subscription<robot_interfaces::msg::LocalizationHealth>" in floor_switch_code
+    assert "FLOOR_TRANSITION_BLOCKED" in floor_switch_code
+    assert "floor_runtime_negative_interlock_enabled" in feature_code
     for operation in (
         "navigation_goal",
         "navigation_goal_submit",
@@ -8273,35 +10008,50 @@ def test_p6_floor_transition_negative_interlock_contract():
         "docking_undock",
         "safety_resume",
     ):
-        assert f'"{operation}"' in api_code
+        assert f'"{operation}"' in feature_code
+        assert f'"{operation}"' not in entry_code
 
-    switch_body = api_code.split(
-        "HttpResponse handle_switch_floor", 1
-    )[1].split("HttpResponse handle_trigger_localization", 1)[0]
+    switch_body = floor_switch_code.split(
+        "HttpResponse handle_offline_switch", 1
+    )[1].split("rclcpp::Node & node_", 1)[0]
     assert "LIVE_FLOOR_SWITCH_DISABLED" in switch_body
     assert switch_body.index("if (resume_navigation)") < switch_body.index(
-        "map_catalog_->find_map_by_id"
+        "map_catalog_.find_map_by_id"
     )
     assert "return handle_resume_floor_navigation" not in switch_body
     assert switch_body.index("future.get()") < switch_body.index(
-        "activate_map_manifest(*selected_map)"
+        "ports_.activate_map_manifest(*selected_map, *selection_transaction)"
     )
-    assert "FLOOR_SELECTION_RUNTIME_BUSY" in switch_body
-    assert switch_body.count("floor_selection_runtime_busy_detail()") >= 2
-    assert switch_body.index("clear_runtime_map_context()") < switch_body.index(
-        "activate_map_manifest(*selected_map)"
+    assert "FLOOR_SELECTION_RUNTIME_BUSY" in floor_switch_code
+    assert switch_body.count("offline_runtime_busy_detail()") >= 2
+    assert "runtime_map_already_selected" in switch_body
+    assert r'\"already_active\":true' in floor_switch_code
+    assert r'\"runtime_unchanged\":true' in floor_switch_code
+    assert r'\"selection_performed\":false' in floor_switch_code
+    assert "floor_switch_noop_commit" in switch_body
+    assert switch_body.index("clear_runtime_context()") < switch_body.index(
+        "ports_.activate_map_manifest(*selected_map, *selection_transaction)"
     )
+    assert 'environment["ROS_DOMAIN_ID"] = "229"' in floor_http_smoke
+    assert 'environment["ROS_LOCALHOST_ONLY"] = "1"' in floor_http_smoke
+    assert "ActionServer(" in floor_http_smoke
+    assert "snapshot_file_tree" in floor_http_smoke
+    assert "switch_floor_calls" in floor_http_smoke
+    assert "same_runtime_map_selection_is_noop" in floor_http_smoke
+    assert "different_runtime_map_selection_remains_blocked" in floor_http_smoke
+    assert floor_http_smoke.count("last_navigation_map_file:=") >= 2
+    assert 'last_navigation_map_path = root / "last_navigation_map.json"' in floor_http_smoke
 
-    docking_body = api_code.split(
-        "HttpResponse handle_docking_start", 1
-    )[1].split("HttpResponse handle_docking_cancel", 1)[0]
-    assert "FLOOR_SWITCH_REQUIRED" in docking_body
-    assert "runtime_context_matches_map" in docking_body
+    docking_body = docking_http_code.split(
+        "HttpResponse handle_start", 1
+    )[1].split("HttpResponse handle_cancel", 1)[0]
+    assert "FLOOR_SWITCH_REQUIRED" in docking_http_code
+    assert "maps_module_.runtime_context_matches" in docking_body
     assert "activate_map_manifest(*selected_map)" not in docking_body
 
-    delete_body = api_code.split(
+    delete_body = maps_code.split(
         "HttpResponse handle_delete_map", 1
-    )[1].split("HttpResponse handle_save_mapping_2d", 1)[0]
+    )[1].split("HttpResponse handle_get_keepout_filter", 1)[0]
     assert "ACTIVE_MAP_DELETE_DISABLED" in delete_body
     assert "activate_map_manifest(remaining.front())" not in delete_body
 
@@ -8312,7 +10062,7 @@ def test_p6_floor_transition_negative_interlock_contract():
     assert "BLOCKED" in interlock_test
     assert "MissingTypedEvidencePreservesLegacyRuntime" in interlock_test
     assert "test_floor_runtime_interlock" in api_cmake
-    assert "src/floor_runtime_interlock.cpp" in api_cmake
+    assert "src/features/floor_switch/floor_runtime_interlock.cpp" in api_cmake
     for config in (api_config, overlay_api_config):
         assert 'floor_transition_status_topic: "/floor_manager/transition_status"' in config
         assert "floor_runtime_negative_interlock_enabled: true" in config
@@ -8430,6 +10180,7 @@ def test_map_toolkit_promotes_only_pgm_nav_map(tmp_path):
 
 def test_runtime_overlay_live_2d_mapping_uses_slam_toolbox():
     run_projected_map = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_projected_map.sh").read_text(encoding="utf-8")
+    common_env = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "common_env.sh").read_text(encoding="utf-8")
     dashboard_patch = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "patch_dashboard_runtime.py").read_text(encoding="utf-8")
     slam_launch = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "launch" / "jt128_slam_toolbox_mapping.launch.py").read_text(encoding="utf-8")
     slam_cfg = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "jt128_slam_toolbox_mapping.yaml").read_text(encoding="utf-8")
@@ -8438,11 +10189,43 @@ def test_runtime_overlay_live_2d_mapping_uses_slam_toolbox():
     fastlio_odom_bridge_cpp = (
         ROOT / "src" / "robot_fastlio_mapping" / "src" / "fastlio_odom_bridge_node.cpp"
     ).read_text(encoding="utf-8")
+    mapping_scan_tf_gate_cpp = (
+        ROOT / "src" / "robot_fastlio_mapping" / "src" / "mapping_scan_tf_gate_node.cpp"
+    ).read_text(encoding="utf-8")
+    fastlio_mapping_cmake = (
+        ROOT / "src" / "robot_fastlio_mapping" / "CMakeLists.txt"
+    ).read_text(encoding="utf-8")
+    fastlio_mapping_package = (
+        ROOT / "src" / "robot_fastlio_mapping" / "package.xml"
+    ).read_text(encoding="utf-8")
+    fastlio_pair_probe = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "verify_mapping_fastlio_pair.py"
+    ).read_text(encoding="utf-8")
+    readiness_probe_cpp = (
+        ROOT / "src" / "robot_bringup" / "src" / "runtime_readiness_probe.cpp"
+    ).read_text(encoding="utf-8")
+    stamped_scan_tf_smoke = (
+        ROOT
+        / "src"
+        / "robot_bringup"
+        / "test"
+        / "run_isolated_stamped_scan_tf_smoke.sh"
+    ).read_text(encoding="utf-8")
     scan_republisher_cpp = (ROOT / "src" / "robot_hesai_jt128" / "src" / "scan_republisher_node.cpp").read_text(encoding="utf-8")
     hesai_cmake = (ROOT / "src" / "robot_hesai_jt128" / "CMakeLists.txt").read_text(encoding="utf-8")
     hesai_package = (ROOT / "src" / "robot_hesai_jt128" / "package.xml").read_text(encoding="utf-8")
     assert "ros2 launch" in run_projected_map
     assert "jt128_slam_toolbox_mapping.launch.py" in run_projected_map
+    assert "require_mapping_ros_package || exit 1" in run_projected_map
+    assert 'get_package_prefix("robot_fastlio_mapping")' in run_projected_map
+    assert run_projected_map.index("require_mapping_ros_package || exit 1") < (
+        run_projected_map.index("stop_legacy_mapping_processes() {")
+    )
     assert "import os" in slam_launch
     assert "os.environ.get" in slam_launch
     assert "require_resident_common_mapping_prereqs" in run_projected_map
@@ -8455,10 +10238,10 @@ def test_runtime_overlay_live_2d_mapping_uses_slam_toolbox():
     assert 'SLAM2D_ODOM_SOURCE="${NJRH_SLAM2D_ODOM_SOURCE:-fastlio}"' in run_projected_map
     assert 'SLAM2D_ALLOW_PRIVATE_FASTLIO="${NJRH_SLAM2D_ALLOW_PRIVATE_FASTLIO:-true}"' in run_projected_map
     assert 'SLAM2D_REUSE_EXISTING_FASTLIO="${NJRH_SLAM2D_REUSE_EXISTING_FASTLIO:-false}"' in run_projected_map
-    assert 'FASTLIO_ODOM_TOPIC="${NJRH_SLAM2D_FASTLIO_ODOM_TOPIC:-/Odometry}"' in run_projected_map
+    assert 'FASTLIO_ODOM_TOPIC="${NJRH_SLAM2D_FASTLIO_ODOM_TOPIC:-/mapping/fastlio/odometry}"' in run_projected_map
     assert 'SLAM2D_PRIVATE_TF_TOPIC="${NJRH_SLAM2D_PRIVATE_TF_TOPIC:-/tf_slam2d}"' in run_projected_map
     assert 'SLAM2D_FASTLIO_ODOM_FRAME="${NJRH_SLAM2D_FASTLIO_ODOM_FRAME:-mapping_odom}"' in run_projected_map
-    assert 'POINTS_TOPIC="${NJRH_SLAM2D_POINTS_TOPIC:-/cloud_registered_body}"' in run_projected_map
+    assert 'POINTS_TOPIC="${NJRH_SLAM2D_POINTS_TOPIC:-/mapping/fastlio/cloud_registered_body}"' in run_projected_map
     assert "FASTLIO_CONFIG_FILE" in run_projected_map
     assert 'LOCAL_ODOM_READY_TIMEOUT="${NJRH_SLAM2D_ODOM_READY_TIMEOUT:-30}"' in run_projected_map
     assert 'FASTLIO_POINTS_READY_TIMEOUT="${NJRH_SLAM2D_FASTLIO_POINTS_READY_TIMEOUT:-60}"' in run_projected_map
@@ -8471,10 +10254,28 @@ def test_runtime_overlay_live_2d_mapping_uses_slam_toolbox():
     assert "apply_slam2d_lidar_rps_xps" in run_projected_map
     assert "restore_slam2d_lidar_rps_xps" in run_projected_map
     assert 'export NJRH_CPUSET_FASTLIO_DESKEW="${NJRH_SLAM2D_FASTLIO_CPUSET:-${NJRH_CPUSET_MAPPING_BACKEND:-7}}"' in run_projected_map
-    assert 'export NJRH_CPUSET_SLAM_TOOLBOX_MAPPING="${NJRH_SLAM2D_SLAM_TOOLBOX_CPUSET:-${NJRH_CPUSET_MAPPING_BACKEND:-7}}"' in run_projected_map
+    assert 'export NJRH_CPUSET_SLAM_TOOLBOX_MAPPING="${NJRH_SLAM2D_SLAM_TOOLBOX_CPUSET:-3,7}"' in run_projected_map
     assert "ros2 run fast_lio fastlio_mapping" in run_projected_map
-    assert "njrh_run_affined fastlio_deskew ros2 run fast_lio fastlio_mapping" in run_projected_map
+    normalized_mapping_runner = re.sub(
+        r"\s+", " ", re.sub(r"\\\s*\n\s*", " ", run_projected_map)
+    )
+    assert (
+        "njrh_start_affined_background fastlio_deskew_pid "
+        "fastlio_deskew env -u FASTDDS_BUILTIN_TRANSPORTS "
+        'FASTRTPS_DEFAULT_PROFILES_FILE="${NJRH_SLAM2D_FASTDDS_ACTIVE_PROFILE_FILE}" '
+        'FASTDDS_DEFAULT_PROFILES_FILE="${NJRH_SLAM2D_FASTDDS_ACTIVE_PROFILE_FILE}" '
+        "NJRH_SLAM2D_FASTDDS_ROLE=large_cloud "
+        "ros2 run fast_lio fastlio_mapping"
+    ) in normalized_mapping_runner
+    assert "njrh_run_affined fastlio_deskew ros2 run fast_lio fastlio_mapping" not in run_projected_map
+    assert '-r /cloud_registered_body:="${POINTS_TOPIC}"' in run_projected_map
+    assert '-r /Odometry:="${FASTLIO_ODOM_TOPIC}"' in run_projected_map
     assert "-r /tf:=/tf_fastlio_internal" in run_projected_map
+    assert 'verify_mapping_fastlio_pair.py' in run_projected_map
+    assert '"${POINTS_TOPIC}" "${FASTLIO_ODOM_TOPIC}"' in run_projected_map
+    assert "get_publishers_info_by_topic" in fastlio_pair_probe
+    assert "exactly one publisher" in fastlio_pair_probe
+    assert "same ROS node" in fastlio_pair_probe
     assert 'reusing existing FAST-LIO2 mapping source: ${POINTS_TOPIC}' in run_projected_map
     assert "FAST-LIO2 is required for mapping and mapping-owned startup is disabled" in run_projected_map
     assert 'if [[ "${SLAM2D_ALLOW_PRIVATE_FASTLIO}" != "true" ]]; then' in run_projected_map
@@ -8501,7 +10302,11 @@ def test_runtime_overlay_live_2d_mapping_uses_slam_toolbox():
     assert 'wait_for_fresh_header_topic_message "${POINTS_TOPIC}" "${FASTLIO_POINTS_READY_TIMEOUT}" "${FASTLIO_POINTS_MAX_AGE_SEC}" 0.25' in run_projected_map
     assert 'wait_for_topic_message "${FASTLIO_ODOM_TOPIC}" "${FASTLIO_ODOM_READY_TIMEOUT}"' in run_projected_map
     assert 'bridge_bin="${NJRH_PROJECT_ROOT}/install/robot_fastlio_mapping/lib/robot_fastlio_mapping/fastlio_odom_bridge_node"' in run_projected_map
-    assert 'njrh_run_affined fastlio_odom_bridge "${bridge_bin}"' in run_projected_map
+    assert (
+        'njrh_start_affined_background fastlio_odom_bridge_pid '
+        'fastlio_odom_bridge "${bridge_bin}"'
+    ) in normalized_mapping_runner
+    assert 'njrh_run_affined fastlio_odom_bridge "${bridge_bin}"' not in run_projected_map
     assert 'python3 "${bridge_script}"' not in run_projected_map
     assert 'wait_for_topic_message "/mapping/fastlio_odometry" 10' in run_projected_map
     assert 'odom_frame:="${slam_odom_frame}"' in run_projected_map
@@ -8512,25 +10317,111 @@ def test_runtime_overlay_live_2d_mapping_uses_slam_toolbox():
     assert "restart_robot_local_state_for_mapping" not in run_projected_map
     assert "starting a fresh local-state stack" not in run_projected_map
     assert 'wait_for_topic_message "/local_state/imu_bias" "${bias_timeout}"' not in run_projected_map
-    assert 'wait_for_tf_edge "base_link" "lidar_level_link" 10' in run_projected_map
-    assert 'wait_for_topic_publisher "/local_state/odometry" "${LOCAL_ODOM_READY_TIMEOUT}"' in run_projected_map
-    assert 'wait_for_fresh_header_topic_message "/local_state/odometry" "${LOCAL_ODOM_READY_TIMEOUT}" "${LOCAL_ODOM_MAX_AGE_SEC}" 0.25' in run_projected_map
-    assert "check_local_state_odom_sane" in run_projected_map
+    assert 'SLAM2D_COMPOSITE_PREFLIGHT_ENABLED="${NJRH_SLAM2D_COMPOSITE_PREFLIGHT_ENABLED:-true}"' in run_projected_map
+    assert "require_resident_common_mapping_prereqs_legacy()" in run_projected_map
+    primary_preflight = run_projected_map.split(
+        "require_resident_common_mapping_prereqs() {", 1
+    )[1].split("\n}\n\ncleanup()", 1)[0]
+    assert "runtime_readiness_probe mapping-preflight" in primary_preflight
+    assert primary_preflight.count("runtime_readiness_probe") == 1
+    assert 'if [[ "${SLAM2D_COMPOSITE_PREFLIGHT_ENABLED}" != "true" ]]; then' in primary_preflight
+    assert "require_resident_common_mapping_prereqs_legacy" in primary_preflight
+    assert "wait_for_tf_edge" not in primary_preflight
+    assert "wait_for_topic_publisher" not in primary_preflight
+    assert "wait_for_fresh_header_topic_message" not in primary_preflight
+    assert "check_local_state_odom_sane" not in primary_preflight
+    assert "bool wait_for_mapping_preflight(" in readiness_probe_cpp
+    assert 'command == "mapping-preflight"' in readiness_probe_cpp
+    assert "mapping-preflight <scan_topic> <scan_owner_node>" in readiness_probe_cpp
+    assert 'mapping-preflight)' in common_env
+    assert 'tf_timeout="${7:-0}"' in common_env
+    assert 'scan_timeout="${8:-0}"' in common_env
+    assert 'odom_timeout="${9:-0}"' in common_env
+    mapping_pipeline_cleanup = run_projected_map.split(
+        "stop_mapping_pipeline_processes() {", 1
+    )[1].split("\n}\n\nterminate_child()", 1)[0]
+    assert 'mapfile -t candidates < <(pgrep -f "${candidate_pattern}"' in (
+        mapping_pipeline_cleanup
+    )
+    assert "for proc in /proc/[0-9]*" not in mapping_pipeline_cleanup
+    assert "process_has_exact_env_marker" in mapping_pipeline_cleanup
+    assert "stop_legacy_mapping_processes() {" in run_projected_map
+    legacy_mapping_cleanup = run_projected_map.split(
+        "stop_legacy_mapping_processes() {", 1
+    )[1].split("\n}\n\nrequire_can_interface_up", 1)[0]
+    assert 'mapfile -t candidates < <(pgrep -f "${candidate_pattern}"' in (
+        legacy_mapping_cleanup
+    )
+    assert "pkill" not in legacy_mapping_cleanup
+    assert "for pattern in" not in legacy_mapping_cleanup
+    assert legacy_mapping_cleanup.index(
+        '[[ ${#pids[@]} -gt 0 ]] || return 0'
+    ) < legacy_mapping_cleanup.index("sleep")
+    mapping_fastlio_cleanup = run_projected_map.split(
+        "stop_mapping_fastlio_processes() {", 1
+    )[1].split("\n}\n\nstop_mapping_pipeline_processes()", 1)[0]
+    assert 'mapfile -t candidates < <(pgrep -f "${candidate_pattern}"' in (
+        mapping_fastlio_cleanup
+    )
+    assert "for proc in /proc/[0-9]*" not in mapping_fastlio_cleanup
+    assert "process_has_exact_env_marker" in mapping_fastlio_cleanup
+    private_fastlio_startup = run_projected_map.split(
+        'log_mapping_startup_stage "fastlio_started"', 1
+    )[1].split(
+        'wait_for_fresh_header_topic_message "${POINTS_TOPIC}"', 1
+    )[0]
+    assert "sleep 2" not in private_fastlio_startup
+    assert 'kill -0 "${fastlio_deskew_pid}"' in private_fastlio_startup
+    for startup_stage in (
+        "script_started",
+        "legacy_processes_stopped",
+        "mapping_pipeline_stopped",
+        "mapping_preflight_ready",
+        "mapping_fastlio_residuals_stopped",
+        "fastlio_started",
+        "fastlio_ready",
+        "odom_bridge_ready",
+        "stamped_scan_tf_ready",
+        "slam_toolbox_started",
+    ):
+        assert f'log_mapping_startup_stage "{startup_stage}"' in run_projected_map
     assert 'local_odom_reference_topic="/fastlio/base_odometry"' in run_projected_map
     assert 'local_odom_reference_topic="/wheel/odom_ekf"' in run_projected_map
     assert 'refusing to start slam_toolbox mapping with unhealthy resident local odometry' in run_projected_map
     assert "slam_toolbox" in slam_launch
-    assert 'DeclareLaunchArgument("points_topic", default_value="/cloud_registered_body")' in slam_launch
+    assert 'DeclareLaunchArgument("scan_topic", default_value="/scan")' in slam_launch
     assert 'DeclareLaunchArgument("tf_topic", default_value="/tf")' in slam_launch
     assert '("/tf", tf_topic)' in slam_launch
     assert "f'image: {pgm_path.name}'," in dashboard_patch
     assert "'image': str(pgm_path)" in dashboard_patch
     assert "nav_cloud_preprocessor" in slam_launch
     assert "pointcloud_to_laserscan_node" in slam_launch
-    assert "scan_republisher_node" in slam_launch
+    assert "mapping_scan_tf_gate_node" not in slam_launch
+    assert '"NJRH_SLAM2D_MAPPING_PIPELINE": "1"' in slam_launch
+    assert slam_launch.count("env=cloud_transport_env") == 2
+    assert slam_launch.count("additional_env=control_transport_env") == 1
+    assert 'cloud_transport_env["NJRH_SLAM2D_FASTDDS_ROLE"] = "large_cloud"' in slam_launch
+    assert '"NJRH_SLAM2D_FASTDDS_ROLE": "control_udp"' in slam_launch
+    assert 'cloud_transport_env.pop("FASTDDS_BUILTIN_TRANSPORTS", None)' in slam_launch
+    assert "stop_mapping_pipeline_processes" in run_projected_map
+    assert "NJRH_SLAM2D_MAPPING_PIPELINE=1" in run_projected_map
+    assert "mapping_scan_tf_gate_node|pointcloud_to_laserscan|nav_cloud_preprocessor|slam_toolbox" in run_projected_map
     assert "scan_republisher_node" not in run_projected_map
-    assert 'restamp_scan_to_now = env_bool("NJRH_SLAM2D_RESTAMP_SCAN_TO_NOW", False)' in slam_launch
-    assert '"restamp_to_now": restamp_scan_to_now' in slam_launch
+    assert "scan_republisher_node" not in slam_launch
+    assert '"scan_topic": scan_topic' in slam_launch
+    assert "canTransform(" in mapping_scan_tf_gate_cpp
+    assert "tf_buffer_.setTransform" in mapping_scan_tf_gate_cpp
+    assert 'declare_parameter<double>("max_wait_sec", 2.0)' in mapping_scan_tf_gate_cpp
+    assert 'declare_parameter<double>("post_tf_settle_ms", 20.0)' in mapping_scan_tf_gate_cpp
+    assert 'declare_parameter<bool>("preserve_stamp", true)' in mapping_scan_tf_gate_cpp
+    assert "outgoing.header.stamp" not in mapping_scan_tf_gate_cpp
+    assert '\\"preserve_stamp\\":true' in mapping_scan_tf_gate_cpp
+    assert "mapping_scan_tf_gate_node src/mapping_scan_tf_gate_node.cpp" in fastlio_mapping_cmake
+    assert "sensor_msgs" in fastlio_mapping_cmake
+    assert "std_msgs" in fastlio_mapping_cmake
+    assert "<depend>sensor_msgs</depend>" in fastlio_mapping_package
+    assert "<depend>std_msgs</depend>" in fastlio_mapping_package
+    assert "<build_type>ament_cmake</build_type>" in fastlio_mapping_package
     assert "motion_gate_enabled" not in slam_launch
     assert "motion_gate_enabled" not in scan_republisher_cpp
     assert "Dropping mapping scan" not in scan_republisher_cpp
@@ -8558,18 +10449,40 @@ def test_runtime_overlay_live_2d_mapping_uses_slam_toolbox():
     assert "max_height: 0.35" in slam_scan_cfg
     assert "minimum_time_interval: 0.05" in slam_cfg
     assert "transform_timeout: 0.50" in slam_cfg
-    assert "scan_queue_size: 30" in slam_cfg
-    assert "minimum_travel_heading: 0.02" in slam_cfg
-    assert "scan_buffer_size: 30" in slam_cfg
+    assert "scan_topic: /scan" in slam_cfg
+    assert "scan_queue_size: 1" in slam_cfg
+    assert "minimum_travel_distance: 0.10" in slam_cfg
+    assert "minimum_travel_heading: 0.035" in slam_cfg
+    assert "scan_buffer_size: 100" in slam_cfg
+    assert "scan_buffer_maximum_scan_distance: 10.0" in slam_cfg
+    assert "use_scan_matching: true" in slam_cfg
+    assert "ceres_loss_function: HuberLoss" in slam_cfg
     assert "do_loop_closing: true" in slam_cfg
     assert "loop_search_maximum_distance: 3.0" in slam_cfg
-    assert "loop_match_minimum_chain_size: 10" in slam_cfg
-    assert "loop_match_maximum_variance_coarse: 2.5" in slam_cfg
-    assert "loop_match_minimum_response_coarse: 0.40" in slam_cfg
-    assert "loop_match_minimum_response_fine: 0.50" in slam_cfg
+    assert "loop_match_minimum_chain_size: 15" in slam_cfg
+    assert "loop_match_maximum_variance_coarse: 2.0" in slam_cfg
+    assert "loop_match_minimum_response_coarse: 0.45" in slam_cfg
+    assert "loop_match_minimum_response_fine: 0.55" in slam_cfg
     assert "loop_search_space_dimension: 6.0" in slam_cfg
     assert "correlation_search_space_dimension: 0.5" in slam_cfg
-    assert "scan_republisher_node" in slam_launch
+    assert "stamped-scan-tf <scan_topic> <tf_topic> <target_frame>" in readiness_probe_cpp
+    assert 'command == "stamped-scan-tf"' in readiness_probe_cpp
+    assert "stamped_scan_tf_fixture.py" in stamped_scan_tf_smoke
+    assert "probe incorrectly accepted scans without dynamic TF" in stamped_scan_tf_smoke
+    assert 'runtime_readiness_probe stamped-scan-tf \\' in run_projected_map
+    assert '"${SLAM2D_SCAN_TOPIC}" \\' in run_projected_map
+    assert '"${slam_tf_topic}" \\' in run_projected_map
+    assert '"${slam_odom_frame}" \\' in run_projected_map
+    stamped_tf_gate = run_projected_map.split(
+        'runtime_readiness_probe stamped-scan-tf \\', 1
+    )[0]
+    assert stamped_tf_gate.index('log_mapping_startup_stage "odom_bridge_ready"') < (
+        stamped_tf_gate.rindex('slam_odom_frame="${SLAM2D_FASTLIO_ODOM_FRAME}"')
+    )
+    assert run_projected_map.index('runtime_readiness_probe stamped-scan-tf \\') > (
+        run_projected_map.index('ros2 launch "${SLAM_LAUNCH_FILE}"')
+    )
+    assert "/mapping/scan" not in slam_launch
     assert "'topic': '/map'" in dashboard_patch
     assert "slam_toolbox_map_grid" in dashboard_patch
     assert "timeout=45.0" in dashboard_patch
@@ -8593,6 +10506,108 @@ def test_runtime_overlay_live_2d_mapping_uses_slam_toolbox():
     assert "self._ensure_driver_fastlio()" not in mapping2d_section
     assert "run_jt128_2d_mapping.sh" not in mapping2d_section
     assert "_cartographer_running()" not in mapping2d_section
+
+
+def test_slam_toolbox_mapping_owns_canonical_scan_from_fastlio_slice():
+    overlay = ROOT / "scripts" / "jetson" / "runtime_overlay"
+    mapping_runner = (overlay / "scripts" / "run_projected_map.sh").read_text(
+        encoding="utf-8"
+    )
+    ownership_helpers = (
+        overlay / "scripts" / "scan_ownership_helpers.sh"
+    ).read_text(encoding="utf-8")
+    transport_helpers = (
+        overlay / "scripts" / "mapping_fastdds_transport.sh"
+    ).read_text(encoding="utf-8")
+    throughput_probe = (
+        overlay / "scripts" / "verify_mapping_scan_throughput.py"
+    ).read_text(encoding="utf-8")
+    launch = (overlay / "launch" / "jt128_slam_toolbox_mapping.launch.py").read_text(
+        encoding="utf-8"
+    )
+    mapping_config = (
+        overlay / "config" / "jt128_slam_toolbox_mapping.yaml"
+    ).read_text(encoding="utf-8")
+    navigation_scan_config = (
+        overlay / "config" / "pointcloud_accel_axis.yaml"
+    ).read_text(encoding="utf-8")
+    accel_core = (
+        ROOT
+        / "src"
+        / "robot_hesai_jt128"
+        / "src"
+        / "pointcloud_accel_core.cpp"
+    ).read_text(encoding="utf-8")
+    assert 'DeclareLaunchArgument("scan_topic", default_value="/scan")' in launch
+    assert '"scan_topic": scan_topic' in launch
+    assert "scan_topic: /scan" in mapping_config
+    assert "scan_output_topic: /scan" in navigation_scan_config
+    assert "nav_cloud_preprocessor" in launch
+    assert "pointcloud_to_laserscan" in launch
+    assert 'DeclareLaunchArgument("points_topic", default_value="/mapping/fastlio/cloud_registered_body")' in launch
+    assert 'DeclareLaunchArgument("nav_points_topic", default_value="/mapping/points_nav")' in launch
+    assert 'DeclareLaunchArgument("scan_topic", default_value="/scan")' in launch
+    assert '("scan", scan_topic)' in launch
+    assert "scan_republisher" not in launch
+    assert "mapping_scan_tf_gate" not in launch
+    assert "restamp" not in launch.lower()
+    assert 'SLAM2D_SCAN_TOPIC="${NJRH_SLAM2D_SCAN_TOPIC:-/scan}"' in mapping_runner
+    assert (
+        'set_resident_scan_output false'
+    ) in mapping_runner
+    assert (
+        'wait_for_scan_publisher_count "${SLAM2D_SCAN_TOPIC}" 0'
+    ) in mapping_runner
+    # Start the graph-identity observer before the mapping publisher.  Fast DDS
+    # can otherwise expose a unique endpoint with UNKNOWN node metadata to a
+    # participant that joins after the launch graph is already active.
+    assert 'SLAM2D_SCAN_OWNER_READY_TIMEOUT="${NJRH_SLAM2D_SCAN_OWNER_READY_TIMEOUT:-30}"' in mapping_runner
+    assert 'SLAM2D_STAMPED_TF_READY_TIMEOUT="${NJRH_SLAM2D_STAMPED_TF_READY_TIMEOUT:-30}"' in mapping_runner
+    assert 'SLAM2D_STAMPED_TF_REQUIRED_GOOD="${NJRH_SLAM2D_STAMPED_TF_REQUIRED_GOOD:-3}"' in mapping_runner
+    assert '"${SLAM2D_SCAN_TOPIC}" "pointcloud_to_laserscan" 1' in mapping_runner
+    assert '"${SLAM2D_SCAN_OWNER_READY_TIMEOUT}"' in mapping_runner
+    assert 'wait_for_scan_owner_observer' in mapping_runner
+    observer_start = mapping_runner.index(
+        'start_scan_owner_observer \\\n'
+    )
+    launch_start = mapping_runner.index('ros2 launch "${SLAM_LAUNCH_FILE}"')
+    observer_wait = mapping_runner.index('wait_for_scan_owner_observer', launch_start)
+    assert observer_start < launch_start < observer_wait
+    assert 'restore_navigation_scan_owner "${SLAM2D_SCAN_TOPIC}"' in mapping_runner
+    assert 'set_resident_scan_output true' in ownership_helpers
+    assert 'wait_for_scan_owner "${topic}" "${RESIDENT_SCAN_OWNER_NODE}" 1' in ownership_helpers
+    assert "resident scan ownership request outcome is unknown" in ownership_helpers
+    assert "resident_scan_output_matches_requested_state" in ownership_helpers
+    assert ownership_helpers.count("ros2 service call") == 1
+    assert "std_srvs::srv::SetBool" in accel_core
+    assert '"~/set_scan_output_enabled"' in accel_core
+    assert "scan_publisher_.reset()" in accel_core
+    assert "create_scan_publisher" in accel_core
+    assert 'source "${SCRIPT_DIR}/mapping_fastdds_transport.sh"' in mapping_runner
+    assert "configure_mapping_fastdds_transport" in mapping_runner
+    assert "cleanup_mapping_fastdds_transport" in mapping_runner
+    assert "NJRH_SLAM2D_FASTDDS_ACTIVE_PROFILE_FILE" in mapping_runner
+    assert "NJRH_SLAM2D_FASTDDS_BASE_PROFILE_FILE" in transport_helpers
+    assert "134217728" in transport_helpers
+    assert "<type>UDPv4</type>" in transport_helpers
+    assert "<type>SHM</type>" in transport_helpers
+    assert "NJRH_SLAM2D_FASTDDS_TRANSPORT:-scoped_shm" in transport_helpers
+    assert "NJRH_SLAM2D_FASTDDS_TRANSPORT=inherit" in transport_helpers
+    assert "mapping_fastdds_stop_profile_participants" in transport_helpers
+    assert "mapping_fastdds_process_uses_profile" in transport_helpers
+    assert "pgrep -f 'fastlio_mapping|nav_cloud_preprocessor|pointcloud_to_laserscan'" in transport_helpers
+    assert "cloud_transport_env" in launch
+    assert "control_transport_env" in launch
+    assert 'cloud_transport_env["NJRH_SLAM2D_FASTDDS_ROLE"] = "large_cloud"' in launch
+    assert '"NJRH_SLAM2D_FASTDDS_ROLE": "control_udp"' in launch
+    assert "nav_cloud_preprocessor" in launch
+    assert "pointcloud_to_scan" in launch
+    assert "slam_toolbox_node" in launch
+    assert "from sensor_msgs.msg import LaserScan" in throughput_probe
+    assert "from sensor_msgs.msg import PointCloud2" not in throughput_probe
+    assert 'default="/scan"' in throughput_probe
+    assert "duplicate_stamp_count" in throughput_probe
+    assert "regressed_stamp_count" in throughput_probe
 
 
 def test_localization_bridge_uses_pose_receive_time_for_freshness():
@@ -8686,6 +10701,9 @@ def test_dashboard_runtime_patches_nav2_params_to_repo_owned_config():
     assert "/api/floors/promote" in patch_v2
     assert "/api/floors/select" in patch_v2
     assert "/api/floors/switch" in patch_v2
+    assert "expected_asset_epoch" in patch_v2
+    assert "expected_asset_digest" in patch_v2
+    assert "safe_map_id" in patch_v2
     assert "resume_navigation: false" in patch_v2
     assert "resume_navigation: true" not in patch_v2
     assert "promote_map_to_floor.sh" in patch_v2
@@ -8988,7 +11006,8 @@ def test_jt128_driver_normalizes_vendor_raw_to_canonical_topics():
     assert 'UPSTREAM_DRIVER_PROFILE="${NJRH_HESAI_UPSTREAM_DRIVER_PROFILE}"' in driver_script
     assert 'use_timestamp_type: 1' in driver_script
     assert 'export DRIVER_PROFILE="${UPSTREAM_DRIVER_PROFILE}"' in driver_script
-    assert 'njrh_run_affined hesai_ros_driver bash "$(require_upstream_script run_driver.sh)" &' in driver_script
+    assert 'njrh_run_large_cloud_affined hesai_ros_driver bash "$(require_upstream_script run_driver.sh)" &' in driver_script
+    assert 'njrh_run_affined hesai_ros_driver bash "$(require_upstream_script run_driver.sh)" &' not in driver_script
     raw_to_canonical = (
         "rotation_matrix:\n"
         "      - 0.0\n"
@@ -9267,91 +11286,182 @@ def test_jt128_driver_normalizes_vendor_raw_to_canonical_topics():
 
 
 def test_robot_api_server_keeps_tf_subscription_resident():
-    node_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
+    entry_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
         encoding="utf-8"
     )
+    localization_feature_cpp = localization_feature_source()
+    localization_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "localization"
+        / "localization_module.cpp"
+    ).read_text(encoding="utf-8")
+    system_status_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "system_status"
+        / "system_status_module.cpp"
+    ).read_text(encoding="utf-8")
+    subscription_module_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "application"
+        / "subscriptions"
+        / "subscription_module.cpp"
+    ).read_text(encoding="utf-8")
 
-    assert "TF is a process-level localization input" in node_cpp
-    assert "set_status_subscriptions_active(true);\n    // TF is a process-level localization input" in node_cpp
-    assert "page leases only report interest and must not tear it down" in node_cpp
-    assert "tf_subscription_active()" not in node_cpp
+    assert "TF is a process-level localization input" in subscription_module_cpp
+    tf_resident_index = subscription_module_cpp.index("// TF is a process-level localization input")
+    assert "ports.ensure_tf_resident" in subscription_module_cpp[tf_resident_index:]
+    assert (
+        "module_->ensure_tf_subscription_active();"
+        in localization_feature_cpp
+    )
+    assert "ensure_floor_status_subscription_active();" in system_status_cpp
+    assert "floor_status_subscription.reset()" not in system_status_cpp
+    assert "Lease transitions only" in subscription_module_cpp
+    assert "bool tf_subscription_active()" not in entry_cpp + localization_cpp
 
-    tf_function = node_cpp[
-        node_cpp.index("void set_tf_subscription_active"):
-        node_cpp.index("RobotPoseSnapshot current_robot_pose_snapshot")
+    tf_function = subscription_module_cpp[
+        subscription_module_cpp.index('resource == "tf"'):
+        subscription_module_cpp.index('resource == "teleop"')
     ]
-    assert "if (!active) {\n      return;\n    }" in tf_function
+    assert "ports.ensure_tf_resident" in tf_function
     assert "tf_sub_.reset()" not in tf_function
     assert "have_pose_ = false" not in tf_function
 
-    wait_function = node_cpp[
-        node_cpp.index("RobotPoseSnapshot wait_for_current_robot_pose"):
-        node_cpp.index("void handle_bms_state")
+    wait_function = localization_cpp[
+        localization_cpp.index("RobotPoseSnapshot wait_for_current_robot_pose"):
+        localization_cpp.index("TfChainFreshnessSnapshot tf_chain_freshness_snapshot")
     ]
-    assert "set_tf_subscription_active(true);" in wait_function
-    assert "set_tf_subscription_active(false)" not in wait_function
+    assert "ensure_tf_subscription_active();" in wait_function
+    assert "tf_sub_.reset()" not in wait_function
     assert "was_active" not in wait_function
 
 
 def test_mapping_stop_only_cleans_private_fastlio_residuals():
-    api_code = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
+    entry_code = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
         encoding="utf-8"
     )
+    composition_code = application_composition_source()
+    mapping_module_code = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "mapping"
+        / "mapping_module.cpp"
+    ).read_text(encoding="utf-8")
+    mapping_configuration_code = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "mapping"
+        / "mapping_configuration_module.cpp"
+    ).read_text(encoding="utf-8")
+    mapping_runtime_code = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "mapping"
+        / "runtime"
+        / "mapping_process_runtime.cpp"
+    ).read_text(encoding="utf-8")
     api_config = (ROOT / "src" / "robot_api_server" / "config" / "robot_api_server.yaml").read_text(
         encoding="utf-8"
     )
     overlay_api_config = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "robot_api_server.yaml"
     ).read_text(encoding="utf-8")
-    runtime_utils = (ROOT / "src" / "robot_api_server" / "src" / "runtime_process_utils.cpp").read_text(
+    runtime_utils = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "infrastructure"
+        / "process"
+        / "runtime_process_utils.cpp"
+    ).read_text(
         encoding="utf-8"
     )
     mapping_script = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_projected_map.sh"
     ).read_text(encoding="utf-8")
 
-    assert "read_proc_environ(pid)" in api_code
-    assert "is_private_slam2d_fastlio_process" in api_code
-    assert "NJRH_SLAM2D_PRIVATE_FASTLIO=1" in api_code
+    assert "read_proc_environ(process_id)" in mapping_runtime_code
+    assert "is_private_slam2d_fastlio_process" in mapping_runtime_code
+    assert "NJRH_SLAM2D_PRIVATE_FASTLIO=1" in mapping_runtime_code
     assert "read_proc_environ" in runtime_utils
-    assert "run_mapping_start_job_guarded" in api_code
-    assert "mapping_lidar_rps_xps_state_dir" in api_code
-    assert "/tmp/njrh_slam2d_lidar_rps_xps" in api_code
-    assert "restore_mapping_lidar_rps_xps_state()" in api_code
-    assert "is_safe_mapping_lidar_rps_xps_path" in api_code
-    assert "rps_xps.tsv" in api_code
-    assert 'starts_with(path, "/sys/class/net/")' in api_code
-    assert 'path.find("/queues/")' in api_code
-    assert '"/rps_cpus"' in api_code
-    assert '"/xps_cpus"' in api_code
+    assert "run_mapping_start_job_guarded" in mapping_module_code
+    assert "MappingConfigurationModule::declare_parameters" in composition_code
+    assert "mapping_lidar_rps_xps_state_dir" in mapping_configuration_code
+    assert "/tmp/njrh_slam2d_lidar_rps_xps" in mapping_configuration_code
+    assert 'declare_parameter<std::string>("mapping_lidar_rps_xps_state_dir"' not in entry_code
+    assert "restore_lidar_rps_xps_state()" in mapping_runtime_code
+    assert "is_safe_mapping_lidar_rps_xps_path" in mapping_runtime_code
+    assert "rps_xps.tsv" in mapping_runtime_code
+    assert 'path.rfind("/sys/class/net/", 0U)' in mapping_runtime_code
+    assert 'path.find("/queues/")' in mapping_runtime_code
+    assert '"/rps_cpus"' in mapping_runtime_code
+    assert '"/xps_cpus"' in mapping_runtime_code
     for config_text in (api_config, overlay_api_config):
         assert 'mapping_lidar_rps_xps_state_dir: "/tmp/njrh_slam2d_lidar_rps_xps"' in config_text
 
-    residual_fn = api_code[
-        api_code.index("bool is_mapping_2d_residual_process_command"):
-        api_code.index("std::set<pid_t> discover_mapping_2d_process_groups")
+    residual_fn = mapping_runtime_code[
+        mapping_runtime_code.index("bool is_mapping_2d_residual_process_command"):
+        mapping_runtime_code.index("bool is_safe_mapping_lidar_rps_xps_path")
     ]
-    fastlio_fn = api_code[
-        api_code.index("bool is_private_slam2d_fastlio_process"):
-        api_code.index("bool is_mapping_2d_residual_process_command")
+    fastlio_fn = mapping_runtime_code[
+        mapping_runtime_code.index("bool is_private_slam2d_fastlio_process"):
+        mapping_runtime_code.index("bool is_mapping_2d_residual_process_command")
     ]
-    terminate_fn = api_code[
-        api_code.index("std::size_t terminate_mapping_2d_process_groups_locked"):
-        api_code.index("HttpResponse handle_start_mapping_2d")
+    terminate_fn = mapping_runtime_code[
+        mapping_runtime_code.index("std::size_t MappingProcessRuntime::terminate_process_groups_locked"):
+        mapping_runtime_code.index("std::size_t MappingProcessRuntime::stop()")
     ]
 
-    assert "ros2 run fast_lio fastlio_mapping" not in residual_fn
-    assert "fast_lio/lib/fast_lio/fastlio_mapping" not in residual_fn
-    assert "fastlio_mapping --ros-args" not in residual_fn
-    assert "nav_cloud_preprocessor" not in residual_fn
-    assert "pointcloud_to_laserscan_node" not in residual_fn
+    assert "nav_cloud_preprocessor" in residual_fn
+    assert "pointcloud_to_laserscan_node" in residual_fn
+    assert "NJRH_SLAM2D_MAPPING_PIPELINE=1" in residual_fn
     assert "scan_republisher_node" not in residual_fn
+    assert "return is_private_slam2d_fastlio_process(cmdline, environ);" in residual_fn
     assert "ros2 run fast_lio fastlio_mapping" in fastlio_fn
     assert "environ.find(\"NJRH_SLAM2D_PRIVATE_FASTLIO=1\")" in fastlio_fn
-    assert "nav_cloud_preprocessor" not in mapping_script
-    assert "pointcloud_to_laserscan_node" not in mapping_script
+    assert "nav_cloud_preprocessor" in mapping_script
+    assert "pointcloud_to_laserscan" in mapping_script
     assert "scan_republisher_node" not in mapping_script
-    assert "restore_mapping_lidar_rps_xps_state();" in terminate_fn
+    assert "restore_lidar_rps_xps_state();" in terminate_fn
+    assert "config_.graceful_stop_timeout_sec" in terminate_fn
+    assert "scan_owner_restore_timeout_sec" in mapping_module_code
+    assert "wait_for_mapping_scan_owner_restored" in mapping_module_code
+    assert "ensure_mapping_scan_owner_restored" in mapping_module_code
+    assert "mapping stop failed to restore canonical navigation /scan ownership" in mapping_module_code
+    assert "set_mapping_runtime_state(false, \"failed\"" in mapping_module_code
+    for config_text in (api_config, overlay_api_config):
+        assert "mapping_graceful_stop_timeout_sec: 30.0" in config_text
+        assert "mapping_scan_owner_restore_timeout_sec: 30.0" in config_text
+
+    restore_fn = (
+        ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "scan_ownership_helpers.sh"
+    ).read_text(encoding="utf-8")
+    restore_fn = restore_fn.split("restore_navigation_scan_owner() {", 1)[1]
+    assert '"${topic}" "${RESIDENT_SCAN_OWNER_NODE}" 1 1' in restore_fn
+    assert restore_fn.index('wait_for_scan_publisher_count "${topic}" 0 1') < (
+        restore_fn.index('"${topic}" "${RESIDENT_SCAN_OWNER_NODE}" 1 "${SCAN_OWNERSHIP_TIMEOUT_SEC}"')
+    )
 
 
 def test_localization_bridge_latches_one_shot_localizer_pose():
@@ -9362,7 +11472,37 @@ def test_localization_bridge_latches_one_shot_localizer_pose():
     overlay_bridge_cfg = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "localization_bridge.yaml"
     ).read_text(encoding="utf-8")
-    api_code = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(encoding="utf-8")
+    entry_code = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(encoding="utf-8")
+    docking_status_code = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_status_module.cpp"
+    ).read_text(encoding="utf-8")
+    localization_code = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "localization"
+        / "localization_module.cpp"
+    ).read_text(encoding="utf-8")
+    pre_navigation_undock_code = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "pre_navigation_undock_module.cpp"
+    ).read_text(encoding="utf-8")
+    api_code = localization_code + pre_navigation_undock_code
     api_cfg = (ROOT / "src" / "robot_api_server" / "config" / "robot_api_server.yaml").read_text(encoding="utf-8")
     overlay_api_cfg = (
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "robot_api_server.yaml"
@@ -9388,16 +11528,18 @@ def test_localization_bridge_latches_one_shot_localizer_pose():
     for cfg in (bridge_cfg, overlay_bridge_cfg):
         assert "forced_jump_threshold_m: 20.0" in cfg
         assert "force_accept_service: /robot_localization_bridge/force_accept_next_localization" in cfg
-    assert "request_localization_bridge_force_accept" in api_code
+    assert "request_localization_bridge_force_accept" not in api_code
+    assert "global localization wrapper owns bridge force-accept" in localization_code
     assert "trigger_localization_and_wait_for_result(" in api_code
-    assert "&relocalization_sequence" in api_code
-    assert "post_undock_relocalization_succeeded" in api_code
+    assert "&relocalization_sequence" in docking_status_code
+    assert "post_undock_relocalization_succeeded" in docking_status_code
     assert "undocked before navigation; post-undock navigation readiness failed, Nav2 goal not sent" in api_code
+    assert "trigger_localization_and_wait_for_result(" not in entry_code
     for cfg in (api_cfg, overlay_api_cfg):
-        assert 'localization_bridge_force_accept_service: "/robot_localization_bridge/force_accept_next_localization"' in cfg
+        assert "localization_bridge_force_accept_service" not in cfg
 
 
-def test_localization_sensing_reuses_slam2d_scan_contract():
+def test_localization_sensing_and_mapping_scan_contracts_are_explicit():
     occupancy_stack = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "launch" / "occupancy_localization_stack.launch.py").read_text(encoding="utf-8")
     localization_sensing = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "launch" / "jt128_localization_sensing.launch.py").read_text(encoding="utf-8")
     localization_script = (ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "run_occupancy_grid_localization.sh").read_text(encoding="utf-8")
@@ -9478,11 +11620,13 @@ def test_localization_sensing_reuses_slam2d_scan_contract():
     assert '("scan", scan_topic)' in localization_sensing
     assert '("flatscan", flatscan_topic)' in localization_sensing
     assert 'overlay_root / "config" / "jt128_scan_slam2d.yaml"' in slam_mapping
+    assert 'DeclareLaunchArgument("scan_topic", default_value="/scan")' in slam_mapping
     assert "target_frame: lidar_level_link" in slam_scan_cfg
     assert "min_height: -0.75" in slam_scan_cfg
     assert "max_height: 0.35" in slam_scan_cfg
     assert "drop_invalid_ranges: true" in flatscan_cfg
     assert "min_scan_fov_degrees: 115.0" in localizer_cfg
+    assert "max_beam_error: 0.50" in localizer_cfg
 
 
 def test_phase111_pointcloud_triage_contracts():
@@ -9552,9 +11696,18 @@ def test_phase111_pointcloud_triage_contracts():
     assert 'export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"' in common_env
     assert 'export FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}"' in common_env
     assert "rmw_cyclonedds_cpp" not in common_env
-    assert 'planner_plugins: ["GridBased"]' in nav2
+    assert (
+        'planner_plugins: ["GridBased", "ElevatorScoped", '
+        '"ElevatorHallScoped", "ElevatorReverseEntryStagingScoped", '
+        '"ElevatorReverseDockingScoped"]'
+    ) in nav2
     assert 'plugin: "nav2_smac_planner/SmacPlanner2D"' in nav2
-    assert 'controller_plugins: ["FollowPath", "FollowPathFallback"]' in nav2
+    assert (
+        'controller_plugins: ["FollowPath", "FollowPathFallback", '
+        '"ElevatorFollowPath", "ElevatorHallFollowPath", '
+        '"ElevatorReverseEntryStagingFollowPath", '
+        '"ElevatorReverseDockingFollowPath"]'
+    ) in nav2
     assert 'primary_controller: "nav2_mppi_controller::MPPIController"' in nav2
     assert 'plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"' in nav2
 
@@ -10520,18 +12673,17 @@ def test_phase_a2_amcl_replaces_isaac_continuous_localization_contracts():
     assert "localizer_input_min_fov_deg: 115.0" in global_cfg
     assert "result_allowed_pretrigger_age_sec: 1.0" in global_cfg
     assert "active_deadline = shortened_deadline" not in global_cpp
-    assert "failure_code=FRESH_LOCALIZATION_RETRY_REQUIRED" in global_cpp
+    assert "draining pre-arm localization_result inside the same trigger transaction" in global_cpp
     assert "force_accept_ignored_pretrigger_result_count" in global_cpp
     assert "last_force_accept_ignored_reason" in global_cpp
-    assert "bridge ignored pre-force-accept stale localization_result" in global_cpp
+    assert "draining pre-arm localization_result inside the same trigger transaction" in global_cpp
     assert "create_subscription<isaac_ros_pointcloud_interfaces::msg::FlatScan>" in global_cpp
     assert "localizer_input_fov_deg" in global_cpp
     assert "localizer_input_min_fov_deg_" in global_cpp
     assert "wait_for_fresh_localizer_input" in global_cpp
     assert "failure_code=LOCALIZER_INPUT_NOT_FRESH" in global_cpp
     assert "localization_result_is_fresh_for_trigger" in global_cpp
-    assert "bridge rejected stale triggered localization_result; a new Isaac trigger is" in global_cpp
-    assert "same-trigger window" not in global_cpp
+    assert "force-accept arm time and deadline remain unchanged" in global_cpp
     assert "map_to_odom_wait_timeout_sec: 8.0" in global_cfg
     assert "bridge_status_topic: /localization/bridge_status" in global_cfg
     assert "bridge_force_accept_service: /robot_localization_bridge/force_accept_next_localization" in global_cfg
@@ -10557,9 +12709,10 @@ def test_phase_a2_amcl_replaces_isaac_continuous_localization_contracts():
     assert "bridge ignoring AMCL observe-only reject while waiting for fresh" in global_cpp
     assert "isaac_triggered_pose_stale_ms" in global_cpp
     assert "wait_for_map_to_odom" in global_cpp
-    assert "failure_code=ISAAC_SERVICE_TIMEOUT" in global_cpp
+    assert "failure_code=ISAAC_SERVICE_UNAVAILABLE" in global_cpp
+    assert "failure_code=ISAAC_DISPATCH_TIMEOUT" in global_cpp
     assert "failure_code=LOCALIZATION_RESULT_TIMEOUT" in global_cpp
-    assert "failure_code=FRESH_LOCALIZATION_RETRY_REQUIRED" in global_cpp
+    assert "failure_code=FRESH_LOCALIZATION_RETRY_REQUIRED" not in global_cpp
     assert "failure_code=BRIDGE_ACCEPT_TIMEOUT" in global_cpp
     assert "failure_code=MAP_TO_ODOM_TIMEOUT" in global_cpp
     assert "failure_code=MAP_TO_ODOM_WRONG_OWNER" in global_cpp
@@ -10576,7 +12729,7 @@ def test_phase_a2_amcl_replaces_isaac_continuous_localization_contracts():
     assert "NJRH_GLOBAL_LOCALIZATION_TRIGGER_CALL_TIMEOUT:-90" in nav_runtime
     assert "GLOBAL_LOCALIZATION_TRIGGER_TIMEOUT" in nav_runtime
     assert "LOCALIZATION_RESULT_TIMEOUT" in nav_runtime
-    assert "trigger_output_reports_transient_amcl_pose_stale_reject" in nav_runtime
+    assert "trigger_output_reports_transient_amcl_pose_stale_reject" not in nav_runtime
     assert "AMCL_POSE_STALE" in nav_runtime
     assert "MAP_TO_ODOM_TIMEOUT" in nav_runtime
     assert "NJRH_RUNTIME_LAST_TRIGGERED_RELOCALIZATION_OK" in nav_runtime
@@ -10658,13 +12811,13 @@ def test_phase_a1_amcl_shadow_localization_contracts():
     assert 'source "${SCRIPT_DIR}/map_server_helpers.sh"' in amcl_runner
     assert 'wait_for_occupancy_grid "/map" "${map_timeout}"' in amcl_runner
     assert 'wait_for_topic_message "/map" "${map_timeout}"' not in amcl_runner
-    assert '"/${AMCL_NODE_NAME}/change_state"' in amcl_runner
-    assert "lifecycle_msgs/srv/ChangeState" in amcl_runner
-    assert '"/${AMCL_NODE_NAME}/get_state"' in amcl_runner
-    assert "lifecycle_msgs/srv/GetState" in amcl_runner
-    assert "amcl_lifecycle_transition_state_reached" in amcl_runner
-    assert "response was not reliable, but state reached target" in amcl_runner
-    assert '[[ "${state}" != active* && "${state}" != inactive* ]]' in amcl_runner
+    assert "AMCL_LIFECYCLE_HELPER=" in amcl_runner
+    assert 'python3 "${AMCL_LIFECYCLE_HELPER}"' in amcl_runner
+    assert "--per-node-timeout-sec" in amcl_runner
+    assert "--change-state-response-timeout-sec" in amcl_runner
+    assert "request_amcl_lifecycle_transition()" not in amcl_runner
+    assert "amcl_lifecycle_transition_state_reached()" not in amcl_runner
+    assert 'ros2 service call \\\n    "/${AMCL_NODE_NAME}/change_state"' not in amcl_runner
     assert 'ros2 lifecycle set "/${AMCL_NODE_NAME}" configure' not in amcl_runner
     assert 'ros2 lifecycle set "/${AMCL_NODE_NAME}" activate' not in amcl_runner
     assert "seed_amcl_initial_pose" in amcl_runner
@@ -10712,12 +12865,12 @@ def test_phase_a1_amcl_shadow_localization_contracts():
         assert "amcl_input_enabled: false" in cfg
         assert "amcl_gate_mode: shadow" in cfg
         assert "amcl_max_result_age_ms: 1000.0" in cfg
-        assert "amcl_small_correction_translation_m: 0.07" in cfg
+        assert "amcl_small_correction_translation_m: 0.12" in cfg
         assert "amcl_small_correction_yaw_rad: 0.20" in cfg
-        assert "amcl_medium_correction_translation_m: 0.15" in cfg
-        assert "amcl_medium_correction_yaw_rad: 0.20" in cfg
+        assert "amcl_medium_correction_translation_m: 0.28" in cfg
+        assert "amcl_medium_correction_yaw_rad: 0.35" in cfg
         assert "amcl_medium_correction_consistency_count: 3" in cfg
-        assert "amcl_hard_reject_translation_m: 0.30" in cfg
+        assert "amcl_hard_reject_translation_m: 0.60" in cfg
         assert "amcl_hard_reject_yaw_rad: 0.8" in cfg
         assert "amcl_max_xy_covariance: 0.15" in cfg
         assert "amcl_max_yaw_covariance: 0.10" in cfg
@@ -11047,7 +13200,51 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     bridge_cpp = (ROOT / "src" / "robot_localization_bridge" / "src" / "localization_bridge_node.cpp").read_text(
         encoding="utf-8"
     )
-    api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(encoding="utf-8")
+    navigation_state_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "navigation_state.cpp"
+    ).read_text(encoding="utf-8")
+    navigation_module_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "navigation_module.cpp"
+    ).read_text(encoding="utf-8")
+    localization_module_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "localization"
+        / "localization_module.cpp"
+    ).read_text(encoding="utf-8")
+    system_status_wiring_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "system_status"
+        / "system_status_wiring.cpp"
+    ).read_text(encoding="utf-8")
+    api_observability_cpp = "\n".join(
+        (
+            navigation_state_cpp,
+            navigation_module_cpp,
+            localization_module_cpp,
+            system_status_wiring_cpp,
+            localization_configuration_source(),
+        )
+    )
     runtime_path = scripts_dir / "run_navigation_runtime_services.sh"
     runtime = runtime_path.read_text(encoding="utf-8")
     lifecycle_sequence = (scripts_dir / "nav2_lifecycle_sequence.py").read_text(encoding="utf-8")
@@ -11354,10 +13551,10 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
         "start_amcl_status_heartbeat_if_enabled_for_navigation"
     )
     assert main_flow.index("start_amcl_status_heartbeat_if_enabled_for_navigation") < main_flow.index(
-        'write_runtime_map_context "ready" "true"'
+        'commit_runtime_ready_context "${ready_context_message}"'
     )
     assert main_flow.index("wait_for_amcl_readiness_background_if_running") < main_flow.index(
-        'write_runtime_map_context "ready" "true"'
+        'commit_runtime_ready_context "${ready_context_message}"'
     )
     assert "complete_amcl_readiness_if_enabled_for_navigation ||" not in main_flow
     assert "--start-resident" in runtime
@@ -11407,20 +13604,20 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "candidate.source == \"isaac_triggered\"" in bridge_cpp
     assert "publish_amcl_initial_pose(candidate.map_base_pose, \"isaac_triggered_accept\")" in bridge_cpp
     assert "tf_broadcaster_->sendTransform(tf)" in bridge_cpp
-    assert "amcl_runtime_status_file" in api_cpp
-    assert "read_amcl_runtime_status" in api_cpp
-    assert "amcl_state" in api_cpp
-    assert "amcl_status_file_stale" in api_cpp
-    assert "amcl_process_ready" in api_cpp
-    assert "amcl_seed_response_ok" in api_cpp
-    assert "amcl_nomotion_pose_received" in api_cpp
-    assert "amcl_static_standby" in api_cpp
-    assert "amcl_correction_ready" in api_cpp
-    assert "amcl_correction_pending" in api_cpp
-    assert "localization_degraded" in api_cpp
-    assert "localization_degraded_reason" in api_cpp
-    assert "using_triggered_baseline_only" in api_cpp
-    assert "amcl_scan_admission_status_publisher_count" in api_cpp
+    assert "amcl_runtime_status_file" in api_observability_cpp
+    assert "read_amcl_runtime_status" in api_observability_cpp
+    assert "amcl_state" in api_observability_cpp
+    assert "amcl_status_file_stale" in api_observability_cpp
+    assert "amcl_process_ready" in api_observability_cpp
+    assert "amcl_seed_response_ok" in api_observability_cpp
+    assert "amcl_nomotion_pose_received" in api_observability_cpp
+    assert "amcl_static_standby" in api_observability_cpp
+    assert "amcl_correction_ready" in api_observability_cpp
+    assert "amcl_correction_pending" in api_observability_cpp
+    assert "localization_degraded" in api_observability_cpp
+    assert "localization_degraded_reason" in api_observability_cpp
+    assert "using_triggered_baseline_only" in api_observability_cpp
+    assert "amcl_scan_admission_status_publisher_count" in api_observability_cpp
 
     assert "tf_broadcast: false" in amcl_cfg
     assert "scan_topic: /scan_amcl" in amcl_cfg
@@ -11430,15 +13627,15 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "robot_model_type: nav2_amcl::OmniMotionModel" in amcl_cfg
     assert "amcl_input_enabled: false" in bridge_cfg
     assert "amcl_gate_mode: shadow" in bridge_cfg
-    assert "amcl_small_correction_translation_m: 0.07" in bridge_cfg
+    assert "amcl_small_correction_translation_m: 0.12" in bridge_cfg
     assert "amcl_small_correction_yaw_rad: 0.20" in bridge_cfg
-    assert "amcl_medium_correction_translation_m: 0.15" in bridge_cfg
-    assert "amcl_medium_correction_yaw_rad: 0.20" in bridge_cfg
+    assert "amcl_medium_correction_translation_m: 0.28" in bridge_cfg
+    assert "amcl_medium_correction_yaw_rad: 0.35" in bridge_cfg
     assert "amcl_medium_correction_consistency_count: 3" in bridge_cfg
     assert "amcl_accept_corrections_while_moving: true" in bridge_cfg
     assert "amcl_moving_linear_speed_mps: 0.02" in bridge_cfg
     assert "amcl_moving_angular_speed_radps: 0.02" in bridge_cfg
-    assert "amcl_hard_reject_translation_m: 0.30" in bridge_cfg
+    assert "amcl_hard_reject_translation_m: 0.60" in bridge_cfg
     assert "amcl_hard_reject_yaw_rad: 0.8" in bridge_cfg
     assert "amcl_scan_admission_status_topic: /amcl_scan_admission/status" in bridge_cfg
     assert "amcl_runtime_status_file: /tmp/njrh_amcl_runtime_status.env" in bridge_cfg
@@ -11527,6 +13724,62 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
                 subprocess.run([bash, "-n", str(path)], check=True)
 
 
+def test_amcl_startup_uses_one_bounded_lifecycle_client_and_heartbeat_grace():
+    scripts_dir = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+    )
+    runner = (scripts_dir / "run_amcl_shadow_localization.sh").read_text(
+        encoding="utf-8"
+    )
+    lifecycle_helper = (scripts_dir / "nav2_lifecycle_sequence.py").read_text(
+        encoding="utf-8"
+    )
+
+    activate_block = runner[
+        runner.index("activate_amcl_lifecycle()") :
+        runner.index("amcl_warn()", runner.index("activate_amcl_lifecycle()"))
+    ]
+    heartbeat_block = runner[
+        runner.index("heartbeat_amcl_runtime_status()") :
+        runner.index("wait_for_pid_exit()", runner.index("heartbeat_amcl_runtime_status()"))
+    ]
+
+    assert 'AMCL_LIFECYCLE_HELPER="${NJRH_AMCL_LIFECYCLE_HELPER:-' in runner
+    assert "nav2_lifecycle_sequence.py" in runner
+    assert '"${AMCL_LIFECYCLE_HELPER}"' in activate_block
+    assert "--per-node-timeout-sec" in activate_block
+    assert "--change-state-response-timeout-sec" in activate_block
+    assert '"/${AMCL_NODE_NAME}"' in activate_block
+    assert "ros2 lifecycle get" not in activate_block
+    assert "ros2 service call" not in activate_block
+    assert "request_amcl_lifecycle_transition()" not in runner
+    assert "amcl_lifecycle_transition_state_reached()" not in runner
+    assert "rclpy.init()" in lifecycle_helper
+    assert "create_client(GetState" in lifecycle_helper
+    assert "create_client(ChangeState" in lifecycle_helper
+    assert lifecycle_helper.count("rclpy.init()") == 1
+
+    assert 'starting) state="AMCL_STARTING"' in runner
+    assert "AMCL_STARTUP_EPOCH_SEC" in runner
+    assert '"${start_result}" != "starting"' in runner
+    assert "NJRH_AMCL_STARTUP_HEARTBEAT_GRACE_SEC:-45" in heartbeat_block
+    assert 'heartbeat_startup_epoch="$(date +%s)"' in heartbeat_block
+    assert 'effective_startup_epoch="${heartbeat_startup_epoch}"' in heartbeat_block
+    assert (
+        '"${existing_failure_reason}" != "AMCL_HEARTBEAT_PROCESS_NOT_ALIVE"'
+        in heartbeat_block
+    )
+    assert (
+        'write_amcl_runtime_status starting false false '
+        '"resident AMCL startup is still in progress"'
+    ) in heartbeat_block
+    assert "AMCL_HEARTBEAT_PROCESS_NOT_ALIVE" in heartbeat_block
+
+
 def test_phase_a22_amcl_readiness_stale_status_and_nomotion_race_contracts():
     overlay = ROOT / "scripts" / "jetson" / "runtime_overlay"
     config_dir = overlay / "config"
@@ -11543,6 +13796,18 @@ def test_phase_a22_amcl_readiness_stale_status_and_nomotion_race_contracts():
         encoding="utf-8"
     )
     api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(encoding="utf-8")
+    navigation_state_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "navigation_state.cpp"
+    ).read_text(encoding="utf-8")
+    api_observability_cpp = "\n".join(
+        (api_cpp, navigation_state_cpp, localization_configuration_source())
+    )
     bridge_cfg = (config_dir / "localization_bridge.yaml").read_text(encoding="utf-8")
     api_cfg = (config_dir / "robot_api_server.yaml").read_text(encoding="utf-8")
 
@@ -11591,15 +13856,15 @@ def test_phase_a22_amcl_readiness_stale_status_and_nomotion_race_contracts():
     assert "AMCL_TRACKING_NOT_READY" in bridge_cpp
     assert "(amcl_gate_mode_ == \"gated\" && !amcl_correction_ready)" not in bridge_cpp
 
-    assert "amcl_runtime_status_ttl_sec" in api_cpp
-    assert "bridge_status.amcl_correction_ready" in api_cpp
-    assert "bridge_status.amcl_correction_pending" in api_cpp
-    assert "amcl_status_file_stale" in api_cpp
-    assert "amcl_seed_response_ok" in api_cpp
-    assert "amcl_nomotion_pose_received" in api_cpp
-    assert "amcl_status_source" in api_cpp
-    assert "stale_file_ignored" in api_cpp
-    assert "using_triggered_baseline_only" in api_cpp
+    assert "amcl_runtime_status_ttl_sec" in api_observability_cpp
+    assert "bridge_status.amcl_correction_ready" in api_observability_cpp
+    assert "bridge_status.amcl_correction_pending" in api_observability_cpp
+    assert "amcl_status_file_stale" in api_observability_cpp
+    assert "amcl_seed_response_ok" in api_observability_cpp
+    assert "amcl_nomotion_pose_received" in api_observability_cpp
+    assert "amcl_status_source" in api_observability_cpp
+    assert "stale_file_ignored" in api_observability_cpp
+    assert "using_triggered_baseline_only" in api_observability_cpp
 
     assert "amcl_runtime_status_ttl_sec: 5.0" in bridge_cfg
     assert "amcl_accept_corrections_while_moving: true" in bridge_cfg
@@ -11743,10 +14008,131 @@ def test_phase_d3_docking_framework_state_machine_contracts():
     api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
         encoding="utf-8"
     )
-    job_hpp = (ROOT / "src" / "robot_api_server" / "include" / "robot_api_server" / "docking_job_model.hpp").read_text(
+    docking_feature_cpp = docking_feature_source()
+    docking_executor_hpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "include"
+        / "robot_api_server"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_job_executor.hpp"
+    ).read_text(encoding="utf-8")
+    docking_executor_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_job_executor.cpp"
+    ).read_text(encoding="utf-8")
+    docking_status_module_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_status_module.cpp"
+    ).read_text(encoding="utf-8")
+    docking_runtime_cpp = (
+        ROOT / "src" / "robot_api_server" / "src" / "features" / "docking"
+        / "lifecycle" / "docking_runtime_module.cpp"
+    ).read_text(encoding="utf-8")
+    docking_correction_pause_cpp = (
+        ROOT / "src" / "robot_api_server" / "src" / "features" / "docking"
+        / "lifecycle" / "docking_correction_pause_module.cpp"
+    ).read_text(encoding="utf-8")
+    pre_navigation_undock_cpp = (
+        ROOT / "src" / "robot_api_server" / "src" / "features" / "docking"
+        / "lifecycle" / "pre_navigation_undock_module.cpp"
+    ).read_text(encoding="utf-8")
+    navigation_feature_cpp = (
+        ROOT / "src" / "robot_api_server" / "src" / "features" / "navigation"
+        / "navigation_feature_module.cpp"
+    ).read_text(encoding="utf-8")
+    predock_control_hpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "include"
+        / "robot_api_server"
+        / "features"
+        / "docking"
+        / "predock_alignment"
+        / "predock_control_module.hpp"
+    ).read_text(encoding="utf-8")
+    predock_control_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "predock_alignment"
+        / "predock_control_module.cpp"
+    ).read_text(encoding="utf-8")
+    docking_cpp = "\n".join(
+        (
+            api_cpp,
+            docking_executor_cpp,
+            docking_status_module_cpp,
+            docking_runtime_cpp,
+            pre_navigation_undock_cpp,
+            predock_control_cpp,
+            navigation_feature_cpp,
+            docking_feature_cpp,
+        )
+    )
+    job_hpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "include"
+        / "robot_api_server"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_job_model.hpp"
+    ).read_text(
         encoding="utf-8"
     )
-    job_cpp = (ROOT / "src" / "robot_api_server" / "src" / "docking_job_model.cpp").read_text(encoding="utf-8")
+    job_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_job_model.cpp"
+    ).read_text(encoding="utf-8")
+    predock_policy_hpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "include"
+        / "robot_api_server"
+        / "features"
+        / "docking"
+        / "predock_alignment"
+        / "predock_alignment_policy.hpp"
+    ).read_text(encoding="utf-8")
+    predock_policy_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "predock_alignment"
+        / "predock_alignment_policy.cpp"
+    ).read_text(encoding="utf-8")
     bridge_cpp = (
         ROOT / "src" / "robot_localization_bridge" / "src" / "localization_bridge_node.cpp"
     ).read_text(encoding="utf-8")
@@ -11785,87 +14171,148 @@ def test_phase_d3_docking_framework_state_machine_contracts():
         "FINE_ALIGN",
         "RESTAGE_RETRY",
     ):
-        assert phase in api_cpp
+        assert phase in docking_cpp
         assert phase in verify
 
     for symbol in (
-        "computeExpectedStagingYaw",
-        "computePredockYawError",
-        "computeContactYawError",
-        "normalizeYawError",
-        "predock_pose_inside_xy_handoff_window",
-        "predock_pose_allows_staging_recovery",
-        "predock_yaw_angles_met",
-        "predock_staging_target_met",
-        "predock_forward_capture_window_met",
-        "predock_lateral_capture_allowed",
-        "run_predock_yaw_align",
-        "run_predock_lateral_align",
-        "predock_lateral_align_yaw_gate_met",
-        "ensure_predock_lateral_alignment",
-        "evaluate_fine_docking_entry",
+        "PredockAlignmentPolicy::expected_staging_yaw",
+        "PredockAlignmentPolicy::predock_yaw_error",
+        "PredockAlignmentPolicy::contact_yaw_error",
+        "PredockAlignmentPolicy::normalize_yaw_error",
+        "PredockAlignmentPolicy::pose_inside_xy_handoff_window",
+        "PredockAlignmentPolicy::pose_allows_staging_recovery",
+        "PredockAlignmentPolicy::yaw_angles_met",
+        "PredockAlignmentPolicy::staging_target_met",
+        "PredockAlignmentPolicy::forward_capture_window_met",
+        "PredockAlignmentPolicy::lateral_capture_allowed",
+        "PredockControlModule::run_yaw_align",
+        "PredockControlModule::run_lateral_align",
+        "PredockAlignmentPolicy::lateral_align_yaw_gate_met",
+        "PredockControlModule::ensure_lateral_alignment",
+        "PredockControlModule::evaluate_fine_entry",
     ):
-        assert symbol in api_cpp
+        assert symbol in predock_policy_cpp + predock_control_cpp
 
-    assert 'predock_yaw_align_cmd_topic_ != "/cmd_vel_docking"' in api_cpp
-    assert "create_publisher<geometry_msgs::msg::Twist>(predock_yaw_align_cmd_topic_" in api_cpp
-    assert "actual_motion_mode_code == 2" in api_cpp
-    assert "Ranger feedback did not confirm SPINNING=2 before predock yaw command timeout" in api_cpp
-    assert "PREDOCK_YAW_ALIGN_MODE_SWITCH_TIMEOUT" in api_cpp
-    assert "PREDOCK_YAW_ALIGN_NO_CONFIRMED_PHYSICAL_SPIN" in api_cpp
-    assert "docking-owned yaw/lateral recovery" in api_cpp
-    assert "retrying predock native Nav2 because current pose is outside docking recovery window" in api_cpp
-    assert 'declare_parameter<bool>("docking_predock_early_handoff_enabled", false)' in api_cpp
-    assert "docking_predock_early_handoff_enabled_ &&" in api_cpp
-    assert "predock_pose_allows_staging_recovery(predock_check)" in api_cpp
-    assert "predock yaw exceeded lateral alignment gate" in api_cpp
-    assert "predock lateral error diverged; reversing side-slip command direction once" in api_cpp
-    assert "direction_multiplier * std::copysign(command_speed, check.lateral_m)" in api_cpp
-    assert "closed-loop predock staging capture verify cycle" in api_cpp
-    assert "recapturing predock yaw in closed-loop staging cycle" in api_cpp
-    assert "closed-loop lateral capture cycle" in api_cpp
-    post_bridge_start = api_cpp.index(
-        'set_docking_job_phase(job_id, "PREDOCK_POSE_VERIFY_AFTER_BRIDGE_SETTLE")'
+    assert "class DockingJobExecutor" in docking_executor_hpp
+    assert "DockingJobExecutor::run" in docking_executor_cpp
+    assert "void run_docking_job(" not in api_cpp
+    assert "job_executor_->run_guarded(job_id);" in docking_feature_cpp
+    assert "src/features/docking/lifecycle/docking_job_executor.cpp" in (
+        ROOT / "src" / "robot_api_server" / "CMakeLists.txt"
+    ).read_text(encoding="utf-8")
+
+    assert "class PredockAlignmentPolicy" in predock_policy_hpp
+    assert "PredockAlignmentPolicy::evaluate_pose" in predock_policy_cpp
+    assert "PredockAlignmentPolicy::pose_inside_handoff_window" in predock_policy_cpp
+    assert "PredockAlignmentPolicy::pose_allows_staging_recovery" in predock_policy_cpp
+    assert "PredockAlignmentPolicy::staging_target_met" in predock_policy_cpp
+    assert "PredockAlignmentPolicy::apply_pose_verification" in predock_policy_cpp
+    assert "PredockAlignmentPolicy::apply_yaw_align_result" in predock_policy_cpp
+    assert "PredockAlignmentPolicy::apply_lateral_align_result" in predock_policy_cpp
+    assert "PredockAlignmentPolicy::apply_fine_entry_check" in predock_policy_cpp
+    assert (
+        "std::unique_ptr<predock_alignment::PredockAlignmentPolicy> predock_alignment_policy_;"
+        in docking_feature_cpp
     )
-    fine_entry_start = api_cpp.index(
-        'set_docking_job_phase(job_id, "FINE_DOCKING_ENTRY_CHECK")',
+    assert "src/features/docking/predock_alignment/predock_alignment_policy.cpp" in (
+        ROOT / "src" / "robot_api_server" / "CMakeLists.txt"
+    ).read_text(encoding="utf-8")
+
+    assert "class PredockControlModule" in predock_control_hpp
+    assert "PredockAssessment probe_handoff" in predock_control_hpp
+    assert "PredockAssessment verify_staging_pose" in predock_control_hpp
+    assert "bool start_fine_docking_handoff" in predock_control_hpp
+    assert (
+        "std::unique_ptr<predock_alignment::PredockControlModule> predock_control_;"
+        in docking_feature_cpp
+    )
+    assert "predock_control_.start_fine_docking_handoff(job_id, job)" in docking_executor_cpp
+
+    assert 'config_.command_topic != "/cmd_vel_docking"' in docking_runtime_cpp
+    assert "config_.command_topic, command_qos" in docking_runtime_cpp
+    assert "predock_yaw_align_cmd_pub_" not in api_cpp
+    assert "actual_motion_mode_code == 2" in predock_control_cpp
+    assert (
+        "Ranger feedback did not confirm SPINNING=2 before predock yaw command timeout"
+        in predock_control_cpp
+    )
+    assert "PREDOCK_YAW_ALIGN_MODE_SWITCH_TIMEOUT" in predock_control_cpp
+    assert "PREDOCK_YAW_ALIGN_NO_CONFIRMED_PHYSICAL_SPIN" in predock_control_cpp
+    assert "docking-owned yaw/lateral recovery" in docking_cpp
+    assert "retrying predock native Nav2 because current pose is outside docking recovery window" in docking_cpp
+    docking_configuration_cpp = docking_configuration_source()
+    assert "config.job_executor.predock_early_handoff_enabled" in docking_configuration_cpp
+    assert '"docking_predock_early_handoff_enabled", false' in docking_configuration_cpp
+    assert "config_.predock_early_handoff_enabled &&" in docking_executor_cpp
+    assert "policy_.pose_allows_staging_recovery(result.check)" in predock_control_cpp
+    assert "predock yaw exceeded lateral alignment gate" in predock_control_cpp
+    assert (
+        "predock lateral error diverged; reversing side-slip command direction once"
+        in predock_control_cpp
+    )
+    assert (
+        "direction_multiplier * std::copysign(command_speed, check.lateral_m)"
+        in predock_control_cpp
+    )
+    assert "closed-loop predock staging capture verify cycle" in predock_control_cpp
+    assert "recapturing predock yaw in closed-loop staging cycle" in predock_control_cpp
+    assert "closed-loop lateral capture cycle" in predock_control_cpp
+    post_bridge_start = predock_control_cpp.index(
+        'job_store_.set_phase(job_id, "PREDOCK_POSE_VERIFY_AFTER_BRIDGE_SETTLE")'
+    )
+    fine_entry_start = predock_control_cpp.index(
+        'job_store_.set_phase(job_id, "FINE_DOCKING_ENTRY_CHECK")',
         post_bridge_start,
     )
-    post_bridge_block = api_cpp[post_bridge_start:fine_entry_start]
-    assert "ensure_predock_lateral_alignment(" in post_bridge_block
+    post_bridge_block = predock_control_cpp[post_bridge_start:fine_entry_start]
+    assert "ensure_lateral_alignment(" in post_bridge_block
     assert "aligning staging lateral after bridge settle with map->odom frozen" in post_bridge_block
-    staging_capture_block = api_cpp[
-        api_cpp.index("bool ensure_predock_lateral_alignment(") :
-        api_cpp.index("bool evaluate_fine_docking_entry", api_cpp.index("bool ensure_predock_lateral_alignment("))
+    staging_capture_block = predock_control_cpp[
+        predock_control_cpp.index("bool PredockControlModule::ensure_lateral_alignment(") :
+        predock_control_cpp.index(
+            "bool PredockControlModule::evaluate_fine_entry",
+            predock_control_cpp.index("bool PredockControlModule::ensure_lateral_alignment("),
+        )
     ]
-    assert "predock_yaw_aligned = predock_yaw_angles_met(predock_check);" in staging_capture_block
-    assert "predock_yaw_aligned = predock_yaw_target_met(predock_check);" not in staging_capture_block
-    assert "bool predock_yaw_aligned = false;" in api_cpp
-    assert "predock staging capture cannot fix current centerline/forward window by side-slip" in api_cpp
-    assert "forward_capture_min=" in api_cpp
-    assert "forward_capture_max=" in api_cpp
-    assert "predock staging capture exhausted closed-loop cycles" in api_cpp
-    assert "publish_predock_lateral_forced_mode(predock_lateral_align_forced_mode_)" in api_cpp
-    assert "twist.linear.y" in api_cpp
-    assert "mode_controller_status_topic_" in api_cpp
-    assert "docking_gs2_scan_topic_" in api_cpp
-    assert 'job_id, true, "docking_staging_alignment", pause_detail' in api_cpp
-    assert "correction_pause_reason" in api_cpp
-    assert "bridge_status_has_docking_fine_pause" in api_cpp
-    assert "release_stale_docking_fine_pause_if_needed" in api_cpp
-    assert "bridge_status_safe_for_fine_docking_entry" in api_cpp
-    assert "bridge_status_safe_for_goal_start(bridge, \"docking fine docking\", base_detail)" in api_cpp
-    assert "AMCL_NOT_TRACKING tolerated_for_fine_docking_after_predock_verified" in api_cpp
-    assert 'bridge.amcl_degraded_reason == "AMCL_NOT_TRACKING"' in api_cpp
-    assert "!bridge.correction_active" in api_cpp
-    assert "!bridge.amcl_correction_pending" in api_cpp
-    assert "std::fabs(bridge.remaining_translation_error_m) <= 0.02" in api_cpp
-    assert "std::fabs(bridge.remaining_yaw_error_rad) <= 0.05" in api_cpp
-    assert '"pre_navigation_undock_start"' in api_cpp
-    assert '"post_undock_relocalization_before_trigger"' in api_cpp
-    assert "POST_UNDOCK_STALE_DOCKING_FINE_PAUSE" in api_cpp
-    assert "docking_job_finished_" in api_cpp
-    assert "std_srvs::srv::SetBool" in api_cpp
+    assert "yaw_aligned = policy_.yaw_angles_met(check);" in staging_capture_block
+    assert "yaw_aligned = policy_.yaw_target_met(check);" not in staging_capture_block
+    assert "bool predock_yaw_aligned = false;" in docking_executor_cpp
+    assert "predock staging capture cannot fix current centerline/forward window by side-slip" in docking_cpp
+    assert "forward_capture_min=" in predock_control_cpp
+    assert "forward_capture_max=" in predock_control_cpp
+    assert "predock staging capture exhausted closed-loop cycles" in predock_control_cpp
+    assert "ports_.publish_forced_mode(config_.lateral_align_forced_mode)" in predock_control_cpp
+    assert "twist.linear.y" in predock_control_cpp
+    assert '"mode_controller_status_topic", "/ranger_base/status"' in navigation_configuration_source()
+    assert "config_.gs2_scan_topic" in docking_runtime_cpp
+    assert "docking_gs2_scan_topic_" not in api_cpp
+    assert 'job_id, true, "docking_staging_alignment", pause_detail' in predock_control_cpp
+    assert "correction_pause_reason" in navigation_feature_cpp
+    assert "bridge_has_docking_fine_pause" in docking_correction_pause_cpp
+    assert "DockingCorrectionPauseModule::release_stale_if_needed" in docking_correction_pause_cpp
+    assert "release_stale_docking_fine_pause_if_needed" not in api_cpp
+    assert "PredockControlModule::bridge_safe_for_fine_entry" in predock_control_cpp
+    assert "ports_.bridge_safe_for_goal_start(bridge, \"docking fine docking\", base_detail)" in predock_control_cpp
+    assert "AMCL_NOT_TRACKING tolerated_for_fine_docking_after_predock_verified" in predock_control_cpp
+    assert 'bridge.amcl_degraded_reason == "AMCL_NOT_TRACKING"' in predock_control_cpp
+    assert "!bridge.correction_active" in predock_control_cpp
+    assert "!bridge.amcl_correction_pending" in predock_control_cpp
+    assert "std::fabs(bridge.remaining_translation_error_m) <= 0.02" in predock_control_cpp
+    assert "std::fabs(bridge.remaining_yaw_error_rad) <= 0.05" in predock_control_cpp
+    assert '"pre_navigation_undock_start"' in docking_cpp
+    assert '"post_undock_relocalization_before_trigger"' in docking_status_module_cpp
+    assert "POST_UNDOCK_STALE_DOCKING_FINE_PAUSE" in docking_status_module_cpp
+    assert "docking_job_finished_" in docking_status_module_cpp
+    localization_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "localization"
+        / "localization_module.cpp"
+    ).read_text(encoding="utf-8")
+    assert "std_srvs::srv::SetBool" in localization_cpp
 
     for code in (
         "DOCK_FAILED_PREDOCK_NAV",
@@ -11894,7 +14341,7 @@ def test_phase_d3_docking_framework_state_machine_contracts():
         "FINAL_INSERTION_NO_CONTACT",
         "DOCK_FAILED_SAFETY_BLOCKED",
     ):
-        assert code in api_cpp
+        assert code in docking_cpp
 
     for field in (
         "dock_profile_id",
@@ -11984,7 +14431,7 @@ def test_phase_d3_docking_framework_state_machine_contracts():
     assert "Aborting" in observe
     assert "kill -KILL" in observe
     assert "ros2 topic pub" not in ab
-    assert "opennav_docking" not in api_cpp
+    assert "opennav_docking" not in docking_cpp
     assert "robot_docking_manager" in phase_doc
     assert "/cmd_vel_docking -> robot_safety" in phase_doc
 
@@ -12099,6 +14546,54 @@ def test_phase_v1_navigation_docking_validation_contracts():
     api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
         encoding="utf-8"
     )
+    navigation_module_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "navigation_module.cpp"
+    ).read_text(encoding="utf-8")
+    localization_module_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "localization"
+        / "localization_module.cpp"
+    ).read_text(encoding="utf-8")
+    docking_executor_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_job_executor.cpp"
+    ).read_text(encoding="utf-8")
+    predock_control_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "predock_alignment"
+        / "predock_control_module.cpp"
+    ).read_text(encoding="utf-8")
+    gateway_cpp = "\n".join(
+        (
+            api_cpp,
+            navigation_configuration_source(),
+            navigation_module_cpp,
+            localization_module_cpp,
+            docking_executor_cpp,
+            predock_control_cpp,
+        )
+    )
     bridge_cpp = (
         ROOT / "src" / "robot_localization_bridge" / "src" / "localization_bridge_node.cpp"
     ).read_text(encoding="utf-8")
@@ -12119,30 +14614,30 @@ def test_phase_v1_navigation_docking_validation_contracts():
     assert bridge_cpp.count("tf_broadcaster_->sendTransform(tf)") == 1
     assert "map_to_odom_ = candidate.transform" not in bridge_cpp
 
-    assert 'navigation_default_goal_completion_policy", "pose_required"' in api_cpp
-    assert 'navigation_delivery_point_goal_completion_policy", "pose_required"' in api_cpp
-    assert "resolve_nav2_goal_yaw_for_policy" in api_cpp
-    assert "nav2_goal_yaw_source" in api_cpp
-    assert "goal_completion_policy=dock_staging is reserved for /api/v1/docking/start" in api_cpp
-    assert 'json_bool_value(body, "wait_for_settle", false)' in api_cpp
-    assert "post_relocalization_settle_requested" in api_cpp
-    assert "PREDOCK_YAW_ALIGN_OWNER_CONFLICT" in api_cpp
-    assert "PREDOCK_LATERAL_ALIGN" in api_cpp
-    assert "fine_docking_entry_require_predock_yaw_aligned_ && !predock_yaw_aligned" in api_cpp
-    fine_entry_block = api_cpp[
-        api_cpp.index("bool evaluate_fine_docking_entry") :
-        api_cpp.index("std::string classify_fine_docking_failure_code")
+    assert '"navigation_default_goal_completion_policy", "pose_required"' in gateway_cpp
+    assert '"navigation_delivery_point_goal_completion_policy", "pose_required"' in gateway_cpp
+    assert "resolve_nav2_goal_yaw" in gateway_cpp
+    assert "nav2_goal_yaw_source" in gateway_cpp
+    assert "goal_completion_policy=dock_staging is reserved for /api/v1/docking/start" in gateway_cpp
+    assert 'json_bool_value(body, "wait_for_settle", false)' in gateway_cpp
+    assert "post_relocalization_settle_requested" in gateway_cpp
+    assert "PREDOCK_YAW_ALIGN_OWNER_CONFLICT" in gateway_cpp
+    assert "PREDOCK_LATERAL_ALIGN" in gateway_cpp
+    assert "config_.fine_entry_require_predock_yaw_aligned && !yaw_aligned" in gateway_cpp
+    fine_entry_block = predock_control_cpp[
+        predock_control_cpp.index("bool PredockControlModule::evaluate_fine_entry") :
+        predock_control_cpp.index("bool PredockControlModule::start_fine_docking_handoff")
     ]
     assert (
-        "if (!dock_staging_handoff_ready || !post_predock_settle_complete)"
+        'if (current_policy != "dock_staging" || !handoff_ready ||'
         in fine_entry_block
     )
     assert "!predock_pose_verified" not in fine_entry_block
-    assert "wait_for_bridge_smoothing_before_fine_docking" in api_cpp
-    assert "bridge_status_safe_for_fine_docking_entry" in api_cpp
-    assert "AMCL_NOT_TRACKING tolerated_for_fine_docking_after_predock_verified" in api_cpp
-    assert "FINE_DOCKING_BRIDGE_SETTLE" in api_cpp
-    assert "DOCK_FAILED_FINE_LOCALIZATION_TRANSITION_TIMEOUT" in api_cpp
+    assert "PredockControlModule::wait_for_bridge_smoothing" in predock_control_cpp
+    assert "PredockControlModule::bridge_safe_for_fine_entry" in predock_control_cpp
+    assert "AMCL_NOT_TRACKING tolerated_for_fine_docking_after_predock_verified" in predock_control_cpp
+    assert "FINE_DOCKING_BRIDGE_SETTLE" in predock_control_cpp
+    assert "DOCK_FAILED_FINE_LOCALIZATION_TRANSITION_TIMEOUT" in predock_control_cpp
 
     audit_reports = sorted((ROOT / "reports").glob("v1_runtime_config_audit_*.md"))
     assert audit_reports
@@ -12193,6 +14688,52 @@ def test_phase_l2_post_relocalization_settle_barrier_contracts():
 
     api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
         encoding="utf-8"
+    )
+    docking_feature_cpp = docking_feature_source()
+    docking_executor_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_job_executor.cpp"
+    ).read_text(encoding="utf-8")
+    docking_status_module_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_status_module.cpp"
+    ).read_text(encoding="utf-8")
+    docking_execution_cpp = "\n".join(
+        (api_cpp, docking_feature_cpp, docking_executor_cpp, docking_status_module_cpp)
+    )
+    localization_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "localization"
+        / "localization_module.cpp"
+    ).read_text(encoding="utf-8")
+    settle_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "localization"
+        / "post_relocalization_settle_module.cpp"
+    ).read_text(encoding="utf-8")
+    localization_feature_cpp = localization_feature_source()
+    api_runtime_cpp = "\n".join(
+        (docking_execution_cpp, localization_cpp, localization_feature_cpp, settle_cpp)
     )
     bridge_cpp = (
         ROOT / "src" / "robot_localization_bridge" / "src" / "localization_bridge_node.cpp"
@@ -12258,21 +14799,21 @@ def test_phase_l2_post_relocalization_settle_barrier_contracts():
     ]
     assert "tf_broadcaster_->sendTransform(tf)" not in refresh_fn
 
-    assert "wait_for_post_relocalization_settle_barrier(" in api_cpp
-    assert '"post_undock"' in api_cpp
-    assert '"before_predock"' in api_cpp
-    assert '"after_predock"' in api_cpp
-    assert '"manual_before_navigation"' in api_cpp
-    assert '"nav2_goal"' in api_cpp
-    assert '"fine_docking"' in api_cpp
-    assert "local_costmap_message_filter_drop_count()" in api_cpp
-    assert "base_to_lidar_static_tf_ready()" in api_cpp
-    assert "post_relocalization_settle_state_json()" in api_cpp
-    assert "publish_teleop_zero_burst()" in api_cpp
-    assert "publish_final_yaw_align_zero_burst()" in api_cpp
-    assert "map_odom_publish_gap_ms" in api_cpp
-    assert "publisher_decoupled_from_correction" in api_cpp
-    assert "map_odom_last_published_sequence" in api_cpp
+    assert "wait_for_settle(" in localization_feature_cpp
+    assert '"post_undock"' in docking_status_module_cpp
+    assert '"before_predock"' in docking_execution_cpp
+    assert '"after_predock"' in docking_execution_cpp
+    assert '"manual_before_navigation"' in api_runtime_cpp
+    assert '"nav2_goal"' in api_runtime_cpp
+    assert '"fine_docking"' in api_runtime_cpp
+    assert "local_costmap_message_filter_drop_count()" in localization_feature_cpp
+    assert "base_to_lidar_static_tf_ready()" in localization_feature_cpp
+    assert "settle_state_json()" in localization_feature_cpp
+    assert "dependencies_.teleop->publish_zero_burst()" in localization_feature_cpp
+    assert "publish_final_yaw_align_zero_burst()" in docking_feature_cpp
+    assert "map_odom_publish_gap_ms" in settle_cpp
+    assert "publisher_decoupled_from_correction" in settle_cpp
+    assert "map_odom_last_published_sequence" in settle_cpp
 
     for code in [
         "POST_RELOCALIZATION_SETTLE_TIMEOUT",
@@ -12291,7 +14832,7 @@ def test_phase_l2_post_relocalization_settle_barrier_contracts():
         "POST_RELOCALIZATION_SEQUENCE_MISMATCH",
         "CANCELLED_BY_APP",
     ]:
-        assert code in api_cpp
+        assert code in settle_cpp
 
     assert verify_script_path.exists()
     assert observe_script_path.exists()
@@ -12341,10 +14882,94 @@ def test_phase_u1_post_undock_settle_before_pending_nav_goal_contracts():
 
     api_cpp_path = ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp"
     api_cpp = api_cpp_path.read_text(encoding="utf-8")
-    docking_job_hpp = (
-        ROOT / "src" / "robot_api_server" / "include" / "robot_api_server" / "docking_job_model.hpp"
+    docking_status_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_status_module.cpp"
     ).read_text(encoding="utf-8")
-    docking_job_cpp = (ROOT / "src" / "robot_api_server" / "src" / "docking_job_model.cpp").read_text(
+    pre_navigation_undock_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "pre_navigation_undock_module.cpp"
+    ).read_text(encoding="utf-8")
+    docking_job_store_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_job_store.cpp"
+    ).read_text(encoding="utf-8")
+    navigation_module_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "navigation_module.cpp"
+    ).read_text(encoding="utf-8")
+    navigation_state_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "navigation_state.cpp"
+    ).read_text(encoding="utf-8")
+    navigation_executor_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "mission"
+        / "navigation_goal_executor.cpp"
+    ).read_text(encoding="utf-8")
+    settle_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "localization"
+        / "post_relocalization_settle_module.cpp"
+    ).read_text(encoding="utf-8")
+    docking_job_hpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "include"
+        / "robot_api_server"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_job_model.hpp"
+    ).read_text(encoding="utf-8")
+    docking_job_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_job_model.cpp"
+    ).read_text(
         encoding="utf-8"
     )
     api_cfg = (ROOT / "src" / "robot_api_server" / "config" / "robot_api_server.yaml").read_text(
@@ -12366,20 +14991,29 @@ def test_phase_u1_post_undock_settle_before_pending_nav_goal_contracts():
         assert "post_undock_reject_if_new_message_filter_drop: true" in cfg
         assert "post_undock_zero_cmd_during_settle: true" in cfg
 
-    complete_start = api_cpp.index("void complete_post_undock_relocalization")
-    complete_end = api_cpp.index("std::string docking_job_json_locked", complete_start)
-    complete_block = api_cpp[complete_start:complete_end]
-    wait_start = api_cpp.index("bool wait_for_pre_navigation_undock")
-    wait_end = api_cpp.index("bool cancel_active_navigation_goal", wait_start)
-    wait_block = api_cpp[wait_start:wait_end]
-    goal_start = api_cpp.index("HttpResponse handle_navigation_goal")
-    goal_end = api_cpp.index("bool undock_before_navigation_if_needed", goal_start)
-    goal_handler = api_cpp[goal_start:goal_end]
-    barrier_start = api_cpp.index("PostRelocalizationSettleResult wait_for_post_relocalization_settle_barrier")
-    barrier_end = api_cpp.index("RobotPoseSnapshot wait_for_current_robot_pose", barrier_start)
-    barrier_block = api_cpp[barrier_start:barrier_end]
-    barrier_idx = complete_block.find("wait_for_post_relocalization_settle_barrier(")
-    finish_success_idx = complete_block.find('finish_docking_job_locked(\n        true,\n        "undocked"')
+    complete_start = docking_status_cpp.index(
+        "void DockingStatusModule::Impl::complete_post_undock_relocalization"
+    )
+    complete_end = docking_status_cpp.index(
+        "DockingStatusModule::DockingStatusModule", complete_start
+    )
+    complete_block = docking_status_cpp[complete_start:complete_end]
+    wait_start = pre_navigation_undock_cpp.index(
+        "bool PreNavigationUndockModule::wait_for_completion"
+    )
+    wait_block = pre_navigation_undock_cpp[wait_start:]
+    goal_start = navigation_module_cpp.index("HttpResponse handle_goal")
+    goal_end = navigation_module_cpp.index("HttpResponse handle_cancel", goal_start)
+    goal_handler = navigation_module_cpp[goal_start:goal_end]
+    barrier_start = settle_cpp.index("  PostRelocalizationSettleResult wait_for_settle(")
+    barrier_end = settle_cpp.index(
+        "  PostRelocalizationSettleState state_snapshot() const", barrier_start
+    )
+    barrier_block = settle_cpp[barrier_start:barrier_end]
+    barrier_idx = complete_block.find("ports_.wait_for_relocalization_settle(")
+    finish_success_idx = complete_block.find(
+        'ports_.finish_docking_job_locked(\n      true,\n      "undocked"'
+    )
     assert barrier_idx != -1
     assert finish_success_idx != -1
     assert barrier_idx < finish_success_idx
@@ -12388,7 +15022,7 @@ def test_phase_u1_post_undock_settle_before_pending_nav_goal_contracts():
     assert "post_undock_failure_code_from_settle_failure" in complete_block
     assert "record_post_undock_navigation_readiness_failure_locked" in complete_block
     assert "undock succeeded; post-undock navigation readiness failed, pending Nav2 goal held" in complete_block
-    assert 'finish_docking_job_locked(\n        false,\n        "failed"' not in complete_block
+    assert 'ports_.finish_docking_job_locked(\n      false,\n      "failed"' not in complete_block
     assert "post_undock_relocalization_succeeded" in wait_block
     assert "post-undock navigation readiness failed, Nav2 goal not sent" in wait_block
     assert "pending_goal_released_after_post_undock_settle = true" in wait_block
@@ -12401,14 +15035,18 @@ def test_phase_u1_post_undock_settle_before_pending_nav_goal_contracts():
     assert "undock_before_navigation_if_needed" not in goal_handler
     assert "async_send_goal(goal)" not in goal_handler
     assert "goal-start readiness will be checked in navigation background job" in goal_handler
-    assert "pre_navigation_dock_check]() {" in goal_handler
+    assert "ports_.run_goal_job(" in goal_handler
 
-    pre_send_start = api_cpp.index("bool run_navigation_goal_pre_send_sequence")
-    pre_send_end = api_cpp.index("void run_navigation_goal_job_guarded", pre_send_start)
-    pre_send_block = api_cpp[pre_send_start:pre_send_end]
+    pre_send_start = navigation_executor_cpp.index(
+        "bool NavigationGoalExecutor::run_pre_send_sequence"
+    )
+    pre_send_end = navigation_executor_cpp.index(
+        "void NavigationGoalExecutor::run_guarded", pre_send_start
+    )
+    pre_send_block = navigation_executor_cpp[pre_send_start:pre_send_end]
     assert "undock_before_navigation_if_needed" in pre_send_block
     assert pre_send_block.find("undock_before_navigation_if_needed") < pre_send_block.find(
-        "wait_for_navigation_goal_start_readiness"
+        "wait_for_goal_start_readiness"
     )
     assert "navigation requires post-undock localization readiness before goal start" in pre_send_block
 
@@ -12429,7 +15067,7 @@ def test_phase_u1_post_undock_settle_before_pending_nav_goal_contracts():
     ]:
         assert field in docking_job_hpp
         assert field in docking_job_cpp
-        assert field in api_cpp
+        assert field in api_cpp + docking_status_cpp + docking_job_store_cpp
 
     for code in [
         "POST_UNDOCK_RELOCALIZATION_FAILED",
@@ -12447,10 +15085,10 @@ def test_phase_u1_post_undock_settle_before_pending_nav_goal_contracts():
         "POST_UNDOCK_WRONG_MAP_ODOM_OWNER",
         "POST_UNDOCK_RELOCALIZATION_SEQUENCE_MISMATCH",
     ]:
-        assert code in api_cpp
+        assert code in docking_status_cpp
 
-    assert "post_undock_settle_state_json_locked()" in api_cpp
-    assert '\\"post_undock_settle\\":' in api_cpp
+    assert "post_undock_settle_json_locked()" in docking_job_store_cpp
+    assert '\\"post_undock_settle\\":' in navigation_state_cpp
     assert observe_path.exists()
     assert "Read-only observer for Phase U1" in observe_script
     assert "does not send goals" in observe_script
@@ -12486,8 +15124,71 @@ def test_phase_u1_post_undock_settle_before_pending_nav_goal_contracts():
 def test_phase_r0_r2_runtime_force_accept_reduction_and_bridge_smoothing_contracts():
     overlay = ROOT / "scripts" / "jetson" / "runtime_overlay"
     scripts_dir = overlay / "scripts"
-    api_cpp = (ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp").read_text(
-        encoding="utf-8"
+    navigation_module_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "navigation_module.cpp"
+    ).read_text(encoding="utf-8")
+    navigation_goal_executor_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "mission"
+        / "navigation_goal_executor.cpp"
+    ).read_text(encoding="utf-8")
+    localization_module_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "localization"
+        / "localization_module.cpp"
+    ).read_text(encoding="utf-8")
+    navigation_state_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "navigation_state.cpp"
+    ).read_text(encoding="utf-8")
+    navigation_bridge_wait_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "navigation"
+        / "runtime"
+        / "navigation_bridge_wait.cpp"
+    ).read_text(encoding="utf-8")
+    system_status_module_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "system_status"
+        / "system_status_module.cpp"
+    ).read_text(encoding="utf-8")
+    composition_cpp = application_composition_source()
+    api_cpp = "\n".join(
+        (
+            navigation_module_cpp,
+            navigation_state_cpp,
+            navigation_bridge_wait_cpp,
+            localization_module_cpp,
+            system_status_module_cpp,
+        )
     )
     bridge_cpp = (
         ROOT / "src" / "robot_localization_bridge" / "src" / "localization_bridge_node.cpp"
@@ -12517,20 +15218,21 @@ def test_phase_r0_r2_runtime_force_accept_reduction_and_bridge_smoothing_contrac
     assert "Normal-path high-risk calls" in audit_report
     assert "Required Reduction" in audit_report
 
-    goal_start = api_cpp.index("HttpResponse handle_navigation_goal")
-    goal_end = api_cpp.index("bool undock_before_navigation_if_needed", goal_start)
-    goal_handler = api_cpp[goal_start:goal_end]
+    goal_start = navigation_module_cpp.index("HttpResponse handle_goal")
+    goal_end = navigation_module_cpp.index("bool request_goal_cancel", goal_start)
+    goal_handler = navigation_module_cpp[goal_start:goal_end]
     assert "trigger_localization_and_wait_for_result(" not in goal_handler
     assert "request_localization_bridge_force_accept(" not in goal_handler
     assert "wait_for_post_relocalization_settle_barrier(" not in goal_handler
     assert "wait_for_localization_result_after(" not in goal_handler
     assert "/global_localization/trigger" not in goal_handler
-    assert 'bridge_safe_for_goal_start("navigation goal"' in goal_handler
+    assert 'bridge_safe_for_goal_start("navigation goal"' in navigation_goal_executor_cpp
     assert "force_relocalize is no longer executed inside normal navigation goals" in goal_handler
     assert "LOCALIZATION_RECOVERY_REQUIRED" in goal_handler
 
     assert "trigger_localization_and_wait_for_result(" in api_cpp
-    assert "request_localization_bridge_force_accept(" in api_cpp
+    assert "request_localization_bridge_force_accept(" not in api_cpp
+    assert "global localization wrapper owns bridge force-accept" in api_cpp
     assert "/api/v1/localization/trigger" in api_cpp
     assert "handle_trigger_localization" in api_cpp
 
@@ -12554,7 +15256,7 @@ def test_phase_r0_r2_runtime_force_accept_reduction_and_bridge_smoothing_contrac
         "removed_redundant_gates",
         "active_runtime_mode",
         "safe_for_goal_start",
-        "bridge_localization_degraded_blocks_goal_start",
+        "localization_recovery_required",
         "bridge.amcl_seeded",
         "bridge.amcl_tracking_ready",
         "!bridge.amcl_correction_pending",
@@ -12570,8 +15272,8 @@ def test_phase_r0_r2_runtime_force_accept_reduction_and_bridge_smoothing_contrac
         "LOCALIZATION_TRANSITION_ACTIVE",
     ):
         assert token in api_cpp
-    assert "bridge_status_safe_for_goal_start(bridge_status, \"status\"" in api_cpp
-    assert "bridge_status_safe_for_goal_start(bridge_status, \"navigation state\"" in api_cpp
+    assert "bridge_status_safe_for_goal_start(bridge, context, detail)" in composition_cpp
+    assert 'BridgeReadinessPurpose::kGoalStart,\n    "navigation state"' in navigation_state_cpp
 
     assert "current_transform" in bridge_cpp
     assert "target_transform" in bridge_cpp
@@ -12738,6 +15440,37 @@ def test_phase24a_local_costmap_timestamp_audit_contracts():
     assert "does not restamp clouds" in phase_doc
 
 
+def test_robot_api_health_uses_process_identity_not_pgrep_command_substrings():
+    common = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "run_common_services.sh"
+    ).read_text(encoding="utf-8")
+    start = common.index("verify_robot_api_server_common_health_or_exit()")
+    end = common.index("\n}\n", start)
+    body = common[start:end]
+
+    assert "process_count_for_executable()" in common
+    assert "process_count_for_executable_with_exact_argument()" in common
+    assert "process_count_for_executable" in body
+    assert "process_count_for_executable_with_exact_argument" in body
+    assert "process_count_for_pattern" not in body
+    assert '"${SCRIPT_DIR}/run_robot_api_server_supervised.sh"' in body
+    assert (
+        '"${PROJECT_ROOT}/install/robot_api_server/lib/robot_api_server/'
+        'robot_api_server_node"'
+    ) in body
+    assert "wait_for_robot_api_server_common_ready()" in common
+    assert "NJRH_ROBOT_API_PROCESS_READY_TIMEOUT_SEC" in common
+    start_call = common.index('start_common_process "robot_api_server"')
+    readiness_call = common.index("wait_for_robot_api_server_common_ready", start_call)
+    ready_stage = common.index('log_common_startup_stage "robot_api_server_ready"', start_call)
+    assert start_call < readiness_call < ready_stage
+
+
 def test_localization_layer_does_not_own_common_runtime_processes():
     scripts_dir = ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts"
     localization = (scripts_dir / "run_occupancy_grid_localization.sh").read_text(encoding="utf-8")
@@ -12813,7 +15546,7 @@ def test_startup_logs_are_bounded_and_lifecycle_readiness_uses_status_file():
     assert "write_nav2_lifecycle_ready_status" in nav2
 
 
-def test_global_localization_retries_immediately_after_stale_result():
+def test_global_localization_keeps_one_immutable_trigger_transaction():
     source = (
         ROOT / "src" / "robot_global_localization" / "src" / "global_localization_node.cpp"
     ).read_text(encoding="utf-8")
@@ -12825,13 +15558,35 @@ def test_global_localization_retries_immediately_after_stale_result():
         source.index("if (latest.rejected_result_count >", source.index("latest.force_accept_ignored_pretrigger_result_count >"))
     ]
 
-    assert "failure_code=FRESH_LOCALIZATION_RETRY_REQUIRED" in ignored_block
-    assert "return false;" in ignored_block
+    assert "draining pre-arm localization_result inside the same trigger transaction" in ignored_block
+    assert "return false;" not in ignored_block
     assert "extend_active_deadline_for_transient_result" not in source
     assert "transient_stale_bridge_accept_timeout_sec" not in source
-    assert "failure_code=FRESH_LOCALIZATION_RETRY_REQUIRED" in source
+    assert "a new Isaac trigger is required" not in source
     assert "bridge_accept_timeout_sec: 12.0" in config
     assert "transient_stale_bridge_accept_timeout_sec" not in config
+
+    bridge_processed = source[
+        source.index("bool bridge_processed_after(") :
+        source.index("bool arm_bridge_force_accept(")
+    ]
+    assert "bridge_explicit_trigger_accept_observed" in bridge_processed
+    assert "rejected_result_count" not in bridge_processed
+    assert "force_accept_ignored_pretrigger_result_count" not in bridge_processed
+
+    arm_result_index = source.index("const bool force_accept_armed =")
+    arm_failure_index = source.index("if (!force_accept_armed)", arm_result_index)
+    direct_trigger_index = source.index(
+        "grid_search_trigger_client_->async_send_request", arm_failure_index
+    )
+    assert arm_result_index < arm_failure_index < direct_trigger_index
+    arm_failure_block = source[arm_failure_index:direct_trigger_index]
+    assert "return;" in arm_failure_block
+    arm_helper = source[
+        source.index("bool arm_bridge_force_accept(") :
+        source.index("bool wait_for_localization_result_or_bridge_processing(")
+    ]
+    assert "dispatch_state=not_dispatched" in arm_helper
 
     arm_index = source.index("arm_bridge_force_accept(")
     post_arm_input_index = source.index("wait_for_localizer_input_after_arm(", arm_index)
@@ -12843,6 +15598,101 @@ def test_global_localization_retries_immediately_after_stale_result():
     assert "snapshot.received_sec >= armed_sec" in source
     assert "snapshot.header_stamp_sec >= min_header_stamp_sec" in source
     assert "snapshot.fov_deg >= localizer_input_min_fov_deg_" in source
+
+
+def test_explicit_isaac_result_requires_arm_and_uses_tf_history_instead_of_wall_age():
+    bridge = (
+        ROOT / "src" / "robot_localization_bridge" / "src" / "localization_bridge_node.cpp"
+    ).read_text(encoding="utf-8")
+    packaged_config = (
+        ROOT / "src" / "robot_localization_bridge" / "config" / "localization_bridge.yaml"
+    ).read_text(encoding="utf-8")
+    field_config = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "localization_bridge.yaml"
+    ).read_text(encoding="utf-8")
+
+    pose_callback = bridge[
+        bridge.index("void on_pose(") : bridge.index("void on_amcl_scan_admission_status(")
+    ]
+    assert "kIgnoreUnarmed" in pose_callback
+    assert "unarmed_isaac_result_ignored_count_" in pose_callback
+    assert "refresh_state(\"pose\")" in pose_callback
+
+    candidate = bridge[
+        bridge.index("CandidateCorrection build_candidate(") :
+        bridge.index("bool candidate_is_small(")
+    ]
+    assert "enforce_wall_age_limit(candidate.explicit_trigger)" in candidate
+    assert "lookup_odom_base(pose.header.stamp" in candidate
+    assert candidate.index("enforce_wall_age_limit(candidate.explicit_trigger)") < candidate.index(
+        "lookup_odom_base(pose.header.stamp"
+    )
+
+    history_parameter_index = bridge.index(
+        'declare_parameter<double>("odom_tf_history_duration_sec", 30.0)'
+    )
+    history_buffer_index = bridge.index(
+        "tf2::durationFromSec(odom_tf_history_duration_sec_)"
+    )
+    assert history_parameter_index < history_buffer_index
+    assert '\\"odom_tf_history_duration_sec\\":' in bridge
+    for config in (packaged_config, field_config):
+        assert "odom_tf_history_duration_sec: 30.0" in config
+
+
+def test_global_localization_callers_retry_only_before_dispatch_and_api_does_not_prearm():
+    resident = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "run_navigation_runtime_services.sh"
+    ).read_text(encoding="utf-8")
+    api = (
+        ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp"
+    ).read_text(encoding="utf-8")
+    localization = (
+        ROOT / "src" / "robot_api_server" / "src" / "features"
+        / "localization" / "localization_module.cpp"
+    ).read_text(encoding="utf-8")
+
+    assert "trigger_output_reports_retryable_before_dispatch" in resident
+    retry_classifier = resident[
+        resident.index("trigger_output_reports_retryable_before_dispatch()") :
+        resident.index("initial_localization_ready_from_bridge_after_wrapper_failure()")
+    ]
+    for code in (
+        "LOCALIZER_OPERATION_BUSY",
+        "LOCALIZER_POST_RELOAD_NOT_READY",
+        "LOCALIZER_INPUT_NOT_FRESH",
+        "ISAAC_SERVICE_UNAVAILABLE",
+        "BRIDGE_FORCE_ACCEPT_UNAVAILABLE",
+        "BRIDGE_FORCE_ACCEPT_TIMEOUT",
+    ):
+        assert code in retry_classifier
+    for code in (
+        "FRESH_LOCALIZATION_RETRY_REQUIRED",
+        "LOCALIZATION_RESULT_TIMEOUT",
+        "BRIDGE_ACCEPT_TIMEOUT",
+        "MAP_TO_ODOM_TIMEOUT",
+    ):
+        assert code not in retry_classifier
+
+    trigger_helper = localization[
+        localization.index("  bool trigger_localization_and_wait_for_result(") :
+        localization.index(
+            "  bool request_bridge_correction_pause(",
+            localization.index("  bool trigger_localization_and_wait_for_result("),
+        )
+    ]
+    assert "request_localization_bridge_force_accept(" not in trigger_helper
+    assert "global localization wrapper owns bridge force-accept" in trigger_helper
 
 
 def test_global_localization_process_is_owned_by_localization_generation():
@@ -12897,7 +15747,7 @@ def test_localization_reuses_long_lived_health_for_ranger_admission():
     assert "ranger_chassis_liveness_ready" in ranger_gate
 
 
-def test_systemd_boot_path_avoids_duplicate_cleanup_and_container_exec_roundtrips():
+def test_systemd_boot_path_proves_complete_runtime_cleanup_before_restart():
     systemd_runtime = (
         ROOT / "scripts" / "jetson" / "njrh_systemd_runtime.sh"
     ).read_text(encoding="utf-8")
@@ -12913,19 +15763,148 @@ def test_systemd_boot_path_avoids_duplicate_cleanup_and_container_exec_roundtrip
         / "scripts"
         / "stop_runtime_processes.sh"
     ).read_text(encoding="utf-8")
+    process_patterns = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "runtime_process_patterns.sh"
+    ).read_text(encoding="utf-8")
 
-    assert "container_runtime_processes_present()" in systemd_runtime
-    assert "no stale runtime processes found; skipping container cleanup sweep" in systemd_runtime
+    assert "verify_container_runtime_processes_absent()" in systemd_runtime
+    assert "Always run the idempotent complete-runtime sweep" in systemd_runtime
+    assert "skipping container cleanup sweep" not in systemd_runtime
     assert "stop_runtime_processes.sh" in systemd_runtime
-    assert "run_driver.sh|run_pointcloud_accel_pipeline.sh|laser_scan_to_flatscan" in cleanup
+    assert "runtime_process_patterns.sh" in cleanup
+    assert "NJRH_RUNTIME_ALL_PATTERN" in cleanup
+    assert '"--check"' in cleanup
+    assert "cleanup_failed=0" in cleanup
+    assert 'exit "${cleanup_failed}"' in cleanup
+    for required_owner in (
+        "robot_docking_manager/docking_manager_node",
+        "robot_floor_manager/floor_manager_node",
+        "robot_safety/robot_safety_node",
+        "__node:=controller_server",
+        "__node:=behavior_server",
+        "__node:=bt_navigator",
+        "__node:=velocity_smoother",
+        "__node:=collision_monitor",
+        "run_projected_map[.]sh",
+        "run_jt128_2d_mapping[.]sh",
+        "jt128_slam_toolbox_mapping[.]launch[.]py",
+        "slam_toolbox",
+        "fastlio_mapping_odom_bridge[.]py",
+        "/mapping/fastlio_odometry",
+        "/tf_slam2d",
+        "stop_floor_navigation[.]sh",
+        "/pointcloud_perception_pipeline[.]launch[.]py([[:space:]]|$)",
+        (
+            "/component_container_mt([[:space:]]|$).*"
+            "__node:=pointcloud_perception_pipeline([[:space:]]|$)"
+        ),
+        "/hesai_accel_driver_node([[:space:]]|$)",
+        "/jt128_accel_driver_node([[:space:]]|$)",
+        "/pointcloud_downsample_node([[:space:]]|$)",
+        "__node:=pointcloud_fastlio_remap([[:space:]]|$)",
+        "/smoother_server([[:space:]]|$)",
+        "__node:=smoother_server([[:space:]]|$)",
+        "/waypoint_follower([[:space:]]|$)",
+        "__node:=waypoint_follower([[:space:]]|$)",
+        "topic (echo|hz|info|pub)",
+        "lifecycle (get|set)",
+    ):
+        assert required_owner in process_patterns
     assert "NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE:-false" in systemd_runtime
     assert "NJRH_NAV2_HELD_PRESTART_WAIT_FOR_LOCALIZER_SERVICE:-true" in systemd_runtime
-    assert "container process table unavailable; running conservative cleanup sweep" in systemd_runtime
     assert 'cleanup_shell_pid="$$"' in cleanup
     assert 'cleanup_parent_pid="${PPID}"' in cleanup
     assert "$1 != cleanup_shell_pid" in cleanup
     assert "$1 != cleanup_parent_pid" in cleanup
-    assert "node_pattern=" not in systemd_runtime
+    assert "NJRH_RUNTIME_NODE_PATTERN" not in systemd_runtime
+
+    bash_candidates = []
+    if sys.platform == "win32":
+        bash_candidates.extend(
+            (
+                Path(r"C:\Program Files\Git\bin\bash.exe"),
+                Path(r"C:\Program Files\Git\usr\bin\bash.exe"),
+            )
+        )
+    discovered_bash = shutil.which("bash")
+    if discovered_bash:
+        bash_candidates.append(Path(discovered_bash))
+    bash = next((candidate for candidate in bash_candidates if candidate.exists()), None)
+    if bash is not None:
+        match_harness = r"""
+set -euo pipefail
+source "$1"
+matches() {
+  local line="$1"
+  local pattern="$2"
+  awk -v pattern="${pattern}" '$0 ~ pattern {found=1} END {exit !found}' <<<"${line}"
+}
+matches \
+  "101 /usr/bin/python3 /opt/ros/humble/bin/ros2 launch /runtime/pointcloud_perception_pipeline.launch.py pointcloud_params:=x" \
+  "${NJRH_RUNTIME_POINTCLOUD_NODE_PATTERN}"
+matches \
+  "102 /opt/ros/humble/lib/rclcpp_components/component_container_mt --ros-args -r __node:=pointcloud_perception_pipeline -r __ns:=/" \
+  "${NJRH_RUNTIME_POINTCLOUD_NODE_PATTERN}"
+matches \
+  "103 /runtime/install/hesai_ros_driver/lib/hesai_ros_driver/hesai_accel_driver_node --ros-args" \
+  "${NJRH_RUNTIME_POINTCLOUD_NODE_PATTERN}"
+matches \
+  "104 /runtime/install/hesai_ros_driver/lib/hesai_ros_driver/jt128_accel_driver_node --ros-args" \
+  "${NJRH_RUNTIME_POINTCLOUD_NODE_PATTERN}"
+matches \
+  "105 /runtime/install/robot_hesai_jt128/lib/robot_hesai_jt128/pointcloud_downsample_node --ros-args" \
+  "${NJRH_RUNTIME_POINTCLOUD_NODE_PATTERN}"
+matches \
+  "106 /runtime/pointcloud_axis_remap --ros-args -r __node:=pointcloud_fastlio_remap" \
+  "${NJRH_RUNTIME_POINTCLOUD_NODE_PATTERN}"
+matches \
+  "201 /opt/ros/humble/lib/nav2_smoother/smoother_server --ros-args -r __node:=smoother_server" \
+  "${NJRH_RUNTIME_NAV2_NODE_PATTERN}"
+matches \
+  "202 /opt/ros/humble/lib/nav2_waypoint_follower/waypoint_follower --ros-args -r __node:=waypoint_follower" \
+  "${NJRH_RUNTIME_NAV2_NODE_PATTERN}"
+if matches \
+  "301 /opt/ros/humble/lib/rclcpp_components/component_container_mt --ros-args -r __node:=unrelated_container" \
+  "${NJRH_RUNTIME_POINTCLOUD_NODE_PATTERN}"; then
+  exit 31
+fi
+if matches \
+  "302 /tmp/hesai_accel_driver_node_probe --ros-args" \
+  "${NJRH_RUNTIME_POINTCLOUD_NODE_PATTERN}"; then
+  exit 32
+fi
+if matches \
+  "401 /tmp/waypoint_follower_test --ros-args" \
+  "${NJRH_RUNTIME_NAV2_NODE_PATTERN}"; then
+  exit 41
+fi
+"""
+        match_result = subprocess.run(
+            [
+                str(bash),
+                "-c",
+                match_harness,
+                "runtime-pattern-contract",
+                str(
+                    ROOT
+                    / "scripts"
+                    / "jetson"
+                    / "runtime_overlay"
+                    / "scripts"
+                    / "runtime_process_patterns.sh"
+                ),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert match_result.returncode == 0, match_result.stderr
+
     assert "prepare_running_container_runtime_once()" in container
     assert "wait_for_and_prepare_running_container" in container
     assert 'id "${NJRH_RUNTIME_USER_CHECK}"' in container
@@ -12944,6 +15923,9 @@ def test_systemd_boot_path_avoids_duplicate_cleanup_and_container_exec_roundtrip
     assert "unset NJRH_COMMON_ENV_SETUP_DONE NJRH_COMMON_ENV_PARENT_READY" in run_driver
     assert "unset NJRH_COMMON_ENV_SETUP_DONE NJRH_COMMON_ENV_PARENT_READY" in pointcloud
     assert 'mapfile -t candidates < <(pgrep -f "${pattern}"' in common
+    assert "latch_safety_stop_for_runtime_shutdown" in common
+    assert "/safety/estop std_msgs/msg/Bool" in common
+    assert "__node:=controller_server|__node:=behavior_server" in common
     fastlio_cleanup = common[
         common.index("stop_non_mapping_fastlio_runtime_processes()") :
         common.index("start_fastlio_common()")
@@ -13037,6 +16019,310 @@ def test_nav2_lifecycle_lost_response_uses_short_fallback_then_state_confirmatio
         assert "NJRH_NAV2_LIFECYCLE_CHANGE_STATE_RESPONSE_TIMEOUT_SEC:-5" in runner
 
 
+def test_resident_runtime_ready_context_commit_is_fail_closed():
+    runtime = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "run_navigation_runtime_services.sh"
+    ).read_text(encoding="utf-8")
+
+    def shell_function(name: str) -> str:
+        match = re.search(
+            rf"(?ms)^{re.escape(name)}\(\) \{{\n.*?^\}}\n",
+            runtime,
+        )
+        assert match is not None, name
+        return match.group(0)
+
+    commit_ready = shell_function("commit_runtime_ready_context")
+    bridge_status_once = shell_function("bridge_status_once")
+    context_sequence = shell_function(
+        "runtime_context_explicit_relocalization_sequence"
+    )
+    wait_for_sequence_after = shell_function(
+        "wait_for_bridge_relocalization_sequence_after"
+    )
+    wait_for_sequence = shell_function(
+        "wait_for_bridge_explicit_relocalization_sequence"
+    )
+    trigger_output_sequence = shell_function(
+        "trigger_output_explicit_relocalization_sequence"
+    )
+    on_exit = shell_function("on_exit")
+
+    assert "wait_for_bridge_relocalization_sequence_after" in commit_ready
+    assert "bridge_status_once" not in commit_ready
+    assert 'NJR H_RUNTIME_LAST_TRIGGERED_RELOCALIZATION_OK' not in commit_ready
+    assert 'NJRH_RUNTIME_LAST_TRIGGERED_RELOCALIZATION_OK:-' in commit_ready
+    assert "ensure_localization_layer_alive" in commit_ready
+    assert 'wait_for_fresh_tf_transform "map" "odom"' in commit_ready
+    assert "using transaction-scoped sequence plus live map->odom" in commit_ready
+    assert 'local expected_sequence="${NJRH_RUNTIME_EXPLICIT_RELOCALIZATION_SEQUENCE:-}"' in (
+        commit_ready
+    )
+    assert "runtime_context_explicit_relocalization_sequence" in commit_ready
+    assert '"$((expected_sequence - 1))"' in commit_ready
+    assert '"${explicit_sequence}" != "${expected_sequence}"' in commit_ready
+    assert "does not exactly match transaction sequence=" in commit_ready
+    assert '"true"' in commit_ready
+    assert 'data.get("confirmed") is True' in context_sequence
+    assert 'data.get("state") == "ready"' in context_sequence
+    assert "value > 0" in context_sequence
+    assert "--qos-reliability reliable" in bridge_status_once
+    assert "--qos-durability volatile" in bridge_status_once
+    assert "std_msgs/msg/String" in bridge_status_once
+    assert "awk '/^\\{/ {print; exit}'" in bridge_status_once
+    assert 'local timeout_sec="${1:-${NJRH_RUNTIME_READY_BRIDGE_STATUS_WAIT_SEC:-15}}"' in (
+        wait_for_sequence_after
+    )
+    assert 'bridge_status_once "${remaining}"' in wait_for_sequence_after
+    assert "if (( remaining <= 0 )); then" in wait_for_sequence_after
+    assert wait_for_sequence_after.index("if (( remaining <= 0 )); then") < (
+        wait_for_sequence_after.index('bridge_status_once "${remaining}"')
+    )
+    assert "while (( SECONDS < deadline ))" in wait_for_sequence_after
+    assert "explicit_sequence > minimum_sequence" in wait_for_sequence_after
+    assert 'bridge_status_field "${bridge_status}" has_map_to_odom' in (
+        wait_for_sequence_after
+    )
+    assert 'bridge_status_field "${bridge_status}" map_to_odom_publisher_owner' in (
+        wait_for_sequence_after
+    )
+    assert (
+        'wait_for_bridge_relocalization_sequence_after "${1:-15}" 0 true'
+        in wait_for_sequence
+    )
+    assert "grep -Eo 'explicit_sequence=[1-9][0-9]*'" in trigger_output_sequence
+    assert (
+        'export NJRH_RUNTIME_EXPLICIT_RELOCALIZATION_SEQUENCE="${accepted_explicit_sequence}"'
+        in runtime
+    )
+    assert runtime.index(
+        'export NJRH_RUNTIME_EXPLICIT_RELOCALIZATION_SEQUENCE="${accepted_explicit_sequence}"'
+    ) < runtime.index(
+        'echo "[runtime-overlay] global localization wrapper accepted: ${trigger_output}"'
+    )
+    assert "captured pre-trigger bridge explicit sequence baseline=" in runtime
+    assert "BRIDGE_ACCEPT_SEQUENCE_NOT_FRESH" in runtime
+    assert "BRIDGE_ACCEPT_SEQUENCE_MISSING" in runtime
+    assert (
+        'export NJRH_RUNTIME_EXPLICIT_RELOCALIZATION_SEQUENCE="${joined_explicit_sequence}"'
+        in runtime
+    )
+    assert commit_ready.index('write_runtime_map_context "ready" "true" "${message}"') < (
+        commit_ready.index("runtime_map_context_matches_current_floor")
+    )
+    assert commit_ready.index("runtime_map_context_matches_current_floor") < (
+        commit_ready.index("runtime_ready=1")
+    )
+    assert runtime.count("runtime_ready=1") == 1
+    assert runtime.count("commit_runtime_ready_context ") == 2
+    assert '[[ "${stage}" != "script_start" &&' in runtime
+    reuse_block = runtime[
+        runtime.index("if resident_navigation_ready; then") :
+        runtime.index(
+            'echo "[runtime-overlay] navigation start source=',
+            runtime.index("if resident_navigation_ready; then"),
+        )
+    ]
+    assert reuse_block.index(
+        'commit_runtime_ready_context "existing resident navigation context matches selected floor"'
+    ) < reuse_block.index('log_startup_stage "resident_context_reused"')
+    assert 'if ! write_runtime_map_context "failed" "false"' in on_exit
+    assert on_exit.index('if ! write_runtime_map_context "failed" "false"') < (
+        on_exit.index("cleanup")
+    )
+
+    bash_candidates = []
+    if sys.platform == "win32":
+        bash_candidates.extend(
+            (
+                Path(r"C:\Program Files\Git\bin\bash.exe"),
+                Path(r"C:\Program Files\Git\usr\bin\bash.exe"),
+            )
+        )
+    discovered_bash = shutil.which("bash")
+    if discovered_bash:
+        bash_candidates.append(Path(discovered_bash))
+    bash = next((candidate for candidate in bash_candidates if candidate.exists()), None)
+    if bash is None:
+        pytest.skip("bash is required for the runtime-ready write failure injection")
+
+    harness = f"""
+set -euo pipefail
+runtime_ready=0
+cleanup_marker="$(mktemp)"
+probe_count_file="$(mktemp)"
+write_count_file="$(mktemp)"
+rm -f "${{cleanup_marker}}"
+printf '%s\n' "0" >"${{probe_count_file}}"
+printf '%s\n' "0" >"${{write_count_file}}"
+export NJRH_RUNTIME_READY_BRIDGE_STATUS_POLL_SEC=0.01
+export NJRH_RUNTIME_EXPLICIT_RELOCALIZATION_SEQUENCE="7"
+bridge_status_once() {{
+  local count
+  count="$(cat "${{probe_count_file}}")"
+  count=$((count + 1))
+  printf '%s\n' "${{count}}" >"${{probe_count_file}}"
+  if [[ "${{count}}" -eq 1 ]]; then
+    printf '%s\n' '{{}}'
+  else
+    printf '%s\n' '{{"last_explicit_relocalization_sequence":7,"has_map_to_odom":true,"map_to_odom_publisher_owner":"robot_localization_bridge"}}'
+  fi
+}}
+bridge_status_field() {{
+  local status="$1"
+  local field="$2"
+  case "${{field}}" in
+    last_explicit_relocalization_sequence)
+      if [[ "${{status}}" == *'"last_explicit_relocalization_sequence":8'* ]]; then
+        printf '%s\n' "8"
+      elif [[ "${{status}}" == *'"last_explicit_relocalization_sequence":7'* ]]; then
+        printf '%s\n' "7"
+      elif [[ "${{status}}" == *'"last_explicit_relocalization_sequence":0'* ]]; then
+        printf '%s\n' "0"
+      else
+        printf '%s\n' ""
+      fi
+      ;;
+    has_map_to_odom)
+      [[ "${{status}}" == *'"has_map_to_odom":true'* ]] && printf '%s\n' "true" || printf '%s\n' "false"
+      ;;
+    map_to_odom_publisher_owner)
+      [[ "${{status}}" == *'"map_to_odom_publisher_owner":"robot_localization_bridge"'* ]] &&
+        printf '%s\n' "robot_localization_bridge" || printf '%s\n' ""
+      ;;
+  esac
+}}
+write_runtime_map_context() {{
+  local count
+  count="$(cat "${{write_count_file}}")"
+  printf '%s\n' "$((count + 1))" >"${{write_count_file}}"
+  return 73
+}}
+runtime_map_context_matches_current_floor() {{
+  return 0
+}}
+cleanup() {{
+  printf '%s\n' "cleaned" >"${{cleanup_marker}}"
+}}
+{trigger_output_sequence}
+{wait_for_sequence_after}
+{wait_for_sequence}
+{commit_ready}
+{on_exit}
+
+parsed_sequence="$(
+  trigger_output_explicit_relocalization_sequence \
+    "accepted: true bridge accepted explicit_sequence=11 current_sequence=17"
+)"
+[[ "${{parsed_sequence}}" == "11" ]]
+
+set +e
+commit_runtime_ready_context "injected write failure"
+commit_rc=$?
+set -e
+[[ "${{commit_rc}}" -ne 0 ]]
+[[ "${{runtime_ready}}" -eq 0 ]]
+[[ "$(cat "${{probe_count_file}}")" -ge 2 ]]
+[[ "$(cat "${{write_count_file}}")" -eq 1 ]]
+
+bridge_status_once() {{
+  printf '%s\n' '{{"last_explicit_relocalization_sequence":0,"has_map_to_odom":true,"map_to_odom_publisher_owner":"robot_localization_bridge"}}'
+}}
+export NJRH_RUNTIME_EXPLICIT_RELOCALIZATION_SEQUENCE="7"
+export NJRH_RUNTIME_READY_BRIDGE_STATUS_WAIT_SEC=1
+set +e
+commit_runtime_ready_context "cached sequence must not bypass live bridge" >/dev/null 2>&1
+stale_commit_rc=$?
+set -e
+[[ "${{stale_commit_rc}}" -ne 0 ]]
+[[ "$(cat "${{write_count_file}}")" -eq 1 ]]
+
+bridge_status_once() {{
+  printf '%s\n' '{{"last_explicit_relocalization_sequence":7,"has_map_to_odom":true,"map_to_odom_publisher_owner":"robot_localization_bridge"}}'
+}}
+set +e
+wait_for_bridge_relocalization_sequence_after 1 7 true >/dev/null
+same_sequence_rc=$?
+set -e
+[[ "${{same_sequence_rc}}" -ne 0 ]]
+
+bridge_status_once() {{
+  printf '%s\n' '{{"last_explicit_relocalization_sequence":8,"has_map_to_odom":true,"map_to_odom_publisher_owner":"robot_localization_bridge"}}'
+}}
+[[ "$(wait_for_bridge_relocalization_sequence_after 1 7 true)" == "8" ]]
+set +e
+commit_runtime_ready_context "concurrent sequence must fail closed" >/dev/null 2>&1
+concurrent_commit_rc=$?
+set -e
+[[ "${{concurrent_commit_rc}}" -ne 0 ]]
+[[ "$(cat "${{write_count_file}}")" -eq 1 ]]
+
+set +e
+(
+  false
+  on_exit
+)
+exit_rc=$?
+set -e
+[[ "${{exit_rc}}" -eq 1 ]]
+[[ "$(cat "${{cleanup_marker}}")" == "cleaned" ]]
+rm -f "${{cleanup_marker}}" "${{probe_count_file}}" "${{write_count_file}}"
+"""
+    result = subprocess.run(
+        [str(bash), "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_global_localization_trigger_process_has_bounded_os_timeout():
+    scripts_dir = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+    )
+    runtime = scripts_dir / "run_navigation_runtime_services.sh"
+    verifier = scripts_dir / "verify_global_localization_trigger_timeout.sh"
+
+    assert verifier.exists()
+    verifier_text = verifier.read_text(encoding="utf-8")
+    assert "timeout --signal=TERM --kill-after=1s 1s" in verifier_text
+    assert "trap \"\" TERM; sleep 30" in verifier_text
+
+    bash_candidates = []
+    if sys.platform == "win32":
+        bash_candidates.extend(
+            (
+                Path(r"C:\Program Files\Git\bin\bash.exe"),
+                Path(r"C:\Program Files\Git\usr\bin\bash.exe"),
+            )
+        )
+    discovered_bash = shutil.which("bash")
+    if discovered_bash:
+        bash_candidates.append(Path(discovered_bash))
+    bash = next((candidate for candidate in bash_candidates if candidate.exists()), None)
+    if bash is None:
+        pytest.skip("bash is required for the global-localization process timeout regression")
+
+    result = subprocess.run(
+        [str(bash), str(verifier), str(runtime)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_ranger_motion_tests_fail_closed_on_stale_latest_odom_feedback():
     scripts_dir = ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts"
 
@@ -13073,6 +16359,16 @@ def test_predock_navigation_has_stable_path_and_contact_stop_contract():
     api_cpp = (
         ROOT / "src" / "robot_api_server" / "src" / "robot_api_server_node.cpp"
     ).read_text(encoding="utf-8")
+    executor_cpp = (
+        ROOT
+        / "src"
+        / "robot_api_server"
+        / "src"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_job_executor.cpp"
+    ).read_text(encoding="utf-8")
     api_cfg = (
         ROOT / "src" / "robot_api_server" / "config" / "robot_api_server.yaml"
     ).read_text(encoding="utf-8")
@@ -13093,23 +16389,27 @@ def test_predock_navigation_has_stable_path_and_contact_stop_contract():
         / "verify_docking_framework_state_machine.sh"
     ).read_text(encoding="utf-8")
 
-    assert '"docking_predock_behavior_tree"' in api_cpp
-    assert "docking_predock_behavior_tree_ = declare_parameter<std::string>(" in api_cpp
-    assert "goal.behavior_tree = docking_predock_behavior_tree_;" in api_cpp
+    docking_configuration_cpp = docking_configuration_source()
+    assert '"docking_predock_behavior_tree"' in docking_configuration_cpp
+    assert (
+        "config.job_executor.predock_behavior_tree = node.declare_parameter<std::string>("
+        in docking_configuration_cpp
+    )
+    assert "goal.behavior_tree = config_.predock_behavior_tree;" in executor_cpp
     for config in (api_cfg, overlay_cfg):
         assert "docking_predock_behavior_tree:" in config
         assert "/behavior_trees/navigate_to_predock.xml" in config
 
-    loop_start = api_cpp.index("while (result_future.wait_for(200ms)")
-    loop_end = api_cpp.index("const auto result = result_future.get();", loop_start)
-    predock_wait_loop = api_cpp[loop_start:loop_end]
+    loop_start = executor_cpp.index("while (result_future.wait_for(200ms)")
+    loop_end = executor_cpp.index("const auto result = result_future.get();", loop_start)
+    predock_wait_loop = executor_cpp[loop_start:loop_end]
     contact_guard = predock_wait_loop.index("bms_charging_contact_snapshot()")
-    handoff_check = predock_wait_loop.index("evaluate_predock_pose(job)")
+    handoff_check = predock_wait_loop.index("predock_control_.probe_handoff(job_id, job)")
     assert contact_guard < handoff_check
     for required in (
         "contact_stable",
         "cancel_active_navigation_goal",
-        "publish_teleop_zero_burst",
+        "port_.publish_teleop_zero_burst",
         "wait_for_terminal_actual_stop",
         "predock_nav_contact_detected",
     ):
@@ -13173,14 +16473,26 @@ def test_rotation_shim_is_armed_once_per_navigation_goal():
 
 def test_keepout_editor_has_raster_transaction_and_runtime_effect_proof():
     api_root = ROOT / "src" / "robot_api_server"
-    node_cpp = (api_root / "src" / "robot_api_server_node.cpp").read_text(
+    entry_cpp = (api_root / "src" / "robot_api_server_node.cpp").read_text(
         encoding="utf-8"
     )
-    module_cpp = (api_root / "src" / "keepout_layer.cpp").read_text(
+    maps_cpp = (api_root / "src" / "features" / "maps" / "maps_module.cpp").read_text(
+        encoding="utf-8"
+    )
+    maps_feature_cpp = (
+        api_root / "src" / "features" / "maps" / "maps_feature_module.cpp"
+    ).read_text(encoding="utf-8")
+    module_cpp = (api_root / "src" / "features" / "maps" / "keepout" / "keepout_layer.cpp").read_text(
         encoding="utf-8"
     )
     module_header = (
-        api_root / "include" / "robot_api_server" / "keepout_layer.hpp"
+        api_root
+        / "include"
+        / "robot_api_server"
+        / "features"
+        / "maps"
+        / "keepout"
+        / "keepout_layer.hpp"
     ).read_text(encoding="utf-8")
     cmake = (api_root / "CMakeLists.txt").read_text(encoding="utf-8")
     source_config = (api_root / "config" / "robot_api_server.yaml").read_text(
@@ -13227,21 +16539,22 @@ def test_keepout_editor_has_raster_transaction_and_runtime_effect_proof():
     assert "kMaxRasterWorkUnits" in module_cpp
     assert "::fsync(" in module_cpp
     assert "::rename(" in module_cpp
-    assert "handle_save_keepout_filter" in node_cpp
-    assert "NAVIGATION_BUSY" in node_cpp
-    assert "ROBOT_NOT_STATIONARY" in node_cpp
-    assert "keepout_integrity_degraded_" in node_cpp
-    assert "navigate_to_pose_action_goal_active_" in node_cpp
-    assert "runtime_context_matches_map" in node_cpp
-    assert "keepout_mask_observation_matches" in node_cpp
-    assert "global_costmap_matches_keepout_samples" in node_cpp
-    assert "global_costmap_content_matches" in node_cpp
-    assert "costmap_samples_cleared" in node_cpp
-    assert "global_costmap_clear_client_" in node_cpp
-    assert "resolve_keepout_runtime_projection" in node_cpp
-    assert "runtime_effective" in node_cpp
-    assert "effective_on_next_activation" in node_cpp
-    assert "src/keepout_layer.cpp" in cmake
+    assert "handle_save_keepout_filter" in maps_cpp
+    assert "NAVIGATION_BUSY" in maps_cpp
+    assert "ROBOT_NOT_STATIONARY" in maps_cpp
+    assert "keepout_integrity_degraded_" in maps_cpp
+    assert "snapshot.nav2_goal_active" in maps_feature_cpp
+    assert "runtime_context_matches_map" in maps_cpp
+    assert "keepout_mask_observation_matches" in maps_cpp
+    assert "global_costmap_matches_keepout_samples" in maps_cpp
+    assert "global_costmap_content_matches" in maps_cpp
+    assert "costmap_samples_cleared" in maps_cpp
+    assert "global_costmap_clear_client_" in maps_cpp
+    assert "resolve_keepout_runtime_projection" in maps_cpp
+    assert "runtime_effective" in maps_cpp
+    assert "effective_on_next_activation" in maps_cpp
+    assert "handle_save_keepout_filter" not in entry_cpp
+    assert "src/features/maps/keepout/keepout_layer.cpp" in cmake
     assert "test_keepout_layer" in cmake
     assert "keepout_http_smoke" in cmake
     for config in (source_config, overlay_config):
@@ -13262,3 +16575,550 @@ def test_keepout_editor_has_raster_transaction_and_runtime_effect_proof():
         assert 'global_costmap_topic: "/global_costmap/costmap"' in config
     assert "NJRH_NAV2_DISABLE_NEUTRAL_COSTMAP_FILTERS:-false" in overlay_nav
     assert "refusing to replace a selected but invalid keepout mask" in mask_stager
+
+
+def test_mode_manager_is_a_resident_runtime_dependency_for_elevator_execution():
+    scripts = ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts"
+    runner = (scripts / "run_mode_manager.sh").read_text(encoding="utf-8")
+    common = (scripts / "run_common_services.sh").read_text(encoding="utf-8")
+    nav = (scripts / "run_navigation_runtime_services.sh").read_text(
+        encoding="utf-8"
+    )
+    helpers = (scripts / "nav_runtime_helpers.sh").read_text(encoding="utf-8")
+    readiness = (scripts / "check_commercial_runtime_ready.sh").read_text(
+        encoding="utf-8"
+    )
+    stop_runtime = (scripts / "stop_runtime_processes.sh").read_text(
+        encoding="utf-8"
+    )
+    runtime_patterns = (scripts / "runtime_process_patterns.sh").read_text(
+        encoding="utf-8"
+    )
+    config = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "config"
+        / "mode_manager.yaml"
+    ).read_text(encoding="utf-8")
+
+    assert "mode_manager_node" in runner
+    assert "--params-file" in runner
+    assert 'start_overlay_helper "mode_manager_common"' in common
+    assert 'ensure_helper_process_no_probe "mode_manager"' in nav
+    assert "robot_mode_manager/mode_manager_node" in helpers
+    assert 'check_node "/robot_mode_manager"' in readiness
+    assert 'source "${SCRIPT_DIR}/runtime_process_patterns.sh"' in stop_runtime
+    assert "robot_mode_manager/mode_manager_node" in runtime_patterns
+    assert "heartbeat_period_sec: 0.20" in config
+
+
+def test_mapping_is_one_deep_module_behind_the_composition_root():
+    package = ROOT / "src" / "robot_api_server"
+    entry_cpp = (package / "src" / "robot_api_server_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    composition_cpp = application_composition_source()
+    application_router_wiring_cpp = (
+        package / "src" / "application" / "routing" / "application_router_wiring.cpp"
+    ).read_text(encoding="utf-8")
+    system_status_wiring_cpp = (
+        package / "src" / "features" / "system_status" / "system_status_wiring.cpp"
+    ).read_text(encoding="utf-8")
+    mapping_header = (
+        package
+        / "include"
+        / "robot_api_server"
+        / "features"
+        / "mapping"
+        / "mapping_module.hpp"
+    ).read_text(encoding="utf-8")
+    mapping_cpp = (
+        package / "src" / "features" / "mapping" / "mapping_module.cpp"
+    ).read_text(encoding="utf-8")
+    teleop_feature_cpp = (
+        package / "src" / "features" / "teleop" / "teleop_feature_module.cpp"
+    ).read_text(encoding="utf-8")
+    elevator_feature_cpp = (
+        package / "src" / "features" / "elevator" / "elevator_feature_module.cpp"
+    ).read_text(encoding="utf-8")
+    subscription_feature_cpp = (
+        package
+        / "src"
+        / "application"
+        / "subscriptions"
+        / "subscription_feature_module.cpp"
+    ).read_text(encoding="utf-8")
+
+    assert "class MappingModule" in mapping_header
+    assert "handle_http" in mapping_header
+    assert "status_json" in mapping_header
+    assert "snapshot" in mapping_header
+    assert "set_live_map_page_active" in mapping_header
+    assert "shutdown" in mapping_header
+
+    for behavior in (
+        "handle_start_mapping_2d",
+        "handle_stop_mapping_2d",
+        "handle_save_mapping_2d",
+        "handle_live_mapping_2d_map_png",
+        "handle_saved_mapping_2d_map_png",
+        "run_mapping_start_job",
+        "ensure_mapping_scan_owner_restored",
+        "refresh_mapping_2d_runtime_state",
+    ):
+        assert behavior in mapping_cpp
+        assert behavior not in entry_cpp
+
+    assert "mapping->handle_http(request, motion_admission_epoch)" in application_router_wiring_cpp
+    assert "dependencies.mapping->status_json" in system_status_wiring_cpp
+    assert "std::unique_ptr<MappingFeatureModule> mapping_feature_module_;" in composition_cpp
+    assert "mapping_feature_module_ = std::make_unique<MappingFeatureModule>" in composition_cpp
+    assert "mapping_feature_module_->module().status_json" not in composition_cpp
+    assert "dependencies_.mapping->snapshot" in teleop_feature_cpp
+    assert "dependencies_.mapping->snapshot" in elevator_feature_cpp
+    assert "mapping->set_live_map_page_active(active)" in subscription_feature_cpp
+
+
+def test_teleop_is_one_deep_module_behind_the_composition_root():
+    package = ROOT / "src" / "robot_api_server"
+    entry_cpp = (package / "src" / "robot_api_server_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    composition_cpp = application_composition_source()
+    docking_feature_cpp = docking_feature_source()
+    teleop_header = (
+        package
+        / "include"
+        / "robot_api_server"
+        / "features"
+        / "teleop"
+        / "teleop_module.hpp"
+    ).read_text(encoding="utf-8")
+    teleop_cpp = (
+        package / "src" / "features" / "teleop" / "teleop_module.cpp"
+    ).read_text(encoding="utf-8")
+    teleop_feature_cpp = (
+        package / "src" / "features" / "teleop" / "teleop_feature_module.cpp"
+    ).read_text(encoding="utf-8")
+
+    assert "class TeleopModule" in teleop_header
+    assert "handle_socket" in teleop_header
+    assert "clear_command" in teleop_header
+    assert "publish_zero_burst" in teleop_header
+    assert "active" in teleop_header
+    assert "idle" in teleop_header
+
+    for behavior in (
+        "handle_teleop_websocket",
+        "publish_teleop_command",
+        "teleop_state_json",
+        "on_repeat_timer",
+        "teleop_session_allowed",
+        "TeleopSessionState teleop_session_",
+        "teleop_cmd_pub_",
+        "teleop_reverse_enable_pub_",
+        "teleop_repeat_timer_",
+    ):
+        assert behavior in teleop_cpp
+        assert behavior not in entry_cpp
+
+    assert "std::unique_ptr<TeleopFeatureModule> teleop_feature_module_;" in composition_cpp
+    assert "teleop_feature_module_->handle_socket" in composition_cpp
+    assert "std::unique_ptr<TeleopModule> module_;" in teleop_feature_cpp
+    assert "impl_->module_->handle_socket" in teleop_feature_cpp
+    assert "impl_->module_->shutdown();" in teleop_feature_cpp
+
+    destructor = composition_cpp[
+        composition_cpp.index("~Impl()") :
+        composition_cpp.index("private:", composition_cpp.index("~Impl()"))
+    ]
+    assert destructor.index("api_gateway_module_->stop();") < destructor.index(
+        "elevator_feature_module_.reset();"
+    )
+    assert destructor.index("elevator_feature_module_.reset();") < destructor.index(
+        "docking_feature_module_->shutdown();"
+    )
+    assert destructor.index("docking_feature_module_->shutdown();") < destructor.index(
+        "teleop_feature_module_.reset();"
+    )
+    assert docking_feature_cpp.index("runtime_->shutdown();") < docking_feature_cpp.index(
+        "status_->shutdown();"
+    )
+
+
+def test_docking_http_surface_is_one_module_behind_the_composition_root():
+    package = ROOT / "src" / "robot_api_server"
+    node_cpp = (package / "src" / "robot_api_server_node.cpp").read_text(encoding="utf-8")
+    module_hpp = (
+        package
+        / "include"
+        / "robot_api_server"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_http_module.hpp"
+    ).read_text(encoding="utf-8")
+    module_cpp = (
+        package
+        / "src"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_http_module.cpp"
+    ).read_text(encoding="utf-8")
+    application_router_wiring_cpp = (
+        package / "src" / "application" / "routing" / "application_router_wiring.cpp"
+    ).read_text(encoding="utf-8")
+    cmake = (package / "CMakeLists.txt").read_text(encoding="utf-8")
+
+    assert "class DockingHttpModule" in module_hpp
+    assert "DockingHttpModule::handle_http" in module_cpp
+    for route in (
+        "/api/v1/docking/state",
+        "/api/v1/docking/start",
+        "/api/v1/docking/undock",
+        "/api/v1/docking/confirm_docked",
+        "/api/v1/docking/clear_docked_latch",
+        "/api/v1/docking/cancel",
+        "/api/v1/docking/stop",
+    ):
+        assert route in module_cpp
+
+    for old_handler in (
+        "handle_docking_state",
+        "handle_docking_start",
+        "handle_docking_undock",
+        "handle_docking_confirm_docked",
+        "handle_docking_clear_latch",
+        "handle_docking_cancel",
+    ):
+        assert old_handler not in node_cpp
+
+    assert "docking->handle_http(request, motion_admission_epoch)" in application_router_wiring_cpp
+    assert "src/features/docking/lifecycle/docking_http_module.cpp" in cmake
+    assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel"' not in module_cpp
+    assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel_safe"' not in module_cpp
+
+
+def test_docking_status_lifecycle_is_one_module_behind_the_composition_root():
+    package = ROOT / "src" / "robot_api_server"
+    node_cpp = (package / "src" / "robot_api_server_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    module_hpp = (
+        package
+        / "include"
+        / "robot_api_server"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_status_module.hpp"
+    ).read_text(encoding="utf-8")
+    module_cpp = (
+        package
+        / "src"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_status_module.cpp"
+    ).read_text(encoding="utf-8")
+    runtime_cpp = (
+        package
+        / "src"
+        / "features"
+        / "docking"
+        / "lifecycle"
+        / "docking_runtime_module.cpp"
+    ).read_text(encoding="utf-8")
+    docking_feature_cpp = docking_feature_source()
+    cmake = (package / "CMakeLists.txt").read_text(encoding="utf-8")
+
+    assert "class DockingStatusModule" in module_hpp
+    assert "struct DockingStatusPorts" in module_hpp
+    assert "DockingStatusModule::handle_status" in module_cpp
+    assert "complete_post_fine_docking_relocalization" in module_cpp
+    assert "complete_post_undock_relocalization" in module_cpp
+    assert "ports_.post_deferred_work" in module_cpp
+    assert "docking_job_finished_" in module_cpp
+    assert "POST_UNDOCK_STALE_DOCKING_FINE_PAUSE" in module_cpp
+    assert "post_undock_failure_code_from_settle_failure" in module_cpp
+    assert "pending Nav2 goal held" in module_cpp
+
+    assert "status_->handle_status(status)" in docking_feature_cpp
+    assert "ports_.on_status(msg->data)" in runtime_cpp
+    assert "status_->shutdown()" in docking_feature_cpp
+    assert "DockingStatusModule>" not in node_cpp
+    assert "void handle_docking_status(" not in node_cpp
+    assert "complete_post_fine_docking_relocalization" not in node_cpp
+    assert "complete_post_undock_relocalization" not in node_cpp
+    assert "docking_relocalization_worker_" not in node_cpp
+    assert "src/features/docking/lifecycle/docking_status_module.cpp" in cmake
+    assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel"' not in module_cpp
+    assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel_safe"' not in module_cpp
+
+
+def test_docking_job_state_has_one_canonical_store_behind_the_composition_root():
+    package = ROOT / "src" / "robot_api_server"
+    entry_cpp = (package / "src" / "robot_api_server_node.cpp").read_text(
+        encoding="utf-8"
+    )
+    composition_cpp = application_composition_source()
+    lifecycle_include = (
+        package / "include" / "robot_api_server" / "features" / "docking" / "lifecycle"
+    )
+    lifecycle_source = package / "src" / "features" / "docking" / "lifecycle"
+    store_hpp = (lifecycle_include / "docking_job_store.hpp").read_text(encoding="utf-8")
+    store_cpp = (lifecycle_source / "docking_job_store.cpp").read_text(encoding="utf-8")
+    http_hpp = (lifecycle_include / "docking_http_module.hpp").read_text(encoding="utf-8")
+    status_hpp = (lifecycle_include / "docking_status_module.hpp").read_text(encoding="utf-8")
+    docking_feature_cpp = docking_feature_source()
+    cmake = (package / "CMakeLists.txt").read_text(encoding="utf-8")
+
+    assert "class DockingJobStore" in store_hpp
+    assert "mutable std::mutex mutex_;" in store_hpp
+    assert "DockingJob job_;" in store_hpp
+    assert "std::uint64_t sequence_{0U};" in store_hpp
+    assert "DockingJobStore::finish_locked" in store_cpp
+    assert "DockingJobStore::finish_with_code" in store_cpp
+    assert '"docking_job_finished_" + final_state' in store_cpp
+    assert '"docking_job_finished_" + code' in store_cpp
+
+    assert "DockingJobStore & job_store" in http_hpp
+    assert "DockingJobStore & job_store" in status_hpp
+    assert "std::unique_ptr<DockingJobStore> job_store_;" in docking_feature_cpp
+    assert "DockingJobStore>" not in entry_cpp
+    assert "std::mutex docking_job_mutex_;" not in entry_cpp
+    assert "DockingJob docking_job_;" not in entry_cpp
+    assert "std::uint64_t docking_job_seq_" not in entry_cpp
+    assert composition_cpp.index("docking_feature_module_ = std::make_unique<DockingFeatureModule>") < composition_cpp.index(
+        "navigation_feature_module_ = std::make_unique<NavigationFeatureModule>"
+    )
+    assert "job_store_ = std::make_unique<DockingJobStore>" in docking_feature_cpp
+
+    assert "src/features/docking/lifecycle/docking_job_store.cpp" in cmake
+    assert "test_docking_job_store" in cmake
+    assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel"' not in store_cpp
+    assert 'create_publisher<geometry_msgs::msg::Twist>("/cmd_vel_safe"' not in store_cpp
+
+
+def test_predock_control_is_one_deep_module_behind_semantic_executor_calls():
+    package = ROOT / "src" / "robot_api_server"
+    node_cpp = (package / "src" / "robot_api_server_node.cpp").read_text(encoding="utf-8")
+    executor_cpp = (
+        package / "src" / "features" / "docking" / "lifecycle" / "docking_job_executor.cpp"
+    ).read_text(encoding="utf-8")
+    predock_dir = package / "src" / "features" / "docking" / "predock_alignment"
+    predock_include = (
+        package
+        / "include"
+        / "robot_api_server"
+        / "features"
+        / "docking"
+        / "predock_alignment"
+    )
+    module_hpp = (predock_include / "predock_control_module.hpp").read_text(encoding="utf-8")
+    module_cpp = (predock_dir / "predock_control_module.cpp").read_text(encoding="utf-8")
+    docking_feature_cpp = docking_feature_source()
+    cmake = (package / "CMakeLists.txt").read_text(encoding="utf-8")
+    verifier = (
+        ROOT
+        / "scripts"
+        / "jetson"
+        / "runtime_overlay"
+        / "scripts"
+        / "verify_docking_framework_state_machine.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "class PredockControlModule" in module_hpp
+    for semantic_call in (
+        "probe_handoff",
+        "verify_staging_pose",
+        "validate_current_pose_near_approach",
+        "start_fine_docking_handoff",
+        "stop_and_release_motion",
+    ):
+        assert semantic_call in module_hpp
+
+    for owned_logic in (
+        "PredockControlModule::wait_for_bridge_smoothing",
+        "PredockControlModule::run_yaw_align",
+        "PredockControlModule::run_lateral_align",
+        "PredockControlModule::ensure_lateral_alignment",
+        "PredockControlModule::evaluate_fine_entry",
+        "PREDOCK_YAW_ALIGN_MODE_SWITCH_TIMEOUT",
+        "predock lateral error diverged; reversing side-slip command direction once",
+        "FINE_DOCKING_BRIDGE_SETTLE",
+        "ports_.start_fine_docking(service_detail)",
+    ):
+        assert owned_logic in module_cpp
+
+    assert "predock_control_.probe_handoff(job_id, job)" in executor_cpp
+    assert "predock_control_.verify_staging_pose(job_id, job)" in executor_cpp
+    assert "predock_control_.start_fine_docking_handoff(job_id, job)" in executor_cpp
+    assert "PredockControlModule::run_yaw_align" not in node_cpp + executor_cpp
+    assert "PredockControlModule::run_lateral_align" not in node_cpp + executor_cpp
+    assert "PREDOCK_YAW_ALIGN_MODE_SWITCH_TIMEOUT" not in node_cpp + executor_cpp
+
+    assert (
+        "std::unique_ptr<predock_alignment::PredockControlModule> predock_control_;"
+        in docking_feature_cpp
+    )
+    assert (
+        "predock_control_ = std::make_unique<predock_alignment::PredockControlModule>"
+        in docking_feature_cpp
+    )
+    assert "PredockControlModule>" not in node_cpp
+    assert "src/features/docking/predock_alignment/predock_control_module.cpp" in cmake
+    assert "test_predock_control_module" in cmake
+    assert 'predock_control_cpp="${WORKSPACE_ROOT}/src/robot_api_server/src/features/docking/' in verifier
+    assert "require_text_any" in verifier
+    assert 'require_text "${predock_control_cpp}" "PredockControlModule::run_yaw_align"' in verifier
+    assert "create_publisher<" not in module_cpp
+    assert "create_subscription<" not in module_cpp
+    assert "create_client<" not in module_cpp
+
+
+def test_power_module_uniquely_owns_battery_subscription_state_and_timing():
+    package = ROOT / "src" / "robot_api_server"
+    entry_cpp = (package / "src" / "robot_api_server_node.cpp").read_text(encoding="utf-8")
+    composition_cpp = application_composition_source()
+    power_include = package / "include" / "robot_api_server" / "features" / "power"
+    power_source = package / "src" / "features" / "power"
+    module_hpp = (power_include / "power_module.hpp").read_text(encoding="utf-8")
+    module_cpp = (power_source / "power_module.cpp").read_text(encoding="utf-8")
+    feature_cpp = (power_source / "power_feature_module.cpp").read_text(encoding="utf-8")
+    docking_feature_cpp = docking_feature_source()
+    module_test = (package / "test" / "features" / "power" / "test_power_module.cpp").read_text(
+        encoding="utf-8"
+    )
+    cmake = (package / "CMakeLists.txt").read_text(encoding="utf-8")
+
+    assert "class PowerModule" in module_hpp
+    assert "BmsChargingContactSnapshot snapshot() const" in module_hpp
+    assert "bool charging_contact_active() const" in module_hpp
+    assert "std::function<void(const BatteryContactEvaluation &, bool, double)>" in module_hpp
+
+    assert "create_subscription<sensor_msgs::msg::BatteryState>" in module_cpp
+    assert "evaluate_battery_charging_contact(" in module_cpp
+    assert "current.contact_stable_duration_sec >= config.contact_stable_required_sec" in module_cpp
+    assert 'result.reason = "stale_bms_state"' in module_cpp
+    stale_block = module_cpp[
+        module_cpp.index("if (!result.fresh)") : module_cpp.index(
+            "return result;", module_cpp.index("if (!result.fresh)")
+        )
+    ]
+    assert "result.contact = false" in stale_block
+    assert "result.contact_stable = false" in stale_block
+    assert module_cpp.index("ports.on_contact_evidence(") < module_cpp.index(
+        "ports.on_charging_contact("
+    )
+
+    assert "std::unique_ptr<PowerFeatureModule> power_feature_module_;" in composition_cpp
+    assert "power_feature_module_ = std::make_unique<PowerFeatureModule>" in composition_cpp
+    assert "std::unique_ptr<PowerModule> module_;" in feature_cpp
+    assert "module_ = std::make_unique<PowerModule>" in feature_cpp
+    assert "void handle_bms_state" not in entry_cpp
+    assert "bms_state_sub_" not in entry_cpp
+    for removed_raw_state in (
+        "have_bms_state_",
+        "have_bms_soc_",
+        "latest_bms_soc_",
+        "latest_bms_charging_contact_",
+        "latest_bms_received_at_",
+    ):
+        assert removed_raw_state not in entry_cpp
+    assert "return dependencies_.power->snapshot();" in docking_feature_cpp
+    assert (
+        "docking->contact_interlock().on_bms_contact_evidence("
+        in feature_cpp
+    )
+    assert "teleop->on_charging_contact(contact)" in feature_cpp
+
+    assert "OwnsCommittedContactEvidenceCallbacksAndFreshness" in module_test
+    assert "callback_order[0]" in module_test
+    assert "stale.contact" in module_test
+    assert "src/features/power/power_module.cpp" in cmake
+    assert "test_power_module" in cmake
+    assert "geometry_msgs::msg::Twist" not in module_cpp
+    assert "publish_estop" not in module_cpp
+
+
+def test_system_status_module_owns_read_only_routes_and_floor_status_lifecycle():
+    package = ROOT / "src" / "robot_api_server"
+    entry_cpp = (package / "src" / "robot_api_server_node.cpp").read_text(encoding="utf-8")
+    composition_cpp = application_composition_source()
+    application_router_wiring_cpp = (
+        package / "src" / "application" / "routing" / "application_router_wiring.cpp"
+    ).read_text(encoding="utf-8")
+    module_hpp = (
+        package
+        / "include"
+        / "robot_api_server"
+        / "features"
+        / "system_status"
+        / "system_status_module.hpp"
+    ).read_text(encoding="utf-8")
+    module_cpp = (
+        package / "src" / "features" / "system_status" / "system_status_module.cpp"
+    ).read_text(encoding="utf-8")
+    wiring_hpp = (
+        package
+        / "include"
+        / "robot_api_server"
+        / "features"
+        / "system_status"
+        / "system_status_wiring.hpp"
+    ).read_text(encoding="utf-8")
+    wiring_cpp = (
+        package / "src" / "features" / "system_status" / "system_status_wiring.cpp"
+    ).read_text(encoding="utf-8")
+    module_test = (
+        package
+        / "test"
+        / "features"
+        / "system_status"
+        / "test_system_status_module.cpp"
+    ).read_text(encoding="utf-8")
+    cmake = (package / "CMakeLists.txt").read_text(encoding="utf-8")
+
+    assert "class SystemStatusModule" in module_hpp
+    assert "struct SystemStatusSnapshot" in module_hpp
+    assert "struct RobotPoseRuntimeContextSnapshot" in module_hpp
+    assert "std::optional<HttpResponse> handle_http" in module_hpp
+    assert 'request.path == "/api/v1/status"' in module_cpp
+    assert 'request.path == "/api/v1/robot/pose"' in module_cpp
+    assert "HttpResponse handle_status()" in module_cpp
+    assert "HttpResponse handle_robot_pose()" in module_cpp
+    assert "create_subscription<std_msgs::msg::String>" in module_cpp
+    assert "ensure_floor_status_subscription_active();" in module_cpp
+    assert "floor_status_subscription.reset()" not in module_cpp
+    assert "ports.status_snapshot()" in module_cpp
+    assert "ports.wait_for_robot_pose(error)" in module_cpp
+    assert "ports.robot_pose_identity()" in module_cpp
+    assert "struct SystemStatusWiringDependencies" in wiring_hpp
+    assert "make_system_status_module_ports" in wiring_cpp
+    assert "snapshot.mapping_status_json" in wiring_cpp
+    assert "snapshot.post_undock_settle_json" in wiring_cpp
+
+    assert "std::unique_ptr<SystemStatusModule> system_status_module_;" in composition_cpp
+    assert "system_status_module_ = std::make_unique<SystemStatusModule>" in composition_cpp
+    assert "system_status->handle_http(request)" in application_router_wiring_cpp
+    assert "SystemStatusSnapshot snapshot;" not in entry_cpp
+    assert "RobotPoseRuntimeContextSnapshot snapshot;" not in entry_cpp
+    assert "HttpResponse handle_status()" not in entry_cpp
+    assert "HttpResponse handle_robot_pose(" not in entry_cpp
+    assert "latest_floor_status_" not in entry_cpp
+    assert "floor_status_sub_" not in entry_cpp
+    assert "set_status_subscriptions_active" not in entry_cpp
+
+    assert "OwnsReadOnlyRoutesAndResidentFloorStatus" in module_test
+    assert "publisher->get_subscription_count()" in module_test
+    assert "runtime map context is not ready" in module_test
+    assert "src/features/system_status/system_status_module.cpp" in cmake
+    assert "src/features/system_status/system_status_wiring.cpp" in cmake
+    assert "test_system_status_module" in cmake
+    assert "create_publisher<" not in module_cpp
+    assert "create_client<" not in module_cpp
+    assert "geometry_msgs::msg::Twist" not in module_cpp

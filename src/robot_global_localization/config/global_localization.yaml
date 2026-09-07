@@ -18,6 +18,9 @@ robot_global_localization:
     localizer_input_max_age_sec: 0.5
     localizer_input_min_fov_deg: 115.0
     localizer_input_required_consecutive_good: 2
+    post_reload_minimum_settle_sec: 1.0
+    post_reload_readiness_timeout_sec: 8.0
+    post_reload_required_service_ready_samples: 3
     result_allowed_pretrigger_age_sec: 1.0
     require_grid_search_trigger: true
     require_bridge_acceptance: true
@@ -26,6 +29,23 @@ robot_global_localization:
     bridge_force_accept_service: /robot_localization_bridge/force_accept_next_localization
     map_frame: map
     odom_frame: odom
+    asset_state_topic: /global_localization/asset_state
+    floor_asset_root: /workspaces/njrh-v3/workspace1/maps_release
+    runtime_map_context_file: /tmp/njrh_runtime_map_context.json
+    runtime_context_bootstrap_retry_sec: 5.0
+    localizer_component_container: /occupancy_grid_localizer_container
+    localizer_component_full_name: /occupancy_grid_localizer
+    localizer_component_package: isaac_ros_occupancy_grid_localizer
+    localizer_component_plugin: nvidia::isaac_ros::occupancy_grid_localizer::OccupancyGridLocalizerNode
+    localizer_component_node_name: occupancy_grid_localizer
+    localizer_component_node_namespace: ""
+    localizer_component_log_level: 0
+    localizer_component_remap_rules:
+      - "flatscan:=/flatscan"
+      - "localization_result:=/localization_result"
+    localizer_component_timeout_sec: 5.0
+    floor_asset_max_yaml_bytes: 2097152
+    floor_asset_max_png_bytes: 536870912
     local_flatscan_config: D:/codespace/car/nav2_test/params/jt128_flatscan.yaml
     local_localizer_config: D:/codespace/car/nav2_test/params/jt128_occupancy_grid_localizer.yaml
     local_localizer_launch: D:/codespace/car/nav2_test/jt128_occupancy_localization.launch.py

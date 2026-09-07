@@ -182,7 +182,6 @@ paths = {
     "nav2_overlay": root / "scripts/jetson/runtime_overlay/config/nav2.yaml",
     "docking_cpp": root / "src/robot_docking_manager/src/docking_manager_node.cpp",
     "safety_cpp": root / "src/robot_safety/src/robot_safety_node.cpp",
-    "mode_cpp": root / "src/ranger_base/src/ranger_messenger.cpp",
 }
 
 def text(name):
@@ -199,15 +198,21 @@ docking = text("docking_overlay")
 nav2 = text("nav2_overlay")
 docking_cpp = text("docking_cpp")
 safety_cpp = text("safety_cpp")
-mode_cpp = text("mode_cpp")
 
-distance = scalar(docking, "distance_m")
-speed = scalar(docking, "speed_mps")
-timeout = scalar(docking, "timeout_s")
-settle = scalar(docking, "command_settle_s")
-motion_start = scalar(docking, "motion_start_timeout_s")
-no_progress = scalar(docking, "no_progress_timeout_s")
-epsilon = scalar(docking, "progress_epsilon_m")
+undock = ""
+undock_marker = "\n    undock:\n"
+contact_stop_marker = "\n    contact_stop:\n"
+if undock_marker in docking:
+    undock = docking.split(undock_marker, 1)[1].split(contact_stop_marker, 1)[0]
+
+distance = scalar(undock, "distance_m")
+speed = scalar(undock, "speed_mps")
+max_speed = scalar(undock, "max_speed_mps")
+timeout = scalar(undock, "timeout_s")
+settle = scalar(undock, "command_settle_s")
+motion_start = scalar(undock, "motion_start_timeout_s")
+no_progress = scalar(undock, "no_progress_timeout_s")
+epsilon = scalar(undock, "progress_epsilon_m")
 vx_min = scalar(nav2, "vx_min")
 
 required_timeout = None
@@ -221,6 +226,7 @@ print("| --- | --- | --- |")
 for key, value in (
     ("undock.distance_m", distance),
     ("undock.speed_mps", speed),
+    ("undock.max_speed_mps", max_speed),
     ("undock.timeout_s", timeout),
     ("undock.command_settle_s", settle),
     ("undock.motion_start_timeout_s", motion_start),
@@ -234,6 +240,7 @@ if required_timeout is not None:
     print(f"| timeout_budget_min | {required_timeout:.3f} | {'PASS' if ok else 'FAIL'} |")
 
 checks = [
+    ("configured undock speed is within its dedicated cap", speed is not None and max_speed is not None and 0.0 < speed <= max_speed),
     ("docking_manager reads persistent latch", "dock_contact_latch_is_docked()" in docking_cpp),
     ("docking_manager accepts latch in start_undocking", "dock_latch_detected" in docking_cpp and "!dock_latch_detected" in docking_cpp),
     ("first motion timeout exists", "undock_failed_motion_start_timeout" in docking_cpp),
@@ -245,9 +252,23 @@ checks = [
     ("after-motion no-progress exists", "undock_failed_no_progress" in docking_cpp),
     ("no old no-motion failure string", "undock_failed_no_motion" not in docking_cpp),
     ("docking path remains /cmd_vel_docking", "/cmd_vel_docking" in docking and "/cmd_vel_docking" in safety_cpp),
-    ("robot_safety allows docking cmd context", "current_snapshot(docking_command)" in safety_cpp and "allow_docking_cmd_when_docked_" in safety_cpp),
-    ("robot_safety holds fresh docking command", "last_docking_cmd_" in safety_cpp and "fresh_docking_command_active()" in safety_cpp and "publish_command(last_docking_cmd_, snapshot)" in safety_cpp),
-    ("mode controller fresh reverse permit", "effectiveAllowReverse" in mode_cpp and "reverse_enable_timeout_s_" in mode_cpp),
+    (
+        "robot_safety allows docking cmd context",
+        "source == CommandSource::DOCKING" in safety_cpp
+        and "fresh_docking_command_active()" in safety_cpp
+        and "allow_docking_cmd_when_docked_" in safety_cpp,
+    ),
+    (
+        "robot_safety holds fresh docking command",
+        "last_docking_cmd_" in safety_cpp
+        and "fresh_docking_command_active()" in safety_cpp
+        and "prepare_checked_command(last_docking_cmd_, CommandSource::DOCKING)" in safety_cpp,
+    ),
+    (
+        "robot_safety requires fresh docking reverse permit",
+        "reverse_allowed(CommandSource::DOCKING)" in safety_cpp
+        and "reverse_enable_timeout_sec_" in safety_cpp,
+    ),
     (
         "Nav2 reverse is bounded to terminal correction",
         vx_min is not None
@@ -547,6 +568,18 @@ if status_last_cmd_x is None:
 status_failure_reason = status_token_value(status_final or "", "failure_reason")
 if not status_failure_reason and failure_reason and "undock_failed" in failure_reason:
     status_failure_reason = failure_reason.split()[0]
+configured_speed_match = re.search(
+    r"\| undock\.speed_mps \| ([-+]?\d+(?:\.\d+)?) \|",
+    read("static_audit.md"),
+)
+configured_speed = float(configured_speed_match.group(1)) if configured_speed_match else None
+expected_reverse_tokens = set()
+if configured_speed is not None:
+    expected_reverse_tokens = {
+        f"{-configured_speed:g}",
+        f"{-configured_speed:.2f}",
+        f"{-configured_speed:.3f}",
+    }
 if topic_cmd_count is not None:
     cmd_source_evidence = "topic_status"
 elif api_cmd_count is not None:
@@ -583,7 +616,12 @@ elif waiting_with_cmd and cmd_time is not None and first_motion is None:
     case = "CASE_DOCKING_MANAGER_WAITING_FIRST_MOTION_WITH_CMD"
 elif safe_time is None:
     case = "CASE_SAFETY_BLOCKED_DOCKING_CMD"
-elif "cmd_out" in mode_status_text and "-0.06" not in mode_status_text and "linear_x" in mode_status_text:
+elif (
+    "cmd_out" in mode_status_text
+    and "linear_x" in mode_status_text
+    and expected_reverse_tokens
+    and not any(token in mode_status_text for token in expected_reverse_tokens)
+):
     case = "CASE_MODE_CONTROLLER_BLOCKED_REVERSE"
 elif odom_samples == 0:
     case = "CASE_ODOM_NOT_UPDATING"
@@ -635,6 +673,7 @@ print(f"- status_cmd_count: `{max_cmd_count}`")
 print(f"- status_reverse_enable_count: `{status_reverse_enable_count}`")
 print(f"- status_last_cmd_x: `{status_last_cmd_x}`")
 print(f"- status_failure_reason: `{status_failure_reason}`")
+print(f"- configured_undock_speed_mps: `{configured_speed}`")
 print()
 print("## External Topic Observation")
 print(f"- observed_cmd_vel_docking_nonzero_count: `{observed_cmd_vel_docking_nonzero_count}`")

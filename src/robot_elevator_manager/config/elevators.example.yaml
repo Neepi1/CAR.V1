@@ -1,4 +1,4 @@
-schema_version: 1
+schema_version: 3
 mock_ports_enabled: false
 
 building_id: building_1
@@ -7,30 +7,19 @@ elevators:
     floors:
       - floor_id: F1
         map_id: map_f1_release
+        hall_call_panel_side: LEFT
+        cabin_panel_side: RIGHT
         poses:
           hall_call: f1_west_hall_call
-          hall_wait: f1_west_hall_wait
-          doorway: f1_west_doorway
+          landing: f1_west_landing
           cabin: f1_west_cabin
-          exit: f1_west_exit
-        threshold:
-          # All coordinates are in this floor's map frame.
-          left: [0.0, -0.6]
-          right: [0.0, 0.6]
-          cabin_reference: [1.0, 0.0]
-          clearance_m: 0.05
-          jamb_clearance_m: 0.05
+          cabin_panel: f1_west_cabin_panel
       - floor_id: F2
         map_id: map_f2_release
+        hall_call_panel_side: RIGHT
+        cabin_panel_side: LEFT
         poses:
           hall_call: f2_west_hall_call
-          hall_wait: f2_west_hall_wait
-          doorway: f2_west_doorway
+          landing: f2_west_landing
           cabin: f2_west_cabin
-          exit: f2_west_exit
-        threshold:
-          left: [0.0, -0.6]
-          right: [0.0, 0.6]
-          cabin_reference: [1.0, 0.0]
-          clearance_m: 0.05
-          jamb_clearance_m: 0.05
+          cabin_panel: f2_west_cabin_panel

@@ -69,7 +69,8 @@ docking:
 
     undock:
       distance_m: 0.60
-      speed_mps: 0.06
+      speed_mps: 0.50
+      max_speed_mps: 0.50
       min_clear_distance_m: 0.45
       timeout_s: 20.0
       odom_topic: /local_state/odometry
@@ -119,7 +120,6 @@ docking:
 
     controller:
       kx: 0.45
-      ky: 0.55
       ky_lateral: 0.70
       lateral_command_sign: 1.0
       kyaw: 0.70
@@ -129,22 +129,26 @@ docking:
       min_angular_speed_radps: 0.05
       min_lateral_speed_mps: 0.025
       max_lateral_speed_mps: 0.04
-      lateral_priority_threshold_m: 0.010
-      yaw_priority_threshold_deg: 1.0
-      yaw_realign_enter_deg: 1.0
+      yaw_realign_enter_deg: 3.0
       yaw_realign_stable_frames: 3
-      max_forward_while_lateral_mps: 0.000
+      yaw_realign_max_count: 1
+      max_parallel_speed_mps: 0.15
+      final_approach_window_m: 0.10
+      final_lateral_lock_distance_m: 0.06
+      final_forward_speed_mps: 0.05
       lock_lateral_during_final_insert: true
-      yaw_spin_priority_enabled: true
-      max_command_steering_rad: 0.35
-      ackermann_wheelbase_m: 0.494
       contact_crawl_speed_mps: 0.05
-      contact_final_slow_zone_m: 0.30
+      contact_final_slow_zone_m: 0.06
       contact_final_crawl_speed_mps: 0.02
+      contact_timeout_safety_factor: 1.5
+      contact_timeout_margin_s: 2.0
+      contact_timeout_min_s: 3.0
       contact_verify_max_distance_m: 0.31
       contact_verify_retry_enabled: true
       contact_retry_max_count: 2
       contact_retry_backoff_distance_m: 0.60
+      contact_retry_backoff_min_distance_m: 0.20
+      contact_retry_backoff_clearance_margin_m: 0.08
       contact_retry_backoff_speed_mps: 0.06
       contact_retry_backoff_timeout_s: 20.0
       contact_retry_backoff_command_settle_s: 0.5

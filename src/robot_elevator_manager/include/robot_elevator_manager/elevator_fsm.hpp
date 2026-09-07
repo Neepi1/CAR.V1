@@ -14,16 +14,17 @@ enum class ElevatorState
   kIdle,
   kNavigatingHallCall,
   kAcquiringHallHold,
+  // Retained only so historical journal state strings remain classifiable.
+  // New elevator-test transactions never enter this state.
   kAcquiringExecutionLease,
   kPressingCallButton,
   kSettingElevatorWaitMode,
   kReleasingHallHold,
-  kNavigatingHallWait,
+  kNavigatingSourceLanding,
   kWaitingSourceDoor,
   kSettingDoorwayEntryMode,
-  kNavigatingSourceDoorway,
   kEnteringCabin,
-  kVerifyingInside,
+  kNavigatingCabinPanel,
   kAcquiringCabinHold,
   kPressingTargetButton,
   kPausingCorrections,
@@ -35,12 +36,13 @@ enum class ElevatorState
   kSwitchingFloor,
   kVerifyingFloorReady,
   kSettingDoorwayExitMode,
+  kReturningToCabinCenter,
   kReleasingCabinHold,
-  kNavigatingTargetDoorway,
-  kExitingCabin,
-  kVerifyingOutside,
+  kNavigatingTargetLanding,
   kAcquiringExitHold,
   kReleasingOperatingMode,
+  // Retained only for historical state compatibility. New transactions do
+  // not create an execution lease and therefore never enter this state.
   kReleasingExecutionLease,
   kReleasingExitHold,
   kComplete,
@@ -52,9 +54,6 @@ enum class ElevatorEventKind
 {
   kEffectSucceeded,
   kEffectFailed,
-  kFootprintInside,
-  kFootprintOutside,
-  kFootprintStraddling,
   kCancelRequested,
 };
 
@@ -72,6 +71,7 @@ enum class ElevatorEffectKind
   kNavigateToPose,
   kAcquireSafetyHold,
   kReleaseSafetyHold,
+  // Deprecated compatibility values. The production FSM never emits them.
   kAcquireExecutionLease,
   kReleaseExecutionLease,
   kMockPressCallButton,
@@ -85,10 +85,23 @@ enum class ElevatorEffectKind
   kBeginFloorTransition,
   kSwitchFloor,
   kVerifyFloorReady,
-  kVerifyFootprintInside,
-  kVerifyFootprintOutside,
   kComplete,
   kHoldAndCancel,
+};
+
+enum class ElevatorNavigationIntent
+{
+  kNone,
+  kHallCall,
+  // The adapter derives heading from landing -> cabin.
+  kSourceLanding,
+  kEnterCabin,
+  kReverseEntryStaging,
+  kReverseEnterCabin,
+  kCabinPanelApproach,
+  kReturnCabinCenter,
+  // The adapter derives heading from cabin -> landing.
+  kTargetLanding,
 };
 
 struct ElevatorEffect
@@ -101,6 +114,11 @@ struct ElevatorEffect
   std::string mode;
   std::string detail;
   std::string map_id;
+  ElevatorNavigationIntent navigation_intent{ElevatorNavigationIntent::kNone};
+  // Relative to the robot's commissioned heading at the corresponding pose.
+  // This is consumed by the future arm/vision port; it never authorizes base
+  // motion and remains UNKNOWN for schema-v2 effects.
+  PanelSide panel_side{PanelSide::kUnknown};
 };
 
 struct ElevatorFsmOutput
@@ -147,5 +165,6 @@ private:
 
 std::string to_string(ElevatorState state);
 std::string to_string(ElevatorEffectKind effect);
+std::string to_string(ElevatorNavigationIntent intent);
 
 }  // namespace robot_elevator_manager

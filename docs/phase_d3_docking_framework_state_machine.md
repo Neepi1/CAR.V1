@@ -1,5 +1,13 @@
 # Phase D3 Docking Framework State Machine
 
+> Current production refinement: `docking_delegate_staging_motion_to_manager=true`
+> bypasses API-owned physical `PREDOCK_YAW_ALIGN` and
+> `PREDOCK_LATERAL_ALIGN` work while retaining their evidence fields for
+> compatibility. The API now admits recoverable residuals directly to
+> `/docking/start`; `robot_docking_manager` is the single near-field physical
+> owner described in `docs/docking_near_field_controller.md`. The older phase
+> descriptions below document the explicit rollback path.
+
 Phase D3 keeps the existing `robot_docking_manager`, GS2 scan driver, BMS/contact
 checks, and `robot_safety` command chain. It does not replace the stack with
 `opennav_docking`.
@@ -7,6 +15,39 @@ checks, and `robot_safety` command chain. It does not replace the stack with
 The default API return-to-dock path is staged as:
 
 `DOCK_REQUESTED -> RESOLVE_DOCK_PROFILE -> BEFORE_PREDOCK_RELOCALIZE -> BEFORE_PREDOCK_SETTLE -> NAV_TO_STAGING_NATIVE_NAV2 -> PREDOCK_CONTACT_STOP|STAGING_NAV2_EARLY_HANDOFF|STAGING_NAV2_GOAL_SUCCEEDED|STAGING_NAV2_GOAL_ABORTED_HANDOFF_CHECK -> PREDOCK_POSE_VERIFY -> PREDOCK_ALIGNMENT_DEFERRED_FOR_BRIDGE_SETTLE -> AFTER_PREDOCK_RELOCALIZE -> AFTER_PREDOCK_SETTLE -> GS2_DOCK_DETECT -> FINE_DOCKING_BRIDGE_SETTLE -> freeze map->odom correction -> PREDOCK_POSE_VERIFY_AFTER_BRIDGE_SETTLE -> PREDOCK_YAW_ALIGN_AFTER_BRIDGE_SETTLE -> PREDOCK_LATERAL_ALIGN_AFTER_BRIDGE_SETTLE -> FINE_DOCKING_ENTRY_CHECK -> FINE_ALIGN`.
+
+This ordered workflow is coordinated by
+`features/docking/lifecycle/DockingJobExecutor`. The executor owns the coarse
+Nav2/relocalization sequence and calls
+`features/docking/predock_alignment/PredockControlModule` for early-handoff
+assessment, staging verification, post-relocalization validation, and the
+complete fine-docking handoff transaction. The API composition root only
+adapts existing ROS resources. Moving these boundaries changes no phase,
+threshold, error code, or command owner.
+
+The App-facing lifecycle transactions are implemented by
+`features/docking/lifecycle/DockingHttpModule`: `state`, `start`, `undock`,
+`confirm_docked`, `clear_docked_latch`, and `cancel/stop`. The module retains
+the existing map identity checks, motion-admission fence, persistent latch
+semantics, response fields, and the single shared `DockingJob` state; the
+composition root now only wires neighboring modules and side-effect ports.
+
+The ROS `/docking/status` transaction is implemented by
+`features/docking/lifecycle/DockingStatusModule`. It owns terminal status
+classification, the exact shared-job/runtime-mode commit, deferred release of
+the `docking_fine` correction pause, and post-fine/post-undock relocalization
+worker lifetime. The composition root supplies the existing localization and
+settle-barrier operations as ports. No status code, required/warning decision,
+TF owner, velocity path, or control parameter changes at this boundary.
+
+The mutable lifecycle record is now owned by
+`features/docking/lifecycle/DockingJobStore`. This object is the only owner of
+the `DockingJob` mutex, current job, and job sequence. `DockingHttpModule`,
+`DockingJobExecutor`, and `DockingStatusModule` receive references to that same
+store. Terminal state, dock-latch/runtime completion, and correction-pause
+release retain their previous ordering; pause release still occurs after the
+job lock is released. No motion command, docking gate, retry, or tolerance was
+added or changed by this extraction.
 
 The coarse pre-dock action explicitly selects `navigate_to_predock.xml`. That
 tree computes one SmacPlanner2D path per action attempt and then continuously
@@ -49,6 +90,19 @@ sanity bound, not the gate that blocks yaw recovery when XY is already inside
 the docking handoff window. The fine entry lateral gate is `0.08 m`, and the GS2 docking manager keeps the final
 `0.030 m` lateral and `4.0 deg` yaw tolerances for contact alignment. It still
 requires XY plus base/contact yaw before GS2 fine docking can start. After
+
+The pure coordinate projection, inclusive threshold predicates, and result-to-
+job field projection are implemented in
+`features/docking/predock_alignment/PredockAlignmentPolicy`.
+`PredockControlModule` owns bridge settling and correction pause, bounded
+physical yaw/lateral capture, Ranger mode confirmation, recapture cycles,
+fine-entry evidence, pause cleanup on terminal failure, and the final
+`/docking/start` call. The node supplies the same clamped runtime parameter
+values and injects pose, safety, command-owner, bridge, drive-mode, observation,
+floor, and service ports. The module creates no ROS endpoint and cannot bypass
+the existing velocity chain. This boundary changes no control stage.
+
+After
 `FINE_DOCKING_BRIDGE_SETTLE`, the API rechecks the staging pose using the latest
 TF; if bridge smoothing exposes yaw error while XY remains valid, docking-owned
 predock yaw alignment runs before `/docking/start`. Global corrections are frozen
@@ -56,6 +110,10 @@ immediately after the settle barrier, then yaw and lateral capture run once
 against that stable transform. There is no pre-settle physical correction and
 therefore no second map-frame side-slip. This prevents bridge yaw smoothing from
 satisfying a spin command while Ranger is only changing wheel posture. The
+first post-bridge yaw capture targets the stricter of
+`predock_yaw_align_tolerance_rad` and `fine_docking_entry_max_yaw_rad`. The
+broader predock tolerance remains the staging/hysteresis envelope, but it cannot
+make the first physical correction stop outside the fine-docking entry limit.
 staging correction is a closed loop, not a
 one-shot check or a normal circular XY goal. In the dock
 approach frame, forward/x is only a broad safety window

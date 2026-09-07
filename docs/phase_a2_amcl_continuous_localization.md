@@ -62,6 +62,13 @@ seeded and the robot is not moving; gated correction still requires
 `amcl_correction_ready=true`, which means a fresh AMCL pose is available for
 the correction gate.
 
+Within `robot_api_server`, parsing and TTL calculation for this file belong to
+the `features/localization/amcl_runtime_status` module. The API composition
+root supplies the configured path, current wall time, and TTL, then combines
+the returned snapshot with live bridge status. The module does not own AMCL
+process lifecycle, ROS graph inspection, stale-file authority, or correction
+admission.
+
 The removed Isaac continuous path no longer starts a repository flatscan
 forwarder. Isaac may still expose internal `/flatscan_localization` endpoints,
 but there is no repository process forwarding `/flatscan` into that topic for

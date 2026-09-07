@@ -69,14 +69,15 @@ def test_mppi_remains_ackermann_and_terminal_lateral_is_permit_gated():
 
     assert 'motion_model: "Ackermann"' in nav2
     assert "vy_max: 0.0" in nav2
-    assert "max_velocity: [1.20, 0.05, 0.70]" in nav2
-    assert "min_velocity: [-0.08, -0.05, -0.70]" in nav2
+    assert "max_velocity: [1.20, 0.40, 0.70]" in nav2
+    assert "min_velocity: [-0.40, -0.40, -0.70]" in nav2
     assert (
         "nav_terminal_lateral_enable_topic: "
         "/ranger_mini3/nav_terminal_lateral_enable"
     ) in safety_config
     assert "reverse_permit_fresh(nav_terminal_lateral_permit_)" in safety
     assert "normal_navigation_lateral_max_mps: 0.05" in safety_config
+    assert "elevator_navigation_lateral_max_mps: 0.40" in safety_config
 
 
 def test_terminal_axis_commands_are_mutually_exclusive():
@@ -119,3 +120,12 @@ def test_terminal_critic_handoff_keeps_path_alignment_until_35cm():
         nav2.index("GoalAngleCritic:") : nav2.index("ObstaclesCritic:")
     ]
     assert "threshold_to_consider: 0.45" in goal_angle
+
+
+def test_terminal_handoff_keeps_six_centimetre_minimum_lateral_trigger():
+    nav2 = read("scripts/jetson/runtime_overlay/config/nav2.yaml")
+    ordinary_start = nav2.index("    FollowPath:\n")
+    fallback_start = nav2.index("    FollowPathFallback:\n", ordinary_start)
+    ordinary = nav2[ordinary_start:fallback_start]
+
+    assert "terminal_handoff_minimum_abs_lateral_m: 0.06" in ordinary

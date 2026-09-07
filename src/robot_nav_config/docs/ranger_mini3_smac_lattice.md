@@ -95,6 +95,16 @@ returned unchanged. This preserves ordinary obstacle detours and keeps
 `rotation_penalty=3.0`, so the fix cannot make arbitrary mid-path spin cheaper.
 The policy is independently rollbackable with `GridBased.direct_corridor_enabled=false`.
 
+For every stock-Lattice fallback, the wrapper also restores the exact requested
+goal pose after the search. Humble State Lattice returns a final pose quantized
+to the 5 cm grid and one of 16 heading bins; using that quantized pose as the
+`FollowPath` goal can otherwise discard a commissioned predock yaw before the
+ordinary goal checker sees it. The searched path is not rewritten. The wrapper
+only appends the original pose when the residue is at most `0.08 m` and
+`0.21 rad`, and every 2.5 cm / 0.05 rad interpolation sample is clear for the
+full footprint. A larger or colliding residue fails planning instead of
+claiming arrival at a different pose.
+
 A nested project planner that directly embedded both Smac2D and
 SmacPlannerLattice was evaluated and rejected: it met path-quality targets but
 reproducibly double-freed memory during plugin process teardown. No part of

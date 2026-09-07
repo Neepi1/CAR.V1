@@ -365,6 +365,16 @@ TEST(FloorAssetSnapshotLoader, RejectsDotIdentityComponent)
   EXPECT_EQ(result.error, FloorAssetSnapshotError::kInvalidRequest);
 }
 
+TEST(FloorAssetSnapshotLoader, SpeedAssetsRemainRequiredInImmutableBundle)
+{
+  MapFixture fixture;
+  fs::remove(fixture.root / "filters" / "speed_mask.yaml");
+
+  const auto result = FloorAssetSnapshotLoader{}.load(fixture.request());
+
+  EXPECT_EQ(result.error, FloorAssetSnapshotError::kInvalidLayout);
+}
+
 #ifndef _WIN32
 TEST(FloorAssetSnapshotLoader, RejectsSymlinkedRequiredAsset)
 {

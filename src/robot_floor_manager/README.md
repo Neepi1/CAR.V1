@@ -9,33 +9,42 @@
 - `/floor_manager/transition_status` (`robot_interfaces/msg/FloorSwitchStatus`,
   reliable + transient local)
 
-The legacy service is selection-only:
+The legacy service is source-preflight-only:
 
-1. Validate `maps_root/<building_id>/<floor_id>` assets.
-2. With `resume_navigation=false`, record the selected floor assets for the next navigation start without requiring `/map_server`, Isaac localization, or Nav2 to be running.
-3. With `resume_navigation=true`, reject before asset validation or any ROS
+1. Require the exact
+   `building_id/floor_id/map_id/expected_asset_epoch/expected_asset_digest`.
+2. Validate only the immutable
+   `maps_root/<building_id>/<floor_id>/maps/<map_id>/` source bundle through
+   `FloorAssetSnapshotLoader`; `current/` may be absent or still point at a
+   different map.
+3. With `resume_navigation=false`, return the exact verified identity and
+   source paths without changing or publishing `active`/`selected` runtime
+   state. The API owns the later `current/` activation; a failed API commit
+   therefore cannot leave a split floor-manager selection hint behind.
+4. With `resume_navigation=true`, reject before asset validation or any ROS
    side effect with `LEGACY_RESUME_NAVIGATION_DISABLED`.
 
-The Action endpoint is currently a non-mutating strict preflight adapter.
-`live_floor_switch_enabled` defaults to `false`; every accepted goal publishes
-typed `PREFLIGHT`/`BLOCKED` status and aborts with a structured failure code.
+The Action endpoint now has a strict live transaction adapter, but
+`live_floor_switch_enabled` deliberately remains `false` by default. With that
+default, every accepted goal publishes typed `PREFLIGHT`/`BLOCKED` status and
+aborts without a ROS or filesystem mutation. Enabling the adapter is a
+deployment decision after isolated runtime validation; it is not enabled by
+installing this package.
 Each goal must identify one immutable target with
 `building_id/floor_id/map_id/expected_asset_epoch/expected_asset_digest`.
 `expected_asset_epoch` must be nonzero and the digest must be canonical
 lowercase `sha256:<64 hex>`. The epoch and digest form one indivisible identity:
 neither a digest match from another epoch nor a nonzero-but-different epoch is
 accepted.
-The adapter intentionally has no map, filter, localizer, bridge, or costmap
-mutation port. It is not a live cross-floor switch.
-Because this preflight is short and non-blocking, the accepted callback executes
-it synchronously instead of detaching a thread that can outlive the node.
+When explicitly enabled, the Action uses one managed worker thread so ROS
+subscriptions and service responses keep progressing. It never detaches a
+thread that can outlive the node.
 Legacy selection state, Action arbitration, selected-asset snapshots, and typed
 status generations share one mutex; a late cancel is rechecked before the
 terminal Action transition.
 
-The old helper methods for map/filter/localizer operations remain internal
-implementation inventory only. They are unreachable from the enabled legacy
-path and must not be treated as a production transaction.
+The legacy service remains source-preflight-only and cannot reach the live
+mutation path.
 
 ## Read-only source bundle snapshot
 
@@ -67,8 +76,12 @@ is neither retained nor hashed. Both files are intentionally excluded from the
 11-role canonical content digest.
 
 The loader has no bind/write method and no ROS, localizer, map-server, bridge,
-or costmap port. It is not connected to the Action callback yet, so it cannot
-block a ROS executor or authorize a live switch.
+or costmap port. The offline legacy service uses it only as an exact
+source-bundle preflight. It is not connected to the live Action callback, and
+its service success is not a runtime/current commit. The API must still verify
+the echoed identity and complete its own serialized activation transaction.
+The gateway holds the cross-process map-asset commit lock from its first exact
+snapshot through the service proof, a second exact snapshot, and activation.
 
 ## Required source assets
 
@@ -89,32 +102,152 @@ maps_release/<building_id>/<floor_id>/maps/<map_id>/
   poses.yaml
 ```
 
-The old floor-level/current projection remains a legacy compatibility input
-for selection and existing runtime startup. It is not authoritative input to
-the strict snapshot loader or a future atomic `FloorSwitch` transaction.
+The old floor-level/current projection remains a compatibility input for
+existing runtime startup only. Offline selection preflight reads the immutable
+source bundle, not `current/`, and neither projection is authoritative input
+to a future atomic live `FloorSwitch` transaction.
+
+## Live Action evidence contract
+
+When `live_floor_switch_enabled=true`, one `FloorSwitch.action` goal executes
+these barriers in order:
+
+1. acquire the exact `robot_floor_manager:<transaction_id>` safety hold and
+   prove fresh Nav2-idle plus stable stopped evidence from both `/wheel/odom`
+   and `/local_state/odometry`;
+2. acquire the exact floor-manager correction pause and call bridge `BEGIN`,
+   which must report `runtime_context_valid=false`;
+3. publish feedback stage `CALLER_PAUSE_HANDOFF_READY` with the exact
+   transaction ID, monotonic effect sequence, and level-triggered
+   `caller_pause_handoff_ready=true`. The flag remains true during
+   `VERIFY_PAUSE_HANDOFF`, so a following feedback sample cannot erase the
+   handoff. The elevator caller may then release only its own pause. The Action
+   does not continue until fresh state proves the floor-manager lease is the
+   sole remaining pause;
+4. revalidate the immutable source snapshot, load the target Nav map and the
+   keepout filter, load the speed filter only when
+   `speed_filter_enabled=true`, then call the strong `ApplyFloorAssets`
+   contract;
+5. normally require both the Apply response and
+   `/global_localization/asset_state` to echo the same transaction, target
+   identity, newer localizer generation, and `reloaded=true`; if the RPC
+   outcome is delayed or lost, reconcile only the exact fresh terminal typed
+   state with the same requested and active identity;
+6. release the floor pause, prove no pause remains, trigger explicit target
+   localization, and require a newer exact-target localization sequence;
+7. require typed pending-target bridge readiness and `amcl_ready=true`
+   (`seeded/tracking-ready`, including valid stationary static standby), clear
+   both costmaps, and observe a fresh post-clear message from each costmap;
+8. call bridge `COMMIT`, require valid/safe target context, atomically publish
+   `/tmp/njrh_runtime_map_context.json`, then release only the floor-manager
+   motion hold.
+
+The Action proves target asset and localization identity; it does not compare
+numeric waypoint coordinates across floor maps. In particular, a target-floor
+`cabin_panel` coordinate is never treated as a localization equality check.
+The elevator caller must obtain a fresh target-map robot pose after completion
+and let the next Nav2 action plan from that live pose.
+
+Ordinary service calls retain the `10 s` timeout. Isaac component asset apply
+has an independent `localizer_apply_timeout_sec` budget (default `30 s`)
+because capture, unload, load, and exact component verification are one
+composite operation. A late/lost Apply response is reconciled against the same
+transaction, exact requested and active identity, `reloaded=true`, a newer
+generation, and `localizer_ready=true`; the request is not repeated. The
+explicit localization transaction has an independent
+`localization_trigger_timeout_sec` budget
+(default `75 s`) because its wrapper contains ordered post-reload readiness,
+Isaac result, bridge acceptance, and canonical-TF barriers. A response timeout
+is reconciled against the same exact target identity, newer localizer
+generation, and newer explicit-localization sequence. Exact evidence may prove
+a delayed/lost response as `OK_RECONCILED`; without that evidence the
+transaction still fails and the existing recovery policy applies.
+
+The live Action retries `/global_localization/trigger` only when the wrapper
+proves `dispatch_state=not_dispatched`: localizer busy/post-reload/input
+readiness, Isaac service unavailable, or bridge-arm service unavailable/timeout.
+Once Isaac is dispatched, the wrapper itself owns old-result draining and
+completion. Result, bridge, TF, and `map->odom` failures do not authorize a new
+Isaac request; the Action instead reconciles a delayed/lost response against
+the exact target generation and explicit sequence. Every safe pre-dispatch
+retry keeps the same target identity, localizer generation, correction state,
+motion hold, and original `75 s` deadline. Cancellation is checked throughout.
+Wrong TF ownership, missing TF history, malformed/unknown failure codes, and
+all post-dispatch failures retain the fail-closed recovery path.
+The API and elevator runtime adapter use the same `120 s` outer Action window,
+so neither caller can cancel the floor manager while its bounded `75 s`
+localization sub-transaction is still valid.
+
+Every `SetMotionHold` and owner-scoped `SetCorrectionPause` request uses one
+process-generation sequence block reserved durably through
+`motion_hold_sequence_state_file` (default
+`/tmp/njrh_floor_manager_hold_sequence.state`). The node fails to start if that
+absolute state file cannot be opened and reserved, fails closed if its block is
+exhausted, and synchronizes to `applied_sequence` after a stale-command
+response. A replacement process therefore cannot emit a sequence below any
+still-in-flight command from the process it replaced.
+
+Service timeout is an unknown outcome, not a rejected command. Pre-mutation
+cleanup therefore always submits higher-sequence exact RELEASE commands for
+both transaction keys, even when the local acquire flag was never set, and
+requires later `MotionInterlockState` and `CorrectionPauseState` samples to
+prove the exact keys absent. If that proof fails, it establishes a newer
+motion hold and reports a recovery lock instead of a clean failure.
+
+Once bridge `BEGIN` is submitted, a timeout is likewise treated as an unknown
+runtime mutation. Cleanup sends a higher-sequence exact
+`OP_ABORT_PREMUTATION`; if it arrives first, its transaction tombstone rejects
+the delayed lower-sequence BEGIN. If BEGIN arrived first, the bridge restores
+the source context only after proving the exact source asset, unchanged
+map-to-odom/localizer state, and the floor-manager pause. A later
+`LocalizationHealth` sample must then prove the same building/floor/map,
+epoch/digest, valid runtime context, ready localizer/bridge, and unique
+canonical TF. A known successful BEGIN is no longer sufficient by itself to
+retain a permanent lock. If exact ABORT is acknowledged, the newer source
+health sample is valid, the source runtime context is durably written back,
+and both exact transaction leases are proven absent, the failed transaction
+terminates as ordinary `FAILED` on the proven source floor. Any unproven
+ABORT, source identity, durable write, or lease release retains the motion
+hold, writes an unconfirmed failed context, and reports
+`recovery_required=true`.
+
+The runtime context writer uses a same-directory durable rename and preserves
+the v1 compatibility fields while adding transaction ID, epoch/digest,
+localizer generation, and explicit-localization sequence.
+
+`speed_filter_enabled` defaults to `false`, matching the deployed Jetson
+profile (`NJRH_ENABLE_SPEED_FILTER=false`). This flag changes only the live
+Nav2 server/lifecycle requirement: keepout is always required and hot-loaded,
+while speed is queried and hot-loaded only when enabled. It does not weaken
+the immutable bundle contract; `speed_mask.yaml` and `speed_mask.pgm` remain
+required and digest-verified members of every exact floor snapshot.
 
 ## Field Validation Still Required
 
-- Prove the Isaac localizer actually reloads the target PNG/parameters instead
-  of only caching paths.
-- Connect the read-only exact bundle snapshot to a non-blocking transaction
-  adapter; do not run its filesystem verification on a ROS executor callback.
-- Wire the Action to owner-scoped hold/pause, bridge begin/commit/abort, typed
-  Nav2 map/filter reload, explicit target localization, fresh costmaps, and
-  final readiness.
-- Only after those gates pass, validate the whole transaction under one
-  supervised runtime restart and then perform controlled hardware acceptance.
+- Run an isolated multi-node transaction with fake motion only and prove the
+  exact `CALLER_PAUSE_HANDOFF_READY` handoff.
+- Verify the bridge publishes pending-target `bridge_ready=true` before
+  COMMIT while keeping `safe_for_goal_start=false` until COMMIT.
+- Verify the Nav2 map and keepout server publish the new maps after their typed
+  load acknowledgements. Repeat with `speed_filter_enabled=true` only in a
+  profile that actually launches the speed mask server.
+- Inject delayed motion-hold, correction-pause, and bridge-BEGIN responses in
+  an isolated graph. Verify higher-sequence releases defeat late ACQUIRE,
+  and verify a BEGIN timeout cannot become an ordinary failure without exact
+  ABORT plus a newer source-identity health sample.
+- Only after those gates pass, enable both live flags for a supervised runtime
+  restart and controlled stationary validation. Real vehicle motion remains a
+  separate acceptance step.
 
 ## P6 transaction core
 
-`floor_transition_core` is a pure C++ safety contract for the future live
-`FloorSwitch.action` adapter. The node now exposes the Action name, but only
-the non-mutating preflight is wired. The core is not connected to the legacy
-service and does not authorize live asset mutation.
+`floor_transition_core` is the pure C++ safety contract used by the live
+`FloorSwitch.action` adapter. It remains disconnected from the legacy service.
 
 Its ordered barriers are:
 
-1. prove motion hold, Nav2 idle, and fresh stopped evidence;
+1. prove a fresh motion hold, the latest latched Nav2 action state is idle, and
+   fresh stopped evidence;
 2. acquire a floor-manager-owned correction pause;
 3. invalidate the ordinary source runtime context;
 4. report the begin barrier, then verify the caller released only its own pause
@@ -132,9 +265,11 @@ Its ordered barriers are:
    the final barrier.
 
 Failure or cancellation produces a retryable `HOLD_AND_LOCK` cleanup effect.
-After source-context invalidation, every failure keeps the context invalid and
-sets `recovery_required=true`; the core never claims that a physical
-cross-floor move was rolled back.
+The runtime port may clear recovery after source-context invalidation only
+when exact ABORT, fresh source identity, durable source-context restoration,
+and exact lease absence have all been proven. That path terminates as
+`FAILED`, not `FAILED_LOCKED`. An incomplete proof remains `FAILED_LOCKED`;
+the core never infers physical floor location from a timeout.
 
 The core GTests cover the ordered success barrier, pre- and post-mutation
 failures, idempotent transaction replay, zero/incorrect epoch rejection,
@@ -144,10 +279,34 @@ and retry with a stable cleanup ID. The cross-package
 the core with the elevator, mission, safety, mode, and correction-pause cores
 and verifies a synthetic success path.
 
-These tests do not change the live runtime. A preflight-only
-`FloorSwitch.action` server exists, and `robot_localization_bridge` exposes the
-separate `BeginFloorTransition` fence, but the floor-manager Action is not yet
-connected to it or to real asset reload, bridge readiness, or typed costmap
-evidence. The bridge also keeps live BEGIN/COMMIT disabled by default. Real
-cross-floor switching and elevator exit remain disabled until those adapters
-pass isolated integration and supervised hardware acceptance.
+The executor, typed evidence tracker, and atomic runtime-context writer have
+isolated GTests. The live adapter still does not change the deployed runtime
+while its flag is false. The bridge also keeps live BEGIN/COMMIT disabled by
+default. Real cross-floor switching and elevator exit remain disabled until
+isolated integration and supervised hardware acceptance pass.
+
+`/navigate_to_pose/_action/status` is event-driven rather than a heartbeat.
+The evidence tracker therefore latches the latest active/terminal action state
+until the next status event. `evidence_max_age_sec` continues to expire the
+motion-hold and wheel/local-odometry samples, but it no longer expires an
+already observed terminal Nav2 result during a manual door confirmation.
+
+A newly started NavigateToPose action server does not publish an initial empty
+`GoalStatusArray` when it has never accepted a goal. The floor manager now
+probes both the `/navigate_to_pose` action server and the discovered status
+publisher. If both remain continuously available for
+`nav_idle_bootstrap_grace_sec` (default `2.0 s`) and no retained or live status
+sample arrives, that bounded absence is accepted as the cold-start idle state.
+An `ACCEPTED`, `EXECUTING`, or `CANCELING` sample overrides it immediately;
+loss of the action graph clears both bootstrap and terminal idle evidence.
+This removes false `NAV_IDLE_UNPROVEN` failures without treating a missing
+Nav2 server or status writer as idle.
+
+The Nav2 graph probe is deliberately graph-only: it checks the three hidden
+`NavigateToPose` action services plus the status publisher and does not create
+an Action Client. The node uses a single-threaded ROS executor because the
+bounded floor transaction already runs on its managed worker thread. The exact
+Humble wait-set exception `Taking data from action client but no ready event`
+is classified as retryable at the process boundary; unrelated exceptions
+remain fatal. This prevents a read-only readiness probe from aborting the
+floor-manager process while preserving strict failure behavior elsewhere.

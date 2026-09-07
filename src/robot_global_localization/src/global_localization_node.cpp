@@ -17,6 +17,10 @@
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "isaac_ros_pointcloud_interfaces/msg/flat_scan.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "robot_global_localization/isaac_asset_reloader.hpp"
+#include "robot_global_localization/post_reload_readiness_gate.hpp"
+#include "robot_global_localization/ros_component_manager_port.hpp"
+#include "robot_interfaces/msg/localizer_asset_state.hpp"
 #include "robot_interfaces/srv/apply_floor_assets.hpp"
 #include "robot_interfaces/srv/trigger_localization.hpp"
 #include "std_msgs/msg/string.hpp"
@@ -55,6 +59,9 @@ public:
     declare_parameter<double>("localizer_input_max_age_sec", 0.5);
     declare_parameter<double>("localizer_input_min_fov_deg", 115.0);
     declare_parameter<int>("localizer_input_required_consecutive_good", 2);
+    declare_parameter<double>("post_reload_minimum_settle_sec", 1.0);
+    declare_parameter<double>("post_reload_readiness_timeout_sec", 8.0);
+    declare_parameter<int>("post_reload_required_service_ready_samples", 3);
     declare_parameter<double>("result_allowed_pretrigger_age_sec", 1.0);
     declare_parameter<bool>("require_grid_search_trigger", true);
     declare_parameter<bool>("require_bridge_acceptance", true);
@@ -64,6 +71,35 @@ public:
       "bridge_force_accept_service", "/robot_localization_bridge/force_accept_next_localization");
     declare_parameter<std::string>("map_frame", "map");
     declare_parameter<std::string>("odom_frame", "odom");
+    declare_parameter<std::string>(
+      "asset_state_topic", "/global_localization/asset_state");
+    declare_parameter<std::string>(
+      "floor_asset_root", "/workspaces/njrh-v3/workspace1/maps_release");
+    declare_parameter<std::string>(
+      "runtime_map_context_file", "/tmp/njrh_runtime_map_context.json");
+    declare_parameter<double>("runtime_context_bootstrap_retry_sec", 5.0);
+    declare_parameter<std::string>(
+      "localizer_component_container", "/occupancy_grid_localizer_container");
+    declare_parameter<std::string>(
+      "localizer_component_full_name", "/occupancy_grid_localizer");
+    declare_parameter<std::string>(
+      "localizer_component_package", "isaac_ros_occupancy_grid_localizer");
+    declare_parameter<std::string>(
+      "localizer_component_plugin",
+      "nvidia::isaac_ros::occupancy_grid_localizer::OccupancyGridLocalizerNode");
+    declare_parameter<std::string>(
+      "localizer_component_node_name", "occupancy_grid_localizer");
+    declare_parameter<std::string>("localizer_component_node_namespace", "");
+    declare_parameter<int>("localizer_component_log_level", 0);
+    declare_parameter<std::vector<std::string>>(
+      "localizer_component_remap_rules",
+      std::vector<std::string>{
+        "flatscan:=/flatscan",
+        "localization_result:=/localization_result",
+      });
+    declare_parameter<double>("localizer_component_timeout_sec", 5.0);
+    declare_parameter<int>("floor_asset_max_yaml_bytes", 2 * 1024 * 1024);
+    declare_parameter<int>("floor_asset_max_png_bytes", 512 * 1024 * 1024);
 
     active_floor_id_ = get_parameter("default_floor_id").as_string();
     grid_search_trigger_service_ = get_parameter("grid_search_trigger_service").as_string();
@@ -82,6 +118,18 @@ public:
     localizer_input_min_fov_deg_ = get_parameter("localizer_input_min_fov_deg").as_double();
     localizer_input_required_consecutive_good_ = std::max(
       1, static_cast<int>(get_parameter("localizer_input_required_consecutive_good").as_int()));
+    robot_global_localization::PostReloadReadinessConfig post_reload_readiness_config;
+    post_reload_readiness_config.minimum_settle_sec =
+      get_parameter("post_reload_minimum_settle_sec").as_double();
+    post_reload_readiness_config.timeout_sec =
+      get_parameter("post_reload_readiness_timeout_sec").as_double();
+    post_reload_readiness_config.input_max_age_sec = localizer_input_max_age_sec_;
+    post_reload_readiness_config.required_consecutive_service_ready_samples =
+      static_cast<std::size_t>(std::max<std::int64_t>(
+          1, get_parameter("post_reload_required_service_ready_samples").as_int()));
+    post_reload_readiness_gate_ =
+      std::make_unique<robot_global_localization::PostReloadReadinessGate>(
+      post_reload_readiness_config);
     result_allowed_pretrigger_age_sec_ =
       get_parameter("result_allowed_pretrigger_age_sec").as_double();
     require_grid_search_trigger_ = get_parameter("require_grid_search_trigger").as_bool();
@@ -92,12 +140,64 @@ public:
     bridge_force_accept_service_ = get_parameter("bridge_force_accept_service").as_string();
     map_frame_ = get_parameter("map_frame").as_string();
     odom_frame_ = get_parameter("odom_frame").as_string();
+    runtime_map_context_file_ =
+      get_parameter("runtime_map_context_file").as_string();
+    runtime_context_bootstrap_retry_sec_ = positive_or_default(
+      get_parameter("runtime_context_bootstrap_retry_sec").as_double(), 5.0);
 
     callback_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
     pose_pub_ = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
       get_parameter("pose_topic").as_string(), rclcpp::QoS(10));
     health_pub_ = create_publisher<std_msgs::msg::String>(
       get_parameter("health_topic").as_string(), rclcpp::QoS(10));
+    auto asset_state_qos = rclcpp::QoS(rclcpp::KeepLast(1));
+    asset_state_qos.reliable();
+    asset_state_qos.transient_local();
+    asset_state_pub_ = create_publisher<robot_interfaces::msg::LocalizerAssetState>(
+      get_parameter("asset_state_topic").as_string(), asset_state_qos);
+
+    robot_global_localization::IsaacAssetReloaderOptions reloader_options;
+    reloader_options.allowed_asset_root =
+      get_parameter("floor_asset_root").as_string();
+    reloader_options.expected_full_node_name =
+      get_parameter("localizer_component_full_name").as_string();
+    reloader_options.component.package_name =
+      get_parameter("localizer_component_package").as_string();
+    reloader_options.component.plugin_name =
+      get_parameter("localizer_component_plugin").as_string();
+    reloader_options.component.node_name =
+      get_parameter("localizer_component_node_name").as_string();
+    reloader_options.component.node_namespace =
+      get_parameter("localizer_component_node_namespace").as_string();
+    const auto configured_log_level =
+      get_parameter("localizer_component_log_level").as_int();
+    reloader_options.component.log_level = static_cast<std::uint8_t>(
+      std::clamp<std::int64_t>(configured_log_level, 0, 255));
+    reloader_options.component.remap_rules =
+      get_parameter("localizer_component_remap_rules").as_string_array();
+    reloader_options.max_yaml_bytes = static_cast<std::uintmax_t>(
+      std::max<std::int64_t>(
+        1, get_parameter("floor_asset_max_yaml_bytes").as_int()));
+    reloader_options.max_png_bytes = static_cast<std::uintmax_t>(
+      std::max<std::int64_t>(
+        1, get_parameter("floor_asset_max_png_bytes").as_int()));
+    asset_reloader_ =
+      std::make_unique<robot_global_localization::IsaacAssetReloader>(
+      reloader_options);
+
+    robot_global_localization::RosComponentManagerOptions component_options;
+    component_options.container_name =
+      get_parameter("localizer_component_container").as_string();
+    component_options.expected_full_node_name =
+      get_parameter("localizer_component_full_name").as_string();
+    component_options.operation_timeout = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::duration<double>(
+        positive_or_default(
+          get_parameter("localizer_component_timeout_sec").as_double(), 5.0)));
+    component_manager_ =
+      std::make_unique<robot_global_localization::RosComponentManagerPort>(
+      *this, callback_group_, component_options);
+
     grid_search_trigger_client_ = create_client<std_srvs::srv::Empty>(
       grid_search_trigger_service_, rmw_qos_profile_services_default, callback_group_);
     bridge_force_accept_client_ = create_client<std_srvs::srv::Trigger>(
@@ -129,6 +229,14 @@ public:
       std::chrono::seconds(1),
       std::bind(&GlobalLocalizationNode::on_timer, this),
       callback_group_);
+    runtime_context_bootstrap_timer_ = create_wall_timer(
+      std::chrono::seconds(1),
+      std::bind(&GlobalLocalizationNode::on_runtime_context_bootstrap, this),
+      callback_group_);
+
+    robot_global_localization::LocalizerAssetState initial_state;
+    initial_state.detail = "no floor asset transaction has completed in this process";
+    publish_asset_state(initial_state, false, "UNINITIALIZED");
   }
 
 private:
@@ -186,6 +294,24 @@ private:
     const std::shared_ptr<robot_interfaces::srv::TriggerLocalization::Request> request,
     std::shared_ptr<robot_interfaces::srv::TriggerLocalization::Response> response)
   {
+    std::unique_lock<std::mutex> localizer_operation_lock(
+      localizer_operation_mutex_, std::try_to_lock);
+    if (!localizer_operation_lock.owns_lock()) {
+      response->accepted = false;
+      response->message =
+        "failure_code=LOCALIZER_OPERATION_BUSY dispatch_state=not_dispatched "
+        "floor asset reload or another trigger is active";
+      return;
+    }
+
+    std::string post_reload_readiness_detail;
+    if (!wait_for_post_reload_readiness(post_reload_readiness_detail)) {
+      response->accepted = false;
+      response->message = post_reload_readiness_detail;
+      last_trigger_status_ = response->message;
+      return;
+    }
+
     const double service_call_timeout_sec =
       positive_or_default(service_call_timeout_sec_, std::min(service_timeout_sec_, 5.0));
     const double result_wait_timeout_sec =
@@ -199,7 +325,8 @@ private:
     if (!grid_search_trigger_client_->wait_for_service(service_timeout)) {
       response->accepted = !require_grid_search_trigger_;
       response->message =
-        "failure_code=ISAAC_SERVICE_TIMEOUT service unavailable: " + grid_search_trigger_service_;
+        "failure_code=ISAAC_SERVICE_UNAVAILABLE dispatch_state=not_dispatched "
+        "service unavailable: " + grid_search_trigger_service_;
       return;
     }
 
@@ -217,15 +344,20 @@ private:
       arm_bridge_force_accept(request->reason, service_call_timeout_sec, force_accept_detail);
     const double force_accept_ready_sec = now().seconds();
 
-    if (force_accept_armed) {
-      std::string post_arm_input_detail;
-      if (!wait_for_localizer_input_after_arm(
-          pre_arm_input, force_accept_ready_sec, post_arm_input_detail))
-      {
-        input_detail += "; " + post_arm_input_detail + "; continuing with the latest fresh input";
-      } else {
-        input_detail += "; " + post_arm_input_detail;
-      }
+    if (!force_accept_armed) {
+      response->accepted = false;
+      response->message = force_accept_detail;
+      last_trigger_status_ = response->message;
+      return;
+    }
+
+    std::string post_arm_input_detail;
+    if (!wait_for_localizer_input_after_arm(
+        pre_arm_input, force_accept_ready_sec, post_arm_input_detail))
+    {
+      input_detail += "; " + post_arm_input_detail + "; continuing with the latest fresh input";
+    } else {
+      input_detail += "; " + post_arm_input_detail;
     }
 
     const auto trigger_started_sec = now().seconds();
@@ -247,7 +379,8 @@ private:
         } catch (const std::exception & exc) {
           response->accepted = false;
           response->message =
-            std::string("failure_code=ISAAC_SERVICE_TIMEOUT direct service failed: ") + exc.what();
+            std::string("failure_code=ISAAC_DISPATCH_FAILED dispatch_state=dispatched ") +
+            "direct service failed: " + exc.what();
           last_trigger_status_ = response->message;
           return;
         }
@@ -265,7 +398,8 @@ private:
     if (direct_service_detail.empty()) {
       response->accepted = false;
       response->message =
-        "failure_code=ISAAC_SERVICE_TIMEOUT direct service did not return or produce localization_result within " +
+        "failure_code=ISAAC_DISPATCH_TIMEOUT dispatch_state=dispatched "
+        "direct service did not return or produce localization_result within " +
         std::to_string(service_call_timeout_sec) + "s";
       last_trigger_status_ = response->message;
       return;
@@ -276,7 +410,8 @@ private:
     {
       response->accepted = false;
       response->message =
-        "failure_code=LOCALIZATION_RESULT_TIMEOUT no localization_result or bridge_status update within " +
+        "failure_code=LOCALIZATION_RESULT_TIMEOUT dispatch_state=dispatched "
+        "no current-arm localization_result or explicit bridge acceptance within " +
         std::to_string(result_wait_timeout_sec) + "s; " + force_accept_detail + "; " +
         direct_service_detail + "; " + input_detail;
       last_trigger_status_ = response->message;
@@ -328,27 +463,251 @@ private:
     const std::shared_ptr<robot_interfaces::srv::ApplyFloorAssets::Request> request,
     std::shared_ptr<robot_interfaces::srv::ApplyFloorAssets::Response> response)
   {
-    std::string missing;
-    append_missing(missing, "nav_map_yaml", request->nav_map_yaml);
-    append_missing(missing, "localizer_map_png", request->localizer_map_png);
-    append_missing(missing, "localizer_params_yaml", request->localizer_params_yaml);
-    if (!missing.empty()) {
+    response->transaction_id = request->transaction_id;
+    response->building_id = request->building_id;
+    response->floor_id = request->floor_id;
+    response->map_id = request->map_id;
+    response->asset_epoch = request->asset_epoch;
+    response->asset_digest = request->asset_digest;
+
+    std::unique_lock<std::mutex> localizer_operation_lock(
+      localizer_operation_mutex_, std::try_to_lock);
+    if (!localizer_operation_lock.owns_lock()) {
       response->success = false;
-      response->message = "missing floor assets: " + missing;
+      response->code = "LOCALIZER_OPERATION_BUSY";
+      response->message =
+        "floor asset reload or explicit localization trigger is already active";
+      response->localizer_generation = last_asset_generation();
       return;
     }
 
-    active_floor_id_ = request->floor_id;
-    active_nav_map_yaml_ = request->nav_map_yaml;
-    active_localizer_map_png_ = request->localizer_map_png;
-    active_localizer_params_yaml_ = request->localizer_params_yaml;
-    response->success = true;
-    response->message = "applied floor " + request->floor_id + ": " + request->nav_map_yaml;
+    robot_global_localization::FloorAssetRequest domain_request;
+    domain_request.transaction_id = request->transaction_id;
+    domain_request.identity.building_id = request->building_id;
+    domain_request.identity.floor_id = request->floor_id;
+    domain_request.identity.map_id = request->map_id;
+    domain_request.identity.asset_epoch = request->asset_epoch;
+    domain_request.identity.asset_digest = request->asset_digest;
+    domain_request.nav_map_yaml = request->nav_map_yaml;
+    domain_request.localizer_map_png = request->localizer_map_png;
+    domain_request.localizer_params_yaml = request->localizer_params_yaml;
+
+    auto applying_state = asset_reloader_->state();
+    applying_state.transaction_id = domain_request.transaction_id;
+    applying_state.requested_identity = domain_request.identity;
+    applying_state.applying = true;
+    applying_state.idempotent = false;
+    applying_state.reloaded = false;
+    applying_state.rollback_attempted = false;
+    applying_state.rollback_succeeded = false;
+    applying_state.failure_code.clear();
+    applying_state.detail = "validating and replacing Isaac localizer floor assets";
+    publish_asset_state(applying_state, false, "APPLYING");
+
+    robot_global_localization::ApplyFloorAssetResult result;
+    try {
+      result = asset_reloader_->apply(domain_request, *component_manager_);
+    } catch (const std::exception & exception) {
+      result.success = false;
+      result.idempotent = false;
+      result.state = asset_reloader_->state();
+      result.state.transaction_id = domain_request.transaction_id;
+      result.state.requested_identity = domain_request.identity;
+      result.state.applying = false;
+      result.state.localizer_ready = false;
+      result.state.failure_code = "LOCALIZER_RELOAD_EXCEPTION";
+      result.state.detail = exception.what();
+    }
+
+    if (result.success && result.state.reloaded && !result.idempotent) {
+      const auto input_baseline = localizer_input_snapshot();
+      // Keep this client alive for the node lifetime. ROS 2 service clients
+      // rediscover a same-named server after the Isaac component is replaced.
+      // Recreating a waitable from this Reentrant callback mutates the callback
+      // group while the MultiThreadedExecutor is spinning and can race inside
+      // rclcpp::CallbackGroup::add_waitable().
+      post_reload_readiness_gate_->arm(
+        result.state.localizer_generation,
+        input_baseline.seq,
+        steady_now_seconds());
+      result.state.detail +=
+        "; post-reload trigger readiness gate armed generation=" +
+        std::to_string(result.state.localizer_generation) +
+        " input_baseline_seq=" + std::to_string(input_baseline.seq);
+    }
+
+    response->success = result.success;
+    response->idempotent = result.idempotent;
+    response->reloaded = result.state.reloaded;
+    response->rollback_attempted = result.state.rollback_attempted;
+    response->rollback_succeeded = result.state.rollback_succeeded;
+    response->localizer_generation = result.state.localizer_generation;
+    response->code = result.success ?
+      (result.idempotent ? "IDEMPOTENT" : "OK") :
+      (result.state.failure_code.empty() ?
+      "LOCALIZER_RELOAD_FAILED" : result.state.failure_code);
+    response->message = result.state.detail;
+
+    if (result.success && result.state.active_identity_valid) {
+      set_active_assets(result.state);
+    }
+    publish_asset_state(result.state, result.success, response->code);
+  }
+
+  std::uint64_t last_asset_generation()
+  {
+    std::lock_guard<std::mutex> lock(asset_state_mutex_);
+    return last_asset_state_.localizer_generation;
+  }
+
+  void publish_asset_state(
+    const robot_global_localization::LocalizerAssetState & state,
+    const bool success,
+    const std::string & code)
+  {
+    robot_interfaces::msg::LocalizerAssetState message;
+    message.stamp = now();
+    message.transaction_id = state.transaction_id;
+    message.applying = state.applying;
+    message.success = success;
+    message.idempotent = state.idempotent;
+    message.reloaded = state.reloaded;
+    message.rollback_attempted = state.rollback_attempted;
+    message.rollback_succeeded = state.rollback_succeeded;
+    message.code = code;
+    message.message = state.detail;
+    message.requested_building_id = state.requested_identity.building_id;
+    message.requested_floor_id = state.requested_identity.floor_id;
+    message.requested_map_id = state.requested_identity.map_id;
+    message.requested_asset_epoch = state.requested_identity.asset_epoch;
+    message.requested_asset_digest = state.requested_identity.asset_digest;
+    message.active_identity_valid = state.active_identity_valid;
+    message.active_building_id = state.active_identity.building_id;
+    message.active_floor_id = state.active_identity.floor_id;
+    message.active_map_id = state.active_identity.map_id;
+    message.active_asset_epoch = state.active_identity.asset_epoch;
+    message.active_asset_digest = state.active_identity.asset_digest;
+    message.active_nav_map_yaml = state.active_nav_map_yaml.string();
+    message.active_localizer_map_png = state.active_localizer_map_png.string();
+    message.active_localizer_params_yaml =
+      state.active_localizer_params_yaml.string();
+    message.localizer_generation = state.localizer_generation;
+    message.localizer_ready = state.localizer_ready;
+    {
+      std::lock_guard<std::mutex> lock(asset_state_mutex_);
+      last_asset_state_ = message;
+    }
+    asset_state_pub_->publish(message);
+  }
+
+  void set_active_assets(
+    const robot_global_localization::LocalizerAssetState & state)
+  {
+    std::lock_guard<std::mutex> lock(active_asset_mutex_);
+    active_floor_id_ = state.active_identity.floor_id;
+    active_nav_map_yaml_ = state.active_nav_map_yaml.string();
+    active_localizer_map_png_ = state.active_localizer_map_png.string();
+    active_localizer_params_yaml_ =
+      state.active_localizer_params_yaml.string();
+  }
+
+  std::string active_floor_id_snapshot()
+  {
+    std::lock_guard<std::mutex> lock(active_asset_mutex_);
+    return active_floor_id_;
+  }
+
+  void on_runtime_context_bootstrap()
+  {
+    const auto steady_now = std::chrono::steady_clock::now();
+    if (steady_now < next_runtime_context_bootstrap_attempt_) {
+      return;
+    }
+
+    std::unique_lock<std::mutex> localizer_operation_lock(
+      localizer_operation_mutex_, std::try_to_lock);
+    if (!localizer_operation_lock.owns_lock()) {
+      return;
+    }
+
+    const auto current_state = asset_reloader_->state();
+    if (
+      current_state.active_identity_valid &&
+      current_state.localizer_ready &&
+      current_state.localizer_generation > 0U)
+    {
+      runtime_context_bootstrap_timer_->cancel();
+      return;
+    }
+
+    auto checking_state = current_state;
+    checking_state.applying = true;
+    checking_state.idempotent = false;
+    checking_state.reloaded = false;
+    checking_state.rollback_attempted = false;
+    checking_state.rollback_succeeded = false;
+    checking_state.failure_code.clear();
+    checking_state.detail =
+      "verifying durable runtime context against exact current assets "
+      "and the unique live Isaac component";
+    publish_asset_state(checking_state, false, "BOOTSTRAP_CHECKING");
+
+    robot_global_localization::ApplyFloorAssetResult result;
+    try {
+      result = asset_reloader_->bootstrap_from_runtime_context(
+        std::filesystem::path(runtime_map_context_file_),
+        *component_manager_);
+    } catch (const std::exception & exception) {
+      result.success = false;
+      result.idempotent = false;
+      result.state = asset_reloader_->state();
+      result.state.applying = false;
+      result.state.active_identity_valid = false;
+      result.state.localizer_ready = false;
+      result.state.failure_code = "EXCEPTION";
+      result.state.detail = exception.what();
+    }
+
+    if (
+      result.success &&
+      result.state.active_identity_valid &&
+      result.state.localizer_ready &&
+      result.state.localizer_generation > 0U)
+    {
+      set_active_assets(result.state);
+      publish_asset_state(result.state, true, "BOOTSTRAP_READY");
+      runtime_context_bootstrap_timer_->cancel();
+      RCLCPP_INFO(
+        get_logger(),
+        "Localizer identity bootstrap ready building=%s floor=%s map=%s "
+        "epoch=%llu generation=%llu",
+        result.state.active_identity.building_id.c_str(),
+        result.state.active_identity.floor_id.c_str(),
+        result.state.active_identity.map_id.c_str(),
+        static_cast<unsigned long long>(
+          result.state.active_identity.asset_epoch),
+        static_cast<unsigned long long>(
+          result.state.localizer_generation));
+      return;
+    }
+
+    const std::string failure_code = result.state.failure_code.empty() ?
+      "FAILED" : result.state.failure_code;
+    publish_asset_state(
+      result.state, false, "BOOTSTRAP_" + failure_code);
+    RCLCPP_WARN(
+      get_logger(), "Localizer identity bootstrap failed [%s]: %s",
+      failure_code.c_str(), result.state.detail.c_str());
+    next_runtime_context_bootstrap_attempt_ =
+      std::chrono::steady_clock::now() +
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+      std::chrono::duration<double>(runtime_context_bootstrap_retry_sec_));
   }
 
   void on_timer()
   {
     const bool trigger_ready = grid_search_trigger_client_->service_is_ready();
+    const std::string active_floor_id = active_floor_id_snapshot();
     if (mock_mode_) {
       geometry_msgs::msg::PoseWithCovarianceStamped pose;
       const int64_t now_ns = get_clock()->now().nanoseconds();
@@ -357,7 +716,7 @@ private:
       pose.header.frame_id = "map";
       pose_pub_->publish(pose);
       std_msgs::msg::String health;
-      health.data = "mock_localizer_ready floor=" + active_floor_id_;
+      health.data = "mock_localizer_ready floor=" + active_floor_id;
       health_pub_->publish(health);
       return;
     }
@@ -365,7 +724,7 @@ private:
     std_msgs::msg::String health;
     const std::string status = trigger_ready ? "localizer_ready" :
       "localizer_waiting_for_grid_search";
-    health.data = status + " floor=" + active_floor_id_ +
+    health.data = status + " floor=" + active_floor_id +
       " trigger_status=" + last_trigger_status_;
     health_pub_->publish(health);
   }
@@ -454,18 +813,6 @@ private:
       static_cast<double>(msg->header.stamp.nanosec) * 1.0e-9;
     localizer_input_.fov_deg = localizer_input_fov_deg(*msg);
     localizer_input_.point_count = msg->angles.size();
-  }
-
-  static void append_missing(std::string & missing, const std::string & name,
-                             const std::string & path)
-  {
-    if (!path.empty() && std::filesystem::exists(path)) {
-      return;
-    }
-    if (!missing.empty()) {
-      missing += "; ";
-    }
-    missing += name + "=" + path;
   }
 
   static double positive_or_default(const double value, const double fallback)
@@ -599,6 +946,71 @@ private:
     return localizer_input_;
   }
 
+  static double steady_now_seconds()
+  {
+    return std::chrono::duration<double>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+
+  bool wait_for_post_reload_readiness(std::string & detail)
+  {
+    if (!post_reload_readiness_gate_ || !post_reload_readiness_gate_->pending()) {
+      detail = "no post-reload readiness wait is pending";
+      return true;
+    }
+
+    std::string subscription_detail;
+    while (rclcpp::ok()) {
+      if (localizer_input_freshness_enabled_ && !localizer_input_topic_.empty()) {
+        (void)ensure_localizer_input_subscription(subscription_detail);
+      }
+
+      const auto input = localizer_input_snapshot();
+      const double input_age_sec = input.available ?
+        now().seconds() - input.received_sec : -1.0;
+      const std::uint64_t observed_input_sequence =
+        (!localizer_input_freshness_enabled_ || localizer_input_topic_.empty()) ?
+        input.seq + 1U : input.seq;
+      const double observed_input_age_sec =
+        (!localizer_input_freshness_enabled_ || localizer_input_topic_.empty()) ?
+        0.0 : input_age_sec;
+      const bool service_ready =
+        grid_search_trigger_client_ && grid_search_trigger_client_->service_is_ready();
+      const auto decision = post_reload_readiness_gate_->observe(
+        {
+          steady_now_seconds(),
+          service_ready,
+          observed_input_sequence,
+          observed_input_age_sec,
+        });
+
+      if (decision == robot_global_localization::PostReloadReadinessDecision::kReady) {
+        detail = "post-reload localizer ready generation=" +
+          std::to_string(post_reload_readiness_gate_->localizer_generation()) +
+          " service_ready=true input_seq=" + std::to_string(input.seq) +
+          " input_age_sec=" + std::to_string(input_age_sec);
+        RCLCPP_INFO(get_logger(), "%s", detail.c_str());
+        return true;
+      }
+      if (decision == robot_global_localization::PostReloadReadinessDecision::kTimedOut) {
+        detail = "failure_code=LOCALIZER_POST_RELOAD_NOT_READY dispatch_state=not_dispatched generation=" +
+          std::to_string(post_reload_readiness_gate_->localizer_generation()) +
+          " service_ready=" + bool_string(service_ready) +
+          " input_seq=" + std::to_string(input.seq) +
+          " input_age_sec=" + std::to_string(input_age_sec) +
+          " subscription_detail=" + subscription_detail;
+        RCLCPP_WARN(get_logger(), "%s", detail.c_str());
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    detail =
+      "failure_code=LOCALIZER_POST_RELOAD_NOT_READY dispatch_state=not_dispatched "
+      "ROS shutdown while waiting";
+    return false;
+  }
+
   bool ensure_localizer_input_subscription(std::string & detail)
   {
     if (!localizer_input_freshness_enabled_ || localizer_input_topic_.empty()) {
@@ -663,7 +1075,9 @@ private:
     }
 
     const auto snapshot = localizer_input_snapshot();
-    detail = "failure_code=LOCALIZER_INPUT_NOT_FRESH topic=" + localizer_input_topic_ +
+    detail =
+      "failure_code=LOCALIZER_INPUT_NOT_FRESH dispatch_state=not_dispatched topic=" +
+      localizer_input_topic_ +
              " timeout_sec=" + std::to_string(timeout_sec) +
              " max_age_sec=" + std::to_string(max_age_sec) +
              " min_fov_deg=" + std::to_string(localizer_input_min_fov_deg_) +
@@ -775,10 +1189,7 @@ private:
     const auto snapshot = bridge_status_snapshot();
     return snapshot.available &&
            snapshot.received_sec >= trigger_started_sec &&
-           (snapshot.accepted_result_count > initial.accepted_result_count ||
-            snapshot.rejected_result_count > initial.rejected_result_count ||
-            snapshot.force_accept_ignored_pretrigger_result_count >
-            initial.force_accept_ignored_pretrigger_result_count);
+           bridge_explicit_trigger_accept_observed(initial, snapshot);
   }
 
   bool arm_bridge_force_accept(
@@ -788,28 +1199,36 @@ private:
   {
     const auto timeout = std::chrono::duration<double>(std::min(timeout_sec, 2.0));
     if (!bridge_force_accept_client_->wait_for_service(timeout)) {
-      detail = "bridge force-accept unavailable for explicit_trigger reason=" + reason;
+      detail =
+        "failure_code=BRIDGE_FORCE_ACCEPT_UNAVAILABLE dispatch_state=not_dispatched "
+        "bridge force-accept unavailable for explicit_trigger reason=" + reason;
       return false;
     }
     auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
     auto future = bridge_force_accept_client_->async_send_request(request);
     if (future.wait_for(timeout) != std::future_status::ready) {
-      detail = "bridge force-accept timed out for explicit_trigger reason=" + reason;
+      detail =
+        "failure_code=BRIDGE_FORCE_ACCEPT_TIMEOUT dispatch_state=not_dispatched "
+        "bridge force-accept timed out for explicit_trigger reason=" + reason;
       return false;
     }
     try {
       const auto response = future.get();
       if (!response->success) {
-        detail = "bridge force-accept rejected explicit_trigger reason=" + reason +
-                 ": " + response->message;
+        detail =
+          "failure_code=BRIDGE_FORCE_ACCEPT_FAILED dispatch_state=not_dispatched "
+          "bridge force-accept rejected explicit_trigger reason=" + reason +
+                  ": " + response->message;
         return false;
       }
       detail = "bridge force-accept armed explicit_trigger=true reason=" + reason +
                ": " + response->message;
       return true;
     } catch (const std::exception & exc) {
-      detail = std::string("bridge force-accept failed explicit_trigger reason=") + reason +
-               ": " + exc.what();
+      detail =
+        std::string("failure_code=BRIDGE_FORCE_ACCEPT_FAILED dispatch_state=not_dispatched ") +
+        "bridge force-accept failed explicit_trigger reason=" + reason +
+                ": " + exc.what();
       return false;
     }
   }
@@ -864,7 +1283,10 @@ private:
   {
     auto active_deadline = steady_deadline(timeout_sec);
     bool saw_nonfresh_bridge_accept = false;
+    bool saw_prearm_result = false;
+    bool saw_transient_triggered_stale_reject = false;
     std::uint64_t last_amcl_observe_only_reject_count = initial.rejected_result_count;
+    std::uint64_t last_transient_triggered_stale_reject_count = initial.rejected_result_count;
     std::uint64_t last_pretrigger_ignored_count =
       initial.force_accept_ignored_pretrigger_result_count;
     BridgeStatusSnapshot latest;
@@ -926,22 +1348,26 @@ private:
         {
           last_pretrigger_ignored_count =
             latest.force_accept_ignored_pretrigger_result_count;
+          saw_prearm_result = true;
           detail =
-            "failure_code=FRESH_LOCALIZATION_RETRY_REQUIRED bridge ignored pre-force-accept stale localization_result; "
-            "a new Isaac trigger is required; ignored_reason=" +
+            "draining pre-arm localization_result inside the same trigger transaction; "
+            "force-accept arm time and deadline remain unchanged; ignored_reason=" +
             latest.last_force_accept_ignored_reason;
           RCLCPP_WARN(get_logger(), "%s", detail.c_str());
-          return false;
         }
         if (latest.rejected_result_count > initial.rejected_result_count) {
           if (bridge_reject_is_transient_triggered_stale(latest.last_reject_reason)) {
-            detail =
-              "failure_code=FRESH_LOCALIZATION_RETRY_REQUIRED "
-              "bridge rejected stale triggered localization_result; a new Isaac trigger is "
-              "required; last_reject_reason=" +
-              latest.last_reject_reason;
-            RCLCPP_WARN(get_logger(), "%s", detail.c_str());
-            return false;
+            saw_transient_triggered_stale_reject = true;
+            if (latest.rejected_result_count > last_transient_triggered_stale_reject_count) {
+              last_transient_triggered_stale_reject_count = latest.rejected_result_count;
+              detail =
+                "draining stale triggered localization_result inside the same trigger transaction; "
+                "force-accept arm time and deadline remain unchanged; last_reject_reason=" +
+                latest.last_reject_reason;
+              RCLCPP_WARN(get_logger(), "%s", detail.c_str());
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
           }
           if (bridge_reject_is_expected_amcl_observe_only(latest.last_reject_reason)) {
             if (latest.rejected_result_count > last_amcl_observe_only_reject_count) {
@@ -953,7 +1379,7 @@ private:
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
           }
-          detail = "failure_code=BRIDGE_REJECTED_RESULT last_reject_reason=" +
+          detail = "failure_code=BRIDGE_REJECTED_RESULT dispatch_state=dispatched last_reject_reason=" +
                    latest.last_reject_reason;
           return false;
         }
@@ -984,12 +1410,22 @@ private:
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     detail = saw_nonfresh_bridge_accept ?
-      "failure_code=BRIDGE_ACCEPT_TIMEOUT bridge accepted a result but map->odom target did not settle" :
-      "failure_code=BRIDGE_ACCEPT_TIMEOUT bridge did not accept localization_result";
+      "failure_code=BRIDGE_ACCEPT_TIMEOUT dispatch_state=dispatched "
+      "bridge accepted a result but map->odom target did not settle" :
+      "failure_code=BRIDGE_ACCEPT_TIMEOUT dispatch_state=dispatched "
+      "bridge did not accept a current-arm localization_result";
+    if (saw_prearm_result) {
+      detail += " saw_prearm_result=true";
+    }
+    if (saw_transient_triggered_stale_reject) {
+      detail += " saw_transient_triggered_stale_reject=true";
+    }
     if (latest.available) {
       detail += " last_reject_reason=" + latest.last_reject_reason;
       if (latest.last_reject_reason.find("tf_history_missing") != std::string::npos) {
-        detail = "failure_code=TF_HISTORY_MISSING " + latest.last_reject_reason;
+        detail =
+          "failure_code=TF_HISTORY_MISSING dispatch_state=dispatched " +
+          latest.last_reject_reason;
       }
     }
     return false;
@@ -1068,7 +1504,9 @@ private:
         latest.has_map_to_odom &&
         latest.owner != "robot_localization_bridge")
       {
-        detail = "failure_code=MAP_TO_ODOM_WRONG_OWNER owner=" + latest.owner;
+        detail =
+          "failure_code=MAP_TO_ODOM_WRONG_OWNER dispatch_state=dispatched owner=" +
+          latest.owner;
         return false;
       }
       if (map_to_odom_ready(latest))
@@ -1080,7 +1518,9 @@ private:
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
-    detail = "failure_code=MAP_TO_ODOM_TIMEOUT map->odom unavailable or stale";
+    detail =
+      "failure_code=MAP_TO_ODOM_TIMEOUT dispatch_state=dispatched "
+      "map->odom unavailable or stale";
     if (latest.available) {
       detail += " has_map_to_odom=" + std::string(latest.has_map_to_odom ? "true" : "false") +
                 " owner=" + latest.owner +
@@ -1095,6 +1535,8 @@ private:
   rclcpp::CallbackGroup::SharedPtr callback_group_;
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr health_pub_;
+  rclcpp::Publisher<robot_interfaces::msg::LocalizerAssetState>::SharedPtr
+    asset_state_pub_;
   rclcpp::Client<std_srvs::srv::Empty>::SharedPtr grid_search_trigger_client_;
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr bridge_force_accept_client_;
   rclcpp::Subscription<isaac_ros_pointcloud_interfaces::msg::FlatScan>::SharedPtr
@@ -1105,7 +1547,16 @@ private:
   rclcpp::Service<robot_interfaces::srv::TriggerLocalization>::SharedPtr trigger_srv_;
   rclcpp::Service<robot_interfaces::srv::ApplyFloorAssets>::SharedPtr apply_floor_srv_;
   rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::TimerBase::SharedPtr runtime_context_bootstrap_timer_;
   std::mutex state_mutex_;
+  std::mutex localizer_operation_mutex_;
+  std::mutex asset_state_mutex_;
+  std::mutex active_asset_mutex_;
+  robot_interfaces::msg::LocalizerAssetState last_asset_state_;
+  std::unique_ptr<robot_global_localization::IsaacAssetReloader> asset_reloader_;
+  std::unique_ptr<robot_global_localization::PostReloadReadinessGate>
+    post_reload_readiness_gate_;
+  std::unique_ptr<robot_global_localization::RosComponentManagerPort> component_manager_;
 
   std::string active_floor_id_;
   std::string active_nav_map_yaml_;
@@ -1118,6 +1569,7 @@ private:
   std::string localizer_input_topic_;
   std::string map_frame_;
   std::string odom_frame_;
+  std::string runtime_map_context_file_;
   double service_timeout_sec_{10.0};
   double service_call_timeout_sec_{10.0};
   double result_wait_timeout_sec_{20.0};
@@ -1129,10 +1581,13 @@ private:
   double localizer_input_min_fov_deg_{115.0};
   int localizer_input_required_consecutive_good_{2};
   double result_allowed_pretrigger_age_sec_{1.0};
+  double runtime_context_bootstrap_retry_sec_{5.0};
   bool localizer_input_freshness_enabled_{true};
   bool require_grid_search_trigger_{true};
   bool require_bridge_acceptance_{true};
   bool mock_mode_{false};
+  std::chrono::steady_clock::time_point
+    next_runtime_context_bootstrap_attempt_{};
   std::string last_trigger_status_{"idle"};
   LocalizerInputSnapshot localizer_input_;
   LocalizationResultSnapshot localization_result_;

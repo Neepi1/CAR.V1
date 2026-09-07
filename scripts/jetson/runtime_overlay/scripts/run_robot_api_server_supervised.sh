@@ -2,8 +2,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RESTART_DELAY_SEC="${ROBOT_API_SERVER_RESTART_DELAY_SEC:-2}"
-
 child_pid=""
 stopping=0
 
@@ -42,21 +40,32 @@ trap stop_child EXIT
 trap 'stop_child; exit 130' INT TERM
 
 echo "[runtime-overlay] robot_api_server supervisor starting" >&2
-while true; do
-  child_pid=""
-  cleanup_stale_api_processes
-  bash "${SCRIPT_DIR}/run_robot_api_server.sh" &
-  child_pid=$!
-  set +e
-  wait "${child_pid}"
-  status=$?
-  set -e
-  child_pid=""
+child_pid=""
+cleanup_stale_api_processes
+bash "${SCRIPT_DIR}/run_robot_api_server.sh" &
+child_pid=$!
+set +e
+wait "${child_pid}"
+status=$?
+set -e
+child_pid=""
 
-  if [[ "${stopping}" -eq 1 ]]; then
-    exit "${status}"
-  fi
+if [[ "${stopping}" -eq 1 ]]; then
+  exit "${status}"
+fi
 
-  echo "[runtime-overlay] robot_api_server exited with ${status}; restarting in ${RESTART_DELAY_SEC}s" >&2
-  sleep "${RESTART_DELAY_SEC}"
-done
+# Never restart the API process in isolation. It owns in-memory admission
+# evidence for ROS requests whose client-side wait timed out while Nav2,
+# localization, docking, or floor services may still execute. Losing that
+# evidence while those servers remain resident could admit overlapping
+# motion. Exiting the supervisor lets run_common_services fail and systemd
+# restart the complete runtime chain.
+echo "[runtime-overlay] robot_api_server exited with ${status}; refusing isolated restart so systemd restarts the complete runtime chain" >&2
+# Wake the common owner immediately instead of waiting for its health period.
+# Its TERM trap latches safety stop first and then tears down every runtime
+# motion publisher before this supervisor exits.
+kill -TERM "${PPID}" 2>/dev/null || true
+if [[ "${status}" -eq 0 ]]; then
+  exit 1
+fi
+exit "${status}"

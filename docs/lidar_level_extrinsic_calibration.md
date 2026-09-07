@@ -88,11 +88,27 @@ Acceptance targets for a good candidate:
   lateral correction larger than `0.05 m`.
 - If yaw was calibrated with a known heading, yaw residual RMS <= `1.0 deg`.
 
-Apply the candidate only after reviewing the report. The current field
-candidate is `x=0.3450, y=0.0000, z=0.85, yaw=3.1764992386296798`; it should
-be treated as provisional until a post-apply four-heading validation run shows
-that the fitted follow-up correction is near zero. Update both runtime overlay
-and source config so future deploys do not revert the calibration:
+Apply the candidate only after reviewing the report. The current field mount,
+calibrated against a stationary vertical wall on 2026-08-20, is
+`xyz=[0.3686, 0.0, 0.85]` and
+`rpy=[0.0, -0.257374941072, 3.070994091224]`. The normalized yaw is equivalent
+to `-3.212191215956 rad`. The same physical orientation is applied to the
+JT128 IMU because it moves with the lidar body.
+
+The strict post-apply check sampled one frame every 10 seconds, six frames per
+minute for five minutes. All 30 fixed slots succeeded on their first short
+subscription. Mean wall-normal residuals were `yaw=-0.0095 deg` and
+`elevation=-0.0869 deg`; absolute P95 values were `0.0182 deg` and
+`0.1101 deg`, and mean plane RMSE was `7.96 mm`. The robot odometry changed by
+`0.0 m / 0.0 deg`. The formal runtime report is under
+`/tmp/njrh_reports/20260820T014656Z_jt128_front_wall_strict30` on the Jetson.
+The earlier run containing one preserved subscription timeout remains under
+`/tmp/njrh_reports/20260820T013231Z_jt128_front_wall_30frames` for diagnosis.
+Wall-normal yaw is valid only when the robot body is physically square to the
+reference wall; this check does not calibrate XYZ or roll.
+
+Update both runtime overlay and source config so future deploys do not revert
+the calibration:
 
 - `scripts/jetson/runtime_overlay/config/sensors.yaml`
 - `src/robot_description/config/sensors.yaml`

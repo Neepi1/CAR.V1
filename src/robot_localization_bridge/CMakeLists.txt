@@ -11,6 +11,7 @@ find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
+find_package(tf2_msgs REQUIRED)
 
 add_library(correction_pause_arbiter
   src/correction_pause_arbiter.cpp
@@ -45,7 +46,9 @@ ament_target_dependencies(
   robot_interfaces
   std_msgs
   std_srvs
+  tf2
   tf2_ros
+  tf2_msgs
 )
 
 add_executable(amcl_scan_admission_node src/amcl_scan_admission_node.cpp)
@@ -80,6 +83,11 @@ if(BUILD_TESTING)
   target_include_directories(test_se2_correction PRIVATE include)
   ament_add_gtest(test_post_isaac_refine_gate test/test_post_isaac_refine_gate.cpp)
   target_include_directories(test_post_isaac_refine_gate PRIVATE include)
+  ament_add_gtest(
+    test_explicit_localization_result_policy
+    test/test_explicit_localization_result_policy.cpp
+  )
+  target_include_directories(test_explicit_localization_result_policy PRIVATE include)
   ament_add_gtest(test_correction_pause_arbiter test/test_correction_pause_arbiter.cpp)
   target_link_libraries(test_correction_pause_arbiter correction_pause_arbiter)
   ament_add_gtest(test_floor_transition_context test/test_floor_transition_context.cpp)

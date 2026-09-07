@@ -47,6 +47,32 @@ njrh_cpuset_for() {
   printf '%s\n' "${!var_name:-}"
 }
 
+njrh_apply_affinity_to_current_process() {
+  local service_name="$1"
+  local cpuset
+  local pid
+  local actual
+  cpuset="$(njrh_cpuset_for "${service_name}")"
+  if ! njrh_affinity_truthy "${NJRH_CPU_AFFINITY_ENABLED:-true}" || [[ -z "${cpuset}" ]]; then
+    return 0
+  fi
+  if ! command -v taskset >/dev/null 2>&1; then
+    echo "[runtime-overlay] ERROR: taskset is required to apply ${service_name} CPU affinity" >&2
+    return 1
+  fi
+  pid="${BASHPID:-$$}"
+  if ! taskset -pc "${cpuset}" "${pid}" >/dev/null 2>&1; then
+    echo "[runtime-overlay] ERROR: failed to apply ${service_name} pid=${pid} -> CPU ${cpuset}" >&2
+    return 1
+  fi
+  actual="$(awk '/^Cpus_allowed_list:/ {print $2}' "/proc/${pid}/status" 2>/dev/null || true)"
+  if [[ -z "${actual}" ]]; then
+    echo "[runtime-overlay] ERROR: failed to verify ${service_name} pid=${pid} CPU affinity" >&2
+    return 1
+  fi
+  echo "[runtime-overlay] cpu affinity applied: ${service_name} pid=${pid} -> CPU ${actual}" >&2
+}
+
 njrh_run_affined() {
   local service_name="$1"
   shift

@@ -1,26 +1,54 @@
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <functional>
 #include <future>
+#include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
+#include "action_msgs/msg/goal_status.hpp"
+#include "action_msgs/msg/goal_status_array.hpp"
 #include "lifecycle_msgs/msg/state.hpp"
 #include "lifecycle_msgs/srv/get_state.hpp"
+#include "nav_msgs/msg/occupancy_grid.hpp"
+#include "nav_msgs/msg/odometry.hpp"
 #include "nav2_msgs/srv/clear_entire_costmap.hpp"
 #include "nav2_msgs/srv/load_map.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
+#include "robot_floor_manager/executor_runtime_policy.hpp"
+#include "robot_floor_manager/floor_asset_snapshot_loader.hpp"
 #include "robot_floor_manager/floor_switch_preflight.hpp"
+#include "robot_floor_manager/floor_transition_evidence_tracker.hpp"
+#include "robot_floor_manager/floor_transition_executor.hpp"
+#include "robot_floor_manager/floor_transition_reconciliation.hpp"
+#include "robot_floor_manager/navigate_action_graph.hpp"
+#include "robot_floor_manager/runtime_map_context_writer.hpp"
 #include "robot_interfaces/action/floor_switch.hpp"
+#include "robot_interfaces/msg/correction_pause_state.hpp"
 #include "robot_interfaces/msg/floor_switch_status.hpp"
+#include "robot_interfaces/msg/localizer_asset_state.hpp"
+#include "robot_interfaces/msg/localization_health.hpp"
+#include "robot_interfaces/msg/motion_interlock_state.hpp"
 #include "robot_interfaces/srv/apply_floor_assets.hpp"
+#include "robot_interfaces/srv/begin_floor_transition.hpp"
+#include "robot_interfaces/srv/set_correction_pause.hpp"
+#include "robot_interfaces/srv/set_motion_hold.hpp"
 #include "robot_interfaces/srv/switch_floor.hpp"
 #include "robot_interfaces/srv/trigger_localization.hpp"
+#include "robot_safety/persistent_sequence_allocator.hpp"
 #include "std_msgs/msg/string.hpp"
 
 namespace fs = std::filesystem;
@@ -33,6 +61,9 @@ struct FloorAssets
 {
   std::string building_id;
   std::string floor_id;
+  std::string map_id;
+  std::uint64_t asset_epoch{0U};
+  std::string asset_digest;
   fs::path root;
   fs::path nav_map_yaml;
   fs::path nav_map_pgm;
@@ -75,9 +106,72 @@ std::string lifecycle_state_service_for_load_map(const std::string & load_map_se
   return load_map_service + "/get_state";
 }
 
+bool cancel_matches_active_floor_switch(
+  const bool action_active,
+  const std::string & active_transaction_id,
+  const std::string & cancel_transaction_id)
+{
+  return action_active &&
+         !cancel_transaction_id.empty() &&
+         active_transaction_id == cancel_transaction_id;
+}
+
+bool bridge_response_requires_target_epoch(const std::uint8_t operation)
+{
+  return
+    operation ==
+    robot_interfaces::srv::BeginFloorTransition::Request::OP_BEGIN ||
+    operation ==
+    robot_interfaces::srv::BeginFloorTransition::Request::OP_COMMIT;
+}
+
+bool bridge_begin_rejection_requires_recovery(
+  const bool success,
+  const bool runtime_context_valid)
+{
+  return !success && !runtime_context_valid;
+}
+
+bool contains_exact_key(
+  const std::vector<std::string> & keys,
+  const std::string & expected)
+{
+  return std::find(keys.cbegin(), keys.cend(), expected) != keys.cend();
+}
+
+bool same_runtime_identity(
+  const robot_floor_manager::LocalizationHealthEvidence & left,
+  const robot_floor_manager::LocalizationHealthEvidence & right)
+{
+  return
+    left.building_id == right.building_id &&
+    left.floor_id == right.floor_id &&
+    left.map_id == right.map_id &&
+    left.asset_epoch == right.asset_epoch &&
+    left.asset_digest == right.asset_digest;
+}
+
+enum class RuntimeFilterRole
+{
+  kKeepout,
+  kSpeed,
+};
+
+std::vector<RuntimeFilterRole> runtime_filter_reload_roles(
+  const bool speed_filter_enabled)
+{
+  std::vector<RuntimeFilterRole> roles{RuntimeFilterRole::kKeepout};
+  if (speed_filter_enabled) {
+    roles.push_back(RuntimeFilterRole::kSpeed);
+  }
+  return roles;
+}
+
 }  // namespace
 
-class FloorManagerNode : public rclcpp::Node
+class FloorManagerNode
+  : public rclcpp::Node,
+    private robot_floor_manager::FloorTransitionRuntimePort
 {
 public:
   using FloorSwitchAction = robot_interfaces::action::FloorSwitch;
@@ -103,8 +197,15 @@ public:
     local_costmap_clear_service_ =
       declare_parameter<std::string>("local_costmap_clear_service", "/local_costmap/clear_entirely_local_costmap");
     service_timeout_sec_ = declare_parameter<double>("service_timeout_sec", 10.0);
+    localizer_apply_timeout_sec_ = std::max(
+      service_timeout_sec_,
+      declare_parameter<double>("localizer_apply_timeout_sec", 30.0));
+    localization_trigger_timeout_sec_ =
+      declare_parameter<double>("localization_trigger_timeout_sec", 75.0);
     call_map_server_load_ = declare_parameter<bool>("call_map_server_load", true);
     call_filter_mask_load_ = declare_parameter<bool>("call_filter_mask_load", true);
+    speed_filter_enabled_ =
+      declare_parameter<bool>("speed_filter_enabled", false);
     call_localizer_apply_ = declare_parameter<bool>("call_localizer_apply", true);
     call_localization_trigger_ = declare_parameter<bool>("call_localization_trigger", true);
     clear_costmaps_after_switch_ = declare_parameter<bool>("clear_costmaps_after_switch", true);
@@ -117,6 +218,78 @@ public:
       "transition_status_topic", "/floor_manager/transition_status");
     live_floor_switch_enabled_ =
       declare_parameter<bool>("live_floor_switch_enabled", false);
+    motion_hold_service_ =
+      declare_parameter<std::string>(
+      "motion_hold_service", "/safety/set_motion_hold");
+    motion_hold_sequence_state_file_ =
+      declare_parameter<std::string>(
+      "motion_hold_sequence_state_file",
+      "/tmp/njrh_floor_manager_hold_sequence.state");
+    try {
+      motion_hold_sequence_allocator_ =
+        std::make_unique<robot_safety::PersistentSequenceAllocator>(
+        fs::path{motion_hold_sequence_state_file_});
+    } catch (const std::exception & exception) {
+      RCLCPP_FATAL(
+        get_logger(),
+        "cannot reserve persistent floor-manager hold sequences from '%s': %s",
+        motion_hold_sequence_state_file_.c_str(), exception.what());
+      throw;
+    }
+    motion_interlock_state_topic_ =
+      declare_parameter<std::string>(
+      "motion_interlock_state_topic", "/safety/motion_interlock_state");
+    navigate_to_pose_status_topic_ =
+      declare_parameter<std::string>(
+      "navigate_to_pose_status_topic", "/navigate_to_pose/_action/status");
+    navigate_to_pose_action_name_ =
+      declare_parameter<std::string>(
+      "navigate_to_pose_action", "/navigate_to_pose");
+    wheel_odom_topic_ =
+      declare_parameter<std::string>("wheel_odom_topic", "/wheel/odom");
+    local_odom_topic_ =
+      declare_parameter<std::string>(
+      "local_odom_topic", "/local_state/odometry");
+    correction_pause_service_ =
+      declare_parameter<std::string>(
+      "correction_pause_service",
+      "/robot_localization_bridge/set_correction_pause_lease");
+    correction_pause_state_topic_ =
+      declare_parameter<std::string>(
+      "correction_pause_state_topic",
+      "/localization/correction_pause_state");
+    begin_floor_transition_service_ =
+      declare_parameter<std::string>(
+      "begin_floor_transition_service",
+      "/robot_localization_bridge/begin_floor_transition");
+    localization_health_topic_ =
+      declare_parameter<std::string>(
+      "localization_health_topic", "/localization/floor_health");
+    localizer_asset_state_topic_ =
+      declare_parameter<std::string>(
+      "localizer_asset_state_topic", "/global_localization/asset_state");
+    global_costmap_topic_ =
+      declare_parameter<std::string>(
+      "global_costmap_topic", "/global_costmap/costmap");
+    local_costmap_topic_ =
+      declare_parameter<std::string>(
+      "local_costmap_topic", "/local_costmap/costmap");
+    runtime_map_context_file_ =
+      declare_parameter<std::string>(
+      "runtime_map_context_file", "/tmp/njrh_runtime_map_context.json");
+    evidence_timeout_sec_ =
+      declare_parameter<double>("evidence_timeout_sec", 10.0);
+    nav_idle_bootstrap_grace_sec_ = std::clamp(
+      declare_parameter<double>("nav_idle_bootstrap_grace_sec", 2.0),
+      0.1, std::max(0.1, evidence_timeout_sec_));
+    evidence_max_age_sec_ =
+      declare_parameter<double>("evidence_max_age_sec", 0.75);
+    stopped_stable_duration_sec_ =
+      declare_parameter<double>("stopped_stable_duration_sec", 0.30);
+    stopped_linear_threshold_mps_ =
+      declare_parameter<double>("stopped_linear_threshold_mps", 0.02);
+    stopped_angular_threshold_radps_ =
+      declare_parameter<double>("stopped_angular_threshold_radps", 0.02);
 
     callback_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
 
@@ -140,6 +313,172 @@ public:
       global_costmap_clear_service_, rmw_qos_profile_services_default, callback_group_);
     local_clear_client_ = create_client<nav2_msgs::srv::ClearEntireCostmap>(
       local_costmap_clear_service_, rmw_qos_profile_services_default, callback_group_);
+    motion_hold_client_ = create_client<robot_interfaces::srv::SetMotionHold>(
+      motion_hold_service_, rmw_qos_profile_services_default, callback_group_);
+    correction_pause_client_ =
+      create_client<robot_interfaces::srv::SetCorrectionPause>(
+      correction_pause_service_, rmw_qos_profile_services_default, callback_group_);
+    begin_floor_transition_client_ =
+      create_client<robot_interfaces::srv::BeginFloorTransition>(
+      begin_floor_transition_service_, rmw_qos_profile_services_default, callback_group_);
+    const auto state_qos =
+      rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
+    motion_interlock_state_sub_ =
+      create_subscription<robot_interfaces::msg::MotionInterlockState>(
+      motion_interlock_state_topic_, state_qos,
+      [this](const robot_interfaces::msg::MotionInterlockState::SharedPtr message) {
+        std::lock_guard<std::mutex> lock(evidence_mutex_);
+        evidence_tracker_.observe_motion_interlock(
+          message->hold_active, message->hold_keys, steady_now_sec());
+        last_motion_interlock_hold_active_ = message->hold_active;
+        last_motion_interlock_hold_keys_ = message->hold_keys;
+        ++motion_interlock_state_generation_;
+        evidence_changed_.notify_all();
+      });
+    correction_pause_state_sub_ =
+      create_subscription<robot_interfaces::msg::CorrectionPauseState>(
+      correction_pause_state_topic_, state_qos,
+      [this](const robot_interfaces::msg::CorrectionPauseState::SharedPtr message) {
+        std::lock_guard<std::mutex> lock(evidence_mutex_);
+        evidence_tracker_.observe_correction_pause(
+          message->paused, message->lease_keys, steady_now_sec());
+        last_correction_pause_active_ = message->paused;
+        last_correction_pause_keys_ = message->lease_keys;
+        ++correction_pause_state_generation_;
+        evidence_changed_.notify_all();
+      });
+    localization_health_sub_ =
+      create_subscription<robot_interfaces::msg::LocalizationHealth>(
+      localization_health_topic_, state_qos,
+      [this](const robot_interfaces::msg::LocalizationHealth::SharedPtr message) {
+        robot_floor_manager::LocalizationHealthEvidence health;
+        health.building_id = message->building_id;
+        health.floor_id = message->floor_id;
+        health.map_id = message->map_id;
+        health.asset_epoch = message->asset_epoch;
+        health.asset_digest = message->asset_digest;
+        health.localizer_generation = message->localizer_generation;
+        health.explicit_relocalization_sequence =
+          message->explicit_relocalization_sequence;
+        health.localizer_ready = message->localizer_ready;
+        health.bridge_ready = message->bridge_ready;
+        health.tf_unique = message->tf_unique;
+        health.transition_active = message->transition_active;
+        health.runtime_context_valid = message->runtime_context_valid;
+        health.amcl_ready = message->amcl_ready;
+        std::lock_guard<std::mutex> lock(evidence_mutex_);
+        evidence_tracker_.observe_localization_health(
+          health, steady_now_sec());
+        last_localization_health_ = health;
+        last_localization_health_received_steady_sec_ = steady_now_sec();
+        ++localization_health_generation_;
+        evidence_changed_.notify_all();
+      });
+    localizer_asset_state_sub_ =
+      create_subscription<robot_interfaces::msg::LocalizerAssetState>(
+      localizer_asset_state_topic_, state_qos,
+      [this](const robot_interfaces::msg::LocalizerAssetState::SharedPtr message) {
+        robot_floor_manager::LocalizerAssetEvidence state;
+        state.transaction_id = message->transaction_id;
+        state.applying = message->applying;
+        state.success = message->success;
+        state.reloaded = message->reloaded;
+        state.active_identity_valid = message->active_identity_valid;
+        state.active_building_id = message->active_building_id;
+        state.active_floor_id = message->active_floor_id;
+        state.active_map_id = message->active_map_id;
+        state.active_asset_epoch = message->active_asset_epoch;
+        state.active_asset_digest = message->active_asset_digest;
+        state.localizer_generation = message->localizer_generation;
+        state.localizer_ready = message->localizer_ready;
+        state.requested_building_id = message->requested_building_id;
+        state.requested_floor_id = message->requested_floor_id;
+        state.requested_map_id = message->requested_map_id;
+        state.requested_asset_epoch = message->requested_asset_epoch;
+        state.requested_asset_digest = message->requested_asset_digest;
+        state.code = message->code;
+        state.detail = message->message;
+        std::lock_guard<std::mutex> lock(evidence_mutex_);
+        evidence_tracker_.observe_localizer_asset(
+          state, steady_now_sec());
+        evidence_changed_.notify_all();
+      });
+    nav_status_sub_ =
+      create_subscription<action_msgs::msg::GoalStatusArray>(
+      navigate_to_pose_status_topic_,
+      rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
+      [this](const action_msgs::msg::GoalStatusArray::SharedPtr message) {
+        bool active = false;
+        for (const auto & status : message->status_list) {
+          if (
+            status.status == action_msgs::msg::GoalStatus::STATUS_ACCEPTED ||
+            status.status == action_msgs::msg::GoalStatus::STATUS_EXECUTING ||
+            status.status == action_msgs::msg::GoalStatus::STATUS_CANCELING)
+          {
+            active = true;
+            break;
+          }
+        }
+        const auto observed_at = steady_now_sec();
+        std::lock_guard<std::mutex> lock(evidence_mutex_);
+        evidence_tracker_.observe_nav_activity(active, observed_at);
+        evidence_changed_.notify_all();
+      });
+    nav_graph_probe_timer_ = create_wall_timer(
+      200ms,
+      [this]() {
+        std::set<std::string> service_names;
+        for (const auto & entry : get_service_names_and_types()) {
+          service_names.insert(entry.first);
+        }
+        const bool graph_ready = robot_floor_manager::navigate_action_graph_ready(
+          navigate_to_pose_action_name_, service_names,
+          count_publishers(navigate_to_pose_status_topic_));
+        std::lock_guard<std::mutex> lock(evidence_mutex_);
+        evidence_tracker_.observe_nav_graph_ready(
+          graph_ready, steady_now_sec());
+        // The grace boundary is time-based, so wake an in-flight precondition
+        // wait even when the graph remains continuously ready.
+        evidence_changed_.notify_all();
+      });
+    wheel_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+      wheel_odom_topic_, rclcpp::SensorDataQoS(),
+      [this](const nav_msgs::msg::Odometry::SharedPtr message) {
+        std::lock_guard<std::mutex> lock(evidence_mutex_);
+        evidence_tracker_.observe_wheel_odom(
+          message->twist.twist.linear.x,
+          message->twist.twist.linear.y,
+          message->twist.twist.angular.z,
+          steady_now_sec());
+        evidence_changed_.notify_all();
+      });
+    local_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+      local_odom_topic_, rclcpp::SensorDataQoS(),
+      [this](const nav_msgs::msg::Odometry::SharedPtr message) {
+        std::lock_guard<std::mutex> lock(evidence_mutex_);
+        evidence_tracker_.observe_local_odom(
+          message->twist.twist.linear.x,
+          message->twist.twist.linear.y,
+          message->twist.twist.angular.z,
+          steady_now_sec());
+        evidence_changed_.notify_all();
+      });
+    global_costmap_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
+      global_costmap_topic_, rclcpp::QoS(rclcpp::KeepLast(1)).reliable(),
+      [this](const nav_msgs::msg::OccupancyGrid::SharedPtr) {
+        std::lock_guard<std::mutex> lock(evidence_mutex_);
+        evidence_tracker_.observe_global_costmap(
+          ++global_costmap_receive_sequence_, steady_now_sec());
+        evidence_changed_.notify_all();
+      });
+    local_costmap_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
+      local_costmap_topic_, rclcpp::QoS(rclcpp::KeepLast(1)).reliable(),
+      [this](const nav_msgs::msg::OccupancyGrid::SharedPtr) {
+        std::lock_guard<std::mutex> lock(evidence_mutex_);
+        evidence_tracker_.observe_local_costmap(
+          ++local_costmap_receive_sequence_, steady_now_sec());
+        evidence_changed_.notify_all();
+      });
 
     status_pub_ = create_publisher<std_msgs::msg::String>(status_topic_, rclcpp::QoS(10).transient_local());
     transition_status_pub_ =
@@ -170,7 +509,23 @@ public:
       "", "IDLE", "IDLE", 0U, "strict live floor switching is disabled by default");
   }
 
+  ~FloorManagerNode() override
+  {
+    shutting_down_.store(true);
+    evidence_changed_.notify_all();
+    std::lock_guard<std::mutex> lock(worker_mutex_);
+    if (floor_switch_worker_.joinable()) {
+      floor_switch_worker_.join();
+    }
+  }
+
 private:
+  static double steady_now_sec()
+  {
+    return std::chrono::duration<double>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+
   void publish_status(const std::string & status)
   {
     std_msgs::msg::String msg;
@@ -198,7 +553,33 @@ private:
       status.selected_floor_id = selected_floor_id_;
       status.selected_map_id = selected_map_id_;
     }
-    status.active_context_valid = false;
+    {
+      std::lock_guard<std::mutex> lock(evidence_mutex_);
+      const bool terminal_runtime_ready =
+        runtime_context_confirmed_ && !motion_hold_acquired_.load();
+      status.active_context_valid = terminal_runtime_ready;
+      status.asset_epoch = published_asset_epoch_;
+      status.asset_digest = published_asset_digest_;
+      status.nav_map_ready = nav_map_ready_;
+      status.filters_ready = filters_ready_;
+      status.localizer_ready = localizer_ready_;
+      status.bridge_ready = bridge_ready_;
+      status.amcl_ready = amcl_ready_;
+      status.costmaps_ready = costmaps_ready_;
+      status.nav2_ready =
+        terminal_runtime_ready &&
+        nav_map_ready_ &&
+        filters_ready_ &&
+        localizer_ready_ &&
+        bridge_ready_ &&
+        amcl_ready_ &&
+        costmaps_ready_;
+      if (terminal_runtime_ready) {
+        status.active_building_id = status.selected_building_id;
+        status.active_floor_id = status.selected_floor_id;
+        status.active_map_id = status.selected_map_id;
+      }
+    }
     status.failure_code = failure_code;
     status.detail = detail;
     if (request != nullptr) {
@@ -222,14 +603,31 @@ private:
   }
 
   rclcpp_action::CancelResponse on_floor_switch_cancel(
-    const std::shared_ptr<FloorSwitchGoalHandle>)
+    const std::shared_ptr<FloorSwitchGoalHandle> goal_handle)
   {
+    const auto transaction_id = goal_handle->get_goal()->transaction_id;
+    {
+      std::lock_guard<std::mutex> lock(floor_state_mutex_);
+      if (!cancel_matches_active_floor_switch(
+          floor_switch_action_active_,
+          active_floor_switch_transaction_,
+          transaction_id))
+      {
+        return rclcpp_action::CancelResponse::REJECT;
+      }
+    }
+    cancel_requested_.store(true);
+    evidence_changed_.notify_all();
     return rclcpp_action::CancelResponse::ACCEPT;
   }
 
   void on_floor_switch_accepted(
     const std::shared_ptr<FloorSwitchGoalHandle> goal_handle)
   {
+    if (live_floor_switch_enabled_) {
+      start_live_floor_switch(goal_handle);
+      return;
+    }
     try {
       execute_floor_switch_preflight(goal_handle);
     } catch (const std::exception & exc) {
@@ -267,6 +665,430 @@ private:
           get_logger(), "failed to abort floor-switch action after unknown exception: %s",
           terminal_exc.what());
       }
+    }
+  }
+
+  void start_live_floor_switch(
+    const std::shared_ptr<FloorSwitchGoalHandle> & goal_handle)
+  {
+    const auto goal = goal_handle->get_goal();
+    bool transaction_conflict = false;
+    {
+      std::lock_guard<std::mutex> lock(floor_state_mutex_);
+      transaction_conflict = floor_switch_action_active_ || switching_;
+      if (!transaction_conflict) {
+        // Reset the probe while holding the same mutex used by cancellation.
+        // A cancel arriving after this point cannot be erased by startup.
+        cancel_requested_.store(false);
+        floor_switch_action_active_ = true;
+        active_floor_switch_transaction_ = goal->transaction_id;
+      }
+    }
+    if (transaction_conflict) {
+      const auto code =
+        robot_floor_manager::FloorSwitchFailureCode::kTransactionConflict;
+      auto result = std::make_shared<FloorSwitchAction::Result>();
+      result->success = false;
+      result->failure_code = static_cast<std::uint16_t>(code);
+      result->message =
+        std::string(robot_floor_manager::to_string(code)) +
+        ": another floor transaction or legacy selection is active";
+      result->runtime_context_valid = false;
+      publish_transition_status(
+        goal->transaction_id, "BLOCKED",
+        robot_floor_manager::to_string(code),
+        result->failure_code, result->message);
+      goal_handle->abort(result);
+      return;
+    }
+
+    try {
+      std::lock_guard<std::mutex> lock(worker_mutex_);
+      if (floor_switch_worker_.joinable()) {
+        floor_switch_worker_.join();
+      }
+      floor_switch_worker_ = std::thread(
+        [this, goal_handle]() {
+          execute_live_floor_switch(goal_handle);
+        });
+    } catch (const std::exception & exception) {
+      release_floor_switch_action(goal->transaction_id);
+      auto result = std::make_shared<FloorSwitchAction::Result>();
+      result->success = false;
+      result->failure_code = static_cast<std::uint16_t>(
+        robot_floor_manager::FloorSwitchFailureCode::kInternalError);
+      result->message =
+        "INTERNAL_ERROR: failed to start floor-switch worker: " +
+        std::string(exception.what());
+      result->runtime_context_valid = true;
+      result->recovery_required = false;
+      goal_handle->abort(result);
+    }
+  }
+
+  static robot_floor_manager::FloorTransitionRequest action_request(
+    const FloorSwitchAction::Goal & goal)
+  {
+    return {
+      goal.transaction_id,
+      goal.building_id,
+      goal.floor_id,
+      goal.map_id,
+      goal.expected_asset_epoch,
+      goal.expected_asset_digest,
+    };
+  }
+
+  static FloorAssets assets_from_snapshot(
+    const robot_floor_manager::FloorAssetSnapshot & snapshot)
+  {
+    FloorAssets assets;
+    assets.building_id = snapshot.building_id;
+    assets.floor_id = snapshot.floor_id;
+    assets.map_id = snapshot.map_id;
+    assets.asset_epoch = snapshot.asset_epoch;
+    assets.asset_digest = snapshot.asset_digest;
+    assets.root = snapshot.paths.root;
+    assets.nav_map_yaml = snapshot.paths.nav_map_yaml;
+    assets.nav_map_pgm = snapshot.paths.nav_map_pgm;
+    assets.localizer_map_png = snapshot.paths.localizer_map_png;
+    assets.localizer_params_yaml = snapshot.paths.localizer_params_yaml;
+    assets.keepout_mask_yaml = snapshot.paths.keepout_mask_yaml;
+    assets.keepout_mask_pgm = snapshot.paths.keepout_mask_pgm;
+    assets.speed_mask_yaml = snapshot.paths.speed_mask_yaml;
+    assets.speed_mask_pgm = snapshot.paths.speed_mask_pgm;
+    assets.binary_mask_yaml = snapshot.paths.binary_mask_yaml;
+    assets.binary_mask_pgm = snapshot.paths.binary_mask_pgm;
+    assets.asset_report_json = snapshot.paths.asset_report_json;
+    assets.poses_yaml = snapshot.paths.poses_yaml;
+    assets.filters = {
+      assets.keepout_mask_yaml,
+      assets.keepout_mask_pgm,
+      assets.speed_mask_yaml,
+      assets.speed_mask_pgm,
+      assets.binary_mask_yaml,
+      assets.binary_mask_pgm,
+    };
+    return assets;
+  }
+
+  void execute_live_floor_switch(
+    const std::shared_ptr<FloorSwitchGoalHandle> & goal_handle)
+  {
+    const auto request = action_request(*goal_handle->get_goal());
+    try {
+      publish_transition_status(
+        request.transaction_id, "PREFLIGHT", "VERIFY_EXACT_ASSET",
+        0U, "verifying immutable target asset snapshot", &request);
+      auto feedback = std::make_shared<FloorSwitchAction::Feedback>();
+      feedback->stage = "VERIFY_EXACT_ASSET";
+      feedback->progress = 0.01F;
+      feedback->detail = "verifying immutable target asset snapshot";
+      feedback->asset_epoch = request.expected_asset_epoch;
+      feedback->transaction_id = request.transaction_id;
+      feedback->stage_sequence = 0U;
+      feedback->caller_pause_handoff_ready = false;
+      goal_handle->publish_feedback(feedback);
+
+      const robot_floor_manager::FloorAssetSnapshotRequest snapshot_request{
+        fs::path(maps_root_),
+        request.building_id,
+        request.floor_id,
+        request.map_id,
+        request.expected_asset_epoch,
+        request.expected_asset_digest,
+      };
+      const auto snapshot_result =
+        robot_floor_manager::FloorAssetSnapshotLoader{}.load(snapshot_request);
+      if (!snapshot_result.ok()) {
+        finish_asset_preflight_failure(
+          goal_handle, request, snapshot_result);
+        return;
+      }
+      if (goal_handle->is_canceling() || shutting_down_.load()) {
+        finish_cancelled_before_mutation(goal_handle, request);
+        return;
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(evidence_mutex_);
+        evidence_tracker_.begin(
+          {
+            request.transaction_id,
+            request.building_id,
+            request.floor_id,
+            request.map_id,
+            request.expected_asset_epoch,
+            request.expected_asset_digest,
+          },
+          steady_now_sec());
+        active_snapshot_ = *snapshot_result.snapshot;
+        source_runtime_context_.reset();
+        const auto source_observed_at = steady_now_sec();
+        if (
+          last_localization_health_.has_value() &&
+          last_localization_health_->runtime_context_valid &&
+          !last_localization_health_->transition_active &&
+          last_localization_health_->localizer_ready &&
+          last_localization_health_->bridge_ready &&
+          last_localization_health_->tf_unique &&
+          last_localization_health_received_steady_sec_ >= 0.0 &&
+          source_observed_at >= last_localization_health_received_steady_sec_ &&
+          source_observed_at - last_localization_health_received_steady_sec_ <=
+          evidence_max_age_sec_)
+        {
+          source_runtime_context_ = last_localization_health_;
+        }
+        bridge_begin_established_ = false;
+        bridge_begin_submitted_ = false;
+        bridge_begin_outcome_unknown_ = false;
+        motion_hold_command_submitted_.store(false);
+        motion_hold_outcome_unknown_.store(false);
+        correction_pause_command_submitted_.store(false);
+        correction_pause_outcome_unknown_.store(false);
+        motion_hold_acquired_.store(false);
+        floor_pause_acquired_ = false;
+        localizer_generation_ = 0U;
+        explicit_relocalization_sequence_ = 0U;
+      }
+
+      robot_floor_manager::FloorTransitionExecutor executor(*this);
+      const auto execution = executor.run(
+        request,
+        *snapshot_result.snapshot,
+        [this, goal_handle]() {
+          return shutting_down_.load() || goal_handle->is_canceling();
+        },
+        [this, &request, &goal_handle](
+          const robot_floor_manager::FloorTransitionOutput & output)
+        {
+          publish_live_progress(goal_handle, request, output);
+        });
+      finish_live_floor_switch(goal_handle, request, execution);
+    } catch (const std::exception & exception) {
+      emergency_lock_after_exception(request, exception.what());
+      auto result = std::make_shared<FloorSwitchAction::Result>();
+      result->success = false;
+      result->failure_code = static_cast<std::uint16_t>(
+        robot_floor_manager::FloorSwitchFailureCode::kInternalError);
+      result->message =
+        "INTERNAL_ERROR: live floor-switch exception: " +
+        std::string(exception.what());
+      result->runtime_context_valid = !bridge_begin_established_;
+      result->recovery_required = bridge_begin_established_;
+      publish_transition_status(
+        request.transaction_id, "FAILED", "INTERNAL_ERROR",
+        result->failure_code, result->message, &request);
+      release_floor_switch_action(request.transaction_id);
+      goal_handle->abort(result);
+    } catch (...) {
+      emergency_lock_after_exception(request, "unknown exception");
+      auto result = std::make_shared<FloorSwitchAction::Result>();
+      result->success = false;
+      result->failure_code = static_cast<std::uint16_t>(
+        robot_floor_manager::FloorSwitchFailureCode::kInternalError);
+      result->message = "INTERNAL_ERROR: unknown live floor-switch exception";
+      result->runtime_context_valid = !bridge_begin_established_;
+      result->recovery_required = bridge_begin_established_;
+      publish_transition_status(
+        request.transaction_id, "FAILED", "INTERNAL_ERROR",
+        result->failure_code, result->message, &request);
+      release_floor_switch_action(request.transaction_id);
+      goal_handle->abort(result);
+    }
+  }
+
+  static robot_floor_manager::FloorSwitchFailureCode snapshot_failure_code(
+    const robot_floor_manager::FloorAssetSnapshotError error)
+  {
+    using Error = robot_floor_manager::FloorAssetSnapshotError;
+    using Code = robot_floor_manager::FloorSwitchFailureCode;
+    switch (error) {
+      case Error::kInvalidRequest: return Code::kInvalidGoal;
+      case Error::kRegistryUnavailable:
+      case Error::kIdentityNotFound:
+        return Code::kAssetNotFound;
+      case Error::kIdentityMismatch:
+      case Error::kAssetChanged:
+        return Code::kAssetIdentityMismatch;
+      case Error::kDigestMismatch:
+        return Code::kAssetDigestMismatch;
+      case Error::kInvalidManifest:
+      case Error::kInvalidLayout:
+      case Error::kUnsafePath:
+      case Error::kUnsafeAsset:
+      case Error::kIoError:
+        return Code::kAssetBundleInvalid;
+      case Error::kNone:
+        break;
+    }
+    return Code::kInternalError;
+  }
+
+  void finish_asset_preflight_failure(
+    const std::shared_ptr<FloorSwitchGoalHandle> & goal_handle,
+    const robot_floor_manager::FloorTransitionRequest & request,
+    const robot_floor_manager::FloorAssetSnapshotResult & snapshot_result)
+  {
+    const auto code = snapshot_failure_code(snapshot_result.error);
+    auto result = std::make_shared<FloorSwitchAction::Result>();
+    result->success = false;
+    result->failure_code = static_cast<std::uint16_t>(code);
+    result->message =
+      std::string(robot_floor_manager::to_string(code)) + ": " +
+      snapshot_result.message;
+    result->runtime_context_valid = true;
+    result->recovery_required = false;
+    publish_transition_status(
+      request.transaction_id, "BLOCKED",
+      robot_floor_manager::to_string(code),
+      result->failure_code, result->message, &request);
+    release_floor_switch_action(request.transaction_id);
+    goal_handle->abort(result);
+  }
+
+  void finish_cancelled_before_mutation(
+    const std::shared_ptr<FloorSwitchGoalHandle> & goal_handle,
+    const robot_floor_manager::FloorTransitionRequest & request)
+  {
+    const auto code =
+      robot_floor_manager::FloorSwitchFailureCode::kCancelledBeforeMutation;
+    auto result = std::make_shared<FloorSwitchAction::Result>();
+    result->success = false;
+    result->failure_code = static_cast<std::uint16_t>(code);
+    result->message =
+      std::string(robot_floor_manager::to_string(code)) +
+      ": no runtime asset was changed";
+    result->runtime_context_valid = true;
+    result->recovery_required = false;
+    publish_transition_status(
+      request.transaction_id, "CANCELED",
+      robot_floor_manager::to_string(code),
+      result->failure_code, result->message, &request);
+    release_floor_switch_action(request.transaction_id);
+    goal_handle->canceled(result);
+  }
+
+  static robot_floor_manager::FloorSwitchFailureCode execution_failure_code(
+    const std::string & failure)
+  {
+    using Code = robot_floor_manager::FloorSwitchFailureCode;
+    if (failure == "CANCELLED") {
+      return Code::kCancelledBeforeMutation;
+    }
+    if (failure.find("MOTION_HOLD") != std::string::npos) {
+      return Code::kMotionHoldUnproven;
+    }
+    if (failure.find("NAV_IDLE") != std::string::npos) {
+      return Code::kNavIdleUnproven;
+    }
+    if (failure.find("STOPPED") != std::string::npos) {
+      return Code::kStoppedUnproven;
+    }
+    if (failure.find("STALE") != std::string::npos ||
+      failure.find("TIMEOUT") != std::string::npos)
+    {
+      return Code::kEvidenceStale;
+    }
+    if (failure.find("LOCALIZER") != std::string::npos) {
+      return Code::kLocalizerReloadUnproven;
+    }
+    if (failure.find("ASSET_IDENTITY") != std::string::npos) {
+      return Code::kAssetIdentityMismatch;
+    }
+    if (
+      failure.find("BRIDGE") != std::string::npos ||
+      failure.find("CONTEXT") != std::string::npos ||
+      failure.find("COSTMAP") != std::string::npos ||
+      failure.find("PAUSE") != std::string::npos)
+    {
+      return Code::kRuntimeContextUnproven;
+    }
+    return Code::kInternalError;
+  }
+
+  void publish_live_progress(
+    const std::shared_ptr<FloorSwitchGoalHandle> & goal_handle,
+    const robot_floor_manager::FloorTransitionRequest & request,
+    const robot_floor_manager::FloorTransitionOutput & output)
+  {
+    const auto stage =
+      robot_floor_manager::floor_transition_feedback_stage(output);
+    auto feedback = std::make_shared<FloorSwitchAction::Feedback>();
+    feedback->stage = stage;
+    feedback->progress =
+      robot_floor_manager::floor_transition_feedback_progress(output.state);
+    feedback->detail = output.message;
+    feedback->asset_epoch = request.expected_asset_epoch;
+    feedback->transaction_id = request.transaction_id;
+    feedback->stage_sequence = output.effect.sequence;
+    feedback->caller_pause_handoff_ready =
+      robot_floor_manager::floor_transition_caller_pause_handoff_ready(output);
+    goal_handle->publish_feedback(feedback);
+    publish_transition_status(
+      request.transaction_id,
+      output.state == robot_floor_manager::FloorTransitionState::kFailureCleanup ?
+      "FAILURE_CLEANUP" : "RUNNING",
+      stage, 0U, output.message, &request);
+  }
+
+  void finish_live_floor_switch(
+    const std::shared_ptr<FloorSwitchGoalHandle> & goal_handle,
+    const robot_floor_manager::FloorTransitionRequest & request,
+    const robot_floor_manager::FloorTransitionExecutionResult & execution)
+  {
+    auto result = std::make_shared<FloorSwitchAction::Result>();
+    result->success = execution.success;
+    result->message = execution.message;
+    result->active_building_id = execution.active_building_id;
+    result->active_floor_id = execution.active_floor_id;
+    result->active_map_id = execution.active_map_id;
+    result->asset_epoch = execution.asset_epoch;
+    result->asset_digest = execution.asset_digest;
+    result->explicit_relocalization_sequence =
+      execution.explicit_relocalization_sequence;
+    result->runtime_context_valid = execution.runtime_context_valid;
+    result->recovery_required = execution.recovery_required;
+
+    if (execution.success) {
+      result->failure_code = 0U;
+      {
+        std::lock_guard<std::mutex> lock(floor_state_mutex_);
+        selected_building_id_ = execution.active_building_id;
+        selected_floor_id_ = execution.active_floor_id;
+        selected_map_id_ = execution.active_map_id;
+      }
+      publish_transition_status(
+        request.transaction_id, "COMPLETE", "COMPLETE",
+        0U, execution.message, &request);
+      release_floor_switch_action(request.transaction_id);
+      goal_handle->succeed(result);
+      return;
+    }
+
+    const auto code =
+      execution.failure_code == "CANCELLED" &&
+      execution.recovery_required ?
+      robot_floor_manager::FloorSwitchFailureCode::kRuntimeContextUnproven :
+      execution_failure_code(execution.failure_code);
+    result->failure_code = static_cast<std::uint16_t>(code);
+    if (result->message.empty()) {
+      result->message =
+        std::string(robot_floor_manager::to_string(code)) + ": " +
+        execution.failure_code;
+    }
+    const auto disposition =
+      robot_floor_manager::floor_transition_failure_disposition(execution);
+    publish_transition_status(
+      request.transaction_id,
+      disposition.state,
+      disposition.stage,
+      result->failure_code, result->message, &request);
+    release_floor_switch_action(request.transaction_id);
+    if (disposition.canceled) {
+      goal_handle->canceled(result);
+    } else {
+      goal_handle->abort(result);
     }
   }
 
@@ -323,6 +1145,9 @@ private:
     feedback->progress = 0.0F;
     feedback->detail = "validating a non-mutating strict floor-switch request";
     feedback->asset_epoch = 0U;
+    feedback->transaction_id = input.request.transaction_id;
+    feedback->stage_sequence = 0U;
+    feedback->caller_pause_handoff_ready = false;
     goal_handle->publish_feedback(feedback);
     publish_transition_status(
       input.request.transaction_id, "PREFLIGHT", "VALIDATE_GOAL", 0U,
@@ -387,10 +1212,572 @@ private:
       std::chrono::duration<double>(service_timeout_sec_));
   }
 
+  std::chrono::nanoseconds localization_trigger_timeout() const
+  {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::duration<double>(
+        std::max(service_timeout_sec_, localization_trigger_timeout_sec_)));
+  }
+
+  std::chrono::nanoseconds localizer_apply_timeout() const
+  {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::duration<double>(
+        std::max(service_timeout_sec_, localizer_apply_timeout_sec_)));
+  }
+
   std::chrono::nanoseconds filter_mask_state_timeout() const
   {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::duration<double>(filter_mask_state_timeout_sec_));
+  }
+
+  std::chrono::nanoseconds evidence_timeout() const
+  {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::duration<double>(evidence_timeout_sec_));
+  }
+
+  bool wait_for_evidence(
+    const std::function<robot_floor_manager::FloorTransitionEvidence()> & evaluate,
+    const std::function<bool(
+      const robot_floor_manager::FloorTransitionEvidence &)> & proven,
+    robot_floor_manager::FloorTransitionEvidence & evidence)
+  {
+    const auto deadline = std::chrono::steady_clock::now() + evidence_timeout();
+    std::unique_lock<std::mutex> lock(evidence_mutex_);
+    while (!shutting_down_.load() && !cancel_requested_.load()) {
+      evidence = evaluate();
+      if (proven(evidence)) {
+        return true;
+      }
+      if (evidence_changed_.wait_until(lock, deadline) ==
+        std::cv_status::timeout)
+      {
+        evidence = evaluate();
+        return proven(evidence);
+      }
+    }
+    return false;
+  }
+
+  bool wait_for_condition(const std::function<bool()> & proven)
+  {
+    const auto deadline = std::chrono::steady_clock::now() + evidence_timeout();
+    std::unique_lock<std::mutex> lock(evidence_mutex_);
+    while (!shutting_down_.load() && !cancel_requested_.load()) {
+      if (proven()) {
+        return true;
+      }
+      if (evidence_changed_.wait_until(lock, deadline) ==
+        std::cv_status::timeout)
+      {
+        return proven();
+      }
+    }
+    return false;
+  }
+
+  bool set_motion_hold(
+    const std::string & transaction_id,
+    const std::uint8_t operation,
+    std::string & error)
+  {
+    if (!wait_for_service(motion_hold_client_, motion_hold_service_, error)) {
+      return false;
+    }
+    auto request =
+      std::make_shared<robot_interfaces::srv::SetMotionHold::Request>();
+    request->owner = "robot_floor_manager";
+    request->transaction_id = transaction_id;
+    request->reason = "atomic_floor_switch";
+    request->operation = operation;
+    if (!motion_hold_sequence_allocator_) {
+      error =
+        "persistent floor-manager hold sequence allocator is unavailable";
+      return false;
+    }
+    const auto sequence = motion_hold_sequence_allocator_->next();
+    if (!sequence.has_value()) {
+      error =
+        "persistent floor-manager hold command sequence block is exhausted";
+      return false;
+    }
+    request->command_sequence = *sequence;
+    std::shared_ptr<robot_interfaces::srv::SetMotionHold::Response> response;
+    try {
+      motion_hold_command_submitted_.store(true);
+      motion_hold_outcome_unknown_.store(true);
+      auto future = motion_hold_client_->async_send_request(request);
+      if (future.wait_for(service_timeout()) != std::future_status::ready) {
+        error =
+          "timed out changing floor-manager motion hold; submitted outcome is unknown";
+        return false;
+      }
+      response = future.get();
+      motion_hold_outcome_unknown_.store(false);
+    } catch (const std::exception & exception) {
+      error =
+        "floor-manager motion-hold response is unknown after submission: " +
+        std::string(exception.what());
+      return false;
+    }
+    std::uint64_t state_generation_after_response = 0U;
+    {
+      std::lock_guard<std::mutex> lock(evidence_mutex_);
+      evidence_tracker_.observe_motion_interlock(
+        response->state.hold_active,
+        response->state.hold_keys,
+        steady_now_sec());
+      state_generation_after_response = motion_interlock_state_generation_;
+      evidence_changed_.notify_all();
+    }
+    if (!response->success) {
+      if (
+        response->result_code ==
+        robot_interfaces::srv::SetMotionHold::Response::RESULT_STALE_COMMAND)
+      {
+        motion_hold_sequence_allocator_->synchronize(
+          response->applied_sequence);
+      }
+      error = "robot_safety rejected floor-manager hold: " + response->message;
+      return false;
+    }
+    if (response->applied_sequence != request->command_sequence) {
+      error =
+        "robot_safety did not prove the exact floor-manager hold sequence";
+      return false;
+    }
+    const auto key = "robot_floor_manager:" + transaction_id;
+    const bool present =
+      contains_exact_key(response->state.hold_keys, key);
+    const bool acquiring =
+      operation == robot_interfaces::srv::SetMotionHold::Request::OP_ACQUIRE;
+    if (present != acquiring) {
+      error = acquiring ?
+        "motion-hold response did not contain exact floor-manager key" :
+        "motion-hold response retained exact floor-manager key";
+      return false;
+    }
+    if (!wait_for_motion_hold_state(
+        transaction_id, acquiring, state_generation_after_response, error))
+    {
+      return false;
+    }
+    motion_hold_acquired_.store(acquiring);
+    if (!acquiring) {
+      motion_hold_command_submitted_.store(false);
+    }
+    return true;
+  }
+
+  bool wait_for_motion_hold_state(
+    const std::string & transaction_id,
+    const bool expected_present,
+    const std::uint64_t generation_after_response,
+    std::string & error)
+  {
+    const auto key = "robot_floor_manager:" + transaction_id;
+    const auto deadline = std::chrono::steady_clock::now() + evidence_timeout();
+    std::unique_lock<std::mutex> lock(evidence_mutex_);
+    const auto proven =
+      [this, &key, expected_present, generation_after_response]() {
+        const bool present =
+          contains_exact_key(last_motion_interlock_hold_keys_, key);
+        return
+          motion_interlock_state_generation_ > generation_after_response &&
+          present == expected_present &&
+          (!expected_present || last_motion_interlock_hold_active_);
+      };
+    while (!shutting_down_.load()) {
+      if (proven()) {
+        return true;
+      }
+      if (evidence_changed_.wait_until(lock, deadline) ==
+        std::cv_status::timeout)
+      {
+        break;
+      }
+    }
+    error = expected_present ?
+      "fresh MotionInterlockState did not prove the exact floor-manager hold" :
+      "fresh MotionInterlockState did not prove the exact floor-manager hold absent";
+    return false;
+  }
+
+  bool set_correction_pause(
+    const std::string & transaction_id,
+    const std::uint8_t operation,
+    std::string & error)
+  {
+    if (!wait_for_service(
+        correction_pause_client_, correction_pause_service_, error))
+    {
+      return false;
+    }
+    auto request =
+      std::make_shared<robot_interfaces::srv::SetCorrectionPause::Request>();
+    request->owner = "robot_floor_manager";
+    request->transaction_id = transaction_id;
+    request->reason = "atomic_floor_switch";
+    request->operation = operation;
+    if (!motion_hold_sequence_allocator_) {
+      error =
+        "persistent floor-manager command sequence allocator is unavailable";
+      return false;
+    }
+    const auto sequence = motion_hold_sequence_allocator_->next();
+    if (!sequence.has_value()) {
+      error =
+        "persistent floor-manager command sequence block is exhausted";
+      return false;
+    }
+    request->command_sequence = *sequence;
+    std::shared_ptr<robot_interfaces::srv::SetCorrectionPause::Response> response;
+    try {
+      correction_pause_command_submitted_.store(true);
+      correction_pause_outcome_unknown_.store(true);
+      auto future = correction_pause_client_->async_send_request(request);
+      if (future.wait_for(service_timeout()) != std::future_status::ready) {
+        error =
+          "timed out changing floor-manager correction pause; submitted outcome is unknown";
+        return false;
+      }
+      response = future.get();
+      correction_pause_outcome_unknown_.store(false);
+    } catch (const std::exception & exception) {
+      error =
+        "floor-manager correction-pause response is unknown after submission: " +
+        std::string(exception.what());
+      return false;
+    }
+    std::uint64_t state_generation_after_response = 0U;
+    {
+      std::lock_guard<std::mutex> lock(evidence_mutex_);
+      evidence_tracker_.observe_correction_pause(
+        response->state.paused,
+        response->state.lease_keys,
+        steady_now_sec());
+      state_generation_after_response = correction_pause_state_generation_;
+      evidence_changed_.notify_all();
+    }
+    if (!response->success) {
+      if (
+        response->result_code ==
+        robot_interfaces::srv::SetCorrectionPause::Response::RESULT_STALE_COMMAND)
+      {
+        motion_hold_sequence_allocator_->synchronize(
+          response->applied_sequence);
+      }
+      error =
+        "localization bridge rejected floor-manager correction pause: " +
+        response->message;
+      return false;
+    }
+    if (response->applied_sequence != request->command_sequence) {
+      error =
+        "localization bridge did not prove the exact correction-pause sequence";
+      return false;
+    }
+    const auto key = "robot_floor_manager:" + transaction_id;
+    const bool present =
+      contains_exact_key(response->state.lease_keys, key);
+    const bool acquiring =
+      operation ==
+      robot_interfaces::srv::SetCorrectionPause::Request::OP_ACQUIRE;
+    if (present != acquiring) {
+      error = acquiring ?
+        "correction-pause response did not contain exact floor-manager key" :
+        "correction-pause response retained exact floor-manager key";
+      return false;
+    }
+    if (!wait_for_correction_pause_state(
+        transaction_id, acquiring, state_generation_after_response, error))
+    {
+      return false;
+    }
+    floor_pause_acquired_ = acquiring;
+    if (!acquiring) {
+      correction_pause_command_submitted_.store(false);
+    }
+    return true;
+  }
+
+  bool wait_for_correction_pause_state(
+    const std::string & transaction_id,
+    const bool expected_present,
+    const std::uint64_t generation_after_response,
+    std::string & error)
+  {
+    const auto key = "robot_floor_manager:" + transaction_id;
+    const auto deadline = std::chrono::steady_clock::now() + evidence_timeout();
+    std::unique_lock<std::mutex> lock(evidence_mutex_);
+    const auto proven =
+      [this, &key, expected_present, generation_after_response]() {
+        const bool present =
+          contains_exact_key(last_correction_pause_keys_, key);
+        return
+          correction_pause_state_generation_ > generation_after_response &&
+          present == expected_present &&
+          (!expected_present || last_correction_pause_active_);
+      };
+    while (!shutting_down_.load()) {
+      if (proven()) {
+        return true;
+      }
+      if (evidence_changed_.wait_until(lock, deadline) ==
+        std::cv_status::timeout)
+      {
+        break;
+      }
+    }
+    error = expected_present ?
+      "fresh CorrectionPauseState did not prove the exact floor-manager lease" :
+      "fresh CorrectionPauseState did not prove the exact floor-manager lease absent";
+    return false;
+  }
+
+  std::shared_ptr<robot_interfaces::srv::BeginFloorTransition::Response>
+  call_bridge_transition(
+    const robot_floor_manager::FloorTransitionEffect & effect,
+    const std::uint8_t operation,
+    std::string & error)
+  {
+    if (!wait_for_service(
+        begin_floor_transition_client_,
+        begin_floor_transition_service_, error))
+    {
+      return nullptr;
+    }
+    auto request =
+      std::make_shared<robot_interfaces::srv::BeginFloorTransition::Request>();
+    request->transaction_id = effect.transaction_id;
+    request->building_id = effect.building_id;
+    request->floor_id = effect.floor_id;
+    request->map_id = effect.map_id;
+    request->asset_epoch = effect.expected_asset_epoch;
+    request->asset_digest = effect.expected_asset_digest;
+    {
+      std::lock_guard<std::mutex> lock(evidence_mutex_);
+      if (source_runtime_context_.has_value()) {
+        request->source_building_id =
+          source_runtime_context_->building_id;
+        request->source_floor_id = source_runtime_context_->floor_id;
+        request->source_map_id = source_runtime_context_->map_id;
+        request->source_asset_epoch =
+          source_runtime_context_->asset_epoch;
+        request->source_asset_digest =
+          source_runtime_context_->asset_digest;
+      }
+    }
+    request->operation = operation;
+    if (!motion_hold_sequence_allocator_) {
+      error =
+        "persistent floor-manager command sequence allocator is unavailable";
+      return nullptr;
+    }
+    const auto sequence = motion_hold_sequence_allocator_->next();
+    if (!sequence.has_value()) {
+      error =
+        "persistent floor-manager command sequence block is exhausted";
+      return nullptr;
+    }
+    request->command_sequence = *sequence;
+    std::shared_ptr<robot_interfaces::srv::BeginFloorTransition::Response> response;
+    try {
+      if (
+        operation ==
+        robot_interfaces::srv::BeginFloorTransition::Request::OP_BEGIN)
+      {
+        bridge_begin_submitted_ = true;
+        bridge_begin_outcome_unknown_ = true;
+      }
+      auto future =
+        begin_floor_transition_client_->async_send_request(request);
+      if (future.wait_for(service_timeout()) != std::future_status::ready) {
+        error =
+          "timed out calling bridge floor-transition fence; submitted outcome is unknown";
+        return nullptr;
+      }
+      response = future.get();
+      if (
+        operation ==
+        robot_interfaces::srv::BeginFloorTransition::Request::OP_BEGIN)
+      {
+        bridge_begin_established_ = response->success;
+        bridge_begin_outcome_unknown_ =
+          bridge_begin_rejection_requires_recovery(
+          response->success, response->runtime_context_valid);
+        if (!response->success && response->runtime_context_valid) {
+          bridge_begin_submitted_ = false;
+        }
+      }
+    } catch (const std::exception & exception) {
+      error =
+        "bridge floor-transition response is unknown after submission: " +
+        std::string(exception.what());
+      return nullptr;
+    }
+    if (!response->success) {
+      if (
+        response->result_code ==
+        robot_interfaces::srv::BeginFloorTransition::Response::RESULT_STALE_COMMAND)
+      {
+        motion_hold_sequence_allocator_->synchronize(
+          response->applied_sequence);
+      }
+      error = "bridge floor-transition fence rejected request: " +
+        response->message;
+      return nullptr;
+    }
+    if (response->applied_sequence != request->command_sequence) {
+      error =
+        "bridge floor-transition response did not prove the exact command sequence";
+      return nullptr;
+    }
+    // ABORT restores the previously active source identity. Its accepted epoch
+    // therefore need not equal the pending target epoch. BEGIN and COMMIT must
+    // still echo the exact target epoch.
+    if (
+      bridge_response_requires_target_epoch(operation) &&
+      response->accepted_asset_epoch != effect.expected_asset_epoch)
+    {
+      error = "bridge floor-transition response epoch mismatch";
+      return nullptr;
+    }
+    return response;
+  }
+
+  bool wait_for_source_runtime_context_after(
+    const std::uint64_t generation_after_response,
+    std::string & error)
+  {
+    const auto deadline = std::chrono::steady_clock::now() + evidence_timeout();
+    std::unique_lock<std::mutex> lock(evidence_mutex_);
+    if (!source_runtime_context_.has_value()) {
+      error =
+        "source runtime identity was not fresh and valid before bridge BEGIN";
+      return false;
+    }
+    const auto proven =
+      [this, generation_after_response]() {
+        return
+          localization_health_generation_ > generation_after_response &&
+          last_localization_health_.has_value() &&
+          same_runtime_identity(
+            *last_localization_health_, *source_runtime_context_) &&
+          last_localization_health_->runtime_context_valid &&
+          !last_localization_health_->transition_active &&
+          last_localization_health_->localizer_ready &&
+          last_localization_health_->bridge_ready &&
+          last_localization_health_->tf_unique;
+      };
+    while (!shutting_down_.load()) {
+      if (proven()) {
+        return true;
+      }
+      if (evidence_changed_.wait_until(lock, deadline) ==
+        std::cv_status::timeout)
+      {
+        break;
+      }
+    }
+    error =
+      "fresh LocalizationHealth did not prove the exact source runtime context restored";
+    return false;
+  }
+
+  bool abort_bridge_and_prove_source(
+    const robot_floor_manager::FloorTransitionEffect & effect,
+    const bool pre_mutation,
+    std::string & error)
+  {
+    const auto response = call_bridge_transition(
+      effect,
+      pre_mutation ?
+      robot_interfaces::srv::BeginFloorTransition::Request::OP_ABORT_PREMUTATION :
+      robot_interfaces::srv::BeginFloorTransition::Request::OP_ABORT,
+      error);
+    if (!response) {
+      return false;
+    }
+    if (!response->runtime_context_valid) {
+      error =
+        "bridge ABORT response did not restore a valid source runtime context";
+      return false;
+    }
+    std::uint64_t health_generation_after_response = 0U;
+    {
+      std::lock_guard<std::mutex> lock(evidence_mutex_);
+      health_generation_after_response = localization_health_generation_;
+    }
+    if (!wait_for_source_runtime_context_after(
+        health_generation_after_response, error))
+    {
+      return false;
+    }
+    bridge_begin_outcome_unknown_ = false;
+    return true;
+  }
+
+  bool write_runtime_context(
+    const robot_floor_manager::FloorTransitionEffect & effect,
+    const std::string & state,
+    const bool confirmed,
+    const std::string & message,
+    std::string & error)
+  {
+    robot_floor_manager::RuntimeMapContextRecord record;
+    record.state = state;
+    record.confirmed = confirmed;
+    record.message = message;
+    record.transaction_id = effect.transaction_id;
+    record.building_id = effect.building_id;
+    record.floor_id = effect.floor_id;
+    record.map_id = effect.map_id;
+    record.asset_epoch = effect.expected_asset_epoch;
+    record.asset_digest = effect.expected_asset_digest;
+    record.localizer_generation = localizer_generation_;
+    record.explicit_relocalization_sequence =
+      explicit_relocalization_sequence_;
+    record.updated_at_sec =
+      static_cast<double>(now().nanoseconds()) * 1.0e-9;
+    return robot_floor_manager::AtomicRuntimeMapContextWriter{}.write(
+      fs::path(runtime_map_context_file_), record, error);
+  }
+
+  bool write_source_runtime_context(
+    const robot_floor_manager::FloorTransitionEffect & effect,
+    const std::string & message,
+    std::string & error)
+  {
+    std::optional<robot_floor_manager::LocalizationHealthEvidence> source;
+    {
+      std::lock_guard<std::mutex> lock(evidence_mutex_);
+      source = source_runtime_context_;
+    }
+    if (!source.has_value()) {
+      error = "source runtime identity is unavailable for durable recovery";
+      return false;
+    }
+
+    robot_floor_manager::RuntimeMapContextRecord record;
+    record.state = "ready";
+    record.confirmed = true;
+    record.message = message;
+    record.transaction_id = effect.transaction_id;
+    record.building_id = source->building_id;
+    record.floor_id = source->floor_id;
+    record.map_id = source->map_id;
+    record.asset_epoch = source->asset_epoch;
+    record.asset_digest = source->asset_digest;
+    record.localizer_generation = source->localizer_generation;
+    record.explicit_relocalization_sequence =
+      source->explicit_relocalization_sequence;
+    record.updated_at_sec =
+      static_cast<double>(now().nanoseconds()) * 1.0e-9;
+    return robot_floor_manager::AtomicRuntimeMapContextWriter{}.write(
+      fs::path(runtime_map_context_file_), record, error);
   }
 
   template<typename ClientT>
@@ -465,6 +1852,65 @@ private:
     return true;
   }
 
+  bool validate_exact_floor_assets(
+    const std::string & building_id,
+    const std::string & floor_id,
+    const std::string & map_id,
+    const std::uint64_t expected_asset_epoch,
+    const std::string & expected_asset_digest,
+    FloorAssets & assets,
+    std::string & error_code,
+    std::string & error) const
+  {
+    const robot_floor_manager::FloorAssetSnapshotRequest request{
+      fs::path(maps_root_),
+      building_id.empty() ? default_building_id_ : building_id,
+      floor_id,
+      map_id,
+      expected_asset_epoch,
+      expected_asset_digest,
+    };
+    const auto result =
+      robot_floor_manager::FloorAssetSnapshotLoader{}.load(request);
+    if (!result.ok()) {
+      error_code =
+        robot_floor_manager::floor_asset_snapshot_error_name(result.error);
+      error = result.message;
+      return false;
+    }
+
+    const auto & snapshot = *result.snapshot;
+    assets.building_id = snapshot.building_id;
+    assets.floor_id = snapshot.floor_id;
+    assets.map_id = snapshot.map_id;
+    assets.asset_epoch = snapshot.asset_epoch;
+    assets.asset_digest = snapshot.asset_digest;
+    assets.root = snapshot.paths.root;
+    assets.nav_map_yaml = snapshot.paths.nav_map_yaml;
+    assets.nav_map_pgm = snapshot.paths.nav_map_pgm;
+    assets.localizer_map_png = snapshot.paths.localizer_map_png;
+    assets.localizer_params_yaml = snapshot.paths.localizer_params_yaml;
+    assets.keepout_mask_yaml = snapshot.paths.keepout_mask_yaml;
+    assets.keepout_mask_pgm = snapshot.paths.keepout_mask_pgm;
+    assets.speed_mask_yaml = snapshot.paths.speed_mask_yaml;
+    assets.speed_mask_pgm = snapshot.paths.speed_mask_pgm;
+    assets.binary_mask_yaml = snapshot.paths.binary_mask_yaml;
+    assets.binary_mask_pgm = snapshot.paths.binary_mask_pgm;
+    assets.asset_report_json = snapshot.paths.asset_report_json;
+    assets.poses_yaml = snapshot.paths.poses_yaml;
+    assets.filters = {
+      assets.keepout_mask_yaml,
+      assets.keepout_mask_pgm,
+      assets.speed_mask_yaml,
+      assets.speed_mask_pgm,
+      assets.binary_mask_yaml,
+      assets.binary_mask_pgm,
+    };
+    error_code = "OK";
+    error.clear();
+    return true;
+  }
+
   bool filter_mask_server_is_active(
     const rclcpp::Client<lifecycle_msgs::srv::GetState>::SharedPtr & client,
     const std::string & service_name,
@@ -501,11 +1947,26 @@ private:
 
   bool filter_mask_servers_are_active()
   {
-    const bool keepout_active = filter_mask_server_is_active(
-      keepout_mask_state_client_, keepout_mask_state_service_, "keepout_filter_mask_server");
-    const bool speed_active = filter_mask_server_is_active(
-      speed_mask_state_client_, speed_mask_state_service_, "speed_filter_mask_server");
-    return keepout_active && speed_active;
+    for (const auto role : runtime_filter_reload_roles(speed_filter_enabled_)) {
+      if (role == RuntimeFilterRole::kKeepout) {
+        if (!filter_mask_server_is_active(
+            keepout_mask_state_client_,
+            keepout_mask_state_service_,
+            "keepout_filter_mask_server"))
+        {
+          return false;
+        }
+        continue;
+      }
+      if (!filter_mask_server_is_active(
+          speed_mask_state_client_,
+          speed_mask_state_service_,
+          "speed_filter_mask_server"))
+      {
+        return false;
+      }
+    }
+    return true;
   }
 
   bool load_map_with_client(
@@ -536,7 +1997,8 @@ private:
   bool load_nav_map(const FloorAssets & assets, std::string & error)
   {
     if (!call_map_server_load_) {
-      return true;
+      error = "live Nav2 map reload is disabled by configuration";
+      return false;
     }
     return load_map_with_client(
       map_load_client_, map_server_load_service_, assets.nav_map_yaml, "Nav2 map", error);
@@ -545,70 +2007,262 @@ private:
   bool load_filter_masks(const FloorAssets & assets, std::string & error)
   {
     if (!call_filter_mask_load_) {
-      return true;
+      error = "live filter-mask reload is disabled by configuration";
+      return false;
     }
     if (!filter_mask_servers_are_active()) {
-      RCLCPP_WARN(
-        get_logger(),
-        "filter mask servers are not active; selected assets remain on disk and will be loaded by Nav2 startup");
-      return true;
+      error =
+        "live filter-mask reload requires active keepout and speed mask servers";
+      return false;
     }
     if (!load_map_with_client(
         keepout_mask_load_client_, keepout_mask_load_service_, assets.keepout_mask_yaml, "keepout mask", error))
     {
       return false;
     }
+    if (!speed_filter_enabled_) {
+      return true;
+    }
     return load_map_with_client(
       speed_mask_load_client_, speed_mask_load_service_, assets.speed_mask_yaml, "speed mask", error);
   }
 
-  bool apply_localizer_assets(const FloorAssets & assets, std::string & error)
+  bool apply_localizer_assets(
+    const std::string & transaction_id,
+    const FloorAssets & assets,
+    const std::uint64_t baseline_generation,
+    std::uint64_t & accepted_generation,
+    std::string & error)
   {
     if (!call_localizer_apply_) {
-      return true;
+      error = "live localizer reload is disabled by configuration";
+      return false;
     }
     if (!wait_for_service(localizer_apply_client_, localizer_apply_service_, error)) {
       return false;
     }
     auto request = std::make_shared<robot_interfaces::srv::ApplyFloorAssets::Request>();
-    request->floor_id = assets.building_id + "/" + assets.floor_id;
+    request->transaction_id = transaction_id;
+    request->building_id = assets.building_id;
+    request->floor_id = assets.floor_id;
+    request->map_id = assets.map_id;
+    request->asset_epoch = assets.asset_epoch;
+    request->asset_digest = assets.asset_digest;
     request->nav_map_yaml = assets.nav_map_yaml.string();
     request->localizer_map_png = assets.localizer_map_png.string();
     request->localizer_params_yaml = assets.localizer_params_yaml.string();
     auto future = localizer_apply_client_->async_send_request(request);
-    if (future.wait_for(service_timeout()) != std::future_status::ready) {
-      error = "timed out applying localizer floor assets";
+    const auto total_timeout = localizer_apply_timeout();
+    const auto deadline = std::chrono::steady_clock::now() + total_timeout;
+    std::string rpc_error;
+
+    while (!shutting_down_.load() && !cancel_requested_.load()) {
+      if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+        try {
+          const auto response = future.get();
+          if (!response->success) {
+            error =
+              "global localization rejected floor assets [" + response->code +
+              "]: " + response->message;
+            return false;
+          }
+          if (
+            !response->reloaded ||
+            response->transaction_id != transaction_id ||
+            response->building_id != assets.building_id ||
+            response->floor_id != assets.floor_id ||
+            response->map_id != assets.map_id ||
+            response->asset_epoch != assets.asset_epoch ||
+            response->asset_digest != assets.asset_digest ||
+            response->localizer_generation <= baseline_generation)
+          {
+            error =
+              "global localization response did not prove an exact new target reload";
+            return false;
+          }
+          accepted_generation = response->localizer_generation;
+          return true;
+        } catch (const std::exception & exception) {
+          rpc_error =
+            std::string("global localization floor-asset response failed: ") +
+            exception.what();
+        }
+      }
+
+      const auto now = std::chrono::steady_clock::now();
+      robot_floor_manager::LocalizerApplyOutcome outcome;
+      {
+        std::unique_lock<std::mutex> lock(evidence_mutex_);
+        outcome = evidence_tracker_.localizer_apply_outcome(
+          baseline_generation, steady_now_sec(), evidence_max_age_sec_);
+        if (!outcome.terminal && now < deadline) {
+          const auto poll_deadline = std::min(
+            deadline, now + std::chrono::milliseconds(50));
+          evidence_changed_.wait_until(lock, poll_deadline);
+          continue;
+        }
+      }
+
+      if (outcome.terminal) {
+        if (!outcome.success) {
+          error = "global localization rejected floor assets from exact typed state";
+          if (!outcome.code.empty()) {
+            error += " [" + outcome.code + "]";
+          }
+          if (!outcome.detail.empty()) {
+            error += ": " + outcome.detail;
+          }
+          return false;
+        }
+        accepted_generation = outcome.localizer_generation;
+        RCLCPP_WARN(
+          get_logger(),
+          "localizer apply RPC response was delayed or lost; reconciled exact "
+          "transaction=%s generation=%llu from typed asset state",
+          transaction_id.c_str(),
+          static_cast<unsigned long long>(accepted_generation));
+        return true;
+      }
+
+      if (now >= deadline) {
+        break;
+      }
+    }
+
+    if (shutting_down_.load() || cancel_requested_.load()) {
+      error = "cancelled while applying localizer floor assets";
       return false;
     }
-    const auto response = future.get();
-    if (!response->success) {
-      error = "global localization rejected floor assets: " + response->message;
-      return false;
+    error =
+      "localizer floor-asset transaction produced neither an exact RPC response "
+      "nor exact terminal typed state within " +
+      std::to_string(std::chrono::duration<double>(total_timeout).count()) + "s";
+    if (!rpc_error.empty()) {
+      error += "; " + rpc_error;
     }
-    return true;
+    return false;
   }
 
   bool trigger_localization(const FloorAssets & assets, std::string & error)
   {
     if (!call_localization_trigger_) {
-      return true;
-    }
-    if (!wait_for_service(localization_trigger_client_, localization_trigger_service_, error)) {
+      error = "explicit target localization is disabled by configuration";
       return false;
     }
-    auto request = std::make_shared<robot_interfaces::srv::TriggerLocalization::Request>();
-    request->reason = "floor_switch:" + assets.building_id + "/" + assets.floor_id;
-    auto future = localization_trigger_client_->async_send_request(request);
-    if (future.wait_for(service_timeout()) != std::future_status::ready) {
-      error = "timed out triggering global localization";
-      return false;
-    }
-    const auto response = future.get();
-    if (!response->accepted) {
+
+    const auto total_timeout = localization_trigger_timeout();
+    const auto deadline = std::chrono::steady_clock::now() + total_timeout;
+    std::size_t attempt = 0U;
+
+    while (!shutting_down_.load() && !cancel_requested_.load()) {
+      const auto before_service_wait = std::chrono::steady_clock::now();
+      if (before_service_wait >= deadline) {
+        break;
+      }
+      const auto service_wait = std::min(
+        service_timeout(),
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+          deadline - before_service_wait));
+      if (!localization_trigger_client_->wait_for_service(service_wait)) {
+        if (shutting_down_.load() || cancel_requested_.load()) {
+          error = "cancelled while waiting for global localization trigger service";
+          return false;
+        }
+        RCLCPP_WARN(
+          get_logger(),
+          "global localization trigger service unavailable inside active floor transaction; "
+          "retrying within the %.3fs total budget",
+          std::chrono::duration<double>(total_timeout).count());
+        continue;
+      }
+
+      ++attempt;
+      auto request = std::make_shared<robot_interfaces::srv::TriggerLocalization::Request>();
+      request->reason = "floor_switch:" + assets.building_id + "/" + assets.floor_id;
+      auto future = localization_trigger_client_->async_send_request(request);
+
+      bool response_ready = false;
+      while (!shutting_down_.load() && !cancel_requested_.load()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+          break;
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          deadline - now);
+        const auto poll = std::min(
+          remaining,
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::milliseconds(50)));
+        if (future.wait_for(poll) == std::future_status::ready) {
+          response_ready = true;
+          break;
+        }
+      }
+
+      if (shutting_down_.load() || cancel_requested_.load()) {
+        error = "cancelled while waiting for global localization transaction response";
+        return false;
+      }
+      if (!response_ready) {
+        break;
+      }
+
+      std::shared_ptr<robot_interfaces::srv::TriggerLocalization::Response> response;
+      try {
+        response = future.get();
+      } catch (const std::exception & exception) {
+        error = std::string("global localization trigger response failed: ") + exception.what();
+        return false;
+      }
+      if (response->accepted) {
+        if (attempt > 1U) {
+          RCLCPP_INFO(
+            get_logger(),
+            "global localization accepted inside floor transaction after %zu attempts",
+            attempt);
+        }
+        error.clear();
+        return true;
+      }
+
       error = "global localization trigger rejected: " + response->message;
+      const auto classification =
+        robot_floor_manager::classify_explicit_localization_failure(error);
+      if (!classification.retryable) {
+        return false;
+      }
+
+      const auto now = std::chrono::steady_clock::now();
+      const double remaining_sec = now < deadline ?
+        std::chrono::duration<double>(deadline - now).count() : 0.0;
+      RCLCPP_WARN(
+        get_logger(),
+        "retryable explicit localization failure kept inside floor transaction: "
+        "attempt=%zu failure_code=%s remaining_sec=%.3f",
+        attempt,
+        classification.failure_code.c_str(),
+        remaining_sec);
+
+      const auto retry_at = std::min(
+        deadline,
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(100));
+      while (
+        !shutting_down_.load() && !cancel_requested_.load() &&
+        std::chrono::steady_clock::now() < retry_at)
+      {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+    }
+
+    if (shutting_down_.load() || cancel_requested_.load()) {
+      error = "cancelled while retrying global localization transaction";
       return false;
     }
-    return true;
+    error = "global localization transaction did not produce an accepted result within the " +
+      std::to_string(std::max(service_timeout_sec_, localization_trigger_timeout_sec_)) +
+      "s total retry budget after " + std::to_string(attempt) + " attempts" +
+      (error.empty() ? std::string{} : "; last_error=" + error);
+    return false;
   }
 
   bool clear_costmap(
@@ -628,6 +2282,843 @@ private:
     return true;
   }
 
+  static bool same_snapshot(
+    const robot_floor_manager::FloorAssetSnapshot & left,
+    const robot_floor_manager::FloorAssetSnapshot & right)
+  {
+    const auto & a = left.fingerprints;
+    const auto & b = right.fingerprints;
+    return
+      left.building_id == right.building_id &&
+      left.floor_id == right.floor_id &&
+      left.map_id == right.map_id &&
+      left.asset_epoch == right.asset_epoch &&
+      left.asset_digest == right.asset_digest &&
+      left.paths.root == right.paths.root &&
+      a.manifest_json == b.manifest_json &&
+      a.nav_map_yaml == b.nav_map_yaml &&
+      a.nav_map_pgm == b.nav_map_pgm &&
+      a.localizer_map_png == b.localizer_map_png &&
+      a.localizer_params_yaml == b.localizer_params_yaml &&
+      a.keepout_mask_yaml == b.keepout_mask_yaml &&
+      a.keepout_mask_pgm == b.keepout_mask_pgm &&
+      a.speed_mask_yaml == b.speed_mask_yaml &&
+      a.speed_mask_pgm == b.speed_mask_pgm &&
+      a.binary_mask_yaml == b.binary_mask_yaml &&
+      a.binary_mask_pgm == b.binary_mask_pgm &&
+      a.asset_report_json == b.asset_report_json &&
+      a.poses_yaml == b.poses_yaml;
+  }
+
+  bool revalidate_snapshot(
+    const robot_floor_manager::FloorAssetSnapshot & snapshot,
+    std::string & error) const
+  {
+    const auto verified = robot_floor_manager::FloorAssetSnapshotLoader{}.load(
+      {
+        fs::path(maps_root_),
+        snapshot.building_id,
+        snapshot.floor_id,
+        snapshot.map_id,
+        snapshot.asset_epoch,
+        snapshot.asset_digest,
+      });
+    if (!verified.ok()) {
+      error = std::string(
+        robot_floor_manager::floor_asset_snapshot_error_name(
+          verified.error)) + ": " + verified.message;
+      return false;
+    }
+    if (!same_snapshot(snapshot, *verified.snapshot)) {
+      error =
+        "immutable target asset fingerprint changed during floor transaction";
+      return false;
+    }
+    return true;
+  }
+
+  static robot_floor_manager::FloorTransitionEvidence target_evidence(
+    const robot_floor_manager::FloorTransitionEffect & effect)
+  {
+    robot_floor_manager::FloorTransitionEvidence evidence;
+    evidence.active_building_id = effect.building_id;
+    evidence.active_floor_id = effect.floor_id;
+    evidence.active_map_id = effect.map_id;
+    evidence.asset_epoch = effect.expected_asset_epoch;
+    evidence.asset_digest = effect.expected_asset_digest;
+    return evidence;
+  }
+
+  robot_floor_manager::FloorTransitionEvidence source_evidence()
+  {
+    robot_floor_manager::FloorTransitionEvidence evidence;
+    std::lock_guard<std::mutex> lock(evidence_mutex_);
+    if (!source_runtime_context_.has_value()) {
+      evidence.runtime_context_invalid = true;
+      return evidence;
+    }
+    const auto & source = *source_runtime_context_;
+    evidence.active_building_id = source.building_id;
+    evidence.active_floor_id = source.floor_id;
+    evidence.active_map_id = source.map_id;
+    evidence.asset_epoch = source.asset_epoch;
+    evidence.asset_digest = source.asset_digest;
+    evidence.explicit_relocalization_sequence =
+      source.explicit_relocalization_sequence;
+    evidence.bridge_ready = source.bridge_ready;
+    evidence.amcl_ready = source.amcl_ready;
+    evidence.runtime_context_invalid = false;
+    evidence.safe_for_goal_start = true;
+    return evidence;
+  }
+
+  static robot_floor_manager::FloorTransitionEffectResult effect_failure(
+    const std::string & code,
+    const std::string & detail,
+    const robot_floor_manager::FloorTransitionEvidence & evidence = {})
+  {
+    robot_floor_manager::FloorTransitionEffectResult result;
+    result.failure_code = code;
+    result.detail = detail;
+    result.evidence = evidence;
+    return result;
+  }
+
+  static robot_floor_manager::FloorTransitionEffectResult effect_success(
+    const std::string & detail,
+    const robot_floor_manager::FloorTransitionEvidence & evidence)
+  {
+    robot_floor_manager::FloorTransitionEffectResult result;
+    result.success = true;
+    result.detail = detail;
+    result.evidence = evidence;
+    return result;
+  }
+
+  robot_floor_manager::FloorTransitionEffectResult perform(
+    const robot_floor_manager::FloorTransitionEffect & effect,
+    const robot_floor_manager::FloorAssetSnapshot & snapshot) override
+  {
+    const auto canceled =
+      [this]() {
+        return shutting_down_.load() || cancel_requested_.load();
+      };
+    FloorAssets assets = assets_from_snapshot(snapshot);
+    std::string error;
+
+    switch (effect.kind) {
+      case robot_floor_manager::FloorTransitionEffectKind::kVerifyPreconditions:
+      {
+        if (!set_motion_hold(
+            effect.transaction_id,
+            robot_interfaces::srv::SetMotionHold::Request::OP_ACQUIRE,
+            error))
+        {
+          return effect_failure("MOTION_HOLD_UNPROVEN", error);
+        }
+        // The hold already exists even if the subsequent Nav/odom proof times
+        // out or cancellation arrives. Record ownership before waiting so
+        // pre-BEGIN cleanup releases exactly this transaction's key.
+        motion_hold_acquired_.store(true);
+        robot_floor_manager::FloorTransitionEvidence evidence;
+        const bool proven = wait_for_evidence(
+          [this]() {
+            return evidence_tracker_.preconditions(
+              steady_now_sec(), evidence_max_age_sec_,
+              stopped_stable_duration_sec_,
+              stopped_linear_threshold_mps_,
+              stopped_angular_threshold_radps_,
+              nav_idle_bootstrap_grace_sec_);
+          },
+          [](const auto & value) {
+            return
+              value.motion_hold_active &&
+              value.nav_idle &&
+              value.stopped;
+          },
+          evidence);
+        if (!proven) {
+          if (canceled()) {
+            return effect_failure("CANCELLED", "cancelled while proving preconditions", evidence);
+          }
+          if (!evidence.motion_hold_active) {
+            return effect_failure(
+              "MOTION_HOLD_UNPROVEN",
+              "exact floor-manager hold was not fresh and active",
+              evidence);
+          }
+          if (!evidence.nav_idle) {
+            return effect_failure(
+              "NAV_IDLE_UNPROVEN",
+              "NavigateToPose action status did not prove idle",
+              evidence);
+          }
+          return effect_failure(
+            "STOPPED_UNPROVEN",
+            "fresh wheel and local odometry did not remain stopped",
+            evidence);
+        }
+        return effect_success(
+          "motion hold, Nav2 idle, and dual-odom stop proven",
+          evidence);
+      }
+
+      case robot_floor_manager::FloorTransitionEffectKind::kAcquireCorrectionPause:
+      {
+        if (!set_correction_pause(
+            effect.transaction_id,
+            robot_interfaces::srv::SetCorrectionPause::Request::OP_ACQUIRE,
+            error))
+        {
+          return effect_failure("CORRECTION_PAUSE_UNPROVEN", error);
+        }
+        floor_pause_acquired_ = true;
+        robot_floor_manager::FloorTransitionEvidence evidence;
+        if (!wait_for_evidence(
+            [this]() {
+              return evidence_tracker_.floor_pause(
+                steady_now_sec(), evidence_max_age_sec_);
+            },
+            [](const auto & value) {
+              return
+                value.floor_pause_owned &&
+                value.correction_pause_effective;
+            },
+            evidence))
+        {
+          return effect_failure(
+            canceled() ? "CANCELLED" : "CORRECTION_PAUSE_UNPROVEN",
+            canceled() ? "cancelled while proving floor correction pause" :
+            "exact floor-manager correction pause was not proven",
+            evidence);
+        }
+        return effect_success(
+          "floor-manager correction pause acquired", evidence);
+      }
+
+      case robot_floor_manager::FloorTransitionEffectKind::kInvalidateRuntimeContext:
+      {
+        {
+          std::lock_guard<std::mutex> lock(evidence_mutex_);
+          if (!source_runtime_context_.has_value()) {
+            return effect_failure(
+              "SOURCE_RUNTIME_CONTEXT_UNPROVEN",
+              "bridge BEGIN requires a fresh exact source identity with "
+              "localizer, map->odom, and canonical TF readiness");
+          }
+        }
+        auto response = call_bridge_transition(
+          effect,
+          robot_interfaces::srv::BeginFloorTransition::Request::OP_BEGIN,
+          error);
+        if (!response || response->runtime_context_valid) {
+          return effect_failure(
+            "BRIDGE_BEGIN_UNPROVEN",
+            error.empty() ?
+            "bridge BEGIN did not invalidate runtime context" : error);
+        }
+        {
+          std::lock_guard<std::mutex> lock(evidence_mutex_);
+          bridge_begin_established_ = true;
+          runtime_context_confirmed_ = false;
+          published_asset_epoch_ = effect.expected_asset_epoch;
+          published_asset_digest_ = effect.expected_asset_digest;
+          nav_map_ready_ = false;
+          filters_ready_ = false;
+          localizer_ready_ = false;
+          bridge_ready_ = false;
+          amcl_ready_ = false;
+          costmaps_ready_ = false;
+        }
+        if (!write_runtime_context(
+            effect, "floor_switch_pending", false,
+            "source runtime context invalidated by bridge BEGIN", error))
+        {
+          auto evidence = target_evidence(effect);
+          evidence.runtime_context_invalid = true;
+          return effect_failure(
+            "RUNTIME_CONTEXT_WRITE_FAILED", error, evidence);
+        }
+        auto evidence = target_evidence(effect);
+        {
+          std::lock_guard<std::mutex> lock(evidence_mutex_);
+          const auto pause = evidence_tracker_.floor_pause(
+            steady_now_sec(), evidence_max_age_sec_);
+          evidence.floor_pause_owned = pause.floor_pause_owned;
+          evidence.correction_pause_effective =
+            pause.correction_pause_effective;
+        }
+        evidence.runtime_context_invalid = true;
+        if (!evidence.floor_pause_owned ||
+          !evidence.correction_pause_effective)
+        {
+          return effect_failure(
+            "CORRECTION_PAUSE_UNPROVEN",
+            "floor pause became stale across bridge BEGIN", evidence);
+        }
+        return effect_success(
+          "bridge BEGIN invalidated source context", evidence);
+      }
+
+      case robot_floor_manager::FloorTransitionEffectKind::kReportBeginReady:
+      {
+        auto evidence = target_evidence(effect);
+        {
+          std::lock_guard<std::mutex> lock(evidence_mutex_);
+          const auto pause = evidence_tracker_.floor_pause(
+            steady_now_sec(), evidence_max_age_sec_);
+          evidence.floor_pause_owned = pause.floor_pause_owned;
+          evidence.correction_pause_effective =
+            pause.correction_pause_effective;
+        }
+        evidence.runtime_context_invalid = bridge_begin_established_;
+        if (
+          !evidence.runtime_context_invalid ||
+          !evidence.floor_pause_owned ||
+          !evidence.correction_pause_effective)
+        {
+          return effect_failure(
+            "CALLER_HANDOFF_UNPROVEN",
+            "caller handoff was not published because BEGIN or the exact "
+            "floor pause was no longer proven",
+            evidence);
+        }
+        return effect_success(
+          "caller pause handoff barrier published", evidence);
+      }
+
+      case robot_floor_manager::FloorTransitionEffectKind::kVerifyPauseHandoff:
+      {
+        robot_floor_manager::FloorTransitionEvidence evidence;
+        if (!wait_for_evidence(
+            [this]() {
+              return evidence_tracker_.pause_handoff(
+                steady_now_sec(), evidence_max_age_sec_);
+            },
+            [](const auto & value) {
+              return
+                value.caller_pause_released &&
+                value.floor_pause_owned &&
+                value.correction_pause_effective;
+            },
+            evidence))
+        {
+          return effect_failure(
+            canceled() ? "CANCELLED" : "PAUSE_HANDOFF_UNPROVEN",
+            canceled() ? "cancelled during caller pause handoff" :
+            "caller pause was not released while exact floor pause remained",
+            evidence);
+        }
+        evidence.runtime_context_invalid = bridge_begin_established_;
+        return effect_success(
+          "caller released only its correction pause", evidence);
+      }
+
+      case robot_floor_manager::FloorTransitionEffectKind::kLoadNavMap:
+      {
+        if (!revalidate_snapshot(snapshot, error)) {
+          return effect_failure("ASSET_IDENTITY_CHANGED", error);
+        }
+        if (!load_nav_map(assets, error)) {
+          return effect_failure("NAV_MAP_LOAD_FAILED", error);
+        }
+        {
+          std::lock_guard<std::mutex> lock(evidence_mutex_);
+          nav_map_ready_ = true;
+        }
+        return effect_success(
+          "target Nav2 map loaded", target_evidence(effect));
+      }
+
+      case robot_floor_manager::FloorTransitionEffectKind::kLoadFilters:
+      {
+        if (!revalidate_snapshot(snapshot, error)) {
+          return effect_failure("ASSET_IDENTITY_CHANGED", error);
+        }
+        if (!load_filter_masks(assets, error)) {
+          return effect_failure("FILTER_LOAD_FAILED", error);
+        }
+        {
+          std::lock_guard<std::mutex> lock(evidence_mutex_);
+          filters_ready_ = true;
+        }
+        return effect_success(
+          "target keepout and speed filters loaded",
+          target_evidence(effect));
+      }
+
+      case robot_floor_manager::FloorTransitionEffectKind::kReloadLocalizer:
+      {
+        if (!revalidate_snapshot(snapshot, error)) {
+          return effect_failure("ASSET_IDENTITY_CHANGED", error);
+        }
+        std::uint64_t baseline_generation = 0U;
+        {
+          std::lock_guard<std::mutex> lock(evidence_mutex_);
+          baseline_generation =
+            evidence_tracker_.begin_localizer_generation();
+        }
+        std::uint64_t accepted_generation = 0U;
+        if (!apply_localizer_assets(
+            effect.transaction_id, assets, baseline_generation,
+            accepted_generation, error))
+        {
+          return effect_failure("LOCALIZER_RELOAD_UNPROVEN", error);
+        }
+        robot_floor_manager::FloorTransitionEvidence evidence;
+        if (!wait_for_evidence(
+            [this, accepted_generation]() {
+              return evidence_tracker_.target_localizer(
+                accepted_generation, steady_now_sec(),
+                evidence_max_age_sec_);
+            },
+            [](const auto & value) {
+              return value.asset_epoch != 0U;
+            },
+            evidence))
+        {
+          return effect_failure(
+            canceled() ? "CANCELLED" : "LOCALIZER_RELOAD_UNPROVEN",
+            canceled() ? "cancelled while proving localizer reload" :
+            "typed localizer state did not echo the exact new reload",
+            evidence);
+        }
+        localizer_generation_ = accepted_generation;
+        {
+          std::lock_guard<std::mutex> lock(evidence_mutex_);
+          localizer_ready_ = true;
+        }
+        return effect_success(
+          "target localizer reload proven by response and typed state",
+          evidence);
+      }
+
+      case robot_floor_manager::FloorTransitionEffectKind::kReleaseFloorPause:
+      {
+        if (!set_correction_pause(
+            effect.transaction_id,
+            robot_interfaces::srv::SetCorrectionPause::Request::OP_RELEASE,
+            error))
+        {
+          return effect_failure("CORRECTION_PAUSE_RELEASE_FAILED", error);
+        }
+        const bool released = wait_for_condition(
+          [this]() {
+            return evidence_tracker_.corrections_released(
+              steady_now_sec(), evidence_max_age_sec_);
+          });
+        auto evidence = target_evidence(effect);
+        if (!released) {
+          return effect_failure(
+            canceled() ? "CANCELLED" : "CORRECTION_PAUSE_REMAINS",
+            canceled() ? "cancelled while releasing correction pause" :
+            "another correction pause remains after floor pause release",
+            evidence);
+        }
+        floor_pause_acquired_ = false;
+        return effect_success(
+          "all correction pauses released for target localization",
+          evidence);
+      }
+
+      case robot_floor_manager::FloorTransitionEffectKind::kTriggerExplicitLocalization:
+      {
+        const bool trigger_call_succeeded = trigger_localization(assets, error);
+        robot_floor_manager::FloorTransitionEvidence evidence;
+        const bool evidence_proven = wait_for_evidence(
+            [this]() {
+              return evidence_tracker_.target_localization(
+                steady_now_sec(), evidence_max_age_sec_,
+                localizer_generation_);
+            },
+            [](const auto & value) {
+              return
+                value.asset_epoch != 0U &&
+                value.explicit_relocalization_sequence != 0U;
+            },
+            evidence);
+        const auto reconciliation =
+          robot_floor_manager::reconcile_explicit_localization(
+          trigger_call_succeeded, evidence_proven, canceled(), error);
+        if (!reconciliation.success) {
+          return effect_failure(
+            reconciliation.code,
+            reconciliation.detail,
+            evidence);
+        }
+        explicit_relocalization_sequence_ =
+          evidence.explicit_relocalization_sequence;
+        return effect_success(
+          reconciliation.detail, evidence);
+      }
+
+      case robot_floor_manager::FloorTransitionEffectKind::kVerifyBridgeReady:
+      {
+        robot_floor_manager::FloorTransitionEvidence evidence;
+        if (!wait_for_evidence(
+            [this]() {
+              return evidence_tracker_.target_localization(
+                steady_now_sec(), evidence_max_age_sec_,
+                localizer_generation_);
+            },
+            [](const auto & value) {
+              return
+                value.bridge_ready &&
+                value.amcl_ready &&
+                value.runtime_context_invalid &&
+                value.explicit_relocalization_sequence != 0U;
+            },
+            evidence))
+        {
+          return effect_failure(
+            canceled() ? "CANCELLED" : "BRIDGE_READY_UNPROVEN",
+            canceled() ? "cancelled while proving bridge readiness" :
+            "pending target map->odom was not ready, unique, and published",
+            evidence);
+        }
+        {
+          std::lock_guard<std::mutex> lock(evidence_mutex_);
+          bridge_ready_ = true;
+          amcl_ready_ = true;
+        }
+        return effect_success(
+          "pending target bridge readiness proven", evidence);
+      }
+
+      case robot_floor_manager::FloorTransitionEffectKind::kClearCostmaps:
+      {
+        if (!clear_costmaps_after_switch_) {
+          return effect_failure(
+            "COSTMAP_CLEAR_DISABLED",
+            "live floor switch requires both typed costmap clears");
+        }
+        if (!clear_costmap(
+            global_clear_client_, global_costmap_clear_service_, error) ||
+          !clear_costmap(
+            local_clear_client_, local_costmap_clear_service_, error))
+        {
+          return effect_failure("COSTMAP_CLEAR_FAILED", error);
+        }
+        {
+          std::lock_guard<std::mutex> lock(evidence_mutex_);
+          evidence_tracker_.mark_costmaps_cleared(steady_now_sec());
+        }
+        return effect_success(
+          "global and local costmap clear services acknowledged",
+          target_evidence(effect));
+      }
+
+      case robot_floor_manager::FloorTransitionEffectKind::kVerifyFreshCostmaps:
+      {
+        robot_floor_manager::FloorTransitionEvidence evidence;
+        if (!wait_for_evidence(
+            [this]() {
+              return evidence_tracker_.fresh_costmaps(
+                steady_now_sec(), evidence_max_age_sec_,
+                localizer_generation_);
+            },
+            [](const auto & value) {
+              return
+                value.global_costmap_fresh &&
+                value.local_costmap_fresh &&
+                value.asset_epoch != 0U;
+            },
+            evidence))
+        {
+          return effect_failure(
+            canceled() ? "CANCELLED" : "COSTMAP_FRESHNESS_UNPROVEN",
+            canceled() ? "cancelled while proving fresh costmaps" :
+            "both post-clear target costmaps were not fresh",
+            evidence);
+        }
+        {
+          std::lock_guard<std::mutex> lock(evidence_mutex_);
+          costmaps_ready_ = true;
+        }
+        return effect_success(
+          "fresh global and local target costmaps proven", evidence);
+      }
+
+      case robot_floor_manager::FloorTransitionEffectKind::kCommitRuntimeContext:
+      {
+        auto response = call_bridge_transition(
+          effect,
+          robot_interfaces::srv::BeginFloorTransition::Request::OP_COMMIT,
+          error);
+        if (
+          !response ||
+          !response->runtime_context_valid ||
+          !response->safe_for_goal_start ||
+          response->explicit_relocalization_sequence == 0U ||
+          response->explicit_relocalization_sequence !=
+          explicit_relocalization_sequence_)
+        {
+          return effect_failure(
+            "BRIDGE_COMMIT_UNPROVEN",
+            error.empty() ?
+            "bridge COMMIT did not prove exact safe target context" : error);
+        }
+        if (!write_runtime_context(
+            effect, "ready", true,
+            "target floor runtime context committed", error))
+        {
+          return effect_failure("RUNTIME_CONTEXT_WRITE_FAILED", error);
+        }
+        {
+          std::lock_guard<std::mutex> lock(evidence_mutex_);
+          runtime_context_confirmed_ = true;
+          published_asset_epoch_ = effect.expected_asset_epoch;
+          published_asset_digest_ = effect.expected_asset_digest;
+        }
+        auto evidence = target_evidence(effect);
+        evidence.runtime_context_valid = true;
+        evidence.safe_for_goal_start = true;
+        evidence.bridge_ready = true;
+        evidence.amcl_ready = true;
+        evidence.explicit_relocalization_sequence =
+          explicit_relocalization_sequence_;
+        return effect_success(
+          "target runtime context durably committed", evidence);
+      }
+
+      case robot_floor_manager::FloorTransitionEffectKind::kComplete:
+      {
+        if (!set_motion_hold(
+            effect.transaction_id,
+            robot_interfaces::srv::SetMotionHold::Request::OP_RELEASE,
+            error))
+        {
+          return effect_failure("MOTION_HOLD_RELEASE_FAILED", error);
+        }
+        motion_hold_acquired_.store(false);
+        {
+          std::lock_guard<std::mutex> lock(floor_state_mutex_);
+          selected_building_id_ = effect.building_id;
+          selected_floor_id_ = effect.floor_id;
+          selected_map_id_ = effect.map_id;
+        }
+        auto evidence = target_evidence(effect);
+        {
+          std::lock_guard<std::mutex> lock(evidence_mutex_);
+          evidence.runtime_context_valid = runtime_context_confirmed_;
+          evidence.safe_for_goal_start = runtime_context_confirmed_;
+          evidence.bridge_ready = bridge_ready_;
+          evidence.amcl_ready = amcl_ready_;
+          evidence.global_costmap_fresh = costmaps_ready_;
+          evidence.local_costmap_fresh = costmaps_ready_;
+        }
+        evidence.explicit_relocalization_sequence =
+          explicit_relocalization_sequence_;
+        return effect_success(
+          "floor-manager motion hold released after commit", evidence);
+      }
+
+      case robot_floor_manager::FloorTransitionEffectKind::kHoldAndLock:
+      {
+        std::string cleanup_detail;
+        const auto append_detail =
+          [&cleanup_detail](const std::string & detail) {
+            if (!detail.empty()) {
+              cleanup_detail +=
+                (cleanup_detail.empty() ? "" : "; ") + detail;
+            }
+          };
+        const auto release_pre_mutation_resources =
+          [this, &effect, &append_detail]() {
+            std::string pause_error;
+            const bool pause_released = set_correction_pause(
+              effect.transaction_id,
+              robot_interfaces::srv::SetCorrectionPause::Request::OP_RELEASE,
+              pause_error);
+            append_detail(pause_error);
+
+            std::string hold_error;
+            const bool hold_released = set_motion_hold(
+              effect.transaction_id,
+              robot_interfaces::srv::SetMotionHold::Request::OP_RELEASE,
+              hold_error);
+            append_detail(hold_error);
+            return pause_released && hold_released;
+          };
+        const auto retain_safety_resources =
+          [this, &effect, &append_detail]() {
+            std::string hold_error;
+            const bool hold_retained = set_motion_hold(
+              effect.transaction_id,
+              robot_interfaces::srv::SetMotionHold::Request::OP_ACQUIRE,
+              hold_error);
+            append_detail(hold_error);
+
+            std::string pause_error;
+            const bool pause_retained = set_correction_pause(
+              effect.transaction_id,
+              robot_interfaces::srv::SetCorrectionPause::Request::OP_ACQUIRE,
+              pause_error);
+            append_detail(pause_error);
+            return std::pair<bool, bool>{hold_retained, pause_retained};
+          };
+
+        const bool begin_established = bridge_begin_established_;
+        const bool begin_outcome_unknown = bridge_begin_outcome_unknown_;
+        if (!begin_established && !begin_outcome_unknown) {
+          // Always issue higher-sequence exact RELEASE commands. An earlier
+          // ACQUIRE may have been accepted even when its response timed out,
+          // so local "acquired" booleans are not cleanup evidence.
+          if (release_pre_mutation_resources()) {
+            auto evidence = target_evidence(effect);
+            evidence.runtime_context_invalid = false;
+            return effect_success(
+              "pre-mutation exact leases released and proven absent by fresh state",
+              evidence);
+          }
+
+          const auto retained = retain_safety_resources();
+          auto evidence = target_evidence(effect);
+          evidence.motion_hold_active = retained.first;
+          evidence.runtime_context_invalid = true;
+          if (retained.first) {
+            std::string context_error;
+            if (!write_runtime_context(
+                effect, "floor_switch_failed_locked", false,
+                "pre-mutation cleanup was not proven; safety hold retained",
+                context_error))
+            {
+              append_detail(context_error);
+            }
+            return effect_success(
+              "pre-mutation cleanup was not proven; higher-sequence safety "
+              "hold retained and explicit recovery is required" +
+              (retained.second ? std::string{} :
+              std::string{"; correction pause retention is unproven"}),
+              evidence);
+          }
+          return effect_failure(
+            "PREMUTATION_CLEANUP_UNPROVEN",
+            cleanup_detail.empty() ?
+            "exact lease release and safety-hold retention were both unproven" :
+            cleanup_detail,
+            evidence);
+        }
+
+        std::string abort_error;
+        const bool source_restored =
+          abort_bridge_and_prove_source(
+          effect, !begin_established, abort_error);
+        append_detail(abort_error);
+
+        // Once exact ABORT and a later source-identity LocalizationHealth
+        // sample prove that the source runtime is valid again, persist that
+        // source identity and release this transaction's resources. This is
+        // a recoverable failed transaction, not a permanent vehicle lock.
+        if (source_restored) {
+          bridge_begin_established_ = false;
+          bridge_begin_submitted_ = false;
+          bridge_begin_outcome_unknown_ = false;
+          {
+            std::lock_guard<std::mutex> lock(evidence_mutex_);
+            runtime_context_confirmed_ = true;
+          }
+          std::string source_context_error;
+          const bool source_context_written = write_source_runtime_context(
+            effect,
+            "floor switch failed; exact source runtime restored by bridge ABORT",
+            source_context_error);
+          append_detail(source_context_error);
+          if (source_context_written && release_pre_mutation_resources()) {
+            auto evidence = source_evidence();
+            evidence.motion_hold_active = false;
+            evidence.floor_pause_owned = false;
+            evidence.correction_pause_effective = false;
+            evidence.runtime_context_invalid = false;
+            return effect_success(
+              "bridge BEGIN was exactly aborted; durable source context and "
+              "exact lease absence were proven",
+              evidence);
+          }
+        }
+
+        // Either BEGIN is known to have invalidated the source context, or its
+        // result/cleanup cannot be proven. Finish only in a retained safety
+        // lock; a higher sequence prevents any delayed RELEASE from undoing it.
+        const auto retained = retain_safety_resources();
+        {
+          std::lock_guard<std::mutex> lock(evidence_mutex_);
+          runtime_context_confirmed_ = false;
+        }
+        std::string context_error;
+        if (!write_runtime_context(
+            effect, "floor_switch_failed_locked", false,
+            source_restored ?
+            "bridge source context restored but floor recovery lock retained" :
+            "bridge BEGIN/ABORT outcome is unproven; floor recovery lock retained",
+            context_error))
+        {
+          append_detail(context_error);
+        }
+        auto evidence = target_evidence(effect);
+        evidence.motion_hold_active = retained.first;
+        evidence.runtime_context_invalid = true;
+        if (!retained.first) {
+          return effect_failure(
+            "FAILURE_CLEANUP_UNPROVEN",
+            cleanup_detail.empty() ?
+            "higher-sequence floor-manager safety hold was not proven" :
+            cleanup_detail,
+            evidence);
+        }
+        return effect_success(
+          source_restored ?
+          "bridge ABORT and source context proven; recovery safety lock retained" :
+          "bridge cleanup remains unproven; recovery safety lock retained" +
+          (retained.second ? std::string{} :
+          std::string{"; correction pause retention is unproven"}),
+          evidence);
+      }
+
+      case robot_floor_manager::FloorTransitionEffectKind::kNone:
+        break;
+    }
+    return effect_failure(
+      "INTERNAL_ERROR", "unsupported floor-transition effect");
+  }
+
+  void emergency_lock_after_exception(
+    const robot_floor_manager::FloorTransitionRequest & request,
+    const std::string & reason) noexcept
+  {
+    try {
+      robot_floor_manager::FloorTransitionEffect effect;
+      effect.kind =
+        robot_floor_manager::FloorTransitionEffectKind::kHoldAndLock;
+      effect.transaction_id = request.transaction_id;
+      effect.building_id = request.building_id;
+      effect.floor_id = request.floor_id;
+      effect.map_id = request.map_id;
+      effect.expected_asset_epoch = request.expected_asset_epoch;
+      effect.expected_asset_digest = request.expected_asset_digest;
+      effect.cleanup_id = request.transaction_id + "-exception-cleanup";
+      effect.detail = reason;
+      robot_floor_manager::FloorAssetSnapshot snapshot;
+      {
+        std::lock_guard<std::mutex> lock(evidence_mutex_);
+        if (active_snapshot_.has_value()) {
+          snapshot = *active_snapshot_;
+        }
+      }
+      const auto cleanup = perform(effect, snapshot);
+      if (!cleanup.success) {
+        RCLCPP_ERROR(
+          get_logger(),
+          "floor-switch exception cleanup remains unproven: %s",
+          cleanup.detail.c_str());
+      }
+    } catch (...) {
+      RCLCPP_ERROR(
+        get_logger(),
+        "floor-switch exception cleanup threw; manual recovery is required");
+    }
+  }
+
   void on_switch_floor(
     const std::shared_ptr<robot_interfaces::srv::SwitchFloor::Request> request,
     std::shared_ptr<robot_interfaces::srv::SwitchFloor::Response> response)
@@ -636,6 +3127,7 @@ private:
       std::lock_guard<std::mutex> lock(floor_state_mutex_);
       if (switching_ || floor_switch_action_active_) {
         response->success = false;
+        response->code = "TRANSACTION_CONFLICT";
         response->message = "floor switch or selection already in progress";
         return;
       }
@@ -643,45 +3135,70 @@ private:
     }
 
     FloorAssets assets;
+    std::string error_code;
     std::string error;
-    const auto finish = [&](const bool success, const std::string & message) {
-      response->success = success;
-      response->message = message;
-      response->nav_map_yaml = assets.nav_map_yaml.string();
-      response->localizer_map_png = assets.localizer_map_png.string();
-      response->localizer_params_yaml = assets.localizer_params_yaml.string();
-      std::string current_floor;
+    const auto finish =
+      [this, &response](
+        const bool success,
+        const std::string & code,
+        const std::string & message,
+        const FloorAssets * proof)
       {
-        std::lock_guard<std::mutex> lock(floor_state_mutex_);
-        current_floor = current_floor_;
-        switching_ = false;
-      }
-      publish_status(success ? ("active:" + current_floor) : ("failed:" + message));
-    };
+        response->success = success;
+        response->code = code;
+        response->message = message;
+        if (proof != nullptr) {
+          response->selected_building_id = proof->building_id;
+          response->selected_floor_id = proof->floor_id;
+          response->selected_map_id = proof->map_id;
+          response->asset_epoch = proof->asset_epoch;
+          response->asset_digest = proof->asset_digest;
+          response->nav_map_yaml = proof->nav_map_yaml.string();
+          response->localizer_map_png = proof->localizer_map_png.string();
+          response->localizer_params_yaml = proof->localizer_params_yaml.string();
+        }
+        {
+          std::lock_guard<std::mutex> lock(floor_state_mutex_);
+          switching_ = false;
+        }
+        // This service proves an immutable source bundle only. The API owns
+        // current/ activation, so service success must not publish or retain
+        // selected/active runtime state that could survive a failed API commit.
+        publish_status(success ? "idle" : ("failed:" + message));
+      };
 
     if (request->resume_navigation) {
       finish(
         false,
+        "LEGACY_RESUME_NAVIGATION_DISABLED",
         "LEGACY_RESUME_NAVIGATION_DISABLED: use /floor_manager/floor_switch; "
-        "the legacy service cannot prove an atomic localizer reload");
+        "the legacy service cannot prove an atomic localizer reload",
+        nullptr);
       return;
     }
 
-    if (!validate_floor_assets(request->building_id, request->floor_id, assets, error)) {
-      finish(false, error);
-      return;
-    }
-
-    const std::string floor_key = assets.building_id + "/" + assets.floor_id;
-    publish_status("switching:" + floor_key);
-
+    if (!validate_exact_floor_assets(
+        request->building_id,
+        request->floor_id,
+        request->map_id,
+        request->expected_asset_epoch,
+        request->expected_asset_digest,
+        assets,
+        error_code,
+        error))
     {
-      std::lock_guard<std::mutex> lock(floor_state_mutex_);
-      current_floor_ = floor_key;
-      selected_building_id_ = assets.building_id;
-      selected_floor_id_ = assets.floor_id;
+      finish(false, error_code, error_code + ": " + error, nullptr);
+      return;
     }
-    finish(true, "floor assets selected for next navigation: " + floor_key);
+
+    const std::string map_key =
+      assets.building_id + "/" + assets.floor_id + "/" + assets.map_id;
+    finish(
+      true,
+      "OK",
+      "floor source preflight verified; API activation is still required: " +
+      map_key,
+      &assets);
   }
 
   std::string maps_root_;
@@ -698,15 +3215,39 @@ private:
   std::string local_costmap_clear_service_;
   std::string floor_switch_action_name_;
   std::string transition_status_topic_;
+  std::string motion_hold_service_;
+  std::string motion_hold_sequence_state_file_;
+  std::string motion_interlock_state_topic_;
+  std::string navigate_to_pose_status_topic_;
+  std::string navigate_to_pose_action_name_;
+  std::string wheel_odom_topic_;
+  std::string local_odom_topic_;
+  std::string correction_pause_service_;
+  std::string correction_pause_state_topic_;
+  std::string begin_floor_transition_service_;
+  std::string localization_health_topic_;
+  std::string localizer_asset_state_topic_;
+  std::string global_costmap_topic_;
+  std::string local_costmap_topic_;
+  std::string runtime_map_context_file_;
   std::string current_floor_;
   std::string selected_building_id_;
   std::string selected_floor_id_;
   std::string selected_map_id_;
   std::string active_floor_switch_transaction_;
   double service_timeout_sec_{10.0};
+  double localizer_apply_timeout_sec_{30.0};
+  double localization_trigger_timeout_sec_{75.0};
   double filter_mask_state_timeout_sec_{0.5};
+  double evidence_timeout_sec_{10.0};
+  double nav_idle_bootstrap_grace_sec_{2.0};
+  double evidence_max_age_sec_{0.75};
+  double stopped_stable_duration_sec_{0.30};
+  double stopped_linear_threshold_mps_{0.02};
+  double stopped_angular_threshold_radps_{0.02};
   bool call_map_server_load_{true};
   bool call_filter_mask_load_{true};
+  bool speed_filter_enabled_{false};
   bool call_localizer_apply_{true};
   bool call_localization_trigger_{true};
   bool clear_costmaps_after_switch_{true};
@@ -714,8 +3255,52 @@ private:
   bool switching_{false};
   bool live_floor_switch_enabled_{false};
   bool floor_switch_action_active_{false};
+  bool bridge_begin_established_{false};
+  bool bridge_begin_submitted_{false};
+  bool bridge_begin_outcome_unknown_{false};
+  std::atomic_bool motion_hold_command_submitted_{false};
+  std::atomic_bool motion_hold_outcome_unknown_{false};
+  std::atomic_bool motion_hold_acquired_{false};
+  std::unique_ptr<robot_safety::PersistentSequenceAllocator>
+    motion_hold_sequence_allocator_;
+  std::atomic_bool correction_pause_command_submitted_{false};
+  std::atomic_bool correction_pause_outcome_unknown_{false};
+  bool floor_pause_acquired_{false};
+  bool runtime_context_confirmed_{false};
+  bool nav_map_ready_{false};
+  bool filters_ready_{false};
+  bool localizer_ready_{false};
+  bool bridge_ready_{false};
+  bool amcl_ready_{false};
+  bool costmaps_ready_{false};
+  std::uint64_t published_asset_epoch_{0U};
+  std::string published_asset_digest_;
+  std::uint64_t localizer_generation_{0U};
+  std::uint64_t explicit_relocalization_sequence_{0U};
+  std::uint64_t global_costmap_receive_sequence_{0U};
+  std::uint64_t local_costmap_receive_sequence_{0U};
   std::uint64_t transition_status_generation_{0U};
   std::mutex floor_state_mutex_;
+  std::mutex evidence_mutex_;
+  std::condition_variable evidence_changed_;
+  robot_floor_manager::FloorTransitionEvidenceTracker evidence_tracker_;
+  std::uint64_t motion_interlock_state_generation_{0U};
+  bool last_motion_interlock_hold_active_{false};
+  std::vector<std::string> last_motion_interlock_hold_keys_;
+  std::uint64_t correction_pause_state_generation_{0U};
+  bool last_correction_pause_active_{false};
+  std::vector<std::string> last_correction_pause_keys_;
+  std::uint64_t localization_health_generation_{0U};
+  double last_localization_health_received_steady_sec_{-1.0};
+  std::optional<robot_floor_manager::LocalizationHealthEvidence>
+    last_localization_health_;
+  std::optional<robot_floor_manager::LocalizationHealthEvidence>
+    source_runtime_context_;
+  std::optional<robot_floor_manager::FloorAssetSnapshot> active_snapshot_;
+  std::atomic_bool cancel_requested_{false};
+  std::atomic_bool shutting_down_{false};
+  std::mutex worker_mutex_;
+  std::thread floor_switch_worker_;
 
   rclcpp::CallbackGroup::SharedPtr callback_group_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
@@ -723,6 +3308,7 @@ private:
     transition_status_pub_;
   rclcpp::Service<robot_interfaces::srv::SwitchFloor>::SharedPtr switch_service_;
   rclcpp_action::Server<FloorSwitchAction>::SharedPtr floor_switch_action_server_;
+  rclcpp::TimerBase::SharedPtr nav_graph_probe_timer_;
   rclcpp::Client<nav2_msgs::srv::LoadMap>::SharedPtr map_load_client_;
   rclcpp::Client<nav2_msgs::srv::LoadMap>::SharedPtr keepout_mask_load_client_;
   rclcpp::Client<nav2_msgs::srv::LoadMap>::SharedPtr speed_mask_load_client_;
@@ -732,17 +3318,70 @@ private:
   rclcpp::Client<robot_interfaces::srv::TriggerLocalization>::SharedPtr localization_trigger_client_;
   rclcpp::Client<nav2_msgs::srv::ClearEntireCostmap>::SharedPtr global_clear_client_;
   rclcpp::Client<nav2_msgs::srv::ClearEntireCostmap>::SharedPtr local_clear_client_;
+  rclcpp::Client<robot_interfaces::srv::SetMotionHold>::SharedPtr
+    motion_hold_client_;
+  rclcpp::Client<robot_interfaces::srv::SetCorrectionPause>::SharedPtr
+    correction_pause_client_;
+  rclcpp::Client<robot_interfaces::srv::BeginFloorTransition>::SharedPtr
+    begin_floor_transition_client_;
+  rclcpp::Subscription<robot_interfaces::msg::MotionInterlockState>::SharedPtr
+    motion_interlock_state_sub_;
+  rclcpp::Subscription<robot_interfaces::msg::CorrectionPauseState>::SharedPtr
+    correction_pause_state_sub_;
+  rclcpp::Subscription<robot_interfaces::msg::LocalizationHealth>::SharedPtr
+    localization_health_sub_;
+  rclcpp::Subscription<robot_interfaces::msg::LocalizerAssetState>::SharedPtr
+    localizer_asset_state_sub_;
+  rclcpp::Subscription<action_msgs::msg::GoalStatusArray>::SharedPtr
+    nav_status_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr wheel_odom_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr local_odom_sub_;
+  rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr
+    global_costmap_sub_;
+  rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr
+    local_costmap_sub_;
 };
 
 #ifndef ROBOT_FLOOR_MANAGER_DISABLE_MAIN
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
-  auto node = std::make_shared<FloorManagerNode>();
-  rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 2);
-  executor.add_node(node);
-  executor.spin();
-  rclcpp::shutdown();
-  return 0;
+  int exit_code = 0;
+  try {
+    auto node = std::make_shared<FloorManagerNode>();
+    // Floor transitions already run on floor_switch_worker_. Keeping ROS
+    // wait-set dispatch single-threaded prevents one executor worker from
+    // consuming an action readiness event observed by another worker.
+    rclcpp::executors::SingleThreadedExecutor executor;
+    executor.add_node(node);
+    while (rclcpp::ok()) {
+      try {
+        executor.spin();
+        break;
+      } catch (const std::runtime_error & exception) {
+        if (
+          robot_floor_manager::classify_executor_runtime_error(exception) !=
+          robot_floor_manager::ExecutorRuntimeErrorDisposition::kRetry)
+        {
+          throw;
+        }
+        RCLCPP_ERROR(
+          node->get_logger(),
+          "continuing after transient action client executor exception: %s",
+          exception.what());
+        std::this_thread::sleep_for(100ms);
+      }
+    }
+  } catch (const std::exception & exception) {
+    std::cerr << "robot_floor_manager fatal exception: " << exception.what() << std::endl;
+    exit_code = 1;
+  } catch (...) {
+    std::cerr << "robot_floor_manager unknown fatal exception" << std::endl;
+    exit_code = 1;
+  }
+  if (rclcpp::ok()) {
+    rclcpp::shutdown();
+  }
+  return exit_code;
 }
 #endif

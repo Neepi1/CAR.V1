@@ -93,8 +93,12 @@ resolve_floor_assets() {
   export NJRH_FLOOR_POSES_YAML="${runtime_root}/poses.yaml"
 
   local asset_report="${runtime_root}/reports/asset_report.json"
+  local manifest_json="${runtime_root}/manifest.json"
   local nav_map_name=""
   local nav_map_id=""
+  local manifest_map_id=""
+  local manifest_asset_epoch=""
+  local manifest_asset_digest=""
   if [[ -f "${asset_report}" ]]; then
     IFS=$'\t' read -r nav_map_name nav_map_id < <(python3 - "${asset_report}" <<'PY'
 import json
@@ -111,9 +115,30 @@ except Exception:
 PY
 )
   fi
+  if [[ -f "${manifest_json}" ]]; then
+    IFS=$'\t' read -r manifest_map_id manifest_asset_epoch manifest_asset_digest < <(python3 - "${manifest_json}" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as stream:
+        data = json.load(stream)
+    map_id = str(data.get("map_id") or "").replace("\t", " ")
+    epoch = data.get("asset_epoch")
+    epoch_text = str(epoch) if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch > 0 else ""
+    digest = str(data.get("asset_digest") or "").replace("\t", " ")
+    print(f"{map_id}\t{epoch_text}\t{digest}")
+except Exception:
+    print("\t\t")
+PY
+)
+  fi
+  nav_map_id="${manifest_map_id:-${nav_map_id}}"
   export NJRH_NAV_MAP_NAME="${nav_map_name}"
   export NJRH_NAV_MAP_ID="${nav_map_id}"
   export NJRH_MAP_ID="${nav_map_id:-${NJRH_MAP_ID:-}}"
+  export NJRH_MAP_ASSET_EPOCH="${manifest_asset_epoch}"
+  export NJRH_MAP_ASSET_DIGEST="${manifest_asset_digest}"
   export NJRH_MAP_DISPLAY_NAME="${nav_map_name:-${NJRH_MAP_DISPLAY_NAME:-}}"
   export NJRH_MAP_CONTEXT_BUILDING_ID="${building_id}"
   export NJRH_MAP_CONTEXT_FLOOR_ID="${floor_id}"

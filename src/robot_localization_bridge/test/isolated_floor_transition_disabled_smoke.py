@@ -31,6 +31,7 @@ def main() -> None:
             "0123456789abcdef0123456789abcdef"
         )
         request.operation = BeginFloorTransition.Request.OP_BEGIN
+        request.command_sequence = 1
         future = client.call_async(request)
         rclpy.spin_until_future_complete(node, future, timeout_sec=5.0)
         if not future.done() or future.result() is None:

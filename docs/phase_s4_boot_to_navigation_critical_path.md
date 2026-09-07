@@ -36,14 +36,18 @@ parsing, cumulative log scans, and per-frame Hesai stdout added variable I/O.
   while the existing 60-second per-node convergence budget remains available
   for a node that is genuinely configuring or activating.
 - A pre-trigger Isaac result remains rejected, but it no longer ends the
-  startup sequence ambiguously. Isaac emits one result per explicit service
-  call, so a bridge-confirmed pre-trigger or over-age result returns
-  `FRESH_LOCALIZATION_RETRY_REQUIRED` immediately and the bounded outer loop
-  issues a new trigger. No result-age or pre-trigger gate is relaxed.
+  current wrapper request or causes the outer loop to issue another trigger.
+  The wrapper drains that result while preserving one immutable arm time and
+  waits for the current request's result. Explicit results retain their source
+  timestamp and use historical odom TF plus latest-odom freshness; the 5-second
+  wall-age value alone cannot reject an explicitly armed result.
 - The normal trigger order is input-health check, bridge force-accept arm,
   first post-arm `/flatscan`, trigger baseline capture, then Isaac service
   call. This removes false pre-arm rejects caused by bridge service latency
   while retaining the existing one-second pose-stamp slack.
+- Startup retries the wrapper only when `dispatch_state=not_dispatched` proves
+  no Isaac request was sent. A post-dispatch timeout is reconciled against the
+  newer explicit bridge sequence and never generates another automatic trigger.
 - The wrapper performs the same 115-degree minimum-FOV admission reported by
   Isaac before triggering. The post-arm gate requires two consecutive good,
   uniquely sequenced FlatScan samples. A narrow transient resets that count and
@@ -88,12 +92,13 @@ parsing, cumulative log scans, and per-frame Hesai stdout added variable I/O.
   trigger service, Isaac grid-search service, selected map, and supervised
   FlatScan owner. Global-costmap readiness similarly combines lifecycle-active
   and costmap-publisher checks without relaxing either condition.
-- Held Nav2 preload waits until Isaac exposes
-  `/trigger_grid_search_localization` and the bridge status reports
-  `has_odom=true`. This gives the bridge time to consume canonical odom before
-  Nav2 DDS load begins. Nav2 still preloads before the first localization result
-  and remains lifecycle-inactive until the bridge-owned `map -> odom` baseline
-  is accepted.
+- Held Nav2 preload waits until the complete selected-floor localization stack
+  is ready and the first localization transaction has been accepted: wrapper
+  and Isaac services exist, the exact map is active, the supervised FlatScan
+  owner is healthy, the floor context is verified, and the bridge owns a live
+  `map -> odom`. A final single-participant probe reconfirms Isaac service and
+  bridge odom before Nav2 DDS load begins. Nav2 remains lifecycle-inactive
+  during this held process preload.
 
 ## Preserved Behavior
 
@@ -135,9 +140,11 @@ For five complete restarts, verify:
    `global_localization_node` exists and its start time is newer than the
    current occupancy-localization owner.
 3. `flatscan_helper_status.env` is fresh and healthy.
-4. `STARTUP_STAGE` reaches `localization_stack_ready` without a chassis restart
-   and reaches `nav2_layer_ready` with a median resident time at or below 50
-   seconds and P95 at or below 60 seconds.
+4. `STARTUP_STAGE` reaches `localization_stack_ready`,
+   `floor_asset_context_verified`, and `initial_global_localization_ready` in
+   that order before `nav2_layer_prestarted_held`, without a chassis restart,
+   and reaches `nav2_layer_ready` with a median resident time at or below
+   50 seconds and P95 at or below 60 seconds.
 5. The full systemd start-to-ready median is at or below 70 seconds after the
    Docker service is already available. Cold boot timing must be reported
    separately because Docker startup is outside the resident timer.

@@ -57,12 +57,14 @@ PY
 param_value() {
   local node="$1"
   local name="$2"
-  local output
-  output="$(timeout 6 ros2 param get "${node}" "${name}" 2>&1 || true)"
-  if [[ "${output}" =~ is:\ (.*)$ ]]; then
-    printf '%s\n' "${BASH_REMATCH[1]}" | tr -d '"'
-    return 0
-  fi
+  local output attempt
+  for attempt in 1 2; do
+    output="$(timeout 6 ros2 param get "${node}" "${name}" 2>&1 || true)"
+    if [[ "${output}" =~ is:\ (.*)$ ]]; then
+      printf '%s\n' "${BASH_REMATCH[1]}" | tr -d '"'
+      return 0
+    fi
+  done
   printf '%s\n' "${output}"
   return 1
 }
@@ -73,11 +75,17 @@ check_static_config() {
     return
   fi
 
-  local plugin radius angle timeout rotate threshold disengage braking closed_loop local_frame yaw_tol
+  local plugin radius angle timeout elevator_radius elevator_angle elevator_timeout
+  local heartbeat_timeout heartbeat_topic rotate threshold disengage braking closed_loop local_frame yaw_tol
   plugin="$(read_nav2_value "controller_server.ros__parameters.progress_checker.plugin" || true)"
   radius="$(read_nav2_value "controller_server.ros__parameters.progress_checker.required_movement_radius" || true)"
   angle="$(read_nav2_value "controller_server.ros__parameters.progress_checker.required_movement_angle" || true)"
   timeout="$(read_nav2_value "controller_server.ros__parameters.progress_checker.movement_time_allowance" || true)"
+  elevator_radius="$(read_nav2_value "controller_server.ros__parameters.progress_checker.elevator_required_movement_radius" || true)"
+  elevator_angle="$(read_nav2_value "controller_server.ros__parameters.progress_checker.elevator_required_movement_angle" || true)"
+  elevator_timeout="$(read_nav2_value "controller_server.ros__parameters.progress_checker.elevator_movement_time_allowance" || true)"
+  heartbeat_timeout="$(read_nav2_value "controller_server.ros__parameters.progress_checker.elevator_heartbeat_timeout" || true)"
+  heartbeat_topic="$(read_nav2_value "controller_server.ros__parameters.progress_checker.elevator_heartbeat_topic" || true)"
   rotate="$(read_nav2_value "controller_server.ros__parameters.FollowPath.rotate_to_goal_heading" || true)"
   threshold="$(read_nav2_value "controller_server.ros__parameters.FollowPath.angular_dist_threshold" || true)"
   disengage="$(read_nav2_value "controller_server.ros__parameters.FollowPath.angular_disengage_threshold" || true)"
@@ -86,23 +94,43 @@ check_static_config() {
   local_frame="$(read_nav2_value "local_costmap.local_costmap.ros__parameters.global_frame" || true)"
   yaw_tol="$(read_nav2_value "controller_server.ros__parameters.goal_checker.yaw_goal_tolerance" || true)"
 
-  [[ "${plugin}" == "nav2_controller::PoseProgressChecker" ]] \
+  [[ "${plugin}" == "robot_nav_config::ElevatorAwareProgressChecker" ]] \
     && pass "static progress_checker.plugin=${plugin}" \
-    || fail "static progress_checker.plugin=${plugin:-missing}, expected nav2_controller::PoseProgressChecker"
+    || fail "static progress_checker.plugin=${plugin:-missing}, expected robot_nav_config::ElevatorAwareProgressChecker"
 
   [[ "${radius}" == "0.03" || "${radius}" == "0.030" ]] \
     && pass "static required_movement_radius=${radius}" \
     || fail "static required_movement_radius=${radius:-missing}, expected 0.03"
 
-  if [[ -n "${angle}" ]] && numeric_between "${angle}" 0.05 0.20; then
+  if [[ "${angle}" == "0.05" || "${angle}" == "0.050" ]]; then
     pass "static required_movement_angle=${angle}"
   else
-    fail "static required_movement_angle=${angle:-missing}, expected 0.05..0.20"
+    fail "static required_movement_angle=${angle:-missing}, expected 0.05"
   fi
 
   [[ "${timeout}" == "12.0" || "${timeout}" == "12" ]] \
     && pass "static movement_time_allowance=${timeout}" \
     || fail "static movement_time_allowance=${timeout:-missing}, expected 12.0"
+
+  [[ "${elevator_radius}" == "0.015" ]] \
+    && pass "static elevator_required_movement_radius=${elevator_radius}" \
+    || fail "static elevator_required_movement_radius=${elevator_radius:-missing}, expected 0.015"
+
+  [[ "${elevator_angle}" == "0.015" ]] \
+    && pass "static elevator_required_movement_angle=${elevator_angle}" \
+    || fail "static elevator_required_movement_angle=${elevator_angle:-missing}, expected 0.015"
+
+  [[ "${elevator_timeout}" == "20.0" || "${elevator_timeout}" == "20" ]] \
+    && pass "static elevator_movement_time_allowance=${elevator_timeout}" \
+    || fail "static elevator_movement_time_allowance=${elevator_timeout:-missing}, expected 20.0"
+
+  [[ "${heartbeat_timeout}" == "0.50" || "${heartbeat_timeout}" == "0.5" ]] \
+    && pass "static elevator_heartbeat_timeout=${heartbeat_timeout}" \
+    || fail "static elevator_heartbeat_timeout=${heartbeat_timeout:-missing}, expected 0.50"
+
+  [[ "${heartbeat_topic}" == "/ranger_mini3/nav_elevator_scoped_progress_heartbeat" ]] \
+    && pass "static elevator_heartbeat_topic=${heartbeat_topic}" \
+    || fail "static elevator_heartbeat_topic=${heartbeat_topic:-missing}, expected /ranger_mini3/nav_elevator_scoped_progress_heartbeat"
 
   [[ "${rotate}" == "true" ]] \
     && pass "static FollowPath.rotate_to_goal_heading=true" \
@@ -139,16 +167,23 @@ check_static_config() {
   fi
 }
 
-check_pose_progress_plugin_available() {
-  if grep -R "PoseProgressChecker" /opt/ros/humble/share/nav2_controller /opt/ros/humble/lib >/dev/null 2>&1; then
-    pass "Humble nav2_controller exposes PoseProgressChecker"
+check_progress_plugin_available() {
+  local prefix plugin_xml plugin_library
+  prefix="$(ros2 pkg prefix robot_nav_config 2>/dev/null || true)"
+  plugin_xml="${prefix}/share/robot_nav_config/robot_nav_config_controller_plugins.xml"
+  plugin_library="${prefix}/lib/libgoal_scoped_rotation_shim_controller.so"
+
+  if [[ -n "${prefix}" && -f "${plugin_xml}" && -f "${plugin_library}" ]] \
+      && grep -q 'robot_nav_config::ElevatorAwareProgressChecker' "${plugin_xml}"; then
+    pass "ElevatorAwareProgressChecker plugin and library are installed under ${prefix}"
   else
-    fail "PoseProgressChecker not found in /opt/ros/humble; do not start Nav2 with this config"
+    fail "ElevatorAwareProgressChecker is not installed completely; do not start Nav2 with this config"
   fi
 }
 
 check_runtime_config() {
-  local lifecycle plugin angle rotate threshold disengage braking closed_loop frame
+  local lifecycle plugin radius angle timeout elevator_radius elevator_angle elevator_timeout
+  local heartbeat_timeout heartbeat_topic rotate threshold disengage braking closed_loop frame
   lifecycle="$(timeout 6 ros2 lifecycle get /controller_server 2>&1 || true)"
   if [[ "${lifecycle}" == *"active [3]"* ]]; then
     pass "controller_server active"
@@ -157,16 +192,51 @@ check_runtime_config() {
   fi
 
   plugin="$(param_value /controller_server progress_checker.plugin || true)"
-  [[ "${plugin}" == "nav2_controller::PoseProgressChecker" ]] \
+  [[ "${plugin}" == "robot_nav_config::ElevatorAwareProgressChecker" ]] \
     && pass "runtime progress_checker.plugin=${plugin}" \
     || warn "runtime progress_checker.plugin unavailable or unexpected: ${plugin}"
 
+  radius="$(param_value /controller_server progress_checker.required_movement_radius || true)"
+  [[ "${radius}" == "0.03" ]] \
+    && pass "runtime required_movement_radius=${radius}" \
+    || warn "runtime required_movement_radius unavailable or unexpected: ${radius}"
+
   angle="$(param_value /controller_server progress_checker.required_movement_angle || true)"
-  if [[ "${angle}" =~ ^[-+0-9.]+$ ]] && numeric_between "${angle}" 0.05 0.20; then
+  if [[ "${angle}" == "0.05" ]]; then
     pass "runtime required_movement_angle=${angle}"
   else
-    warn "runtime required_movement_angle unavailable or outside expected range: ${angle}"
+    warn "runtime required_movement_angle unavailable or unexpected: ${angle}"
   fi
+
+  timeout="$(param_value /controller_server progress_checker.movement_time_allowance || true)"
+  [[ "${timeout}" == "12.0" || "${timeout}" == "12" ]] \
+    && pass "runtime movement_time_allowance=${timeout}" \
+    || warn "runtime movement_time_allowance unavailable or unexpected: ${timeout}"
+
+  elevator_radius="$(param_value /controller_server progress_checker.elevator_required_movement_radius || true)"
+  [[ "${elevator_radius}" == "0.015" ]] \
+    && pass "runtime elevator_required_movement_radius=${elevator_radius}" \
+    || warn "runtime elevator_required_movement_radius unavailable or unexpected: ${elevator_radius}"
+
+  elevator_angle="$(param_value /controller_server progress_checker.elevator_required_movement_angle || true)"
+  [[ "${elevator_angle}" == "0.015" ]] \
+    && pass "runtime elevator_required_movement_angle=${elevator_angle}" \
+    || warn "runtime elevator_required_movement_angle unavailable or unexpected: ${elevator_angle}"
+
+  elevator_timeout="$(param_value /controller_server progress_checker.elevator_movement_time_allowance || true)"
+  [[ "${elevator_timeout}" == "20.0" || "${elevator_timeout}" == "20" ]] \
+    && pass "runtime elevator_movement_time_allowance=${elevator_timeout}" \
+    || warn "runtime elevator_movement_time_allowance unavailable or unexpected: ${elevator_timeout}"
+
+  heartbeat_timeout="$(param_value /controller_server progress_checker.elevator_heartbeat_timeout || true)"
+  [[ "${heartbeat_timeout}" == "0.5" || "${heartbeat_timeout}" == "0.50" ]] \
+    && pass "runtime elevator_heartbeat_timeout=${heartbeat_timeout}" \
+    || warn "runtime elevator_heartbeat_timeout unavailable or unexpected: ${heartbeat_timeout}"
+
+  heartbeat_topic="$(param_value /controller_server progress_checker.elevator_heartbeat_topic || true)"
+  [[ "${heartbeat_topic}" == "/ranger_mini3/nav_elevator_scoped_progress_heartbeat" ]] \
+    && pass "runtime elevator_heartbeat_topic=${heartbeat_topic}" \
+    || warn "runtime elevator_heartbeat_topic unavailable or unexpected: ${heartbeat_topic}"
 
   rotate="$(param_value /controller_server FollowPath.rotate_to_goal_heading || true)"
   [[ "${rotate}" == "True" || "${rotate}" == "true" ]] \
@@ -233,7 +303,7 @@ check_cmd_chain() {
 }
 
 check_static_config
-check_pose_progress_plugin_available
+check_progress_plugin_available
 check_runtime_config
 check_cmd_chain
 

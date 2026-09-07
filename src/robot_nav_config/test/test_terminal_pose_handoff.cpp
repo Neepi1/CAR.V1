@@ -1,5 +1,7 @@
-#include "gtest/gtest.h"
+#include <limits>
+
 #include "robot_nav_config/terminal_pose_handoff.hpp"
+#include "gtest/gtest.h"
 
 namespace robot_nav_config
 {
@@ -16,19 +18,20 @@ TerminalPoseError observed_terminal_error()
   return error;
 }
 
-TEST(TerminalPoseHandoff, ObservedAckermannHairpinTriggersNormalHandoff)
-{
+TEST(TerminalPoseHandoff, ObservedAckermannHairpinTriggersNormalHandoff) {
   TerminalHandoffParameters parameters;
   TerminalPathMetrics path;
   path.chord_m = 0.4031;
   path.length_m = 1.3703;
   path.max_cross_track_m = 0.2722;
 
-  EXPECT_TRUE(should_start_terminal_handoff(observed_terminal_error(), path, parameters));
+  EXPECT_TRUE(
+    should_start_terminal_handoff(
+      observed_terminal_error(), path,
+      parameters));
 }
 
-TEST(TerminalPoseHandoff, ReachableTerminalPathRemainsWithMppi)
-{
+TEST(TerminalPoseHandoff, ReachableTerminalPathRemainsWithMppi) {
   TerminalHandoffParameters parameters;
   auto error = observed_terminal_error();
   error.distance_m = 0.35;
@@ -42,8 +45,7 @@ TEST(TerminalPoseHandoff, ReachableTerminalPathRemainsWithMppi)
   EXPECT_FALSE(should_start_terminal_handoff(error, path, parameters));
 }
 
-TEST(TerminalPoseHandoff, LivePureLateralResidualTriggersWithoutHairpin)
-{
+TEST(TerminalPoseHandoff, LivePureLateralResidualTriggersWithoutHairpin) {
   TerminalHandoffParameters parameters;
   TerminalPoseError error;
   error.distance_m = 0.1353;
@@ -59,8 +61,7 @@ TEST(TerminalPoseHandoff, LivePureLateralResidualTriggersWithoutHairpin)
   EXPECT_TRUE(should_start_terminal_handoff(error, path, parameters));
 }
 
-TEST(TerminalPoseHandoff, ResidualOutsideRecoveryEnvelopeFailsClosed)
-{
+TEST(TerminalPoseHandoff, ResidualOutsideRecoveryEnvelopeFailsClosed) {
   TerminalHandoffParameters parameters;
   auto error = observed_terminal_error();
   error.distance_m = 0.41;
@@ -72,8 +73,7 @@ TEST(TerminalPoseHandoff, ResidualOutsideRecoveryEnvelopeFailsClosed)
   EXPECT_FALSE(should_start_terminal_handoff(error, path, parameters));
 }
 
-TEST(TerminalPoseHandoff, AxisStagesKeepTaskRunningUntilStrictGoalAcceptance)
-{
+TEST(TerminalPoseHandoff, AxisStagesKeepTaskRunningUntilStrictGoalAcceptance) {
   TerminalHandoffParameters parameters;
   TerminalPoseHandoffController controller(parameters);
   controller.begin(0.0);
@@ -137,5 +137,69 @@ TEST(TerminalPoseHandoff, AxisStagesKeepTaskRunningUntilStrictGoalAcceptance)
   EXPECT_FALSE(output.failed);
 }
 
-}  // namespace
-}  // namespace robot_nav_config
+TEST(TerminalPoseHandoff, LocalizationCorrectionAfterCompletionReopensControl) {
+  TerminalHandoffParameters parameters;
+  parameters.settle_stable_duration_sec = 0.30;
+  TerminalPoseHandoffController controller(parameters);
+  controller.begin(0.0);
+
+  TerminalControlInput input;
+  input.now_sec = 0.31;
+  auto output = controller.update(input);
+  ASSERT_EQ(output.phase, TerminalControlPhase::kSettling);
+  input.now_sec = 0.62;
+  output = controller.update(input);
+  ASSERT_EQ(output.phase, TerminalControlPhase::kComplete);
+  ASSERT_TRUE(output.complete);
+
+  // A later map->odom correction moves the canonical map goal in the local
+  // control frame. Completion must not remain latched on the stale pose.
+  input.error.distance_m = 0.12;
+  input.error.forward_m = 0.12;
+  input.now_sec = 0.70;
+  output = controller.update(input);
+  EXPECT_EQ(output.phase, TerminalControlPhase::kSettling);
+  EXPECT_FALSE(output.complete);
+
+  input.now_sec = 1.01;
+  output = controller.update(input);
+  EXPECT_EQ(output.phase, TerminalControlPhase::kForward);
+  EXPECT_GT(output.command.linear_x, 0.0);
+}
+
+TEST(TerminalPoseHandoff, ReportsTimeoutAsTheExactFailureReason) {
+  TerminalHandoffParameters parameters;
+  parameters.total_timeout_sec = 1.0;
+  TerminalPoseHandoffController controller(parameters);
+  controller.begin(10.0);
+
+  TerminalControlInput input;
+  input.now_sec = 11.01;
+  const auto output = controller.update(input);
+
+  ASSERT_TRUE(output.failed);
+  EXPECT_EQ(output.failure_reason, TerminalControlFailureReason::kTimeout);
+}
+
+TEST(TerminalPoseHandoff, SeparatesInvalidInputFromClockRegression) {
+  TerminalPoseHandoffController invalid_controller;
+  invalid_controller.begin(10.0);
+  TerminalControlInput invalid_input;
+  invalid_input.now_sec = std::numeric_limits<double>::quiet_NaN();
+  const auto invalid_output = invalid_controller.update(invalid_input);
+  ASSERT_TRUE(invalid_output.failed);
+  EXPECT_EQ(invalid_output.failure_reason,
+            TerminalControlFailureReason::kInvalidInput);
+
+  TerminalPoseHandoffController clock_controller;
+  clock_controller.begin(10.0);
+  TerminalControlInput regressed_input;
+  regressed_input.now_sec = 9.9;
+  const auto regressed_output = clock_controller.update(regressed_input);
+  ASSERT_TRUE(regressed_output.failed);
+  EXPECT_EQ(regressed_output.failure_reason,
+            TerminalControlFailureReason::kClockRegression);
+}
+
+} // namespace
+} // namespace robot_nav_config

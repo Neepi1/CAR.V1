@@ -111,9 +111,11 @@ fi
 run_check check_process "robot_local_state" "ekf_node --ros-args.*__node:=robot_local_state|robot_localization/ekf_node|robot_local_state/local_state_node|local_state_node --ros-args"
 run_check check_process "localization_bridge" "robot_localization_bridge/localization_bridge_node|localization_bridge_node --ros-args"
 run_check check_process "robot_safety" "robot_safety/robot_safety_node|robot_safety_node --ros-args"
+run_check check_process "robot_mode_manager" "robot_mode_manager/mode_manager_node|mode_manager_node --ros-args"
 
 run_check check_node "/robot_api_server"
 run_check check_node "/robot_floor_manager"
+run_check check_node "/robot_mode_manager"
 run_check check_node "/robot_global_localization"
 run_check check_node "/map_server"
 run_check check_node "/controller_server"

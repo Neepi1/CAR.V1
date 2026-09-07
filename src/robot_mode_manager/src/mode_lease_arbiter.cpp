@@ -49,25 +49,39 @@ ModeDecision ModeLeaseArbiter::apply(const ModeCommand & command, const double n
     if (command.owner.empty() || command.mission_id.empty() || command.lease_id.empty()) {
       return reject(ModeDecisionCode::kInvalidRequest, "release requires owner, mission, and lease");
     }
-    if (is_retired(command.lease_id)) {
-      return reject(ModeDecisionCode::kStaleLease, "lease has already retired");
-    }
-    if (
-      !state_.lease_active ||
-      state_.owner != command.owner ||
-      state_.mission_id != command.mission_id ||
-      state_.lease_id != command.lease_id)
-    {
-      return reject(ModeDecisionCode::kNotOwner, "only the exact active lease can release");
+    if (state_.lease_active) {
+      if (
+        state_.owner != command.owner ||
+        state_.mission_id != command.mission_id ||
+        state_.lease_id != command.lease_id)
+      {
+        return reject(
+          ModeDecisionCode::kNotOwner,
+          "only the exact active lease can release");
+      }
+      retire_active_lease();
+      enter_normal("lease_released");
+      ModeDecision decision;
+      decision.accepted = true;
+      decision.changed = true;
+      decision.code = ModeDecisionCode::kOk;
+      decision.message = "mode lease released";
+      decision.state = snapshot(now_sec);
+      return decision;
     }
 
-    retire_active_lease();
-    enter_normal("lease_released");
+    const bool newly_retired =
+      retired_lease_ids_.insert(command.lease_id).second;
+    if (newly_retired) {
+      state_.generation += 1U;
+      state_.transition_reason = "lease_release_fenced";
+    }
     ModeDecision decision;
     decision.accepted = true;
-    decision.changed = true;
+    decision.changed = newly_retired;
     decision.code = ModeDecisionCode::kOk;
-    decision.message = "mode lease released";
+    decision.message =
+      "mode lease was already absent and is fenced from a delayed set";
     decision.state = snapshot(now_sec);
     return decision;
   }

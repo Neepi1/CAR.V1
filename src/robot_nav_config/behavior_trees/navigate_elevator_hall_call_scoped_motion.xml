@@ -1,0 +1,17 @@
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Sequence name="navigate_elevator_hall_call_scoped_motion">
+      <RecoveryNode number_of_retries="3" name="retry_elevator_hall_scoped_planning">
+        <ComputePathToPose
+          goal="{goal}"
+          path="{path}"
+          planner_id="ElevatorHallScoped"/>
+        <Wait wait_duration="0.5"/>
+      </RecoveryNode>
+      <FollowPath
+        path="{path}"
+        controller_id="ElevatorHallFollowPath"
+        goal_checker_id="goal_checker"/>
+    </Sequence>
+  </BehaviorTree>
+</root>

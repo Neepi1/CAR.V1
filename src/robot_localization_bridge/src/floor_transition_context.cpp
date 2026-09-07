@@ -79,26 +79,79 @@ bool same_asset(
 
 }  // namespace
 
-FloorTransitionContextDecision FloorTransitionContext::begin(
-  const FloorTransitionIdentity & identity,
-  const bool floor_pause_owned,
-  const std::uint64_t current_explicit_relocalization_sequence)
+FloorTransitionContextDecision FloorTransitionContext::seed_active_source(
+  const FloorTransitionIdentity & identity)
 {
   if (!valid_identity(identity)) {
     return decision(
       false, false, FloorTransitionDecisionCode::kInvalidRequest,
-      "BEGIN requires safe identifiers, nonzero epoch, and canonical sha256 digest");
+      "active source seed requires an exact verified identity");
+  }
+  if (state_.transition_active || state_.failed_locked) {
+    return decision(
+      false, false, FloorTransitionDecisionCode::kConflict,
+      "active source cannot be seeded during a transition or recovery lock");
+  }
+  if (valid_identity(state_.active)) {
+    if (same_asset(state_.active, identity)) {
+      return decision(
+        true, true, FloorTransitionDecisionCode::kOk,
+        "active source identity already seeded");
+    }
+    return decision(
+      false, false, FloorTransitionDecisionCode::kConflict,
+      "active source identity is already bound to another asset");
+  }
+  state_.active = identity;
+  state_.runtime_context_valid = true;
+  state_.recovery_required = false;
+  state_.failed_locked = false;
+  state_.detail = "ACTIVE_SOURCE_SEEDED";
+  return decision(
+    true, false, FloorTransitionDecisionCode::kOk,
+    "verified live source identity seeded");
+}
+
+FloorTransitionContextDecision FloorTransitionContext::begin(
+  const FloorTransitionIdentity & identity,
+  const FloorTransitionIdentity & source,
+  const bool floor_pause_owned,
+  const std::uint64_t current_explicit_relocalization_sequence,
+  const std::uint64_t command_sequence)
+{
+  if (!valid_identity(identity) || !valid_identity(source)) {
+    return decision(
+      false, false, FloorTransitionDecisionCode::kInvalidRequest,
+      "BEGIN requires exact valid target and source identities");
+  }
+  FloorTransitionContextDecision sequence_rejection;
+  if (!command_sequence_valid(
+      identity, command_sequence, sequence_rejection))
+  {
+    return sequence_rejection;
   }
   if (state_.failed_locked) {
     return decision(
       false, false, FloorTransitionDecisionCode::kFailedLocked,
       "floor transition is failure-locked and requires an explicit recovery protocol");
   }
+  if (!valid_identity(state_.active)) {
+    return decision(
+      false, false, FloorTransitionDecisionCode::kPreMutationUnproven,
+      "BEGIN requires a bridge-verified active source identity",
+      command_sequence);
+  }
+  if (!same_asset(state_.active, source)) {
+    return decision(
+      false, false, FloorTransitionDecisionCode::kIdentityMismatch,
+      "BEGIN source identity does not match the bridge-verified active source",
+      command_sequence);
+  }
   if (state_.transition_active) {
     if (same_identity(state_.pending, identity)) {
       return decision(
-        true, true, FloorTransitionDecisionCode::kOk,
-        "idempotent BEGIN replay");
+      true, true, FloorTransitionDecisionCode::kOk,
+      "idempotent BEGIN replay", command_sequence);
     }
     return decision(
       false, false, FloorTransitionDecisionCode::kConflict,
@@ -119,17 +172,25 @@ FloorTransitionContextDecision FloorTransitionContext::begin(
   state_.detail = "BEGIN_HELD";
   return decision(
     true, false, FloorTransitionDecisionCode::kOk,
-    "source runtime context invalidated under floor-manager correction pause");
+    "source runtime context invalidated under floor-manager correction pause",
+    command_sequence);
 }
 
 FloorTransitionContextDecision FloorTransitionContext::commit(
   const FloorTransitionIdentity & identity,
-  const FloorTransitionCommitEvidence & evidence)
+  const FloorTransitionCommitEvidence & evidence,
+  const std::uint64_t command_sequence)
 {
   if (!valid_identity(identity)) {
     return decision(
       false, false, FloorTransitionDecisionCode::kInvalidRequest,
       "COMMIT contains an invalid floor identity");
+  }
+  FloorTransitionContextDecision sequence_rejection;
+  if (!command_sequence_valid(
+      identity, command_sequence, sequence_rejection))
+  {
+    return sequence_rejection;
   }
   if (
     !state_.transition_active && state_.runtime_context_valid &&
@@ -137,7 +198,7 @@ FloorTransitionContextDecision FloorTransitionContext::commit(
   {
     return decision(
       true, true, FloorTransitionDecisionCode::kOk,
-      "idempotent COMMIT replay");
+      "idempotent COMMIT replay", command_sequence);
   }
   if (!state_.transition_active || !same_identity(state_.pending, identity)) {
     return decision(
@@ -179,16 +240,28 @@ FloorTransitionContextDecision FloorTransitionContext::commit(
   state_.detail = "COMMITTED";
   return decision(
     true, false, FloorTransitionDecisionCode::kOk,
-    "target floor runtime context committed");
+    "target floor runtime context committed", command_sequence);
 }
 
 FloorTransitionContextDecision FloorTransitionContext::abort(
-  const FloorTransitionIdentity & identity)
+  const FloorTransitionIdentity & identity,
+  const std::uint64_t command_sequence)
 {
+  if (!valid_identity(identity)) {
+    return decision(
+      false, false, FloorTransitionDecisionCode::kInvalidRequest,
+      "ABORT contains an invalid floor identity");
+  }
+  FloorTransitionContextDecision sequence_rejection;
+  if (!command_sequence_valid(
+      identity, command_sequence, sequence_rejection))
+  {
+    return sequence_rejection;
+  }
   if (state_.failed_locked && same_identity(state_.pending, identity)) {
     return decision(
       true, true, FloorTransitionDecisionCode::kOk,
-      "idempotent ABORT replay; failure lock retained");
+      "idempotent ABORT replay; failure lock retained", command_sequence);
   }
   if (!state_.transition_active || !same_identity(state_.pending, identity)) {
     return decision(
@@ -203,7 +276,75 @@ FloorTransitionContextDecision FloorTransitionContext::abort(
   state_.detail = "FAILED_LOCKED";
   return decision(
     true, false, FloorTransitionDecisionCode::kOk,
-    "floor transition aborted; invalid runtime context and recovery lock retained");
+    "floor transition aborted; invalid runtime context and recovery lock retained",
+    command_sequence);
+}
+
+FloorTransitionContextDecision FloorTransitionContext::abort_pre_mutation(
+  const FloorTransitionIdentity & identity,
+  const FloorTransitionPreMutationAbortEvidence & evidence,
+  const std::uint64_t command_sequence)
+{
+  if (!valid_identity(identity) || !valid_identity(evidence.source)) {
+    return decision(
+      false, false, FloorTransitionDecisionCode::kInvalidRequest,
+      "pre-mutation ABORT requires exact valid target and source identities");
+  }
+  FloorTransitionContextDecision sequence_rejection;
+  if (!command_sequence_valid(
+      identity, command_sequence, sequence_rejection))
+  {
+    return sequence_rejection;
+  }
+  if (state_.failed_locked) {
+    return decision(
+      false, false, FloorTransitionDecisionCode::kFailedLocked,
+      "pre-mutation ABORT cannot clear an existing recovery lock",
+      command_sequence);
+  }
+  if (!evidence.source_assets_unchanged) {
+    return decision(
+      false, false, FloorTransitionDecisionCode::kPreMutationUnproven,
+      "source localizer/map->odom state changed or was not proven",
+      command_sequence);
+  }
+  if (state_.transition_active) {
+    if (!same_identity(state_.pending, identity)) {
+      return decision(
+        false, false, FloorTransitionDecisionCode::kIdentityMismatch,
+        "pre-mutation ABORT does not match the active pending transaction",
+        command_sequence);
+    }
+    if (!same_asset(state_.active, evidence.source)) {
+      return decision(
+        false, false, FloorTransitionDecisionCode::kIdentityMismatch,
+        "pre-mutation ABORT source identity does not match the active source",
+        command_sequence);
+    }
+    state_.pending = FloorTransitionIdentity{};
+    state_.transition_active = false;
+    state_.runtime_context_valid = true;
+    state_.failed_locked = false;
+    state_.recovery_required = false;
+    state_.detail = "PREMUTATION_ABORTED";
+    return decision(
+      true, false, FloorTransitionDecisionCode::kOk,
+      "pending BEGIN fenced and exact source runtime context restored",
+      command_sequence);
+  }
+  if (
+    state_.runtime_context_valid &&
+    same_asset(state_.active, evidence.source))
+  {
+    return decision(
+      true, true, FloorTransitionDecisionCode::kOk,
+      "no BEGIN was active; higher command sequence fenced delayed BEGIN",
+      command_sequence);
+  }
+  return decision(
+    false, false, FloorTransitionDecisionCode::kPreMutationUnproven,
+    "no exact valid source context was available for pre-mutation ABORT",
+    command_sequence);
 }
 
 bool FloorTransitionContext::candidate_allowed(
@@ -228,9 +369,38 @@ FloorTransitionContextDecision FloorTransitionContext::decision(
   const bool accepted,
   const bool idempotent,
   const FloorTransitionDecisionCode code,
-  const std::string & message) const
+  const std::string & message,
+  const std::uint64_t applied_sequence) const
 {
-  return {accepted, idempotent, code, message, state_};
+  return {accepted, idempotent, code, message, applied_sequence, state_};
+}
+
+bool FloorTransitionContext::command_sequence_valid(
+  const FloorTransitionIdentity & identity,
+  const std::uint64_t command_sequence,
+  FloorTransitionContextDecision & rejection)
+{
+  if (command_sequence == 0U) {
+    rejection = decision(
+      false, false, FloorTransitionDecisionCode::kInvalidRequest,
+      "floor-transition command_sequence must be non-zero");
+    return false;
+  }
+  const auto previous = last_command_sequences_.find(identity.transaction_id);
+  if (
+    previous != last_command_sequences_.cend() &&
+    command_sequence <= previous->second)
+  {
+    rejection = decision(
+      false, false, FloorTransitionDecisionCode::kStaleCommand,
+      "floor-transition command_sequence is stale", previous->second);
+    return false;
+  }
+  // Consume every syntactically valid command before semantic validation.
+  // A delayed lower-sequence BEGIN can therefore never run after a compensating
+  // pre-mutation ABORT, even if DDS/service callbacks are reordered.
+  last_command_sequences_[identity.transaction_id] = command_sequence;
+  return true;
 }
 
 const char * to_string(const FloorTransitionDecisionCode code) noexcept
@@ -245,6 +415,9 @@ const char * to_string(const FloorTransitionDecisionCode code) noexcept
       return "EXPLICIT_RELOCALIZATION_UNPROVEN";
     case FloorTransitionDecisionCode::kMapOdomUnsettled: return "MAP_ODOM_UNSETTLED";
     case FloorTransitionDecisionCode::kFailedLocked: return "FAILED_LOCKED";
+    case FloorTransitionDecisionCode::kStaleCommand: return "STALE_COMMAND";
+    case FloorTransitionDecisionCode::kPreMutationUnproven:
+      return "PREMUTATION_UNPROVEN";
   }
   return "UNKNOWN";
 }

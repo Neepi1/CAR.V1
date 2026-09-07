@@ -1,5 +1,6 @@
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -26,6 +27,25 @@ using namespace std::chrono_literals;
 
 namespace
 {
+
+class ScopedRclcppRuntime
+{
+public:
+  ScopedRclcppRuntime()
+  {
+    rclcpp::init(0, nullptr);
+  }
+
+  ~ScopedRclcppRuntime()
+  {
+    if (rclcpp::ok()) {
+      rclcpp::shutdown();
+    }
+  }
+
+  ScopedRclcppRuntime(const ScopedRclcppRuntime &) = delete;
+  ScopedRclcppRuntime & operator=(const ScopedRclcppRuntime &) = delete;
+};
 
 class TemporaryFloorAssets
 {
@@ -74,7 +94,7 @@ private:
 
 TEST(FloorManagerLegacyService, LiveSwitchNeverSucceedsWithoutFilterAndCostmapProof)
 {
-  rclcpp::init(0, nullptr);
+  ScopedRclcppRuntime runtime;
   TemporaryFloorAssets assets;
   std::atomic_bool keepout_loaded{false};
   std::atomic_bool global_cleared{false};
@@ -132,6 +152,9 @@ TEST(FloorManagerLegacyService, LiveSwitchNeverSucceedsWithoutFilterAndCostmapPr
   options.parameter_overrides({
     rclcpp::Parameter("maps_root", assets.root().string()),
     rclcpp::Parameter("service_timeout_sec", 0.5),
+    rclcpp::Parameter(
+      "motion_hold_sequence_state_file",
+      (assets.root() / "hold_sequence.state").string()),
   });
   auto floor_manager = std::make_shared<FloorManagerNode>(options);
   auto client_node = std::make_shared<rclcpp::Node>("floor_manager_legacy_test_client");
@@ -166,18 +189,18 @@ TEST(FloorManagerLegacyService, LiveSwitchNeverSucceedsWithoutFilterAndCostmapPr
 
   executor.cancel();
   spin_thread.join();
-  rclcpp::shutdown();
 }
 
 TEST(FloorManagerFloorSwitchAction, ProductionDefaultAbortsWithoutMutationCapability)
 {
   using FloorSwitch = robot_interfaces::action::FloorSwitch;
 
-  rclcpp::init(0, nullptr);
+  ScopedRclcppRuntime runtime;
   std::atomic_int map_load_calls{0};
   std::atomic_int localizer_apply_calls{0};
   std::atomic_int localization_trigger_calls{0};
   std::atomic_int costmap_clear_calls{0};
+  TemporaryFloorAssets isolated_state;
 
   auto fake = std::make_shared<rclcpp::Node>("floor_switch_action_fake_ports");
   auto map_load = fake->create_service<nav2_msgs::srv::LoadMap>(
@@ -224,7 +247,13 @@ TEST(FloorManagerFloorSwitchAction, ProductionDefaultAbortsWithoutMutationCapabi
       ++costmap_clear_calls;
     });
 
-  auto floor_manager = std::make_shared<FloorManagerNode>();
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({
+    rclcpp::Parameter(
+      "motion_hold_sequence_state_file",
+      (isolated_state.root() / "hold_sequence.state").string()),
+  });
+  auto floor_manager = std::make_shared<FloorManagerNode>(options);
   auto client_node = std::make_shared<rclcpp::Node>("floor_switch_action_test_client");
   auto action_client = rclcpp_action::create_client<FloorSwitch>(
     client_node, "/floor_manager/floor_switch");
@@ -242,11 +271,10 @@ TEST(FloorManagerFloorSwitchAction, ProductionDefaultAbortsWithoutMutationCapabi
       last_status = message;
     });
 
-  rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 4);
+  rclcpp::executors::SingleThreadedExecutor executor;
   executor.add_node(fake);
   executor.add_node(floor_manager);
   executor.add_node(client_node);
-  std::thread spin_thread([&executor]() {executor.spin();});
 
   std::shared_ptr<FloorSwitch::Result> result;
   rclcpp_action::ResultCode result_code = rclcpp_action::ResultCode::UNKNOWN;
@@ -260,11 +288,15 @@ TEST(FloorManagerFloorSwitchAction, ProductionDefaultAbortsWithoutMutationCapabi
     goal.expected_asset_digest =
       "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     auto goal_future = action_client->async_send_goal(goal);
-    if (goal_future.wait_for(2s) == std::future_status::ready) {
+    if (executor.spin_until_future_complete(goal_future, 2s) ==
+      rclcpp::FutureReturnCode::SUCCESS)
+    {
       const auto goal_handle = goal_future.get();
       if (goal_handle) {
         auto result_future = action_client->async_get_result(goal_handle);
-        if (result_future.wait_for(2s) == std::future_status::ready) {
+        if (executor.spin_until_future_complete(result_future, 2s) ==
+          rclcpp::FutureReturnCode::SUCCESS)
+        {
           const auto wrapped = result_future.get();
           result_code = wrapped.code;
           result = wrapped.result;
@@ -305,8 +337,46 @@ TEST(FloorManagerFloorSwitchAction, ProductionDefaultAbortsWithoutMutationCapabi
   }
 
   executor.cancel();
-  spin_thread.join();
-  rclcpp::shutdown();
+}
+
+TEST(FloorManagerFloorSwitchAction, ForeignCancellationCannotCancelActiveTransaction)
+{
+  EXPECT_TRUE(cancel_matches_active_floor_switch(true, "tx-active", "tx-active"));
+  EXPECT_FALSE(cancel_matches_active_floor_switch(true, "tx-active", "tx-other"));
+  EXPECT_FALSE(cancel_matches_active_floor_switch(false, "tx-active", "tx-active"));
+  EXPECT_FALSE(cancel_matches_active_floor_switch(true, "tx-active", ""));
+}
+
+TEST(FloorManagerBridgeContract, AbortMayEchoRestoredSourceEpoch)
+{
+  using Request = robot_interfaces::srv::BeginFloorTransition::Request;
+  EXPECT_TRUE(bridge_response_requires_target_epoch(Request::OP_BEGIN));
+  EXPECT_TRUE(bridge_response_requires_target_epoch(Request::OP_COMMIT));
+  EXPECT_FALSE(bridge_response_requires_target_epoch(Request::OP_ABORT));
+  EXPECT_FALSE(
+    bridge_response_requires_target_epoch(Request::OP_ABORT_PREMUTATION));
+}
+
+TEST(FloorManagerBridgeContract, RejectedBeginWithInvalidContextRequiresRecovery)
+{
+  EXPECT_FALSE(bridge_begin_rejection_requires_recovery(false, true));
+  EXPECT_TRUE(bridge_begin_rejection_requires_recovery(false, false));
+  EXPECT_FALSE(bridge_begin_rejection_requires_recovery(true, false));
+}
+
+TEST(FloorManagerFilterPolicy, KeepoutIsAlwaysRuntimeRequired)
+{
+  const auto roles = runtime_filter_reload_roles(false);
+  ASSERT_EQ(roles.size(), 1U);
+  EXPECT_EQ(roles.front(), RuntimeFilterRole::kKeepout);
+}
+
+TEST(FloorManagerFilterPolicy, SpeedIsRuntimeRequiredOnlyWhenEnabled)
+{
+  const auto roles = runtime_filter_reload_roles(true);
+  ASSERT_EQ(roles.size(), 2U);
+  EXPECT_EQ(roles[0], RuntimeFilterRole::kKeepout);
+  EXPECT_EQ(roles[1], RuntimeFilterRole::kSpeed);
 }
 
 }  // namespace

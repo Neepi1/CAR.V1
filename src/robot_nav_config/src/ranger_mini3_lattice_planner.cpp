@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "nav2_core/exceptions.hpp"
 #include "nav2_costmap_2d/cost_values.hpp"
 #include "nav2_costmap_2d/footprint_collision_checker.hpp"
 #include "nav2_util/node_utils.hpp"
@@ -75,25 +76,42 @@ nav_msgs::msg::Path RangerMini3LatticePlanner::createPlan(
   const geometry_msgs::msg::PoseStamped & goal)
 {
   auto lattice_path = nav2_smac_planner::SmacPlannerLattice::createPlan(start, goal);
-  if (!direct_corridor_enabled_ || lattice_path.poses.empty()) {
+  if (lattice_path.poses.empty()) {
     return lattice_path;
   }
 
   std::lock_guard<std::mutex> lock(_mutex);
-  const auto direct_path = make_direct_corridor_path(
-    start, goal, direct_corridor_parameters_,
-    [this](const double x, const double y, const double yaw) {
-      return corridor_pose_is_clear(x, y, yaw);
-    });
-  if (!direct_path.has_value()) {
-    return lattice_path;
+  if (direct_corridor_enabled_) {
+    const auto direct_path = make_direct_corridor_path(
+      start, goal, direct_corridor_parameters_,
+      [this](const double x, const double y, const double yaw) {
+        return corridor_pose_is_clear(x, y, yaw);
+      });
+    if (direct_path.has_value()) {
+      RCLCPP_INFO(
+        _logger,
+        "Ranger direct corridor selected: direct_length=%.3fm lattice_length=%.3fm poses=%zu",
+        path_length(*direct_path), path_length(lattice_path), direct_path->poses.size());
+      return *direct_path;
+    }
   }
 
-  RCLCPP_INFO(
-    _logger,
-    "Ranger direct corridor selected: direct_length=%.3fm lattice_length=%.3fm poses=%zu",
-    path_length(*direct_path), path_length(lattice_path), direct_path->poses.size());
-  return *direct_path;
+  const auto exact_goal_path = append_exact_goal_endpoint(
+    lattice_path, goal, ExactGoalEndpointParameters{},
+    [this](const double x, const double y, const double yaw) {
+      return endpoint_pose_is_clear(x, y, yaw);
+    });
+  if (!exact_goal_path.has_value()) {
+    throw nav2_core::PlannerException(
+            "Ranger lattice endpoint cannot safely preserve the exact requested goal pose");
+  }
+  if (exact_goal_path->poses.size() != lattice_path.poses.size()) {
+    RCLCPP_DEBUG(
+      _logger,
+      "Ranger lattice exact goal endpoint appended: lattice_poses=%zu final_poses=%zu",
+      lattice_path.poses.size(), exact_goal_path->poses.size());
+  }
+  return *exact_goal_path;
 }
 
 bool RangerMini3LatticePlanner::corridor_pose_is_clear(
@@ -127,6 +145,33 @@ bool RangerMini3LatticePlanner::corridor_pose_is_clear(
   const double footprint_cost = checker.footprintCostAtPose(
     x, y, yaw, _costmap_ros->getRobotFootprint());
   return footprint_cost < static_cast<double>(nav2_costmap_2d::LETHAL_OBSTACLE);
+}
+
+bool RangerMini3LatticePlanner::endpoint_pose_is_clear(
+  const double x, const double y, const double yaw)
+{
+  if (_costmap == nullptr || _costmap_ros == nullptr ||
+    !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(yaw))
+  {
+    return false;
+  }
+
+  const double resolution = _costmap->getResolution();
+  const double map_x = (x - _costmap->getOriginX()) / resolution;
+  const double map_y = (y - _costmap->getOriginY()) / resolution;
+  if (map_x < 0.0 || map_y < 0.0 ||
+    map_x >= static_cast<double>(_costmap->getSizeInCellsX()) ||
+    map_y >= static_cast<double>(_costmap->getSizeInCellsY()))
+  {
+    return false;
+  }
+
+  nav2_costmap_2d::FootprintCollisionChecker<nav2_costmap_2d::Costmap2D *> checker(
+    _costmap);
+  const double footprint_cost = checker.footprintCostAtPose(
+    x, y, yaw, _costmap_ros->getRobotFootprint());
+  return footprint_cost >= 0.0 &&
+         footprint_cost < static_cast<double>(nav2_costmap_2d::LETHAL_OBSTACLE);
 }
 
 double RangerMini3LatticePlanner::path_length(const nav_msgs::msg::Path & path) const

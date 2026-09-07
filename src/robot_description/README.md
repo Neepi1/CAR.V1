@@ -16,7 +16,9 @@ Single-source robot body and static sensor extrinsics for the canonical TF tree.
 - `lidar_level_link`: derived horizontal slice frame with the same XYZ as the final `lidar_link`, the same final yaw, and zero roll/pitch
 - `gs2_xyz/rpy`: near-field docking lidar mount; current value is front-center, flush with the body front plane, `xyz=[0.36, 0.0, 0.290]`
 - `charge_contact_xyz/rpy`: charging contact center; current value is `xyz=[0.398, 0.0, 0.255]`, 3.8 cm ahead of `gs2_link` on the same centerline
-- current default lidar mount values are reused from `D:/codespace/car/ros2_ws/src/car_description`
+- current field-calibrated JT128/IMU mount is `xyz=[0.3686, 0.0, 0.85]`,
+  `rpy=[0.0, -0.257374941072, 3.070994091224]`; the yaw is equivalent to
+  `-3.212191215956 rad`
 
 ## Rules
 

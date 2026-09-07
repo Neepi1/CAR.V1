@@ -3,7 +3,9 @@
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <fstream>
 #include <map>
 #include <iostream>
@@ -319,6 +321,28 @@ bool wait_for_topic_publisher(const rclcpp::Node::SharedPtr & node, const std::s
   return false;
 }
 
+bool wait_for_topic_publisher_count(
+  const rclcpp::Node::SharedPtr & node,
+  const std::string & topic,
+  std::size_t expected_count,
+  double timeout_sec)
+{
+  const auto deadline = Clock::now() + std::chrono::duration<double>(timeout_sec);
+  while (rclcpp::ok() && Clock::now() < deadline) {
+    const auto actual_count = node->count_publishers(topic);
+    if (actual_count == expected_count) {
+      std::cerr << "[runtime-overlay] exact publisher count ready: " << topic
+                << " count=" << actual_count << "\n";
+      return true;
+    }
+    spin_slice(node);
+  }
+  std::cerr << "[runtime-overlay] timed out waiting for exact publisher count: " << topic
+            << " expected=" << expected_count
+            << " actual=" << node->count_publishers(topic) << "\n";
+  return false;
+}
+
 bool wait_for_publisher_from_node(const rclcpp::Node::SharedPtr & node, const std::string & topic,
                                   const std::string & node_name, double timeout_sec)
 {
@@ -336,6 +360,48 @@ bool wait_for_publisher_from_node(const rclcpp::Node::SharedPtr & node, const st
   }
   std::cerr << "[runtime-overlay] timed out waiting for publisher " << expected << " on " << topic
             << "\n";
+  return false;
+}
+
+bool wait_for_exact_publisher_owner(
+  const rclcpp::Node::SharedPtr & node,
+  const std::string & topic,
+  const std::string & node_name,
+  std::size_t expected_count,
+  double timeout_sec)
+{
+  const std::string expected = node_name.empty() || node_name.front() != '/' ? node_name :
+    node_name.substr(1);
+  const auto deadline = Clock::now() + std::chrono::duration<double>(timeout_sec);
+  while (rclcpp::ok() && Clock::now() < deadline) {
+    const auto publishers = node->get_publishers_info_by_topic(topic);
+    const auto owner_count = static_cast<std::size_t>(std::count_if(
+      publishers.begin(), publishers.end(), [&expected](const auto & info) {
+        return info.node_name() == expected;
+      }));
+    if (publishers.size() == expected_count && owner_count == expected_count) {
+      std::cerr << "[runtime-overlay] exact publisher owner ready: " << topic
+                << " owner=" << expected << " count=" << expected_count << "\n";
+      return true;
+    }
+    spin_slice(node);
+  }
+  std::cerr << "[runtime-overlay] timed out waiting for exact publisher owner: " << topic
+            << " owner=" << expected << " expected_count=" << expected_count;
+  const auto publishers = node->get_publishers_info_by_topic(topic);
+  std::cerr << " actual_count=" << publishers.size() << " actual_owners=[";
+  for (std::size_t index = 0; index < publishers.size(); ++index) {
+    if (index != 0U) {
+      std::cerr << ",";
+    }
+    const auto & publisher = publishers[index];
+    std::cerr << publisher.node_namespace();
+    if (publisher.node_namespace().empty() || publisher.node_namespace().back() != '/') {
+      std::cerr << "/";
+    }
+    std::cerr << publisher.node_name();
+  }
+  std::cerr << "]\n";
   return false;
 }
 
@@ -723,6 +789,496 @@ bool wait_for_fresh_tf(const rclcpp::Node::SharedPtr & node, const std::string &
   return false;
 }
 
+bool wait_for_stable_local_state(const rclcpp::Node::SharedPtr & node,
+                                 double timeout_sec,
+                                 int required_consecutive_good,
+                                 double odom_max_age_sec,
+                                 double odom_max_future_sec,
+                                 double tf_max_age_sec)
+{
+  constexpr const char * kOdomTopic = "/local_state/odometry";
+  constexpr const char * kTfTopic = "/tf";
+  constexpr const char * kOdomFrame = "odom";
+  constexpr const char * kBaseFrame = "base_link";
+
+  const auto deadline = Clock::now() + std::chrono::duration<double>(timeout_sec);
+  const int required_good = std::max(1, required_consecutive_good);
+  int consecutive_good = 0;
+  int accepted_samples = 0;
+  bool have_odom = false;
+  bool have_tf = false;
+  bool odom_valid = false;
+  bool tf_valid = false;
+  std::int64_t latest_odom_stamp_ns = 0;
+  std::int64_t latest_tf_stamp_ns = 0;
+  std::int64_t last_accepted_odom_stamp_ns = 0;
+  std::int64_t last_accepted_tf_stamp_ns = 0;
+  double last_odom_age = 0.0;
+  double last_tf_age = 0.0;
+  std::string last_error{"waiting for local_state observations"};
+
+  auto on_odom = [&](const nav_msgs::msg::Odometry::SharedPtr msg) {
+      const rclcpp::Time odom_stamp(msg->header.stamp);
+      const std::int64_t odom_stamp_ns = odom_stamp.nanoseconds();
+      if (have_odom && odom_stamp_ns <= latest_odom_stamp_ns) {
+        return;
+      }
+      have_odom = true;
+      latest_odom_stamp_ns = odom_stamp_ns;
+      last_odom_age = (node->get_clock()->now() - odom_stamp).seconds();
+
+      if (msg->header.frame_id != kOdomFrame || msg->child_frame_id != kBaseFrame) {
+        odom_valid = false;
+        consecutive_good = 0;
+        last_error = "local_state odometry frame contract mismatch";
+        return;
+      }
+      if (last_odom_age > odom_max_age_sec || last_odom_age < -odom_max_future_sec) {
+        odom_valid = false;
+        consecutive_good = 0;
+        last_error = "local_state odometry timestamp is stale or future-dated";
+        return;
+      }
+      odom_valid = true;
+    };
+
+  auto on_tf = [&](const tf2_msgs::msg::TFMessage::SharedPtr msg) {
+      for (const auto & transform : msg->transforms) {
+        if (transform.header.frame_id != kOdomFrame ||
+          transform.child_frame_id != kBaseFrame)
+        {
+          continue;
+        }
+        const rclcpp::Time tf_stamp(transform.header.stamp);
+        const std::int64_t tf_stamp_ns = tf_stamp.nanoseconds();
+        if (have_tf && tf_stamp_ns <= latest_tf_stamp_ns) {
+          continue;
+        }
+        have_tf = true;
+        latest_tf_stamp_ns = tf_stamp_ns;
+        last_tf_age = (node->get_clock()->now() - tf_stamp).seconds();
+        if (last_tf_age > tf_max_age_sec || last_tf_age < -odom_max_future_sec) {
+          tf_valid = false;
+          consecutive_good = 0;
+          last_error = "odom->base_link timestamp is stale or future-dated";
+          continue;
+        }
+        tf_valid = true;
+      }
+    };
+
+  const auto observation_qos = qos_profile(
+    RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT,
+    RMW_QOS_POLICY_DURABILITY_VOLATILE,
+    10);
+  auto odom_subscription =
+    node->create_subscription<nav_msgs::msg::Odometry>(
+    kOdomTopic, observation_qos, on_odom);
+  auto tf_subscription =
+    node->create_subscription<tf2_msgs::msg::TFMessage>(
+    kTfTopic, observation_qos, on_tf);
+  (void)odom_subscription;
+  (void)tf_subscription;
+
+  while (rclcpp::ok() && Clock::now() < deadline && consecutive_good < required_good) {
+    spin_slice(node);
+    const auto now = node->get_clock()->now();
+    if (have_odom) {
+      last_odom_age =
+        (now - rclcpp::Time(latest_odom_stamp_ns, node->get_clock()->get_clock_type())).seconds();
+      if (last_odom_age > odom_max_age_sec || last_odom_age < -odom_max_future_sec) {
+        odom_valid = false;
+        consecutive_good = 0;
+        last_error = "local_state odometry timestamp is stale or future-dated";
+      }
+    }
+    if (have_tf) {
+      last_tf_age =
+        (now - rclcpp::Time(latest_tf_stamp_ns, node->get_clock()->get_clock_type())).seconds();
+      if (last_tf_age > tf_max_age_sec || last_tf_age < -odom_max_future_sec) {
+        tf_valid = false;
+        consecutive_good = 0;
+        last_error = "odom->base_link timestamp is stale or future-dated";
+      }
+    }
+
+    if (!odom_valid || !tf_valid) {
+      continue;
+    }
+    if (latest_odom_stamp_ns <= last_accepted_odom_stamp_ns ||
+      latest_tf_stamp_ns <= last_accepted_tf_stamp_ns)
+    {
+      last_error = "waiting for both local_state timestamps to advance";
+      continue;
+    }
+
+    last_accepted_odom_stamp_ns = latest_odom_stamp_ns;
+    last_accepted_tf_stamp_ns = latest_tf_stamp_ns;
+    ++consecutive_good;
+    ++accepted_samples;
+    last_error.clear();
+  }
+
+  if (consecutive_good >= required_good) {
+    std::cerr << "[runtime-overlay] stable local_state ready: consecutive_good="
+              << consecutive_good << "/" << required_good
+              << " accepted_samples=" << accepted_samples
+              << " odom_age=" << last_odom_age << "s"
+              << " tf_age=" << last_tf_age << "s\n";
+    return true;
+  }
+
+  std::cerr << "[runtime-overlay] timed out waiting for stable local_state: consecutive_good="
+            << consecutive_good << "/" << required_good
+            << " accepted_samples=" << accepted_samples
+            << " have_odom=" << have_odom
+            << " have_tf=" << have_tf;
+  if (have_odom) {
+    std::cerr << " last_odom_age=" << last_odom_age << "s";
+  }
+  if (have_tf) {
+    std::cerr << " last_tf_age=" << last_tf_age << "s";
+  }
+  std::cerr << " last_error=" << (last_error.empty() ? "none" : last_error) << "\n";
+  return false;
+}
+
+bool wait_for_mapping_preflight(const rclcpp::Node::SharedPtr & node,
+                                const std::string & scan_topic,
+                                const std::string & scan_owner_node,
+                                const std::string & local_odom_topic,
+                                const std::string & reference_odom_topic,
+                                const std::string & local_state_mode,
+                                double tf_timeout_sec,
+                                double scan_timeout_sec,
+                                double odom_timeout_sec,
+                                double scan_max_age_sec,
+                                double odom_max_age_sec,
+                                double max_future_sec,
+                                double max_odom_diff_m)
+{
+  constexpr const char * kBaseFrame = "base_link";
+  constexpr const char * kLidarLevelFrame = "lidar_level_link";
+
+  const auto started_at = Clock::now();
+  const auto tf_deadline = started_at + std::chrono::duration<double>(std::max(0.1, tf_timeout_sec));
+  const auto scan_deadline =
+    started_at + std::chrono::duration<double>(std::max(0.1, scan_timeout_sec));
+  const auto odom_deadline =
+    started_at + std::chrono::duration<double>(std::max(0.1, odom_timeout_sec));
+
+  auto tf_buffer = std::make_shared<tf2_ros::Buffer>(node->get_clock());
+  auto tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer, node, false);
+  (void)tf_listener;
+
+  bool scan_received = false;
+  bool local_odom_received = false;
+  bool reference_odom_received = false;
+  std::int64_t latest_scan_stamp_ns = 0;
+  std::int64_t latest_local_odom_stamp_ns = 0;
+  double local_x = 0.0;
+  double local_y = 0.0;
+  double reference_x = 0.0;
+  double reference_y = 0.0;
+
+  const auto observation_qos = qos_profile(
+    RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT,
+    RMW_QOS_POLICY_DURABILITY_VOLATILE,
+    10);
+  auto scan_subscription = node->create_subscription<sensor_msgs::msg::LaserScan>(
+    scan_topic, observation_qos,
+    [&](const sensor_msgs::msg::LaserScan::SharedPtr msg) {
+      scan_received = true;
+      latest_scan_stamp_ns = rclcpp::Time(msg->header.stamp).nanoseconds();
+    });
+  auto local_odom_subscription = node->create_subscription<nav_msgs::msg::Odometry>(
+    local_odom_topic, observation_qos,
+    [&](const nav_msgs::msg::Odometry::SharedPtr msg) {
+      local_odom_received = true;
+      latest_local_odom_stamp_ns = rclcpp::Time(msg->header.stamp).nanoseconds();
+      local_x = msg->pose.pose.position.x;
+      local_y = msg->pose.pose.position.y;
+    });
+  auto reference_odom_subscription = node->create_subscription<nav_msgs::msg::Odometry>(
+    reference_odom_topic, observation_qos,
+    [&](const nav_msgs::msg::Odometry::SharedPtr msg) {
+      reference_odom_received = true;
+      reference_x = msg->pose.pose.position.x;
+      reference_y = msg->pose.pose.position.y;
+    });
+  (void)scan_subscription;
+  (void)local_odom_subscription;
+  (void)reference_odom_subscription;
+
+  bool tf_ready = false;
+  bool scan_owner_ready = false;
+  bool scan_fresh = false;
+  bool local_state_endpoint_ready = false;
+  bool local_odom_fresh = false;
+  bool reference_odom_publisher_ready = false;
+  double scan_age_sec = 0.0;
+  double local_odom_age_sec = 0.0;
+  double odom_diff_m = 0.0;
+  const bool require_fastlio_subscription = local_state_mode == "fastlio";
+
+  while (rclcpp::ok()) {
+    spin_slice(node);
+    const auto steady_now = Clock::now();
+    const auto ros_now = node->get_clock()->now();
+
+    if (!tf_ready) {
+      try {
+        tf_buffer->lookupTransform(kBaseFrame, kLidarLevelFrame, tf2::TimePointZero);
+        tf_ready = true;
+      } catch (const tf2::TransformException &) {
+        tf_ready = false;
+      }
+    }
+
+    scan_owner_ready = false;
+    for (const auto & info : node->get_publishers_info_by_topic(scan_topic)) {
+      if (node_name_matches(info.node_name(), scan_owner_node)) {
+        scan_owner_ready = true;
+        break;
+      }
+    }
+
+    bool has_local_state_node = false;
+    for (const auto & name : node->get_node_names()) {
+      if (node_name_matches(name, "/robot_local_state")) {
+        has_local_state_node = true;
+        break;
+      }
+    }
+    bool has_local_state_odom_publisher = false;
+    for (const auto & info : node->get_publishers_info_by_topic(local_odom_topic)) {
+      if (info.node_name() == "robot_local_state") {
+        has_local_state_odom_publisher = true;
+        break;
+      }
+    }
+    bool has_fastlio_subscription = false;
+    if (require_fastlio_subscription) {
+      for (const auto & info : node->get_subscriptions_info_by_topic("/fastlio/base_odometry")) {
+        if (info.node_name() == "robot_local_state") {
+          has_fastlio_subscription = true;
+          break;
+        }
+      }
+    }
+    local_state_endpoint_ready = has_local_state_node && has_local_state_odom_publisher &&
+      (!require_fastlio_subscription || has_fastlio_subscription);
+    reference_odom_publisher_ready = node->count_publishers(reference_odom_topic) > 0;
+
+    if (scan_received) {
+      scan_age_sec =
+        (ros_now - rclcpp::Time(latest_scan_stamp_ns, node->get_clock()->get_clock_type())).seconds();
+      scan_fresh = std::isfinite(scan_age_sec) && scan_age_sec <= scan_max_age_sec &&
+        scan_age_sec >= -max_future_sec;
+    }
+    if (local_odom_received) {
+      local_odom_age_sec =
+        (ros_now - rclcpp::Time(
+          latest_local_odom_stamp_ns, node->get_clock()->get_clock_type())).seconds();
+      local_odom_fresh = std::isfinite(local_odom_age_sec) &&
+        local_odom_age_sec <= odom_max_age_sec && local_odom_age_sec >= -max_future_sec;
+    }
+
+    if (local_odom_received && reference_odom_received) {
+      if (!std::isfinite(local_x) || !std::isfinite(local_y) ||
+        !std::isfinite(reference_x) || !std::isfinite(reference_y))
+      {
+        std::cerr << "[runtime-overlay] mapping preflight failed: non-finite odometry pose"
+                  << " local_topic=" << local_odom_topic
+                  << " reference_topic=" << reference_odom_topic << "\n";
+        return false;
+      }
+      odom_diff_m = std::hypot(local_x - reference_x, local_y - reference_y);
+      if (odom_diff_m > max_odom_diff_m) {
+        std::cerr << "[runtime-overlay] mapping preflight failed: local odometry differs from "
+                  << "reference by " << odom_diff_m << "m, max=" << max_odom_diff_m << "m"
+                  << " local_topic=" << local_odom_topic
+                  << " reference_topic=" << reference_odom_topic << "\n";
+        return false;
+      }
+    }
+
+    const bool odom_sane = local_odom_received && reference_odom_received &&
+      odom_diff_m <= max_odom_diff_m;
+    if (tf_ready && scan_owner_ready && scan_fresh && local_state_endpoint_ready &&
+      local_odom_fresh && reference_odom_publisher_ready && odom_sane)
+    {
+      std::cerr << "[runtime-overlay] mapping preflight ready: tf=" << kBaseFrame << "->"
+                << kLidarLevelFrame << " scan_topic=" << scan_topic
+                << " scan_owner=" << scan_owner_node << " scan_age=" << scan_age_sec << "s"
+                << " local_odom_topic=" << local_odom_topic
+                << " local_odom_age=" << local_odom_age_sec << "s"
+                << " reference_odom_topic=" << reference_odom_topic
+                << " odom_diff=" << odom_diff_m << "m\n";
+      return true;
+    }
+
+    const bool tf_timed_out = steady_now >= tf_deadline && !tf_ready;
+    const bool scan_timed_out = steady_now >= scan_deadline &&
+      (!scan_owner_ready || !scan_fresh);
+    const bool odom_timed_out = steady_now >= odom_deadline &&
+      (!local_state_endpoint_ready || !local_odom_fresh ||
+      !reference_odom_publisher_ready || !odom_sane);
+    if (tf_timed_out || scan_timed_out || odom_timed_out) {
+      std::cerr << "[runtime-overlay] mapping preflight not ready:"
+                << " tf_ready=" << tf_ready
+                << " scan_owner_ready=" << scan_owner_ready
+                << " scan_received=" << scan_received
+                << " scan_fresh=" << scan_fresh
+                << " local_state_endpoint_ready=" << local_state_endpoint_ready
+                << " local_odom_received=" << local_odom_received
+                << " local_odom_fresh=" << local_odom_fresh
+                << " reference_publisher_ready=" << reference_odom_publisher_ready
+                << " reference_odom_received=" << reference_odom_received;
+      if (scan_received) {
+        std::cerr << " scan_age=" << scan_age_sec << "s";
+      }
+      if (local_odom_received) {
+        std::cerr << " local_odom_age=" << local_odom_age_sec << "s";
+      }
+      if (local_odom_received && reference_odom_received) {
+        std::cerr << " odom_diff=" << odom_diff_m << "m";
+      }
+      std::cerr << "\n";
+      return false;
+    }
+  }
+
+  std::cerr << "[runtime-overlay] mapping preflight interrupted before readiness\n";
+  return false;
+}
+
+bool wait_for_stamped_scan_tf(const rclcpp::Node::SharedPtr & node,
+                              const std::string & scan_topic,
+                              const std::string & tf_topic,
+                              const std::string & target_frame,
+                              double timeout_sec,
+                              int required_consecutive_good)
+{
+  struct ScanObservation
+  {
+    std::int64_t stamp_ns;
+    std::string frame_id;
+  };
+
+  const int required_good = std::max(1, required_consecutive_good);
+  constexpr std::size_t kMaximumObservations = 64;
+  const auto deadline = Clock::now() + std::chrono::duration<double>(
+    std::max(0.1, timeout_sec));
+  auto tf_buffer = std::make_shared<tf2_ros::Buffer>(node->get_clock());
+  std::deque<ScanObservation> observations;
+  std::uint64_t scan_count = 0;
+  std::uint64_t dynamic_tf_count = 0;
+  std::uint64_t static_tf_count = 0;
+  int best_consecutive_good = 0;
+  std::string last_scan_frame;
+  std::string last_error{"waiting for scan and TF observations"};
+
+  const auto scan_qos = qos_profile(
+    RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT,
+    RMW_QOS_POLICY_DURABILITY_VOLATILE,
+    10);
+  const auto dynamic_tf_qos = qos_profile(
+    RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT,
+    RMW_QOS_POLICY_DURABILITY_VOLATILE,
+    100);
+  const auto static_tf_qos = qos_profile(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL,
+    10);
+
+  auto on_tf = [&](const tf2_msgs::msg::TFMessage::SharedPtr msg, const bool is_static) {
+      for (const auto & transform : msg->transforms) {
+        try {
+          if (tf_buffer->setTransform(transform, "stamped_scan_tf_probe", is_static)) {
+            if (is_static) {
+              ++static_tf_count;
+            } else {
+              ++dynamic_tf_count;
+            }
+          }
+        } catch (const tf2::TransformException & exc) {
+          last_error = exc.what();
+        }
+      }
+    };
+
+  auto scan_subscription = node->create_subscription<sensor_msgs::msg::LaserScan>(
+    scan_topic, scan_qos,
+    [&](const sensor_msgs::msg::LaserScan::SharedPtr msg) {
+      ++scan_count;
+      last_scan_frame = msg->header.frame_id;
+      const auto stamp_ns = rclcpp::Time(msg->header.stamp).nanoseconds();
+      if (msg->header.frame_id.empty() || stamp_ns <= 0) {
+        last_error = "scan header has an empty frame or zero timestamp";
+        return;
+      }
+      observations.push_back(ScanObservation{stamp_ns, msg->header.frame_id});
+      while (observations.size() > kMaximumObservations) {
+        observations.pop_front();
+      }
+    });
+  auto dynamic_tf_subscription = node->create_subscription<tf2_msgs::msg::TFMessage>(
+    tf_topic, dynamic_tf_qos,
+    [&](const tf2_msgs::msg::TFMessage::SharedPtr msg) {on_tf(msg, false);});
+  auto static_tf_subscription = node->create_subscription<tf2_msgs::msg::TFMessage>(
+    "/tf_static", static_tf_qos,
+    [&](const tf2_msgs::msg::TFMessage::SharedPtr msg) {on_tf(msg, true);});
+  (void)scan_subscription;
+  (void)dynamic_tf_subscription;
+  (void)static_tf_subscription;
+
+  while (rclcpp::ok() && Clock::now() < deadline) {
+    spin_slice(node);
+    int consecutive_good = 0;
+    for (const auto & observation : observations) {
+      std::string transform_error;
+      const tf2::TimePoint stamp{
+        std::chrono::nanoseconds(observation.stamp_ns)};
+      const bool transformable = static_cast<const tf2::BufferCore &>(*tf_buffer).canTransform(
+        target_frame, observation.frame_id, stamp, &transform_error);
+      if (transformable) {
+        ++consecutive_good;
+        best_consecutive_good = std::max(best_consecutive_good, consecutive_good);
+        if (consecutive_good >= required_good) {
+          std::cerr << "[runtime-overlay] original-stamp scan TF ready: consecutive_good="
+                    << consecutive_good << "/" << required_good
+                    << " scan_topic=" << scan_topic
+                    << " tf_topic=" << tf_topic
+                    << " target_frame=" << target_frame
+                    << " scan_frame=" << observation.frame_id
+                    << " scans_seen=" << scan_count
+                    << " dynamic_tf_seen=" << dynamic_tf_count
+                    << " static_tf_seen=" << static_tf_count << "\n";
+          return true;
+        }
+      } else {
+        consecutive_good = 0;
+        if (!transform_error.empty()) {
+          last_error = transform_error;
+        }
+      }
+    }
+  }
+
+  std::cerr << "[runtime-overlay] original-stamp scan TF not ready: consecutive_good="
+            << best_consecutive_good << "/" << required_good
+            << " scan_topic=" << scan_topic
+            << " tf_topic=" << tf_topic
+            << " target_frame=" << target_frame
+            << " last_scan_frame=" << (last_scan_frame.empty() ? "none" : last_scan_frame)
+            << " scans_seen=" << scan_count
+            << " dynamic_tf_seen=" << dynamic_tf_count
+            << " static_tf_seen=" << static_tf_count
+            << " last_error=" << last_error << "\n";
+  return false;
+}
+
 bool wait_for_transformable_scan(const rclcpp::Node::SharedPtr & node,
                                  double timeout_sec, int required_good)
 {
@@ -1088,13 +1644,23 @@ void print_usage()
     << "  service <service_name> <timeout_sec>\n"
     << "  node <absolute_node_name> <timeout_sec>\n"
     << "  topic-publisher <topic> <timeout_sec>\n"
+    << "  publisher-count <topic> <expected_count> <timeout_sec>\n"
     << "  publisher-from-node <topic> <node_name> <timeout_sec>\n"
+    << "  exact-publisher-owner <topic> <node_name> <expected_count> <timeout_sec>\n"
     << "  topic <topic> <timeout_sec>\n"
     << "  fresh-header-topic <topic> <timeout_sec> <max_age_sec> <max_future_sec>\n"
     << "  ranger-chassis <timeout_sec> <odom_max_age_sec> <odom_max_future_sec>\n"
     << "  imu-bias-filter <corrected_imu_topic> <bias_topic> <timeout_sec>\n"
     << "  tf <target_frame> <source_frame> <timeout_sec>\n"
     << "  fresh-tf <target_frame> <source_frame> <timeout_sec> <max_age_sec>\n"
+    << "  stable-local-state <timeout_sec> <required_consecutive_good> "
+       "<odom_max_age_sec> <odom_max_future_sec> <tf_max_age_sec>\n"
+    << "  mapping-preflight <scan_topic> <scan_owner_node> <local_odom_topic> "
+       "<reference_odom_topic> <local_state_mode> <tf_timeout_sec> <scan_timeout_sec> "
+       "<odom_timeout_sec> <scan_max_age_sec> <odom_max_age_sec> <max_future_sec> "
+       "<max_odom_diff_m>\n"
+    << "  stamped-scan-tf <scan_topic> <tf_topic> <target_frame> <timeout_sec> "
+       "<required_consecutive_good>\n"
     << "  transformable-scan <timeout_sec> <required_good>\n"
     << "  local-state-endpoint <timeout_sec> <mode>\n"
     << "  lifecycle-active <node_name> <timeout_sec>\n"
@@ -1126,9 +1692,19 @@ int main(int argc, char ** argv)
       ok = wait_for_node(node, argv[2], parse_double(argv[3], "timeout_sec"));
     } else if (command == "topic-publisher" && argc == 4) {
       ok = wait_for_topic_publisher(node, argv[2], parse_double(argv[3], "timeout_sec"));
+    } else if (command == "publisher-count" && argc == 5) {
+      ok = wait_for_topic_publisher_count(
+        node, argv[2],
+        static_cast<std::size_t>(std::max(0, parse_int(argv[3], "expected_count"))),
+        parse_double(argv[4], "timeout_sec"));
     } else if (command == "publisher-from-node" && argc == 5) {
       ok = wait_for_publisher_from_node(node, argv[2], argv[3], parse_double(argv[4],
         "timeout_sec"));
+    } else if (command == "exact-publisher-owner" && argc == 6) {
+      ok = wait_for_exact_publisher_owner(
+        node, argv[2], argv[3],
+        static_cast<std::size_t>(std::max(0, parse_int(argv[4], "expected_count"))),
+        parse_double(argv[5], "timeout_sec"));
     } else if (command == "topic" && argc == 4) {
       ok = wait_for_topic_message(node, argv[2], parse_double(argv[3], "timeout_sec"));
     } else if (command == "fresh-header-topic" && argc == 6) {
@@ -1149,6 +1725,37 @@ int main(int argc, char ** argv)
       ok = wait_for_fresh_tf(
         node, argv[2], argv[3], parse_double(argv[4], "timeout_sec"),
         parse_double(argv[5], "max_age_sec"));
+    } else if (command == "stable-local-state" && argc == 7) {
+      ok = wait_for_stable_local_state(
+        node,
+        parse_double(argv[2], "timeout_sec"),
+        std::max(1, parse_int(argv[3], "required_consecutive_good")),
+        parse_double(argv[4], "odom_max_age_sec"),
+        parse_double(argv[5], "odom_max_future_sec"),
+        parse_double(argv[6], "tf_max_age_sec"));
+    } else if (command == "mapping-preflight" && argc == 14) {
+      std::string mode = argv[6];
+      std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
+          return static_cast<char>(std::tolower(c));
+        });
+      ok = wait_for_mapping_preflight(
+        node,
+        argv[2],
+        argv[3],
+        argv[4],
+        argv[5],
+        mode,
+        parse_double(argv[7], "tf_timeout_sec"),
+        parse_double(argv[8], "scan_timeout_sec"),
+        parse_double(argv[9], "odom_timeout_sec"),
+        parse_double(argv[10], "scan_max_age_sec"),
+        parse_double(argv[11], "odom_max_age_sec"),
+        parse_double(argv[12], "max_future_sec"),
+        parse_double(argv[13], "max_odom_diff_m"));
+    } else if (command == "stamped-scan-tf" && argc == 7) {
+      ok = wait_for_stamped_scan_tf(
+        node, argv[2], argv[3], argv[4], parse_double(argv[5], "timeout_sec"),
+        std::max(1, parse_int(argv[6], "required_consecutive_good")));
     } else if (command == "transformable-scan" && argc == 4) {
       ok = wait_for_transformable_scan(
         node, parse_double(argv[2], "timeout_sec"), std::max(1, parse_int(argv[3],

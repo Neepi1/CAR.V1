@@ -42,7 +42,8 @@ constexpr std::uintmax_t kMaximumReleaseFileBytes = 2U * 1024U * 1024U;
 constexpr std::size_t kMaximumElevators = 16U;
 constexpr std::size_t kMaximumFloorsPerElevator = 64U;
 constexpr std::size_t kMaximumFloorBindings = 128U;
-constexpr std::size_t kRoleCount = 5U;
+constexpr std::size_t kLegacyRoleCount = 5U;
+constexpr std::size_t kMaximumRoleCount = kLegacyRoleCount;
 
 class LoadFailure : public std::runtime_error
 {
@@ -152,8 +153,10 @@ struct ConfigFloor
   std::string map_id;
   std::uint64_t map_asset_epoch{0U};
   std::string map_asset_digest;
-  DoorThreshold threshold;
+  std::optional<DoorThreshold> threshold;
   std::map<PoseRole, ConfigPose> poses;
+  PanelSide hall_call_panel_side{PanelSide::kUnknown};
+  PanelSide cabin_panel_side{PanelSide::kUnknown};
 };
 
 struct ConfigElevator
@@ -164,6 +167,7 @@ struct ConfigElevator
 
 struct ParsedConfiguration
 {
+  std::uint32_t schema_version{0U};
   std::string building_id;
   std::map<std::string, ConfigElevator> elevators;
   std::map<
@@ -186,10 +190,17 @@ struct InternalPose
 using InternalPoseKey =
   std::tuple<std::string, std::string, std::string, PoseRole>;
 
+struct ParsedInternalPoses
+{
+  std::uint32_t schema_version{0U};
+  std::map<InternalPoseKey, InternalPose> poses;
+};
+
 struct VerifiedMetadata
 {
   std::uint64_t generation{0U};
   std::string configuration_digest;
+  std::optional<std::uint32_t> source_draft_schema_version;
 };
 
 ElevatorReleaseLoadResult failed(
@@ -266,10 +277,23 @@ std::uint64_t release_generation(const std::string & value)
   return converted.ec == std::errc{} ? generation : 0U;
 }
 
+std::uint32_t draft_revision_schema_version(const std::string & value)
+{
+  std::uint32_t schema_version = 0U;
+  if (value.rfind("draft-v1-", 0U) == 0U) {
+    schema_version = 1U;
+  } else if (value.rfind("draft-v2-", 0U) == 0U) {
+    schema_version = 2U;
+  } else if (value.rfind("draft-v3-", 0U) == 0U) {
+    schema_version = 3U;
+  }
+  return schema_version != 0U && lower_hex(value.substr(9U), 16U) ?
+         schema_version : 0U;
+}
+
 bool valid_draft_revision(const std::string & value)
 {
-  return value.rfind("draft-v1-", 0U) == 0U &&
-         lower_hex(value.substr(9U), 16U);
+  return draft_revision_schema_version(value) != 0U;
 }
 
 std::uint64_t fnv1a64(const std::string & value)
@@ -426,21 +450,41 @@ int schema_version(
   return 1;
 }
 
-std::optional<PoseRole> parse_role(const std::string & role)
+std::uint32_t content_schema_version(
+  const YAML::Node & root,
+  const std::string & field,
+  const ElevatorReleaseLoadError error)
+{
+  const auto value = node_uint(root["schema_version"], field, error);
+  if (value != 1U && value != 2U && value != 3U) {
+    throw LoadFailure(error, field + " must be 1, 2, or 3");
+  }
+  return static_cast<std::uint32_t>(value);
+}
+
+std::optional<PoseRole> parse_role(
+  const std::string & role,
+  const std::uint32_t schema_version)
 {
   if (role == "hall_call") {
     return PoseRole::kHallCall;
   }
-  if (role == "hall_wait") {
+  if ((schema_version == 2U || schema_version == 3U) && role == "landing") {
+    return PoseRole::kLanding;
+  }
+  if (schema_version == 1U && role == "hall_wait") {
     return PoseRole::kHallWait;
   }
-  if (role == "doorway") {
+  if (schema_version == 1U && role == "doorway") {
     return PoseRole::kDoorway;
   }
   if (role == "cabin") {
     return PoseRole::kCabin;
   }
-  if (role == "exit") {
+  if (schema_version == 3U && role == "cabin_panel") {
+    return PoseRole::kCabinPanel;
+  }
+  if (schema_version == 1U && role == "exit") {
     return PoseRole::kExit;
   }
   return std::nullopt;
@@ -468,24 +512,38 @@ DoorThreshold parse_threshold(
   if (!node || !node.IsMap()) {
     throw LoadFailure(error, field + " must be a map");
   }
+  const double clearance = node["clearance_m"] ?
+    node_finite_double(node["clearance_m"], field + ".clearance_m", error) :
+    0.05;
+  const double jamb_clearance = node["jamb_clearance_m"] ?
+    node_finite_double(
+    node["jamb_clearance_m"], field + ".jamb_clearance_m", error) :
+    0.05;
   return DoorThreshold{
     parse_point(node["left"], field + ".left", error),
     parse_point(node["right"], field + ".right", error),
     parse_point(node["cabin_reference"], field + ".cabin_reference", error),
-    node_finite_double(node["clearance_m"], field + ".clearance_m", error),
-    node_finite_double(
-      node["jamb_clearance_m"], field + ".jamb_clearance_m", error),
+    clearance,
+    jamb_clearance,
   };
 }
 
-bool same_threshold(const DoorThreshold & left, const DoorThreshold & right)
+bool same_threshold(
+  const std::optional<DoorThreshold> & left,
+  const std::optional<DoorThreshold> & right)
 {
-  return left.left.x == right.left.x && left.left.y == right.left.y &&
-         left.right.x == right.right.x && left.right.y == right.right.y &&
-         left.cabin_reference.x == right.cabin_reference.x &&
-         left.cabin_reference.y == right.cabin_reference.y &&
-         left.clearance_m == right.clearance_m &&
-         left.jamb_clearance_m == right.jamb_clearance_m;
+  if (left.has_value() != right.has_value()) {
+    return false;
+  }
+  if (!left) {
+    return true;
+  }
+  return left->left.x == right->left.x && left->left.y == right->left.y &&
+         left->right.x == right->right.x && left->right.y == right->right.y &&
+         left->cabin_reference.x == right->cabin_reference.x &&
+         left->cabin_reference.y == right->cabin_reference.y &&
+         left->clearance_m == right->clearance_m &&
+         left->jamb_clearance_m == right->jamb_clearance_m;
 }
 
 double normalized_publisher_yaw(double yaw)
@@ -1479,7 +1537,14 @@ VerifiedMetadata verify_metadata(
             ElevatorReleaseLoadError::kInvalidContent,
             "release content FNV identity is invalid");
   }
-  return VerifiedMetadata{manifest_generation, recorded_digest};
+  return VerifiedMetadata{
+    manifest_generation,
+    recorded_digest,
+    source_draft ?
+    std::optional<std::uint32_t>{
+      draft_revision_schema_version(*source_draft)} :
+    std::nullopt,
+  };
 }
 
 ConfigPose parse_config_pose(
@@ -1504,6 +1569,22 @@ ConfigPose parse_config_pose(
   };
 }
 
+PanelSide parse_panel_side(
+  const YAML::Node & node,
+  const std::string & field)
+{
+  const auto parsed = panel_side_from_string(
+    node_string(
+      node, field,
+      ElevatorReleaseLoadError::kInvalidConfiguration));
+  if (!parsed.has_value()) {
+    throw LoadFailure(
+            ElevatorReleaseLoadError::kInvalidConfiguration,
+            field + " must be LEFT or RIGHT");
+  }
+  return *parsed;
+}
+
 ParsedConfiguration parse_configuration(
   const std::string & text,
   const std::string & expected_building)
@@ -1511,10 +1592,10 @@ ParsedConfiguration parse_configuration(
   const auto root = parse_document(
     text, "configuration.yaml",
     ElevatorReleaseLoadError::kInvalidConfiguration);
-  schema_version(
+  ParsedConfiguration result;
+  result.schema_version = content_schema_version(
     root, "configuration.schema_version",
     ElevatorReleaseLoadError::kInvalidConfiguration);
-  ParsedConfiguration result;
   result.building_id = node_string(
     root["building_id"], "configuration.building_id",
     ElevatorReleaseLoadError::kInvalidConfiguration);
@@ -1598,9 +1679,24 @@ ParsedConfiguration parse_configuration(
                 ElevatorReleaseLoadError::kInvalidConfiguration,
                 "configuration floor identity or SHA-256 binding is invalid");
       }
-      floor.threshold = parse_threshold(
-        floor_node["threshold"], "configuration.threshold",
-        ElevatorReleaseLoadError::kInvalidConfiguration);
+      if (result.schema_version == 3U) {
+        floor.hall_call_panel_side = parse_panel_side(
+          floor_node["hall_call_panel_side"],
+          "configuration.hall_call_panel_side");
+        floor.cabin_panel_side = parse_panel_side(
+          floor_node["cabin_panel_side"],
+          "configuration.cabin_panel_side");
+      }
+      const auto threshold = floor_node["threshold"];
+      if (result.schema_version == 1U) {
+        floor.threshold = parse_threshold(
+          threshold, "configuration.threshold",
+          ElevatorReleaseLoadError::kInvalidConfiguration);
+      } else if (threshold) {
+        throw LoadFailure(
+                ElevatorReleaseLoadError::kInvalidConfiguration,
+                "configuration schema v2+ forbids legacy threshold geometry");
+      }
       const auto poses = floor_node["poses"];
       if (!poses || !poses.IsMap()) {
         throw LoadFailure(
@@ -1611,7 +1707,7 @@ ParsedConfiguration parse_configuration(
         const auto role_name = node_string(
           entry.first, "configuration.pose.role",
           ElevatorReleaseLoadError::kInvalidConfiguration);
-        const auto role = parse_role(role_name);
+        const auto role = parse_role(role_name, result.schema_version);
         if (!role ||
           !floor.poses.emplace(
             *role,
@@ -1623,10 +1719,10 @@ ParsedConfiguration parse_configuration(
                   "configuration pose role is unknown or duplicated");
         }
       }
-      if (floor.poses.size() != kRoleCount) {
+      if (floor.poses.size() != required_pose_roles(result.schema_version).size()) {
         throw LoadFailure(
                 ElevatorReleaseLoadError::kInvalidConfiguration,
-                "configuration must contain all five pose roles");
+                "configuration must contain every pose role required by its schema");
       }
 
       const auto binding_key =
@@ -1756,6 +1852,11 @@ void cross_check_configuration_and_topology(
             "configuration and topology elevator sets disagree");
   }
   for (const auto & topology_elevator : topology.elevators) {
+    if (topology_elevator.schema_version != configuration.schema_version) {
+      throw LoadFailure(
+              ElevatorReleaseLoadError::kInvalidTopology,
+              "configuration and topology schema versions disagree");
+    }
     const auto configured =
       configuration.elevators.find(topology_elevator.elevator_id);
     if (configured == configuration.elevators.end() ||
@@ -1769,7 +1870,10 @@ void cross_check_configuration_and_topology(
       const auto floor = configured->second.floors.find(topology_floor.floor_id);
       if (floor == configured->second.floors.end() ||
         floor->second.map_id != topology_floor.map_id ||
-        !same_threshold(floor->second.threshold, topology_floor.threshold))
+        !same_threshold(floor->second.threshold, topology_floor.threshold) ||
+        floor->second.hall_call_panel_side !=
+        topology_floor.hall_call_panel_side ||
+        floor->second.cabin_panel_side != topology_floor.cabin_panel_side)
       {
         throw LoadFailure(
                 ElevatorReleaseLoadError::kInvalidTopology,
@@ -1779,14 +1883,15 @@ void cross_check_configuration_and_topology(
   }
 }
 
-std::map<InternalPoseKey, InternalPose> parse_internal_poses(
+ParsedInternalPoses parse_internal_poses(
   const std::string & text,
   const std::string & expected_building)
 {
   const auto root = parse_document(
     text, "elevator_internal_poses.yaml",
     ElevatorReleaseLoadError::kInvalidInternalPoses);
-  schema_version(
+  ParsedInternalPoses result;
+  result.schema_version = content_schema_version(
     root, "internal_poses.schema_version",
     ElevatorReleaseLoadError::kInvalidInternalPoses);
   const auto building = node_string(
@@ -1800,14 +1905,13 @@ std::map<InternalPoseKey, InternalPose> parse_internal_poses(
   const auto poses = root["poses"];
   if (!poses || !poses.IsSequence() ||
     poses.size() == 0U ||
-    poses.size() > kMaximumFloorBindings * kRoleCount)
+    poses.size() > kMaximumFloorBindings * kMaximumRoleCount)
   {
     throw LoadFailure(
             ElevatorReleaseLoadError::kInvalidInternalPoses,
             "internal pose count is invalid");
   }
 
-  std::map<InternalPoseKey, InternalPose> result;
   std::set<std::string> pose_ids;
   for (const auto & node : poses) {
     if (!node.IsMap()) {
@@ -1831,7 +1935,7 @@ std::map<InternalPoseKey, InternalPose> parse_internal_poses(
     const auto role_name = node_string(
       node["role"], "internal_pose.role",
       ElevatorReleaseLoadError::kInvalidInternalPoses);
-    const auto role = parse_role(role_name);
+    const auto role = parse_role(role_name, result.schema_version);
     if (!role ||
       node_string(
         node["type"], "internal_pose.type",
@@ -1858,7 +1962,7 @@ std::map<InternalPoseKey, InternalPose> parse_internal_poses(
     const InternalPoseKey key{
       pose.elevator_id, pose.floor_id, pose.map_id, pose.role};
     if (!pose_ids.insert(pose.pose_id).second ||
-      !result.emplace(key, pose).second)
+      !result.poses.emplace(key, pose).second)
     {
       throw LoadFailure(
               ElevatorReleaseLoadError::kInvalidInternalPoses,
@@ -1871,8 +1975,13 @@ std::map<InternalPoseKey, InternalPose> parse_internal_poses(
 void cross_check_internal_poses(
   const ParsedConfiguration & configuration,
   const ElevatorTopologyCatalog & topology,
-  const std::map<InternalPoseKey, InternalPose> & internal_poses)
+  const ParsedInternalPoses & internal_poses)
 {
+  if (internal_poses.schema_version != configuration.schema_version) {
+    throw LoadFailure(
+            ElevatorReleaseLoadError::kInvalidInternalPoses,
+            "configuration and internal pose schema versions disagree");
+  }
   std::size_t expected_count = 0U;
   for (const auto & elevator : topology.elevators) {
     const auto configured_elevator =
@@ -1880,16 +1989,16 @@ void cross_check_internal_poses(
     for (const auto & floor : elevator.floors) {
       const auto configured_floor =
         configured_elevator->second.floors.find(floor.floor_id);
-      for (const auto role : required_pose_roles()) {
+      for (const auto role : required_pose_roles(configuration.schema_version)) {
         ++expected_count;
         const auto topology_pose_id = find_pose_id(floor, role);
         const auto configured_pose = configured_floor->second.poses.find(role);
         const InternalPoseKey key{
           elevator.elevator_id, floor.floor_id, floor.map_id, role};
-        const auto internal = internal_poses.find(key);
+        const auto internal = internal_poses.poses.find(key);
         if (!topology_pose_id ||
           configured_pose == configured_floor->second.poses.end() ||
-          internal == internal_poses.end() ||
+          internal == internal_poses.poses.end() ||
           internal->second.pose_id != *topology_pose_id ||
           internal->second.x != configured_pose->second.x ||
           internal->second.y != configured_pose->second.y ||
@@ -1903,7 +2012,7 @@ void cross_check_internal_poses(
       }
     }
   }
-  if (internal_poses.size() != expected_count) {
+  if (internal_poses.poses.size() != expected_count) {
     throw LoadFailure(
             ElevatorReleaseLoadError::kInvalidInternalPoses,
             "internal pose catalog contains missing or extra records");
@@ -1956,31 +2065,34 @@ ElevatorRuntimeFloor make_runtime_floor(
   const std::string & elevator_id,
   const FloorElevatorTopology & topology_floor,
   const ConfigFloor & configured_floor,
-  const std::map<InternalPoseKey, InternalPose> & internal_poses)
+  const ParsedInternalPoses & internal_poses,
+  const std::uint32_t schema_version)
 {
   ElevatorRuntimeFloor floor;
   floor.floor_id = topology_floor.floor_id;
   floor.map_id = topology_floor.map_id;
   floor.map_asset_epoch = configured_floor.map_asset_epoch;
   floor.map_asset_digest = configured_floor.map_asset_digest;
-  floor.threshold = topology_floor.threshold;
-  const auto & roles = required_pose_roles();
-  for (std::size_t index = 0U; index < roles.size(); ++index) {
+  floor.hall_call_panel_side = topology_floor.hall_call_panel_side;
+  floor.cabin_panel_side = topology_floor.cabin_panel_side;
+  const auto & roles = required_pose_roles(schema_version);
+  floor.poses.reserve(roles.size());
+  for (const auto role : roles) {
     const InternalPoseKey key{
-      elevator_id, floor.floor_id, floor.map_id, roles[index]};
-    const auto pose = internal_poses.find(key);
-    if (pose == internal_poses.end()) {
+      elevator_id, floor.floor_id, floor.map_id, role};
+    const auto pose = internal_poses.poses.find(key);
+    if (pose == internal_poses.poses.end()) {
       throw LoadFailure(
               ElevatorReleaseLoadError::kInvalidInternalPoses,
               "selected runtime route has no internal pose");
     }
-    floor.poses[index] = ElevatorRuntimePose{
+    floor.poses.push_back(ElevatorRuntimePose{
       pose->second.role,
       pose->second.pose_id,
       pose->second.x,
       pose->second.y,
       pose->second.yaw,
-    };
+    });
   }
   return floor;
 }
@@ -2001,6 +2113,7 @@ ElevatorReleaseLoadResult load_elevator_release(
       !safe_asset_id(request.source_map_id) ||
       !safe_asset_id(request.target_floor_id) ||
       !safe_asset_id(request.target_map_id) ||
+      request.source_floor_id == request.target_floor_id ||
       (!request.preferred_elevator_id.empty() &&
       !safe_asset_id(request.preferred_elevator_id)))
     {
@@ -2014,6 +2127,13 @@ ElevatorReleaseLoadResult load_elevator_release(
     const auto metadata = verify_metadata(pinned.release_id, files);
     const auto configuration =
       parse_configuration(files.configuration, request.building_id);
+    if (metadata.source_draft_schema_version &&
+      *metadata.source_draft_schema_version != configuration.schema_version)
+    {
+      throw LoadFailure(
+              ElevatorReleaseLoadError::kInvalidMetadata,
+              "source draft schema and configuration schema disagree");
+    }
     const auto manifest_bindings =
       parse_manifest_bindings(files.manifest);
     if (manifest_bindings != configuration.bindings) {
@@ -2027,6 +2147,11 @@ ElevatorReleaseLoadResult load_elevator_release(
     const auto internal_poses =
       parse_internal_poses(files.internal_poses, request.building_id);
     cross_check_internal_poses(configuration, topology, internal_poses);
+    if (configuration.schema_version == 1U) {
+      return failed(
+        ElevatorReleaseLoadError::kLegacyReadOnly,
+        "schema v1 elevator releases are historical read-only assets and cannot execute");
+    }
 
     const auto & selected = select_elevator(request, topology);
     const auto route = resolve_route(
@@ -2053,12 +2178,13 @@ ElevatorReleaseLoadResult load_elevator_release(
     release.configuration_digest = metadata.configuration_digest;
     release.building_id = request.building_id;
     release.elevator_id = selected.elevator_id;
+    release.schema_version = configuration.schema_version;
     release.source = make_runtime_floor(
       selected.elevator_id, route.route->source,
-      configured_source->second, internal_poses);
+      configured_source->second, internal_poses, configuration.schema_version);
     release.target = make_runtime_floor(
       selected.elevator_id, route.route->target,
-      configured_target->second, internal_poses);
+      configured_target->second, internal_poses, configuration.schema_version);
     return ElevatorReleaseLoadResult{
       ElevatorReleaseLoadError::kNone,
       "",
@@ -2094,6 +2220,8 @@ const char * to_string(const ElevatorReleaseLoadError error) noexcept
       return "INVALID_TOPOLOGY";
     case ElevatorReleaseLoadError::kInvalidInternalPoses:
       return "INVALID_INTERNAL_POSES";
+    case ElevatorReleaseLoadError::kLegacyReadOnly:
+      return "LEGACY_READ_ONLY";
     case ElevatorReleaseLoadError::kNoRoute:
       return "NO_ROUTE";
   }

@@ -33,6 +33,7 @@
 #include "sensor_msgs/point_cloud2_iterator.hpp"
 #include "std_msgs/msg/header.hpp"
 #include "std_msgs/msg/string.hpp"
+#include "std_srvs/srv/set_bool.hpp"
 #include "tf2/LinearMath/Matrix3x3.h"
 #include "tf2/LinearMath/Quaternion.h"
 #include "tf2/exceptions.h"
@@ -41,6 +42,7 @@
 #include "tf2_ros/transform_listener.h"
 
 #include "robot_hesai_jt128/pointcloud_accel_core.hpp"
+#include "robot_hesai_jt128/scan_self_mask.hpp"
 
 namespace
 {
@@ -341,6 +343,9 @@ struct WorkerDiagnostics
   std::size_t last_clearing_points{0U};
   double scan_output_header_age_ms{-1.0};
   double scan_output_source_age_ms{-1.0};
+  std::size_t last_scan_self_mask_filtered_points{0U};
+  std::uint64_t scan_self_mask_filtered_points_total{0U};
+  std::uint64_t scan_self_mask_tf_unavailable_count{0U};
 };
 
 struct ClearingRayBin
@@ -462,6 +467,12 @@ public:
     node_.declare_parameter<std::string>("flatscan_output_topic", "/flatscan");
     node_.declare_parameter<std::string>("scan_output_topic", "/scan");
     node_.declare_parameter<std::string>("scan_worker_frame_id", "lidar_level_link");
+    node_.declare_parameter<bool>("scan_worker_self_mask_enabled", true);
+    node_.declare_parameter<std::string>("scan_worker_self_mask_frame_id", "base_link");
+    node_.declare_parameter<double>("scan_worker_self_mask_min_x", -0.39);
+    node_.declare_parameter<double>("scan_worker_self_mask_max_x", 0.39);
+    node_.declare_parameter<double>("scan_worker_self_mask_min_y", -0.28);
+    node_.declare_parameter<double>("scan_worker_self_mask_max_y", 0.28);
     node_.declare_parameter<double>("scan_worker_rate_hz", 9.0);
     node_.declare_parameter<double>("scan_worker_min_height", -0.75);
     node_.declare_parameter<double>("scan_worker_max_height", 0.35);
@@ -509,10 +520,11 @@ public:
         "PointCloud2 local obstacle worker is disabled: Nav2 local marking+clearing uses /scan; "
         "local PointCloud2 obstacle and clearing outputs will not be published");
     }
-    worker_scan_enabled_ =
+    worker_scan_configured_ =
       node_.get_parameter("worker_scan_enabled").as_bool() &&
       node_.get_parameter("scan_worker_enabled").as_bool() &&
       profile_uses_workers(accel_profile_);
+    scan_output_enabled_.store(worker_scan_configured_);
     obstacle_output_topic_ = node_.get_parameter("obstacle_output_topic").as_string();
     clearing_output_topic_ = node_.get_parameter("clearing_output_topic").as_string();
     local_worker_output_frame_id_ = node_.get_parameter("local_worker_output_frame_id").as_string();
@@ -576,6 +588,16 @@ public:
 
     scan_output_topic_ = node_.get_parameter("scan_output_topic").as_string();
     scan_worker_frame_id_ = node_.get_parameter("scan_worker_frame_id").as_string();
+    scan_self_mask_.enabled = node_.get_parameter("scan_worker_self_mask_enabled").as_bool();
+    scan_self_mask_frame_id_ = node_.get_parameter("scan_worker_self_mask_frame_id").as_string();
+    scan_self_mask_.min_x = node_.get_parameter("scan_worker_self_mask_min_x").as_double();
+    scan_self_mask_.max_x = node_.get_parameter("scan_worker_self_mask_max_x").as_double();
+    scan_self_mask_.min_y = node_.get_parameter("scan_worker_self_mask_min_y").as_double();
+    scan_self_mask_.max_y = node_.get_parameter("scan_worker_self_mask_max_y").as_double();
+    if (scan_self_mask_.enabled && (!scan_self_mask_.valid() || scan_self_mask_frame_id_.empty())) {
+      throw std::invalid_argument(
+              "enabled scan_worker self mask requires a frame_id and finite ordered XY bounds");
+    }
     scan_worker_rate_hz_ = std::max(node_.get_parameter("scan_worker_rate_hz").as_double(), 0.1);
     scan_worker_min_height_ = node_.get_parameter("scan_worker_min_height").as_double();
     scan_worker_max_height_ = node_.get_parameter("scan_worker_max_height").as_double();
@@ -616,10 +638,16 @@ public:
           std::bind(&PointCloudAccelCore::Impl::handle_local_worker_odom, this, std::placeholders::_1));
       }
     }
-    if (worker_scan_enabled_) {
-      scan_publisher_ = node_.create_publisher<sensor_msgs::msg::LaserScan>(
-        scan_output_topic_, rclcpp::SensorDataQoS());
+    if (worker_scan_configured_) {
+      create_scan_publisher();
     }
+    scan_output_control_service_ = node_.create_service<std_srvs::srv::SetBool>(
+      "~/set_scan_output_enabled",
+      std::bind(
+        &PointCloudAccelCore::Impl::handle_set_scan_output_enabled,
+        this,
+        std::placeholders::_1,
+        std::placeholders::_2));
     if (!status_topic_.empty() && status_publish_period_sec_ > 0.0) {
       status_publisher_ = node_.create_publisher<std_msgs::msg::String>(status_topic_, 10);
       accel_status_publisher_ = node_.create_publisher<std_msgs::msg::String>(accel_status_topic_, 10);
@@ -631,7 +659,7 @@ public:
     if (local_compact_publisher_ || worker_local_enabled_) {
       local_worker_thread_ = std::thread(&PointCloudAccelCore::Impl::local_worker_loop, this);
     }
-    if (nav_compact_publisher_ || worker_scan_enabled_) {
+    if (nav_compact_publisher_ || worker_scan_configured_) {
       scan_worker_thread_ = std::thread(&PointCloudAccelCore::Impl::scan_worker_loop, this);
     }
   }
@@ -680,6 +708,47 @@ public:
   }
 
 private:
+  void create_scan_publisher()
+  {
+    if (!scan_publisher_) {
+      scan_publisher_ = node_.create_publisher<sensor_msgs::msg::LaserScan>(
+        scan_output_topic_, rclcpp::SensorDataQoS());
+    }
+  }
+
+  void handle_set_scan_output_enabled(
+    const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+    std::shared_ptr<std_srvs::srv::SetBool::Response> response)
+  {
+    if (request->data && !worker_scan_configured_) {
+      response->success = false;
+      response->message = "scan worker is not configured for this runtime profile";
+      return;
+    }
+
+    // The worker and this service share the same mutex.  A successful disable
+    // response therefore proves that no in-flight publish still owns the old
+    // publisher, and reset() removes this node from the ROS graph before the
+    // mapping-owned /scan publisher is admitted.
+    std::lock_guard<std::mutex> lock(scan_publisher_mutex_);
+    if (request->data) {
+      create_scan_publisher();
+      scan_output_enabled_.store(true);
+      response->message = "navigation scan publisher enabled";
+    } else {
+      scan_output_enabled_.store(false);
+      scan_publisher_.reset();
+      response->message = "navigation scan publisher disabled; pointcloud trunk remains active";
+    }
+    response->success = true;
+    RCLCPP_INFO(
+      node_.get_logger(),
+      "scan output ownership control: enabled=%s topic=%s publisher_registered=%s",
+      request->data ? "true" : "false",
+      scan_output_topic_.c_str(),
+      scan_publisher_ ? "true" : "false");
+  }
+
   std::size_t positive_size_param(const std::string & name, const std::size_t fallback) const
   {
     const auto raw = node_.get_parameter(name).as_int();
@@ -989,7 +1058,7 @@ private:
         output_topic_.c_str(),
         output_frame_id_.c_str(),
         worker_local_enabled_ ? "true" : "false",
-        worker_scan_enabled_ ? "true" : "false",
+        scan_output_enabled_.load() ? "true" : "false",
         local_compact_publisher_ ? local_output_topic_.c_str() : "(disabled)",
         nav_compact_publisher_ ? nav_output_topic_.c_str() : "(disabled)");
       logged_ready_ = true;
@@ -1138,7 +1207,7 @@ private:
       next += std::chrono::duration_cast<Clock::duration>(period);
       const auto begin = Clock::now();
       publish_nav_compact_once();
-      if (worker_scan_enabled_) {
+      if (scan_output_enabled_.load()) {
         process_scan_once();
       }
       const auto elapsed_ms = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
@@ -1613,6 +1682,7 @@ private:
   {
     ++scan_worker_.tick_count;
     scan_worker_.reused_output_buffer = true;
+    std::lock_guard<std::mutex> publisher_lock(scan_publisher_mutex_);
     if (!scan_publisher_ || scan_publisher_->get_subscription_count() == 0U) {
       return;
     }
@@ -1625,6 +1695,15 @@ private:
     scan_worker_.start_source_age_ms = age_ms_from_ros_stamp(node_.now().seconds(), buffer->stamp);
     Transform3x4 transform;
     if (!lookup_transform(scan_worker_frame_id_, buffer->frame_id, transform)) {
+      return;
+    }
+    Transform3x4 self_mask_transform;
+    scan_worker_.last_scan_self_mask_filtered_points = 0U;
+    if (
+      scan_self_mask_.enabled &&
+      !lookup_transform(scan_self_mask_frame_id_, scan_worker_frame_id_, self_mask_transform))
+    {
+      ++scan_worker_.scan_self_mask_tf_unavailable_count;
       return;
     }
     const auto bin_count = static_cast<std::size_t>(
@@ -1650,6 +1729,14 @@ private:
       const double range = std::hypot(static_cast<double>(point.x), static_cast<double>(point.y));
       if (range < scan_worker_range_min_ || range > scan_worker_range_max_) {
         continue;
+      }
+      if (scan_self_mask_.enabled) {
+        const auto self_mask_point = transform_point(self_mask_transform, point);
+        if (scan_self_mask_.contains(self_mask_point.x, self_mask_point.y)) {
+          ++scan_worker_.last_scan_self_mask_filtered_points;
+          ++scan_worker_.scan_self_mask_filtered_points_total;
+          continue;
+        }
       }
       const double angle = std::atan2(static_cast<double>(point.y), static_cast<double>(point.x));
       if (angle < scan_worker_angle_min_ || angle > scan_worker_angle_max_) {
@@ -1793,9 +1880,11 @@ private:
            << " last_cloud_bytes=" << last_cloud_bytes_
            << " accel_profile=" << accel_profile_
            << " worker_local_enabled=" << (worker_local_enabled_ ? "true" : "false")
-           << " worker_scan_enabled=" << (worker_scan_enabled_ ? "true" : "false")
+           << " worker_scan_configured=" << (worker_scan_configured_ ? "true" : "false")
+           << " worker_scan_enabled=" << (scan_output_enabled_.load() ? "true" : "false")
            << " local_worker_enabled=" << (worker_local_enabled_ ? "true" : "false")
-           << " scan_worker_enabled=" << (worker_scan_enabled_ ? "true" : "false")
+           << " scan_worker_enabled=" << (scan_output_enabled_.load() ? "true" : "false")
+           << " scan_publisher_registered=" << (scan_output_enabled_.load() ? "true" : "false")
            << " nav_branch_enabled=" << (nav_compact_publisher_ ? "true" : "false")
            << " local_branch_enabled=" << (local_compact_publisher_ ? "true" : "false")
            << " nav_branch_publish_hz=" << static_cast<double>(nav_compact_delta) / elapsed_sec
@@ -1888,6 +1977,18 @@ private:
            << " scan_output_header_age_ms=" << scan_worker_.scan_output_header_age_ms
            << " scan_output_source_age_ms=" << scan_worker_.scan_output_source_age_ms
            << " scan_output_frame_id=" << scan_worker_frame_id_
+           << " scan_self_mask_enabled=" << (scan_self_mask_.enabled ? "true" : "false")
+           << " scan_self_mask_frame_id=" << scan_self_mask_frame_id_
+           << " scan_self_mask_min_x=" << scan_self_mask_.min_x
+           << " scan_self_mask_max_x=" << scan_self_mask_.max_x
+           << " scan_self_mask_min_y=" << scan_self_mask_.min_y
+           << " scan_self_mask_max_y=" << scan_self_mask_.max_y
+           << " scan_self_mask_last_filtered_points=" <<
+             scan_worker_.last_scan_self_mask_filtered_points
+           << " scan_self_mask_filtered_points_total=" <<
+             scan_worker_.scan_self_mask_filtered_points_total
+           << " scan_self_mask_tf_unavailable_count=" <<
+             scan_worker_.scan_self_mask_tf_unavailable_count
            << " tf_drop_suspect_obstacle_header_age_over_100ms_count=" <<
              tf_drop_suspect_obstacle_header_age_over_100ms_count_
            << " tf_drop_suspect_obstacle_header_age_over_200ms_count=" <<
@@ -1963,7 +2064,9 @@ private:
   std::size_t nav_output_qos_depth_{1U};
 
   bool worker_local_enabled_{true};
-  bool worker_scan_enabled_{true};
+  bool worker_scan_configured_{true};
+  std::atomic<bool> scan_output_enabled_{true};
+  std::mutex scan_publisher_mutex_;
   std::string obstacle_output_topic_;
   std::string clearing_output_topic_;
   std::string local_worker_output_frame_id_;
@@ -2013,6 +2116,8 @@ private:
 
   std::string scan_output_topic_;
   std::string scan_worker_frame_id_;
+  ScanSelfMask scan_self_mask_{};
+  std::string scan_self_mask_frame_id_{"base_link"};
   double scan_worker_rate_hz_{9.0};
   double scan_worker_min_height_{-0.75};
   double scan_worker_max_height_{0.35};
@@ -2094,6 +2199,7 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr obstacle_publisher_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr clearing_publisher_;
   rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr scan_publisher_;
+  rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr scan_output_control_service_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_publisher_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr accel_status_publisher_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr local_worker_odom_subscription_;

@@ -5,6 +5,7 @@
 
 #include "nav2_smac_planner/smac_planner_lattice.hpp"
 #include "robot_nav_config/ranger_direct_corridor.hpp"
+#include "robot_nav_config/ranger_exact_goal_endpoint.hpp"
 
 namespace robot_nav_config
 {
@@ -27,6 +28,7 @@ public:
 
 private:
   bool corridor_pose_is_clear(double x, double y, double yaw);
+  bool endpoint_pose_is_clear(double x, double y, double yaw);
   double path_length(const nav_msgs::msg::Path & path) const;
 
   bool direct_corridor_enabled_{true};

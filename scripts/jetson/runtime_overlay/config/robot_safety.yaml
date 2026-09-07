@@ -2,6 +2,7 @@ robot_safety:
   ros__parameters:
     mock_mode: false
     watchdog_timeout_sec: 1.0
+    recovery_hold_release_service: /safety/release_motion_hold_if_execution_idle
     publish_rate_hz: 10.0
     cmd_vel_in_topic: /cmd_vel_collision_checked
     api_cmd_vel_in_topic: /cmd_vel_api
@@ -10,6 +11,10 @@ robot_safety:
     docking_cmd_vel_in_topic: /cmd_vel_docking
     enable_docking_cmd_priority: true
     docking_cmd_priority_timeout_sec: 0.25
+    elevator_entry_cmd_vel_in_topic: /cmd_vel_nav
+    elevator_entry_collision_bypass_permit_topic: /ranger_mini3/elevator_entry_collision_bypass
+    elevator_entry_collision_bypass_permit_timeout_sec: 0.75
+    elevator_entry_cmd_timeout_sec: 0.25
     cmd_vel_out_topic: /cmd_vel
     cmd_vel_mirror_topic: /cmd_vel_safe
     cmd_vel_qos_depth: 1
@@ -48,10 +53,12 @@ robot_safety:
     nav_terminal_lateral_enable_topic: /ranger_mini3/nav_terminal_lateral_enable
     reverse_enable_timeout_sec: 0.75
     normal_navigation_reverse_max_mps: 0.08
+    elevator_navigation_reverse_max_mps: 0.40
     final_cmd_lateral_deadband_mps: 0.001
     allow_api_lateral_cmd: true
     api_lateral_max_mps: 0.10
     normal_navigation_lateral_max_mps: 0.05
+    elevator_navigation_lateral_max_mps: 0.40
     estop_topic: /safety/estop
     localization_ok_topic: /localization/health
     require_localization_health: false

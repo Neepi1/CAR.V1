@@ -9,9 +9,23 @@ source "${SCRIPT_DIR}/common_env.sh"
 source "${SCRIPT_DIR}/cpu_affinity.sh"
 source "${SCRIPT_DIR}/local_perception_profile.sh"
 source "${SCRIPT_DIR}/pointcloud_accel_profile.sh"
+source "${SCRIPT_DIR}/large_cloud_fastdds_transport.sh"
 njrh_load_local_perception_input_profile
 njrh_load_pointcloud_accel_profile
 njrh_load_pointcloud_ingress_profile
+configure_large_cloud_fastdds_transport
+
+njrh_run_large_cloud_affined() {
+  local affinity_role="$1"
+  shift
+  njrh_run_affined "${affinity_role}" \
+    env -u FASTDDS_BUILTIN_TRANSPORTS \
+      FASTRTPS_DEFAULT_PROFILES_FILE="${NJRH_LARGE_CLOUD_FASTDDS_PROFILE_FILE}" \
+      FASTDDS_DEFAULT_PROFILES_FILE="${NJRH_LARGE_CLOUD_FASTDDS_PROFILE_FILE}" \
+      SKIP_DEFAULT_XML=1 \
+      NJRH_LARGE_CLOUD_FASTDDS_ROLE=resident_publisher \
+      "$@"
+}
 
 DEFAULT_HESAI_CONFIG_FILE="${UPSTREAM_WS}/src/hesai_lidar_ros2/config/config.yaml"
 REPO_HESAI_CONFIG_FILE="${NJRH_PROJECT_ROOT}/src/third_party/hesai_lidar_ros2_overlay/config/config.yaml"
@@ -209,7 +223,7 @@ if [[ "${NJRH_POINTCLOUD_INGRESS_PROFILE}" == "driver_integrated" ]]; then
   }
   echo "[runtime-overlay] starting driver_integrated JT128 ingress: ${HESAI_ACCEL_DRIVER_CPP_BIN}" >&2
   echo "[runtime-overlay] production pointcloud path bypasses /jt128/vendor/points_raw DDS; rollback keeps hesai_ros_driver_node -> /jt128/vendor/points_raw -> pointcloud_accel_axis_node" >&2
-  njrh_run_affined hesai_ros_driver \
+  njrh_run_large_cloud_affined hesai_ros_driver \
     "${HESAI_ACCEL_DRIVER_CPP_BIN}" --ros-args \
       --params-file "${HESAI_ACCEL_DRIVER_CONFIG}" \
       -p "config_path:=${RUNTIME_CONFIG_FILE}" &
@@ -281,7 +295,7 @@ else
   if [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" != "legacy" ]]; then
     pointcloud_remap_service="pointcloud_accel_container"
   fi
-  njrh_run_affined "${pointcloud_remap_service}" \
+  njrh_run_large_cloud_affined "${pointcloud_remap_service}" \
     "${POINTCLOUD_REMAP_CPP_BIN}" "${pointcloud_remap_args[@]}" &
   pointcloud_remap_pid=$!
 fi
@@ -311,6 +325,9 @@ njrh_run_affined imu_axis_remap \
 imu_remap_pid=$!
 
 export DRIVER_PROFILE="${UPSTREAM_DRIVER_PROFILE}"
-njrh_run_affined hesai_ros_driver bash "$(require_upstream_script run_driver.sh)" &
+# The upstream Hesai publisher and the separate pointcloud accelerator exchange
+# full-density PointCloud2 messages. Keep both endpoints on the same UDPv4+SHM
+# participant profile so the large cloud never falls back to fragmented UDP.
+njrh_run_large_cloud_affined hesai_ros_driver bash "$(require_upstream_script run_driver.sh)" &
 driver_pid=$!
 wait "${driver_pid}"

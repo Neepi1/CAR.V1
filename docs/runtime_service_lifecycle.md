@@ -29,6 +29,58 @@ path.
 
 `robot_api_server` is supervised inside the common-service layer. If the API process exits, `run_robot_api_server_supervised.sh` restarts it after a short delay. Before each restart, the supervisor clears stale orphan API processes so only one `robot_api_server_node` can own port `8080` and the fixed HTTP worker pool. `njrh_container.sh start-runtime` and `start-common` now also require `GET /api/v1/status` on port `8080` to become healthy before reporting common services as ready. That host-side HTTP wait defaults to `NJRH_ROBOT_API_READY_TIMEOUT_SEC=120` with `NJRH_ROBOT_API_READY_POLL_SEC=1`; it does not create ROS readiness participants. The API process uses a fixed HTTP worker pool controlled by `max_http_connections` and returns `503` when overloaded instead of creating unbounded detached request threads.
 
+The common-service health loop counts the API node by canonical
+`/proc/<pid>/exe` identity and counts its Bash supervisor by that executable
+identity plus an exact NUL-delimited script argument. It does not use a
+`pgrep -f` substring match for this ownership decision. Consequently, a field
+diagnostic command that merely contains the installed API path cannot be
+misclassified as a second API node and cannot trigger a false complete-chain
+restart. A genuinely missing or duplicate executable still fails closed and
+causes the systemd owner to restart the complete runtime chain.
+
+Cold startup now keeps that runtime ownership rule but does not apply it before
+the API executable has had time to finish ROS/Fast DDS construction. After the
+supervisor shell starts, `run_common_services.sh` waits up to
+`NJRH_ROBOT_API_PROCESS_READY_TIMEOUT_SEC=120` for exactly one supervisor and
+exactly one installed API executable before it records
+`robot_api_server_ready`. This is an initial process-readiness window only; once
+common services are running, a missing or duplicate owner is still rejected on
+the next health check without a 120-second grace period.
+
+Local-state health uses a separate classification for the resident observer
+and for the observed runtime. A missing, invalid, clock-invalid, or stale
+`runtime_health_guard.py` JSON snapshot is an observer fault. A fresh odometry
+callback that contradicts temporarily missing ROS-graph endpoint/publisher
+metadata is also observer-side graph lag. These cases are logged with snapshot
+and odometry ages and reset the local-state failure budget, but they do not
+authorize estop latching, common-owner exit, or a complete-chain restart. A
+fresh snapshot that identifies an endpoint, publisher, message-delivery,
+odometry-stamp, or summary failure is only the first recovery candidate. When
+the EKF process is still alive, the common owner runs one bounded independent
+`/local_state/odometry` freshness probe before consuming the producer-failure
+budget. If that participant receives fresh canonical odometry, the snapshot is
+classified as observer-side DDS visibility loss and the producer-failure budget
+is reset. If the independent confirmation also fails, or the required process
+is missing, three consecutive confirmed candidates retain the existing
+fail-closed complete-chain recovery behavior.
+
+Orbbec docking-camera health follows the same observer/evidence boundary. A
+missing or stale `runtime_health_guard.py` snapshot is not proof that the
+camera stream failed, so it is diagnostic-only and resets the docking-sensor
+failure counter. A fresh snapshot with `docking_sensor_healthy=false` advances
+a bounded diagnostic counter, but camera health alone never authorizes a
+common-owner exit or complete-chain restart. The consumer remains responsible
+for safety: `robot_docking_manager` refuses docking motion whenever its target
+observation is missing, stale, unhealthy, or invalid, while unrelated Nav2,
+localization, chassis, and API services stay alive.
+
+Field acceptance for this guard is intentionally split in two. With the robot
+stationary, an observer-only stale/missing fixture must leave systemd
+`NRestarts` unchanged. A supervised true local-odometry outage with a fresh
+observer must produce three concrete diagnostics and then fail closed. Neither
+check sends a navigation goal or changes odometry, localization, controller,
+costmap, or safety parameters.
+
 Canonical helper startup has a bounded failure path. During cold boot,
 `robot_local_state_common` may briefly have its EKF process alive before ROS
 graph discovery and the fresh `odom -> base_link` probe both pass. If the first
@@ -104,7 +156,26 @@ progressing; `NJRH_RESIDENT_NAVIGATION_READY_HARD_TIMEOUT_SEC` is the hard
 cleanup timeout. This prevents a few seconds of Nav2 activation or AMCL
 readiness overrun from creating a self-inflicted restart loop.
 
-The API server's BMS charging-contact policy lives in `robot_api_server/bms_contact.hpp` and `src/bms_contact.cpp`, separate from HTTP routing. UTC timestamp formatting and generated map/current-pose IDs live in `robot_api_server/api_time_utils.hpp` and `src/api_time_utils.cpp`. Docking job state formatting lives in `robot_api_server/docking_job_model.hpp` and `src/docking_job_model.cpp`; docking/undocking status string classification lives in `robot_api_server/docking_status_utils.hpp` and `src/docking_status_utils.cpp`. Common text/binary file reads and writes, PGM output, and map YAML image-file rewrites live in `robot_api_server/file_utils.hpp` and `src/file_utils.cpp`. Floor asset completeness checks, active `current/` selection, `poses.yaml` fallback, and stored pose lookup live in `robot_api_server/floor_asset_resolver.hpp` and `src/floor_asset_resolver.cpp`. HTTP request/response structs, WebSocket accept-key helpers, and lightweight JSON parsing live in `robot_api_server/http_common.hpp` and `src/http_common.cpp`; localization result snapshots and relocalization diagnostic text live in `robot_api_server/localization_result_model.hpp` and `src/localization_result_model.cpp`. Map/pose models plus safe ID/name validation live in `robot_api_server/storage_models.hpp` and `src/storage_models.cpp`; grayscale PNG encoding, PGM dimension reads, and Nav map YAML metadata extraction live in `robot_api_server/map_asset_io.hpp` and `src/map_asset_io.cpp`; OccupancyGrid-to-image conversion, saved map YAML text, neutral costmap filter assets, and asset reports live in `robot_api_server/map_asset_writer.hpp` and `src/map_asset_writer.cpp`; released map directory paths, manifest traversal, and active/name/id lookup live in `robot_api_server/map_catalog.hpp` and `src/map_catalog.cpp`; `MapManifest` path derivation and `manifest.json` read/write formatting live in `robot_api_server/map_manifest_io.hpp` and `src/map_manifest_io.cpp`; navigation-cancel job state formatting lives in `robot_api_server/navigation_cancel_job_model.hpp` and `src/navigation_cancel_job_model.cpp`; `poses.yaml` parsing/writing lives in `robot_api_server/poses_io.hpp` and `src/poses_io.cpp`; runtime map context file formatting lives in `robot_api_server/runtime_map_context_io.hpp` and `src/runtime_map_context_io.cpp`; saved 2D PNG lookup and runtime flat-map companion file paths live in `robot_api_server/runtime_map_lookup.hpp` and `src/runtime_map_lookup.cpp`; robot pose snapshots and `/api/v1/robot/pose` response payloads live in `robot_api_server/robot_pose_model.hpp` and `src/robot_pose_model.cpp`; Linux child-process setup and pid/pgid helpers live in `robot_api_server/runtime_process_utils.hpp` and `src/runtime_process_utils.cpp`; keepout semantic JSON paths and response fragments live in `robot_api_server/semantic_layer_io.hpp` and `src/semantic_layer_io.cpp`; App subscription request parsing lives in `robot_api_server/subscription_api.hpp` and `src/subscription_api.cpp`; App page-scoped subscription leases and TTL expiry live in `robot_api_server/subscription_manager.hpp` and `src/subscription_manager.cpp`; frame ID normalization, yaw extraction, angle wrapping, and ROS timestamp helpers live in `robot_api_server/tf_pose_utils.hpp` and `src/tf_pose_utils.cpp`. These pure modules keep full-SOC dock-contact inference, timestamp/ID generation, docking job state formatting, docking status classification, file asset IO, floor asset resolution, gateway parsing, localization result diagnostics, map asset validation, saved-map asset generation, manifest catalog lookup, navigation-cancel state formatting, saved PNG lookup, robot pose payload formatting, semantic layer formatting, TF pose math, runtime process helpers, and subscription lease behavior testable without touching navigation, docking, or socket-loop code.
+The API server now mirrors one domain-oriented layout under `include/`, `src/`,
+and `test/`: robot behavior is grouped below `features/`, request orchestration
+below `application/`, and technical adapters below `infrastructure/`. Map
+catalog/activation, poses, keepout, mapping assets/runtime, localization, floor switching,
+navigation configuration/runtime/mission/terminal control, elevator configuration/execution,
+power, docking configuration/lifecycle/predock alignment, safety, teleop, and
+system-status models therefore have explicit
+module roots. HTTP/JSON primitives live in `infrastructure/http/`; process and
+deferred-work helpers live in `infrastructure/process/`; App subscription
+lifecycle lives in `application/subscriptions/`. `robot_api_server_node.cpp`
+remains the composition root for ROS wiring and not-yet-extracted handlers.
+Directory movement does not change service lifecycle, TF ownership, runtime
+process ownership, velocity routing, timeouts, or commercial acceptance rules.
+Docking configuration now resolves manual predock points and validates their
+distance/yaw geometry behind
+`features/docking/configuration/docking_predock_pose_resolver`; the root only
+supplies read-only pose lookup ports and wires the result into docking HTTP.
+The safety module owns only the resident gateway subscriptions/publisher and
+status interpretation; `robot_safety` remains the final velocity and estop
+owner.
 
 The Web dashboard is not part of the production runtime. It is only a manual observation/debug window.
 
@@ -114,7 +185,17 @@ Jetson CPU affinity is now a runtime policy, not a launch-file assumption. The d
 NJRH_CPU_AFFINITY_ENABLED=false
 ```
 
-The default 8-core split reserves CPU0 for lightweight API/map-filter work plus bursty Nav2 planner/BT work, CPU0/CPU1 for Nav2 lifecycle supervision, CPU1 for base/safety command arbitration, CPU2 for EKF local state, CPU3 for Nav2 controller/collision work, CPU4 for the JT128 UDP driver, CPU5 for full-density pointcloud remap ingress, CPU6 for IMU remap plus AMCL scan/localization helpers, and CPU7 for the `map -> odom` bridge plus mapping backend work. FAST-LIO2 is not resident during normal navigation; live 2D mapping re-derives its mode-local CPU sets at launch so FAST-LIO2 frontend/deskew defaults to CPU7 only while mapping is active and PGO/slam_toolbox mapping defaults to CPU7. During live 2D mapping, `run_projected_map.sh` also applies a temporary LiDAR NIC RPS/XPS profile (`NJRH_SLAM2D_LIDAR_RPS_XPS_INTERFACE=eth1`, `NJRH_SLAM2D_LIDAR_RPS_XPS_CPUSET=5` by default) and restores the previous queue masks on exit. `robot_api_server` also restores the same `mapping_lidar_rps_xps_state_dir` state on mapping stop/save, because API process-group termination can bypass the shell EXIT trap. It does not write IRQ affinity; the current Jetson eth1 IRQ rejects affinity writes, while RPS/XPS is sufficient to recover `/lidar_points` to the JT128 target cadence in mapping mode. Future arm control/planning should use CPU6/CPU7 only when mapping is not active. Existing processes can be retagged without restarting motion by running the helper below. It applies affinity to every Linux thread under `/proc/<pid>/task`, not only the process leader, because ROS 2 executors and DDS workers are multithreaded. The helper does not source `common_env.sh` and does not initialize ROS/DDS, so it cannot create extra participants or rewrite DDS profiles during a live navigation run:
+The default 8-core split reserves CPU0 for lightweight API/map-filter work plus bursty Nav2 planner/BT work, CPU0/CPU1 for Nav2 lifecycle supervision, CPU1 for base/safety command arbitration, CPU2 for EKF local state, CPU3 for Nav2 controller/collision work, CPU4,6 for the multithreaded JT128 UDP driver, CPU5 for full-density pointcloud remap ingress, CPU6 for IMU remap plus AMCL scan/localization helpers, and CPU7 for the `map -> odom` bridge plus mapping backend work. CPU4 remains the driver's primary placement; CPU6 prevents unrelated arm/vision load from forcing the receive/parser workers into a persistent decode backlog. FAST-LIO2 is not resident during normal navigation; live 2D mapping re-derives its mode-local CPU sets at launch so FAST-LIO2 frontend/deskew defaults to CPU7 only while mapping is active and PGO/slam_toolbox mapping defaults to CPU7. During live 2D mapping, `run_projected_map.sh` also applies a temporary LiDAR NIC RPS/XPS profile (`NJRH_SLAM2D_LIDAR_RPS_XPS_INTERFACE=eth1`, `NJRH_SLAM2D_LIDAR_RPS_XPS_CPUSET=5` by default) and restores the previous queue masks on exit. `robot_api_server` also restores the same `mapping_lidar_rps_xps_state_dir` state on mapping stop/save, because API process-group termination can bypass the shell EXIT trap. It does not write IRQ affinity; the current Jetson eth1 IRQ rejects affinity writes, while RPS/XPS is sufficient to recover `/lidar_points` to the JT128 target cadence in mapping mode. Future arm control/planning should use CPU6/CPU7 only when mapping is not active. Existing processes can be retagged without restarting motion by running the helper below. It applies affinity to every Linux thread under `/proc/<pid>/task`, not only the process leader, because ROS 2 executors and DDS workers are multithreaded. The helper does not source `common_env.sh` and does not initialize ROS/DDS, so it cannot create extra participants or rewrite DDS profiles during a live navigation run:
+
+`robot_api_server` itself is pinned to CPU0. A navigation runtime created by
+`POST /api/v1/navigation/start` is forked from that process and would otherwise
+inherit CPU0 for the owner shell and every child that does not yet have a
+service-specific mask. `run_navigation_runtime_services.sh` therefore applies
+`NJRH_CPUSET_NAVIGATION_RUNTIME_OWNER=0-7` to its current shell before floor
+asset resolution, cleanup, logging, or child startup. The operation is
+idempotent on the systemd boot path, whose owner already has CPUs 0-7, and it
+fails startup instead of silently continuing when an enabled affinity policy
+cannot be applied or verified. Service-specific node masks remain unchanged.
 
 ```bash
 bash scripts/jetson/runtime_overlay/scripts/apply_cpu_affinity.sh
@@ -148,7 +229,7 @@ bash scripts/jetson/runtime_overlay/scripts/inspect_runtime_cpu_affinity.sh
 bash scripts/jetson/runtime_overlay/scripts/observe_navigation_tf_jitter_180s.sh --duration-sec 180 --label nav_tf_jitter
 ```
 
-Hardware validation still needs a loaded navigation run after a full restart to confirm `taskset -pc <pid>` matches the intended service groups: JT128 driver on CPU4, standalone pointcloud remap on CPU5, IMU remap/localization helpers on CPU6, `robot_localization_bridge` on CPU7, planner/BT on CPU0, and both Nav2 lifecycle managers on CPU0/CPU1. Also confirm no `fastlio_mapping` process is resident during navigation, `/lidar_points` remains the only high-density trunk, `/scan` and `/flatscan` are live, old `/perception/obstacle_points` and `/perception/clearing_points` publishers are zero, the filter lifecycle manager reaches active before the core navigation lifecycle manager, and `/scan` is subscribed by local costmap plus collision monitor. Use `verify_pointcloud_rates.sh`, `verify_lidar_trunk_jitter.sh`, `diagnose_lidar_points_jitter.sh`, `diagnose_nav_scan_pipeline.sh`, `diagnose_pointcloud_cpu_pressure.sh`, `run_pointcloud_cpu_affinity_ab.sh --print`, `check_runtime_process_freshness.sh`, `inspect_pointcloud_subscribers.sh`, `verify_pointcloud_delivery_matrix.sh`, `inspect_pointcloud_cpu_affinity.sh`, `record_pointcloud_nav_acceptance.sh --duration-sec 1200`, `run_pointcloud_dds_transport_ab.sh`, and `run_lidar_trunk_pure_ab.sh --execute` as manual verification tools, not background monitors.
+Hardware validation still needs a loaded navigation run after a full restart to confirm `taskset -pc <pid>` matches the intended service groups: JT128 driver on CPU4,6, standalone pointcloud remap on CPU5, IMU remap/localization helpers on CPU6, `robot_localization_bridge` on CPU7, planner/BT on CPU0, and both Nav2 lifecycle managers on CPU0/CPU1. Also confirm no `fastlio_mapping` process is resident during navigation, `/lidar_points` remains the only high-density trunk, `/scan` and `/flatscan` are live, old `/perception/obstacle_points` and `/perception/clearing_points` publishers are zero, the filter lifecycle manager reaches active before the core navigation lifecycle manager, and `/scan` is subscribed by local costmap plus collision monitor. Use `verify_pointcloud_rates.sh`, `verify_lidar_trunk_jitter.sh`, `diagnose_lidar_points_jitter.sh`, `diagnose_nav_scan_pipeline.sh`, `diagnose_pointcloud_cpu_pressure.sh`, `run_pointcloud_cpu_affinity_ab.sh --print`, `check_runtime_process_freshness.sh`, `inspect_pointcloud_subscribers.sh`, `verify_pointcloud_delivery_matrix.sh`, `inspect_pointcloud_cpu_affinity.sh`, `record_pointcloud_nav_acceptance.sh --duration-sec 1200`, `run_pointcloud_dds_transport_ab.sh`, and `run_lidar_trunk_pure_ab.sh --execute` as manual verification tools, not background monitors.
 
 Phase C1 adds a controller/local-costmap CPU-set A/B profile for the specific
 case where external `/tf` still publishes at the expected rate but
@@ -157,7 +238,7 @@ case where external `/tf` still publishes at the expected rate but
 `control_wide` sets only `controller_server` to CPU3,5, matching the fact that
 Nav2 hosts the local costmap inside that process. Startup logs the selected
 profile, CPU set, and PID, then fails if `/proc/<pid>/status` or any controller
-thread does not match the expected CPU set. EKF/local-state CPU2, JT128 CPU4,
+thread does not match the expected CPU set. EKF/local-state CPU2, JT128 CPU4,6,
 AMCL scan admission CPU6, and `robot_localization_bridge` CPU7 remain reserved.
 Run the A/B as:
 
@@ -381,7 +462,23 @@ The local costmap `MessageFilter` drops observed on `/scan` are separate from
 `/flatscan` startup admission. They require a producer/TF timing audit and must
 not be hidden by restamping or mixed into the flatscan lifecycle fix.
 
-Standard Nav2 startup separates filter lifecycle from core navigation lifecycle. `lifecycle_manager_costmap_filters` owns only the keepout/speed mask map servers and filter-info servers. The production resident cold-start path first prepares localization, triggers the bridge-owned `map -> odom` baseline, and only then launches Nav2. `NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION=true` remains available only as an A/B optimization switch. After the trigger result is accepted and bridge-owned `map -> odom` is live, resident runtime starts the core lifecycle nodes through Nav2's lifecycle helper with a bounded runtime timeout. The default keeps deterministic TF ordering without changing Nav2 controller/planner plugins, TF tolerances, pointcloud QoS, FAST-LIO2, Ranger odom, or EKF policy.
+Standard Nav2 startup separates filter lifecycle from core navigation lifecycle. `lifecycle_manager_costmap_filters` owns only the keepout/speed mask map servers and filter-info servers. The production resident cold-start path first proves the complete selected-floor localization stack and exact floor context, then completes the initial localization transaction and requires a bridge-owned live `map -> odom` before launching the Nav2 process tree in held mode. `NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION=true` remains available only as an earlier A/B optimization switch. After the held preload, resident runtime starts the core lifecycle nodes through Nav2's lifecycle helper with a bounded runtime timeout. The default keeps deterministic TF ordering without changing Nav2 controller/planner plugins, TF tolerances, pointcloud QoS, FAST-LIO2, Ranger odom, or EKF policy.
+
+The initial global-localization trigger client also has a process-level bound,
+separate from its rclpy service/result timeout. Every attempt receives its
+existing wrapper timeout, while GNU `timeout` allows 5 additional seconds for
+result emission and rclpy shutdown, sends `SIGTERM`, and escalates to `SIGKILL`
+after 2 seconds. Timeout output and exit status continue through the original
+retry, failure-code, and bridge-readiness fallback branches. This guard changes
+no localization, odometry, AMCL, Nav2, or TF threshold.
+
+The final ready-context write reuses the exact explicit sequence accepted by
+that same startup transaction. It first attempts a fresh bridge-status sample.
+If only that temporary CLI observation misses, readiness is still allowed only
+when the transaction was accepted, the resident localization owner remains
+alive, and the compiled TF probe confirms a fresh `map -> odom`. A missing
+accepted sequence, a changed observed sequence, a dead localization owner, or
+a stale/missing transform still fails closed.
 
 Global-costmap readiness uses one bounded participant to require both lifecycle
 active state and a live `/global_costmap/costmap` publisher. A full large
@@ -425,6 +522,18 @@ override.
 
 Navigation resume scripts do not restore broad ROS graph/topic/TF probe loops, but they do keep the critical localization startup chain as a gate. `run_navigation_runtime_services.sh` starts the selected-floor localization layer, verifies the initial localizer inputs/services, sends one bounded global-localization trigger request, waits for bridge-accepted localization and `map -> odom`, starts Nav2, then marks the runtime context ready only after Nav2 lifecycle activation and the global costmap are available. The runtime context identity comes from the selected floor assets: `resolve_floor_assets` reads `asset_report.json`, exports `NJRH_NAV_MAP_ID`, and mirrors it into `NJRH_MAP_ID` so `/api/v1/robot/pose` can attach the confirmed `building_id` / `floor_id` / `map_id` instead of rejecting an otherwise fresh TF pose. Explicit readiness tools still exist for field diagnostics, but a transient Fast DDS discovery miss outside this critical chain must not keep the App in `starting`. The API server also polls the navigation resume child process while serving `/api/v1/status` and `/api/v1/navigation/state`; if the child process exits during startup or the runtime context records `state=failed`, the API reports navigation `failed` with the resume log path instead of leaving the App in `starting`.
 
+The shared resident script has an explicit start-source contract. Boot autostart
+launches it with `NJRH_NAVIGATION_START_SOURCE=systemd_autostart`, retaining the
+measured parallel localization prewarm. The API launches the same script with
+`NJRH_NAVIGATION_START_SOURCE=api_resume`; after a manual navigation stop and
+map selection, this branch waits for three consecutive advancing
+`/local_state/odometry` and `odom -> base_link` observations before starting
+the localization process. It bypasses a cached health snapshot for this check,
+uses the existing odometry/TF age limits, and fails closed with
+`LOCAL_STATE_ODOM_TF_NOT_STABLE` if the common local-state boundary is stale.
+There is no fixed delay, threshold relaxation, duplicate owner, or second
+startup script, so the App repair does not extend the systemd cold-start path.
+
 The occupancy localization bridge watchdog follows the same process-first rule. It still rejects a real `robot_localization_bridge` process loss, but ROS graph probe misses during Nav2/map-server activation are diagnostics only while the bridge process is still alive.
 
 Local perception does not run in production navigation. `run_nav2_navigation.sh` no longer starts local perception, primes a probe-owned TF buffer, or blocks on local-costmap observation checks before launching Nav2. Nav2 builds its own costmap/TF buffers during normal lifecycle activation. Hardware validation should inspect `/local_costmap/costmap`, `/scan` subscriber topology, old `/perception/*` publisher counts, and TF logs after startup, but those checks are diagnostic rather than startup blockers.
@@ -439,7 +548,7 @@ Extended same-day validation found one counterexample before the final weight ad
 
 RotationShim startup alignment and terminal goal heading now share the Nav2 controller path for ordinary `pose_required` goals. `RotationShimController` wraps MPPI, `FollowPath.rotate_to_goal_heading=true`, and Nav2 uses `PoseProgressChecker` with `required_movement_radius=0.03`, `required_movement_angle=0.05`, and `movement_time_allowance=12.0` so measurable terminal creep or in-place yaw progress is not falsely treated as a short no-progress wait. Both the public `SimpleGoalChecker` and Humble RotationShim's private `.position_checker` are `stateful=false`; the public tolerances remain `xy_goal_tolerance=0.06` and `yaw_goal_tolerance=0.05`. This prevents a transient XY hit from remaining latched while terminal yaw rotation moves the robot back outside tolerance. `robot_api_server` treats Nav2 result success as input to commercial final verification rather than business completion by itself. Docking fine alignment remains stricter and is handled by the docking/GS2 pipeline after predock staging. `robot_api_server` owns business admission, cancellation, state reporting, final-pose verification, bounded retry, and degraded reporting. `position_only` is only an explicit engineering opt-out. If a short goal still produces angular-only commands, use `diagnose_nav2_zero_linear_progress_failure.sh` or `observe_nav2_native_pose_required_goal.sh` to classify whether the zero-linear behavior originates in the controller, collision monitor, robot_safety, mode controller/chassis, or odom reflection before changing pointcloud, DDS, costmap, EKF, FAST-LIO2, or App API behavior.
 
-Return-to-dock uses Nav2 only as the coarse owner up to the pre-dock approach area; final predock yaw and lateral centerline capture are owned by `robot_api_server`. The backend prefers a manual point (`predock_pose_id`, `approach_pose_id`, or a saved pose such as `dock_main_predock`) and validates its yaw against the dock contact pose. That predock target is treated as `goal_completion_policy=dock_staging`, so ordinary navigation `final_yaw_align` is not allowed to run after staging Nav2 succeeds. Manual pre-dock distance checking is disabled by default (`docking_manual_predock_distance_check_enable=false`), so a close but intentionally saved point is not rejected only because it is below the old `0.50m` lower bound. If no manual point exists, the backend falls back to a geometric offset from the saved dock contact pose and exposes whether a reverse yaw offset was applied. The default docking normal path no longer forces before-predock, after-predock, or after-fine-docking relocalization around this short route. Instead, `robot_api_server` checks bridge `safe_for_goal_start`, sends `NavigateToPose(predock x/y/expected_base_yaw_at_predock)`, and while Nav2 is running it cancels early once the current pose enters the docking recovery window. That early transition is exposed as `STAGING_NAV2_EARLY_HANDOFF`, `predock_nav_early_handoff`, and `predock_nav_handoff_detail`; it prevents RotationShim/MPPI terminal yaw behavior from competing with docking-owned yaw/lateral capture. If Nav2 finishes normally or aborts before the early window, the API still enters `PREDOCK_POSE_VERIFY` only after checking that the pose is recoverable. If XY is acceptable but yaw is not, `PREDOCK_YAW_ALIGN_RECOVERY` can run before GS2 handoff; if the pose is outside the handoff window it fails with `DOCK_FAILED_PREDOCK_NAV_OUTSIDE_HANDOFF_WINDOW`, `PREDOCK_NATIVE_GOAL_VERIFY_FAILED`, or `PREDOCK_YAW_NOT_ALIGNED_AFTER_NAV2` instead of blindly entering fine docking. Fine docking is not started unless `predock_pose_verified`, `dock_staging_handoff_ready`, `predock_yaw_aligned`, GS2 freshness, a bounded `FINE_DOCKING_BRIDGE_SETTLE` wait for bridge `map->odom` smoothing to finish, and global-correction pause are all satisfied. `PREDOCK_YAW_ALIGN_RECOVERY` remains available only when `predock_yaw_align_enabled=true` and `predock_yaw_align_fallback_enabled=true`; it is still docking-owned and publishes only through `/cmd_vel_docking`. Explicit localization recovery remains available when localization is degraded, but it is not mixed into the default predock path.
+Return-to-dock sends the complete commissioned predock pose through Nav2 before near-field ownership changes. The backend prefers a manual point (`predock_pose_id`, `approach_pose_id`, or a saved pose such as `dock_main_predock`) and validates its yaw against the dock contact pose. The API retains `goal_completion_policy=dock_staging` only to keep ordinary API fallback motion out of the docking job; `navigate_to_predock.xml` explicitly selects the normal `goal_checker`, so the Nav2 action cannot succeed until both `0.06 m` XY and `0.05 rad` yaw are satisfied. Manual pre-dock distance checking is disabled by default (`docking_manual_predock_distance_check_enable=false`), so a close but intentionally saved point is not rejected only because it is below the old `0.50m` lower bound. If no manual point exists, the backend falls back to a geometric offset from the saved dock contact pose and exposes whether a reverse yaw offset was applied. The default docking path no longer forces before-predock, after-predock, or after-fine-docking relocalization around this short route. `robot_api_server` checks bridge `safe_for_goal_start`, sends `NavigateToPose(predock x/y/expected_base_yaw_at_predock)`, waits for the native terminal result, publishes zero, and proves wheel/local odometry has stopped before `PREDOCK_POSE_VERIFY` and `/docking/start`. `docking_predock_early_handoff_enabled=false` is the production setting, so entering a wider recovery window cannot cancel a live predock action. Fine-docking GS2 freshness, bridge settle, correction pause, and manager camera alignment remain downstream gates; they are not replacements for Nav2 reaching the commissioned predock pose. Explicit localization recovery remains available when localization is degraded, but it is not mixed into the default predock path.
 
 After each explicit docking recovery relocalization, the API can still use the post-relocalization settle barrier. Default docking normal path admission is lighter: it requires `robot_localization_bridge` to own `map -> odom` and report `safe_for_goal_start=true`, leaving correction timing and smoothing inside the bridge. Docking cancel calls `/docking/stop` with the configured service wait and records that result instead of treating a short service-discovery miss as a clean stop.
 
@@ -453,9 +562,35 @@ Phase 2.6 extends that latch for full-charge and missing-contact recovery. `dock
 
 Phase D2.3 separates charging/contact telemetry from physical dock occupancy. New live BMS charging/contact/current evidence writes a strong `source=charging_session` latch. `source=charging_session` and `source=docking_job` represent dock/session evidence and cannot be cleared by BMS `no_contact`, `current=0`, or `present=false` alone while live docking context or full-charge-idle evidence still suggests the robot may physically remain on the charger. A legacy `source=bms` latch can be auto-cleared when fresh BMS reports stable no-contact and runtime/docking state has no docked, charging, or undocking context. A strong `source=charging_session` latch is not cleared by restart-time idle/no-contact context; it is auto-cleared only after confirmed live undock plus stable BMS no-contact, or by explicit maintenance/session clear. A full battery at charger idle can therefore still be `DOCKED_CHARGE_IDLE` when the context supports it. `dock_occupancy_state` is exposed by `/api/v1/navigation/state`, `/api/v1/docking/state`, and `pre_navigation_dock_check`; `CONFIRMED_DOCKED`, `DOCKED_CHARGING`, `DOCKED_CHARGE_IDLE`, and `UNCERTAIN_ON_DOCK` block direct Nav2 submission and require auto-undock first. SOC=100 without prior charging/session evidence remains insufficient dock proof.
 
-Phase 2.8 keeps the same docking ownership but splits undock progress timing into explicit phases. `robot_docking_manager` still owns near-field docking and controlled undocking; return-to-dock travel remains Nav2 up to the pre-dock pose. The undock path remains `/cmd_vel_docking -> robot_safety -> /cmd_vel`, while ordinary Nav2 reverse is bounded to MPPI terminal correction only (`vx_min=-0.08` with `PreferForwardCritic`). `/cmd_vel_safe` is a robot_safety mirror for diagnostics. The retained calibrated speed is `undock.speed_mps=0.06`. `undock.command_settle_s` allows the Ranger park/forced-mode/reverse-enable state to settle before nonzero undock commands, `undock.motion_start_timeout_s` waits for first odometry-confirmed motion, and `undock.no_progress_timeout_s` is used only after first motion to detect a mid-undock stall. The total `undock.timeout_s` must cover command settle, first-motion wait, `distance / speed`, and margin. Use `scripts/jetson/runtime_overlay/scripts/diagnose_undock_logic_and_no_motion.sh --dry-run` for static/API checks, and `--execute-undock` only for a supervised controlled undock diagnostic.
+Inside `robot_api_server`, that complete persistent-latch and occupancy policy
+now lives in `features/docking/lifecycle/dock_contact_interlock_module`. The
+composition root only injects the canonical runtime-mode snapshot, the one
+PowerModule BMS snapshot, and navigation-job activity, then passes the immutable
+decision to navigation, docking, terminal control, and system status. File
+schema, source strength, TTL, full-charge-idle retention, confirmed-undock clear
+conditions, JSON fields, and auto-undock result are unchanged.
 
-Phase 2.7c tightens the motion-start phase so it cannot wait for odometry before sending the reverse command. After `command_settle_s`, every control tick in `waiting_first_motion` publishes `/ranger_mini3/docking_allow_reverse=true` and `/cmd_vel_docking.linear.x=-0.06` while waiting for `/local_state/odometry` to move by `progress_epsilon_m`. `/docking/status` includes `cmd_x`, `cmd_count`, `reverse_enable`, and timing fields. `undock_failed_motion_start_timeout ... cmd_count>0` means commands were sent and the next diagnosis should follow `robot_safety`, mode-controller, chassis execution, and odometry. `undock_failed_no_command_published` or `cmd_count=0` means the docking-manager state machine did not publish the undock command and must be treated as a software bug. This does not change Nav2, pointcloud, DDS/RMW, EKF, FAST-LIO2, Ranger CAN, App velocity ownership, or the final `robot_safety` speed chain.
+The subsequent controlled-undock transaction now lives in
+`features/docking/lifecycle/pre_navigation_undock_module`. The navigation goal
+executor still invokes it before bridge goal-start readiness and before sending
+any Nav2 action. The module shares the canonical docking job and start mutex,
+reuses an active undock, records the same service/status evidence, and holds the
+pending goal until physical undock plus configured post-undock localization
+readiness is proven. The composition root supplies ports only; the 28-second
+undock timeout, optional relocation allowance, charging retry, and all failure
+semantics are unchanged.
+
+The `docking_fine` correction-pause lifecycle now lives in
+`features/docking/lifecycle/docking_correction_pause_module`. It owns the bridge
+pause request, canonical docking-job/display-pose update, active fine-stage
+ownership test, and stale-pause recovery used by undock/status entry points.
+The composition root only injects read-only bridge/pose evidence and the
+existing correction-pause service call; no pause reason, timeout, gate, TF
+owner, or motion path changes.
+
+Phase 2.8 keeps the same docking ownership but splits undock progress timing into explicit phases. `robot_docking_manager` still owns near-field docking and controlled undocking; return-to-dock travel remains Nav2 up to the pre-dock pose. The undock path remains `/cmd_vel_docking -> robot_safety -> /cmd_vel`, while ordinary Nav2 reverse is bounded to MPPI terminal correction only (`vx_min=-0.08` with `PreferForwardCritic`). `/cmd_vel_safe` is a robot_safety mirror for diagnostics. The configured speed and dedicated cap are `undock.speed_mps=0.50` and `undock.max_speed_mps=0.50`; the general near-field docking cap remains `safety.max_linear_speed_mps=0.15`. `undock.command_settle_s` allows the Ranger park/forced-mode/reverse-enable state to settle before nonzero undock commands, `undock.motion_start_timeout_s` waits for first odometry-confirmed motion, and `undock.no_progress_timeout_s` is used only after first motion to detect a mid-undock stall. The total `undock.timeout_s` must cover command settle, first-motion wait, `distance / speed`, and margin. Use `scripts/jetson/runtime_overlay/scripts/diagnose_undock_logic_and_no_motion.sh --dry-run` for static/API checks, and `--execute-undock` only for a supervised controlled undock diagnostic.
+
+Phase 2.7c tightens the motion-start phase so it cannot wait for odometry before sending the reverse command. After `command_settle_s`, every control tick in `waiting_first_motion` publishes `/ranger_mini3/docking_allow_reverse=true` and `/cmd_vel_docking.linear.x=-0.50` while waiting for `/local_state/odometry` to move by `progress_epsilon_m`. `/docking/status` includes `cmd_x`, `cmd_count`, `reverse_enable`, and timing fields. `undock_failed_motion_start_timeout ... cmd_count>0` means commands were sent and the next diagnosis should follow `robot_safety`, mode-controller, chassis execution, and odometry. `undock_failed_no_command_published` or `cmd_count=0` means the docking-manager state machine did not publish the undock command and must be treated as a software bug. This does not change Nav2, pointcloud, DDS/RMW, EKF, FAST-LIO2, Ranger CAN, App velocity ownership, or the final `robot_safety` speed chain.
 
 Phase 2.7d keeps the same speed and ownership but makes the final safety arbiter continuous for push-in spring charging docks. Because the charging switch is mechanically engaged by pushing into the dock, undocking must drive at the controlled low speed through the switch travel rather than stopping on the DC contact. `robot_safety` stores the last fresh `/cmd_vel_docking` command and republishes it from its safety timer while `docking_cmd_priority_timeout_sec` is active; blocking states still publish zero, stale commands still expire, and ordinary Nav2 reverse is bounded to low-speed terminal correction instead of undock ownership. `diagnose_undock_logic_and_no_motion.sh` now also treats API `cmd_count` evidence as command evidence, so reports with `cmd_count>0` are classified downstream of the docking manager instead of as no-command state-machine failures.
 
@@ -520,9 +655,9 @@ docker exec -it NJRH-car bash -lc \
   'cd /workspaces/njrh-v3/workspace1 && NJRH_BUILDING_ID=building_1 NJRH_FLOOR_ID=floor_1 bash scripts/jetson/runtime_overlay/scripts/run_navigation_runtime_services.sh'
 ```
 
-`run_navigation_runtime_services.sh` resolves the selected floor assets, first reuses the fresh `local_state_ready` runtime-health snapshot produced by common services, and only falls back to direct `/local_state/odometry` plus `odom -> base_link` probes when that snapshot is unavailable. It then starts the resident occupancy-localization layer and runs the initial `/global_localization/trigger` only after selected-floor localization readiness and floor context selection by default. Nav2 starts after that initial baseline in production; `NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION=true` is A/B only. The experimental `NJRH_INITIAL_GLOBAL_LOCALIZATION_BACKGROUND_START=true` path can still overlap the trigger with map/floor readiness for A/B, but it is not the production default because field startup showed it can increase stale Isaac cold-start results. A missing local-state endpoint now fails as `LOCAL_STATE_ENDPOINT_NOT_READY`, stale odometry as `LOCAL_STATE_ODOM_NOT_FRESH`, and stale local TF as `ODOM_BASE_TF_NOT_FRESH`, instead of being reported later as an AMCL warmup failure. The wrapper calls Isaac's direct grid-search service but startup success is judged by `robot_localization_bridge` accepting the result, `/localization/bridge_status.has_map_to_odom=true`, and a live `map -> odom` TF owned by `robot_localization_bridge`. AMCL resident warmup before the initial triggered baseline is disabled by default (`NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION=false`) because AMCL lifecycle depends on stable map/seed context; enabling it is an A/B diagnostic path only. AMCL readiness still starts after the initial triggered baseline has been accepted, and the commercial navigation default is `NJRH_AMCL_LOCALIZATION_MODE=gated`, so bounded AMCL corrections can continuously update `map -> odom`; `shadow` remains the odom-only audit rollback. Nonfatal AMCL background failures are logged without poisoning the resident runtime context. The runtime context is marked ready after Nav2 lifecycle activation, `/global_costmap/global_costmap` is active, and `/global_costmap/costmap` has a publisher.
+`run_navigation_runtime_services.sh` resolves and verifies the already committed `current/` floor assets, first reuses the fresh `local_state_ready` runtime-health snapshot produced by common services, and only falls back to direct `/local_state/odometry` plus `odom -> base_link` probes when that snapshot is unavailable. It does not repeat `/floor_manager/switch_floor` during startup: that service is source preflight only, while the API transaction or a previously durable selection already owns `current/`. The runtime then starts the resident occupancy-localization layer, proves the wrapper service, Isaac service, active exact map, and supervised FlatScan owner, and verifies the exact floor context. It completes the foreground initial `/global_localization/trigger`, requires bridge acceptance and live `map -> odom`, and only then starts the held Nav2 process tree. `NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION=true` is an earlier A/B-only path. The experimental `NJRH_INITIAL_GLOBAL_LOCALIZATION_BACKGROUND_START=true` path moves the already-admitted trigger into a child process for A/B; it is joined before `initial_global_localization_ready` and cannot overlap held Nav2 preload. A missing local-state endpoint now fails as `LOCAL_STATE_ENDPOINT_NOT_READY`, stale odometry as `LOCAL_STATE_ODOM_NOT_FRESH`, and stale local TF as `ODOM_BASE_TF_NOT_FRESH`, instead of being reported later as an AMCL warmup failure. The wrapper calls Isaac's direct grid-search service but startup success is judged by `robot_localization_bridge` accepting the result, `/localization/bridge_status.has_map_to_odom=true`, and a live `map -> odom` TF owned by `robot_localization_bridge`. The bridge retains 30 seconds of `odom -> base_link` history for the wrapper's 20-second result window and still evaluates the original result timestamp. AMCL resident warmup before the initial triggered baseline is disabled by default (`NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION=false`) because AMCL lifecycle depends on stable map/seed context; enabling it is an A/B diagnostic path only. AMCL readiness still starts after the initial triggered baseline has been accepted, and the commercial navigation default is `NJRH_AMCL_LOCALIZATION_MODE=gated`, so bounded AMCL corrections can continuously update `map -> odom`; `shadow` remains the odom-only audit rollback. Nonfatal AMCL background failures are logged without poisoning the resident runtime context. The runtime context is marked ready after Nav2 lifecycle activation, `/global_costmap/global_costmap` is active, and `/global_costmap/costmap` has a publisher.
 
-If `NJRH_AMCL_LOCALIZATION_MODE=shadow` or `gated`, AMCL is not part of the Nav2 controller/planner lifecycle and does not publish TF. After `/global_localization/trigger` is accepted by `robot_localization_bridge` and `map -> odom` is live, resident startup starts AMCL resident warmup in the background while Nav2 lifecycle activation proceeds. That warmup activates AMCL through the standard `/amcl/change_state` lifecycle service, warms AMCL's process-local TF buffer from `/map`, `/scan`, `odom -> base_link`, and `base_link -> scan_frame`, and starts the C++ `/scan_amcl` admission relay. After Nav2 lifecycle activation and global costmap readiness, the runtime joins the AMCL warmup if it is still running, then retries readiness completion for a bounded window: seed `/initialpose` through `/robot_localization_bridge/seed_amcl_initial_pose`, then wait for `/amcl_pose` only when explicit diagnostics disable static-standby skip. AMCL and the C++ scan-admission relay start through installed binaries (`/opt/ros/humble/lib/nav2_amcl/amcl` and `install/robot_localization_bridge/lib/robot_localization_bridge/amcl_scan_admission_node`) instead of `ros2 run` wrappers, and the seed service is called by an in-process rclpy client instead of `ros2 service call`, so startup avoids CLI package lookup and wrapper shutdown cost. `/scan_amcl` is an AMCL production admission input derived from `/scan`, preserves the original stamp/frame/ranges, drops stale or non-TF-transformable scans, defaults to 5 Hz, and is bound to `NJRH_CPUSET_AMCL_SCAN_ADMISSION` by `taskset` when started. AMCL readiness requires AMCL active, seed success, and healthy scan admission; while stopped or docked, stale `/amcl_pose` is not fatal and is exposed as `amcl_not_moving_no_update_ok`. During motion, stale `/amcl_pose` makes AMCL not tracking. `gated` is the commercial default and applies only bounded bridge-approved corrections; `shadow` reports bridge candidates only for diagnostics and odom-only audits. If AMCL readiness does not complete within `NJRH_AMCL_READINESS_COMPLETION_TIMEOUT_SEC`, resident startup fails instead of writing a ready context that the API would later reject. Navigation stop calls the AMCL stop helper, which also stops the scan admission relay, before stopping the rest of the navigation stack.
+If `NJRH_AMCL_LOCALIZATION_MODE=shadow` or `gated`, AMCL is not part of the Nav2 controller/planner lifecycle and does not publish TF. After `/global_localization/trigger` is accepted by `robot_localization_bridge` and `map -> odom` is live, resident startup starts AMCL resident warmup in the background while Nav2 lifecycle activation proceeds. That warmup activates AMCL through the standard `/amcl/get_state` and `/amcl/change_state` services using one bounded `rclpy` lifecycle client. It does not spawn a sequence of short-lived `ros2 lifecycle get` and `ros2 service call` processes, which can observe an invalid CLI context during App resume on a busy Fast DDS graph. The same client handles `unconfigured -> inactive -> active` idempotently and confirms the resulting state before exit. While that bounded activation and scan-admission startup are in progress, the status heartbeat reports `AMCL_STARTING` for at most `NJRH_AMCL_STARTUP_HEARTBEAT_GRACE_SEC` instead of publishing a false `AMCL_HEARTBEAT_PROCESS_NOT_ALIVE`; expiry or a completed startup failure still fails closed. The warmup then fills AMCL's process-local TF buffer from `/map`, `/scan`, `odom -> base_link`, and `base_link -> scan_frame`, and starts the C++ `/scan_amcl` admission relay. After Nav2 lifecycle activation and global costmap readiness, the runtime joins the AMCL warmup if it is still running, then retries readiness completion for a bounded window: seed `/initialpose` through `/robot_localization_bridge/seed_amcl_initial_pose`, then wait for `/amcl_pose` only when explicit diagnostics disable static-standby skip. AMCL and the C++ scan-admission relay start through installed binaries (`/opt/ros/humble/lib/nav2_amcl/amcl` and `install/robot_localization_bridge/lib/robot_localization_bridge/amcl_scan_admission_node`) instead of `ros2 run` wrappers, and the seed service is called by an in-process rclpy client instead of `ros2 service call`, so startup avoids CLI package lookup and wrapper shutdown cost. `/scan_amcl` is an AMCL production admission input derived from `/scan`, preserves the original stamp/frame/ranges, drops stale or non-TF-transformable scans, defaults to 5 Hz, and is bound to `NJRH_CPUSET_AMCL_SCAN_ADMISSION` by `taskset` when started. AMCL readiness requires AMCL active, seed success, and healthy scan admission; while stopped or docked, stale `/amcl_pose` is not fatal and is exposed as `amcl_not_moving_no_update_ok`. During motion, stale `/amcl_pose` makes AMCL not tracking. `gated` is the commercial default and applies only bounded bridge-approved corrections; `shadow` reports bridge candidates only for diagnostics and odom-only audits. If AMCL readiness does not complete within `NJRH_AMCL_READINESS_COMPLETION_TIMEOUT_SEC`, resident startup fails instead of writing a ready context that the API would later reject. Navigation stop calls the AMCL stop helper, which also stops the scan admission relay, before stopping the rest of the navigation stack.
 
 The AMCL runner writes `/tmp/njrh_amcl_runtime_status.env` on start, readiness completion, degraded startup, failure, and stop. The file records `AMCL_STATE`, `AMCL_READY`, `AMCL_DEGRADED`, `AMCL_FAILURE_REASON`, AMCL lifecycle/process state, stale PID cleanup, scan-admission PID/publisher state, `/amcl_pose` publisher count, seed status, the observed `map -> odom` owner, `AMCL_STATUS_STAMP_SEC`, no-motion probe fields, and split readiness fields for process/seed/static-standby/tracking/correction. `run_navigation_runtime_services.sh` captures the AMCL runner exit code under `set +e`, reads this status file, logs `AMCL_STATUS`, and only allows exit `10` to continue in `shadow` mode. Startup status writing is fast by default and uses the already validated AMCL/scan-admission PIDs plus the lifecycle action outcome instead of launching additional `ros2 node/topic` graph probes; set `NJRH_AMCL_STATUS_GRAPH_PROBE_ENABLED=true` only for explicit diagnostics. The file is a TTL-bound snapshot rather than a permanent authority: if it becomes stale, `robot_localization_bridge` reports `amcl_status_source=stale_file_ignored` and uses live AMCL graph/subscription evidence instead of letting an old `AMCL_FAILED` keep localization degraded. AMCL is event-driven while stationary, so a stale or absent fresh `/amcl_pose` immediately after seed is normal static standby, not a failure, when AMCL is active, scan admission is publishing, and the seed service succeeded. Startup defaults to `NJRH_AMCL_STATIC_STANDBY_SKIP_POSE_WAIT=true`, so successful seed immediately writes `AMCL_STATIC_STANDBY_ACCEPTED=true`, `AMCL_TRACKING_READY=true`, and `AMCL_CORRECTION_READY=false`; this means AMCL is ready as a resident candidate but has not yet supplied an applyable correction. If resident AMCL initially reports `AMCL_WAITING_SEED`, the bridge can resolve that transient state from live evidence once seed, scan admission, stationary robot state, and static standby are all true; normal goal admission then remains allowed when `map -> odom` is stable. Explicit diagnostics can disable the skip and use `amcl_nomotion_update_probe.py`, which subscribes to `/amcl_pose`, waits a short warmup, then calls `/request_nomotion_update`; the seed check accepts a pose received during that service window even if the header is older than the correction gate, while actual gated corrections still require a fresh header/TF-compatible pose. A seeded stationary AMCL that is tracking-ready but has not yet produced a fresh gated correction is reported as `amcl_correction_pending=true`; that is diagnostic and not `localization_degraded=true`. API goal admission allows clean no-motion static standby using structured bridge fields, but treats non-standby pending/not-ready correction as `LOCALIZATION_TRANSITION_ACTIVE` so Nav2 is not started while map correction is still entering `map -> odom`. `/localization/bridge_status`, `/api/v1/status`, and `/api/v1/navigation/state` expose `amcl_status_file_stale`, `amcl_status_source`, `amcl_seed_response_ok`, `amcl_nomotion_pose_received`, `amcl_process_ready`, `amcl_seeded`, `amcl_static_standby`, `amcl_tracking_ready`, `amcl_correction_ready`, `amcl_correction_pending`, `localization_degraded`, and `using_triggered_baseline_only`.
 
@@ -557,7 +692,7 @@ debug-only manual run. This prevents `docker exec -d` or `nohup` from starting a
 second transient navigation owner whose EXIT cleanup can tear down Nav2,
 localization, AMCL, and bridge children while readiness scripts continue waiting.
 
-If resident navigation startup exits before the runtime context reaches confirmed `ready`, `run_navigation_runtime_services.sh` writes the context as `failed` with the resume log path. If the failure is Nav2 lifecycle activation, the script stops only the failed Nav2 layer, then runs one outer standard-Nav2 process sweep so stale `controller_server`, `planner_server`, `bt_navigator`, and lifecycle-manager processes cannot remain in the ROS graph. It keeps the selected-floor localization layer alive for diagnostics and retry. The runtime context includes `startup_stage` and `startup_elapsed_sec`, and the App should show that failed or starting state instead of waiting forever on generic TF pose timeouts.
+If resident navigation startup exits before the runtime context reaches confirmed `ready`, `run_navigation_runtime_services.sh` writes the context as `failed` with the resume log path. A successful startup now commits readiness in fail-closed order: atomically write `state=ready, confirmed=true`, read it back through the exact-current-floor matcher, and only then set the shell owner's internal `runtime_ready=1` guard. A write or read-back failure therefore reaches the EXIT trap with cleanup still enabled. The trap treats its secondary `failed`-context write as best-effort, so the same unwritable path cannot short-circuit cleanup. If Nav2 lifecycle activation fails, the script stops the failed Nav2 layer, runs one outer standard-Nav2 process sweep, exits nonzero, and lets the existing cleanup trap remove the incomplete localization/localizer/bridge layer as well. A later `/navigation/start` therefore cannot inherit stale `controller_server`, `planner_server`, `bt_navigator`, lifecycle-manager, or localization participants. The runtime context includes `startup_stage` and `startup_elapsed_sec`, and the App should show that failed or starting state instead of waiting forever on generic TF pose timeouts.
 
 Host `scripts/jetson/njrh_container.sh start-runtime` is a full runtime readiness command, not only a container/API probe. It first waits for `/api/v1/status`, then, when `NJRH_RESIDENT_NAVIGATION_AUTOSTART` is enabled and a selected or last navigation map exists, waits for `/tmp/njrh_runtime_map_context.json` to report `state=ready` and `confirmed=true`. By default that confirmed context means bridge-owned `map -> odom` plus Nav2 lifecycle readiness; AMCL tracking readiness is reported separately and continues in the background unless `NJRH_REQUIRE_AMCL_TRACKING_FOR_NAV_READY=true` is set. The default full runtime SLA window is `NJRH_ROBOT_NAV_READY_TIMEOUT_SEC=120` from the start of `start-runtime`. `stop-common` also clears stale runtime context and explicitly stops detached resident navigation, Nav2 lifecycle, occupancy localization, AMCL, scan admission, bridge, and API processes by fixed repository process patterns before the next start. This prevents an old ready context or orphaned Nav2 stack from making a cold restart look ready when the newly-started chain is not.
 
@@ -573,7 +708,26 @@ docking, and API resident even when Nav2 or localization is still starting or
 has failed, instead of letting a navigation-context timeout restart the whole
 common-service layer.
 
-Manual floor-navigation stop clears the runtime map context after killing Nav2/localization helper processes. This prevents `robot_api_server` from recovering a stale `ready` context after the stack has been stopped. The script sends INT/TERM/KILL to Nav2, localization bridge, occupancy localizer, AMCL, scan admission, and local-perception process patterns before the bounded AMCL shutdown helper runs; if AMCL lifecycle cleanup exceeds `NJRH_NAV_STOP_AMCL_TIMEOUT_SEC`, the script logs that diagnostic and continues with final lingering-process verification instead of letting AMCL block the API stop window.
+Manual floor-navigation stop clears the runtime map context after killing Nav2/localization helper processes. This prevents `robot_api_server` from recovering a stale `ready` context after the stack has been stopped. The script sends INT/TERM/KILL to Nav2, localization bridge, occupancy localizer, AMCL, scan admission, and local-perception process patterns before the bounded AMCL shutdown helper runs; if AMCL lifecycle cleanup exceeds `NJRH_NAV_STOP_AMCL_TIMEOUT_SEC`, the script logs that diagnostic and continues with final lingering-process verification instead of letting AMCL block the API stop window. `robot_floor_manager` is a common resident service and is deliberately excluded from this navigation-only cleanup, so a successful `/api/v1/navigation/stop` cannot remove the `/floor_manager/switch_floor` preflight service needed by the next offline selection.
+
+`POST /api/v1/navigation/cancel` cancels only the current goal and keeps the
+resident runtime alive. `POST /api/v1/navigation/stop` with `stop_stack=true`
+is the mode transition used before map selection: it removes only the
+navigation/localization layer while common `robot_local_state`, chassis,
+safety, floor-manager, and API ownership remain resident. A later
+`POST /api/v1/navigation/start` therefore uses the `api_resume` stable
+local-state preflight described above rather than replaying the complete boot
+sequence.
+
+The stop transition is ordered `zero command -> cancel proof -> stack stop`.
+It must never close Nav2 merely because the stop script itself succeeded. An
+accepted cancel-all response with `goals_canceling=[]` proves the already-idle
+case immediately; waiting for a later empty action-status frame is invalid
+because an idle action server may publish no new frame. If terminal evidence is
+still unknown, the stop job remains failed and the Nav2 process stays alive so
+the status subscriber can observe a late terminal result. This prevents a
+successful-looking stop from creating `DELAYED_SIDE_EFFECT_UNKNOWN` and then
+blocking the subsequent offline floor selection.
 
 `robot_api_server` now treats a repeated same-floor resume as idempotent when the runtime context is already confirmed `ready` for the requested `map_id/building_id/floor_id` and the existing resume process is still alive. In that case it returns `navigation_runtime_reused` and does not signal the old process group, so the old cleanup trap cannot tear down an already-ready Nav2/localization stack.
 
@@ -588,6 +742,15 @@ They refresh local process/context caches only and do not synchronously probe
 Nav2 lifecycle services on every poll. Blocking lifecycle checks remain on
 runtime resume, navigation goal admission, and explicit readiness diagnostics so
 mobile polling cannot exhaust the API connection limit.
+
+The lightweight mapping/navigation/docking business snapshot and the
+single-owner mode-transition token are implemented in
+`robot_api_server/application/runtime_mode/RuntimeModeCoordinator`. Snapshot
+priority remains `ERROR > DOCKING > MAPPING_2D > NAVIGATION > IDLE`.
+Multi-field docking admission and completion updates are committed under one
+coordinator lock, so extraction from the API composition root does not expose
+partially updated dock ID/status/active state to App polling. The coordinator
+does not start processes, probe ROS, publish velocity, or add a new gate.
 
 Explicit readiness and field diagnostics must use the same DDS environment as
 the production runtime. Every diagnostic script that starts a ROS participant
@@ -613,15 +776,60 @@ start FAST-LIO2/PGO explicitly.
 The Web dashboard is still a test UI; its stop-core path now keeps
 driver/chassis/common services alive by default. Saving a 2D map writes the map
 bundle under `maps_release/<building_id>/<floor_id>/maps/<map_id>/` but does not
-activate it for navigation. The App must explicitly select the saved map with
-`POST /api/v1/floors/switch` and `resume_navigation=true`; that selection writes
-`last_navigation_map.json` for the next boot.
+activate it for navigation. The App may select the saved map only after all
+motion runtimes have stopped, using `POST /api/v1/floors/switch` with
+`resume_navigation=false`. The gateway first freezes the source
+`map_id/asset_epoch/asset_digest`; `robot_floor_manager` verifies that exact
+inactive-capable bundle and echoes its identity and dynamic paths. Only after
+the gateway matches that proof does its serialized activation transaction
+project the bundle into the floor's backend-owned `current/` mirror for a
+later controlled startup. It neither starts nor reloads navigation.
+`resume_navigation=true`
+returns `LIVE_FLOOR_SWITCH_DISABLED`. Opening the App map editor does not
+select runtime assets and must not call this endpoint.
+
+An operator-requested ordinary navigation startup follows the offline
+selection with `POST /api/v1/navigation/start` using the same exact
+`building_id/floor_id/map_id`. The backend revalidates the selected immutable
+bundle and fixed `current/` projection, then starts or reuses the single
+repository-owned localization/Nav2 runtime. HTTP `202` is only acceptance;
+the App waits for `/api/v1/navigation/state` to confirm the same ready runtime
+identity and `safe_for_goal_start=true`. This single-floor flow does not
+enable or bypass the legacy `resume_navigation` flag. A resident-runtime
+cross-floor change instead uses `/api/v1/floor-switch/start`, polls
+`/api/v1/floor-switch/state`, and is committed only by the strict Action after
+stopped-motion, target-localization, bridge, and costmap proof.
+
+For a resident cross-floor change, component load acknowledgement is not
+treated as localizer readiness. The global-localization wrapper recreates the
+Isaac trigger client and waits for a post-reload `/flatscan`, a minimum settle
+interval, and stable trigger-service discovery before it arms bridge
+force-accept. The floor manager gives this complete ordered localization
+transaction `75 s`, independent from its `10 s` ordinary-service timeout, and
+reconciles a delayed RPC response against the exact target generation and
+explicit-relocation sequence. This ordering prevents a successful map reload
+from being followed immediately by a false `timed out triggering global
+localization` lock.
+The API's direct floor-switch worker and its elevator runtime adapter share the
+same configured `120 s` Action deadline, which envelopes the `75 s`
+localization sub-transaction instead of canceling it at the adapter's former
+90-second default.
 
 The API promotes 2D mapping from `starting` to `running` only after a live `/map` occupancy grid from the App-started `slam_toolbox` session is fresh and image-renderable. While 2D mapping is active, `robot_api_server` keeps its own `/map` cache subscription alive for startup readiness, `/api/v1/status`, and save operations; the App page lease is still required for live PNG rendering. `GET /api/v1/status` exposes `mapping.live_map_available`, `mapping.live_map_age_sec`, and the current live map dimensions so App-side delays can be distinguished from backend startup failures.
 
 Live 2D mapping sets `slam_toolbox.scan_queue_size=30` and `transform_timeout=0.50` to tolerate short TF/scan timestamp jitter in the JT128 -> FAST-LIO -> flatscan chain. It also enables conservative 2D loop closing (`loop_search_maximum_distance=3.0`, `loop_match_minimum_response_coarse=0.40`, `loop_match_minimum_response_fine=0.50`, `loop_search_space_dimension=6.0`) so long 2D mapping routes can close planar drift without loose matches in repeated indoor geometry. The startup script waits up to `NJRH_SLAM2D_ODOM_READY_TIMEOUT=30` seconds for fresh resident `/local_state/odometry`, then starts a mapping-owned FAST-LIO2 frontend and waits up to `NJRH_SLAM2D_FASTLIO_POINTS_READY_TIMEOUT=60` seconds for `/cloud_registered_body`. It does not start, kill, or repair canonical TF/local-state; cleanup stops only the C++ mapping bridge and a FAST-LIO2 process carrying the `NJRH_SLAM2D_PRIVATE_FASTLIO=1` marker. It also compares `/local_state/odometry` with the resident local odom reference and refuses mapping if the difference exceeds `NJRH_SLAM2D_LOCAL_ODOM_MAX_WHEEL_DIFF_M=25.0`; this catches a diverged local-state process before `slam_toolbox` can create a corrupted map. If `Message Filter dropping message ... queue is full` continues after restart, treat it as a TF timing or producer-rate problem rather than simply increasing the queue again.
 
 The API's mapping-stop residual sweep must keep this ownership boundary: FAST-LIO2 is cleaned only when both the command line matches the FAST-LIO2 mapping binary and `/proc/<pid>/environ` contains `NJRH_SLAM2D_PRIVATE_FASTLIO=1`. Residual cleanup must not match generic scan/localization helper names such as `nav_cloud_preprocessor`, `pointcloud_to_laserscan_node`, or `scan_republisher_node`; those names are also used by resident navigation localization. Hardware validation after an App mapping stop should confirm no mapping-owned `fast_lio`/`fastlio`/`laser_mapping` process remains, while the driver, chassis, `robot_local_state`, canonical TF publisher, `robot_safety`, `robot_api_server`, and any active resident navigation services are still alive.
+
+Inside `robot_api_server`, `features/mapping/runtime/mapping_process_runtime`
+owns that process boundary, including the launcher PID/process group, bounded
+signal escalation, marked residual discovery, and temporary LiDAR RPS/XPS
+restoration. `features/mapping/runtime/mapping_start_job` owns the single
+thread-safe App-visible start transaction. The API composition root deliberately
+retains the cross-domain transition order, exact ROS graph proof for the
+navigation `/scan` owner, and live `/map` subscription. This split changes no
+mapping parameter, TF publisher, DDS/QoS/timestamp rule, scan geometry, or
+velocity ownership.
 
 The Windows Jetson helper refreshes `scripts/jetson/runtime_overlay` before remote actions. If a stale root-owned remote overlay prevents deletion, `Invoke-NJRHJetson.ps1` quarantines it as `runtime_overlay.stale.<timestamp>` and uploads a clean overlay so status/start commands are not blocked by old temporary logs.
 
@@ -635,8 +843,75 @@ clean up Nav2 plus AMCL. Process teardown safely reclaims this short-lived DDS
 participant and keeps the resident owner result aligned with the confirmed
 lifecycle state.
 
+Both foreground and background held-Nav2 activation paths wait for the same
+atomic launch-readiness record before creating that lifecycle client. The
+record must belong to the current `run_nav2_navigation.sh` wrapper, be fresh,
+and name a live `controller_server` PID. Lifecycle discovery and transition
+requests therefore cannot begin while the current Nav2 launch is still creating
+its child processes. This is process-order synchronization, not an additional
+navigation, localization, obstacle, or motion-admission gate.
+
+The fallback `GetState` loop retains all requests that are still pending across
+its bounded two-second retry intervals and accepts the first successful late
+response. Previously each retry overwrote the local Future, so a response that
+took slightly longer than the retry interval completed an abandoned Future and
+the observer could chase newer requests until the 30-second node deadline. A
+successful response now removes the remaining unresolved requests, while no
+response still fails at the unchanged per-node deadline. This changes only
+lifecycle observation timing; transition success and selected-map publication
+remain fail-closed.
+
 The 2026-07-22 full-service restart after this change reached
 `startup_stage=nav2_layer_ready` in 36 seconds. The resident owner stayed alive,
 AMCL completed its background seed retry and reached `AMCL_READY`, and six
 subsequent navigation goals ran without the previous active-then-cleaned
 startup failure.
+
+Ordinary navigation goal execution is now one lifecycle unit behind
+`features/navigation/mission/navigation_goal_execution_module`. The unit begins
+with the already-admitted pre-goal dock/readiness snapshot, owns each action
+submission's delayed-side-effect evidence, and ends only after Nav2 terminal
+proof plus the existing commercial final-pose/yaw transaction. Bridge settle,
+AMCL no-motion request, bounded same-goal retry, terminal correction and the
+predock command-owner mutex remain in that unit. The API composition root keeps
+only dependency wiring. The full concrete docking executor edge now lives in
+`features/docking/lifecycle/docking_job_execution_module`: it owns canonical
+job-store access, serialized pre-dock Nav2 submission and unresolved-side-effect
+evidence, and delegates the unchanged localization/BMS/terminal effects through
+explicit ports. The root no longer inherits `DockingJobExecutionPort`; no
+service is restarted and no runtime parameter or velocity path changes with
+these ownership moves.
+
+Docking parameter declaration and validation now form one construction-time
+unit at `features/docking/configuration/docking_configuration_module`. The unit
+owns all 100 existing docking-related ROS parameters and emits the already
+defined runtime/interlock/predock/executor/HTTP/status configs. The root passes
+only five neighboring-domain constraints and keeps no duplicate docking scalar
+members. This is an ownership-only move: defaults, clamp dependencies, timeout
+budgets, relocalization settings, BMS rules, and the velocity chain are
+unchanged.
+
+Navigation parameter declaration and config composition now form one
+construction-time unit at
+`features/navigation/configuration/navigation_configuration_module`. The unit
+owns all 112 existing API-side navigation parameters and returns the unchanged
+navigation, terminal-runtime, goal-execution, and goal-executor config objects.
+The root retains only explicit cross-domain inputs and no duplicate navigation
+scalar configuration; this move starts no process, changes no runtime value,
+and publishes neither TF nor velocity.
+
+API-side localization parameter declaration and config composition now live
+in `features/localization/localization_configuration_module`. Its 48 owned
+parameters produce the existing `LocalizationModuleConfig` and
+`PostRelocalizationSettleConfig`; frame normalization and every dependent
+timeout/sample bound are unchanged. The construction unit does not start
+Isaac or AMCL, call a localization service, inspect the graph, publish TF, or
+command motion.
+
+Elevator runtime parameter composition now lives in
+`features/elevator/configuration/elevator_runtime_configuration_module`. The
+unit owns all 15 elevator-runtime declarations and returns the complete
+`ElevatorModuleConfig`; map/action/safety values are explicit neighbor inputs.
+It has no process or request lifecycle and cannot call the external arm
+service, submit Nav2/FloorSwitch work, publish the collision-bypass permit, or
+change any motion gate.

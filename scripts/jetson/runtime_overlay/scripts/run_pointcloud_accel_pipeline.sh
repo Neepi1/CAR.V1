@@ -24,6 +24,10 @@ FLATSCAN_GRAPH_PROBE_TIMEOUT_SEC="${NJRH_FLATSCAN_GRAPH_PROBE_TIMEOUT_SEC:-4}"
 FLATSCAN_MESSAGE_CONFIRM_TIMEOUT_SEC="${NJRH_FLATSCAN_MESSAGE_CONFIRM_TIMEOUT_SEC:-10}"
 FLATSCAN_WAIT_SEC="${NJRH_FLATSCAN_WAIT_SEC:-30}"
 FLATSCAN_MIN_HZ="${NJRH_FLATSCAN_MIN_HZ:-5.0}"
+FLATSCAN_STARTUP_WARMUP_SEC="${NJRH_FLATSCAN_STARTUP_WARMUP_SEC:-2.0}"
+FLATSCAN_STARTUP_RATE_ATTEMPTS="${NJRH_FLATSCAN_STARTUP_RATE_ATTEMPTS:-2}"
+FLATSCAN_STARTUP_RATE_RETRY_SEC="${NJRH_FLATSCAN_STARTUP_RATE_RETRY_SEC:-1.0}"
+FLATSCAN_STARTUP_RATE_SAMPLE_SEC="${NJRH_FLATSCAN_STARTUP_RATE_SAMPLE_SEC:-4}"
 FLATSCAN_SUPERVISE_PERIOD_SEC="${NJRH_FLATSCAN_SUPERVISE_PERIOD_SEC:-10.0}"
 FLATSCAN_STATUS_FILE="${NJRH_FLATSCAN_HELPER_STATUS_FILE:-${NJRH_RUNTIME_LOG_DIR}/flatscan_helper_status.env}"
 
@@ -117,9 +121,10 @@ flatscan_publisher_exists() {
 }
 
 flatscan_hz_ok() {
+  local sample_timeout_sec="${1:-${FLATSCAN_MESSAGE_CONFIRM_TIMEOUT_SEC}}"
   local output
   local hz
-  output="$(timeout --kill-after=1 "${FLATSCAN_MESSAGE_CONFIRM_TIMEOUT_SEC}" \
+  output="$(timeout --kill-after=1 "${sample_timeout_sec}" \
     ros2 topic hz /flatscan --window 3 2>/dev/null || true)"
   hz="$(awk '/average rate:/ {value=$3} END {if (value != "") print value}' <<<"${output}")"
   if [[ -z "${hz}" ]]; then
@@ -131,6 +136,27 @@ flatscan_hz_ok() {
     return 0
   fi
   echo "[pointcloud-accel] FAIL /flatscan hz=${hz} below min=${FLATSCAN_MIN_HZ}" >&2
+  return 1
+}
+
+flatscan_startup_rate_confirmed() {
+  local attempt
+  local attempts="${FLATSCAN_STARTUP_RATE_ATTEMPTS}"
+  if ! [[ "${attempts}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[pointcloud-accel] WARN invalid startup rate attempts=${attempts}; using 2" >&2
+    attempts=2
+  fi
+
+  for ((attempt = 1; attempt <= attempts; attempt += 1)); do
+    if flatscan_hz_ok "${FLATSCAN_STARTUP_RATE_SAMPLE_SEC}"; then
+      echo "[pointcloud-accel] /flatscan startup rate confirmed attempt=${attempt}/${attempts}" >&2
+      return 0
+    fi
+    if [[ "${attempt}" -lt "${attempts}" ]]; then
+      echo "[pointcloud-accel] WARN /flatscan startup rate probe ${attempt}/${attempts} was inconclusive; keeping helper alive and retrying" >&2
+      sleep "${FLATSCAN_STARTUP_RATE_RETRY_SEC}"
+    fi
+  done
   return 1
 }
 
@@ -251,7 +277,8 @@ wait_for_flatscan_ready() {
     fi
     return 1
   fi
-  flatscan_hz_ok
+  sleep "${FLATSCAN_STARTUP_WARMUP_SEC}"
+  flatscan_startup_rate_confirmed
 }
 
 restart_flatscan_helper_if_allowed() {
@@ -416,6 +443,12 @@ case "${PROFILE}" in
     ;;
 esac
 
-wait_for_flatscan_ready
-note_flatscan_healthy
+if wait_for_flatscan_ready; then
+  note_flatscan_healthy
+else
+  flatscan_helper_health_state="startup_degraded"
+  flatscan_helper_healthy_since_epoch=0
+  write_flatscan_helper_status
+  echo "[pointcloud-accel] WARN /flatscan startup readiness was not fully confirmed; keeping the helper and parent supervisor alive for automatic recovery" >&2
+fi
 supervise_flatscan_helper

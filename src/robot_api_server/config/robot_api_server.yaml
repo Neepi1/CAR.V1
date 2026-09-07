@@ -7,6 +7,21 @@ robot_api_server:
 
     maps_root: "/workspaces/njrh-v3/workspace1/maps_release"
     runtime_maps_dir: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/maps"
+    elevator_runtime_adapter_enabled: false
+    elevator_arm_button_control_enabled: false
+    elevator_arm_service_host: "127.0.0.1"
+    elevator_arm_service_port: 8083
+    elevator_arm_request_timeout_sec: 12.0
+    elevator_arm_task_timeout_sec: 180.0
+    elevator_arm_poll_interval_sec: 0.20
+    elevator_scoped_behavior_tree: "/workspaces/njrh-v3/workspace1/install/robot_nav_config/share/robot_nav_config/behavior_trees/navigate_elevator_scoped_motion.xml"
+    elevator_hall_call_scoped_behavior_tree: "/workspaces/njrh-v3/workspace1/install/robot_nav_config/share/robot_nav_config/behavior_trees/navigate_elevator_hall_call_scoped_motion.xml"
+    elevator_reverse_entry_staging_behavior_tree: "/workspaces/njrh-v3/workspace1/install/robot_nav_config/share/robot_nav_config/behavior_trees/navigate_elevator_reverse_entry_staging.xml"
+    elevator_reverse_docking_behavior_tree: "/workspaces/njrh-v3/workspace1/install/robot_nav_config/share/robot_nav_config/behavior_trees/navigate_elevator_reverse_docking.xml"
+    elevator_cabin_entry_direct_behavior_tree: "/workspaces/njrh-v3/workspace1/install/robot_nav_config/share/robot_nav_config/behavior_trees/navigate_elevator_cabin_entry_direct.xml"
+    elevator_entry_collision_bypass_permit_topic: "/ranger_mini3/elevator_entry_collision_bypass"
+    elevator_entry_collision_bypass_refresh_sec: 0.20
+    elevator_recovery_hold_release_service: "/safety/release_motion_hold_if_execution_idle"
 
     safety_estop_topic: "/safety/estop"
     safety_status_topic: "/safety/status"
@@ -23,6 +38,8 @@ robot_api_server:
     bms_full_soc_threshold_pct: 99.0
     bms_full_soc_voltage_contact_enable: true
     floor_switch_service: "/floor_manager/switch_floor"
+    live_floor_switch_action: "/floor_manager/floor_switch"
+    live_floor_switch_timeout_sec: 120.0
     keepout_mask_load_service: "/keepout_filter_mask_server/load_map"
     keepout_mask_state_service: "/keepout_filter_mask_server/get_state"
     keepout_filter_info_state_service: "/keepout_costmap_filter_info_server/get_state"
@@ -35,7 +52,6 @@ robot_api_server:
     global_costmap_topic: "/global_costmap/costmap"
     keepout_runtime_apply_timeout_sec: 5.0
     localization_trigger_service: "/global_localization/trigger"
-    localization_bridge_force_accept_service: "/robot_localization_bridge/force_accept_next_localization"
     localization_result_topic: "/localization_result"
     localization_bridge_status_topic: "/localization/bridge_status"
     localization_floor_health_topic: "/localization/floor_health"
@@ -45,6 +61,11 @@ robot_api_server:
     mapping_2d_start_command: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/run_projected_map.sh"
     mapping_2d_log_file: "/tmp/njrh_mapping2d_slam_toolbox.log"
     mapping_lidar_rps_xps_state_dir: "/tmp/njrh_slam2d_lidar_rps_xps"
+    mapping_graceful_stop_timeout_sec: 30.0
+    mapping_scan_owner_restore_timeout_sec: 30.0
+    mapping_scan_owner_topic: "/scan"
+    mapping_navigation_scan_owner_node: "pointcloud_accel_axis_node"
+    mapping_resident_scan_control_service: "/pointcloud_accel_axis_node/set_scan_output_enabled"
     navigation_resume_command: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/scripts/run_navigation_runtime_services.sh"
     navigation_resume_log_file: "/workspaces/njrh-v3/workspace1/scripts/jetson/runtime_overlay/web_dashboard/runtime_logs/resident_navigation_runtime.log"
     runtime_map_context_file: "/tmp/njrh_runtime_map_context.json"
@@ -105,6 +126,7 @@ robot_api_server:
     docking_default_sensor_frame: "camera336l_depth_optical_frame"
     docking_max_retries: 2
     predock_yaw_align_enabled: true
+    docking_delegate_staging_motion_to_manager: true
     predock_yaw_align_fallback_enabled: true
     predock_yaw_align_cmd_topic: "/cmd_vel_docking"
     predock_yaw_align_tolerance_rad: 0.0698

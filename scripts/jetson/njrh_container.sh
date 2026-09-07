@@ -11,6 +11,8 @@ UPSTREAM_WORKSPACE_ALIAS_CONTAINER="${NJRH_UPSTREAM_WORKSPACE_ALIAS_CONTAINER:-/
 CONTAINER_NAME="${NJRH_CONTAINER_NAME:-NJRH-car}"
 IMAGE_NAME="${NJRH_IMAGE_NAME:-njrh-car:latest}"
 BASE_IMAGE="${NJRH_BASE_IMAGE:-isaac_ros_dev-aarch64:latest}"
+EXPECTED_IMAGE_ID="${NJRH_EXPECTED_IMAGE_ID:-}"
+PROVISION_MOTION_LOCK="${NJRH_PROVISION_MOTION_LOCK:-/var/lib/njrh/provision/motion.lock}"
 RUNTIME_USER="${NJRH_RUNTIME_USER:-root}"
 RUNTIME_GROUP="${NJRH_RUNTIME_GROUP:-${RUNTIME_USER}}"
 RUNTIME_HOME="${NJRH_RUNTIME_HOME:-}"
@@ -22,6 +24,11 @@ if [[ -z "${RUNTIME_HOME}" ]]; then
   fi
 fi
 ALLOW_BASE_IMAGE_FALLBACK="${NJRH_ALLOW_BASE_IMAGE_FALLBACK:-true}"
+if [[ -n "${EXPECTED_IMAGE_ID}" ]]; then
+  # A production release always pins the image content and disables fallback.
+  NJRH_ALLOW_BASE_IMAGE_FALLBACK=false
+  ALLOW_BASE_IMAGE_FALLBACK=false
+fi
 DOCKER_BUILD_NETWORK="${NJRH_DOCKER_BUILD_NETWORK:-host}"
 DOCKERFILE_PATH="${NJRH_DOCKERFILE_PATH:-${WORKSPACE_HOST}/Dockerfile.car}"
 ORBBEC_LAYER_DOCKERFILE_PATH="${NJRH_ORBBEC_LAYER_DOCKERFILE_PATH:-${WORKSPACE_HOST}/Dockerfile.orbbec-runtime}"
@@ -42,6 +49,12 @@ RUNTIME_IMAGE_NAME="$IMAGE_NAME"
 die() {
   echo "[njrh-container] $*" >&2
   exit 1
+}
+
+require_motion_unlocked() {
+  if [[ -e "${PROVISION_MOTION_LOCK}" ]]; then
+    die "provisioning motion lock is present: ${PROVISION_MOTION_LOCK}; refusing ${ACTION}"
+  fi
 }
 
 require_cmd() {
@@ -76,6 +89,23 @@ container_has_dynamic_usb_bus_bind() {
   container_exists || return 1
   docker inspect --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}' \
     "$CONTAINER_NAME" 2>/dev/null | grep -Fx '/dev/bus/usb -> /dev/bus/usb' >/dev/null 2>&1
+}
+
+verify_expected_image() {
+  local reference="$1"
+  [[ -n "${EXPECTED_IMAGE_ID}" ]] || return 0
+  local actual=""
+  actual="$(docker image inspect --format '{{.Id}}' "${reference}" 2>/dev/null || true)"
+  [[ "${actual}" == "${EXPECTED_IMAGE_ID}" ]] || die \
+    "image identity mismatch for ${reference}: expected ${EXPECTED_IMAGE_ID}, got ${actual:-missing}"
+}
+
+verify_running_container_image() {
+  [[ -n "${EXPECTED_IMAGE_ID}" ]] || return 0
+  local actual=""
+  actual="$(docker inspect --format '{{.Image}}' "${CONTAINER_NAME}" 2>/dev/null || true)"
+  [[ "${actual}" == "${EXPECTED_IMAGE_ID}" ]] || die \
+    "running container image mismatch: expected ${EXPECTED_IMAGE_ID}, got ${actual:-missing}"
 }
 
 ensure_base_image() {
@@ -157,8 +187,12 @@ build_orbbec_layer_image() {
 
 ensure_image() {
   if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+    verify_expected_image "$IMAGE_NAME"
     RUNTIME_IMAGE_NAME="$IMAGE_NAME"
     return
+  fi
+  if [[ -n "${EXPECTED_IMAGE_ID}" ]]; then
+    die "pinned production image is missing: ${IMAGE_NAME} (${EXPECTED_IMAGE_ID})"
   fi
   build_image "$ALLOW_BASE_IMAGE_FALLBACK"
 }
@@ -310,6 +344,7 @@ wait_for_and_prepare_running_container() {
 
 start_container() {
   if container_running; then
+    verify_running_container_image
     if [[ -d "/dev/bus/usb" ]] && ! container_has_dynamic_usb_bus_bind; then
       die "running container lacks /dev/bus/usb dynamic bind; rebuild the image and run '${0} restart' once"
     fi
@@ -574,6 +609,7 @@ common_services_running() {
 
 start_common_services() {
   local runtime_start_epoch
+  require_motion_unlocked
   runtime_start_epoch="${SECONDS}"
   container_running || start_container
   wait_for_container_ready
@@ -588,13 +624,15 @@ start_common_services() {
     return
   fi
   clear_stale_runtime_context
-  docker exec -u "${RUNTIME_USER}" --workdir "${DASHBOARD_RUNTIME_ROOT}" "$CONTAINER_NAME" \
+  docker exec -u "${RUNTIME_USER}" --workdir "${DASHBOARD_RUNTIME_ROOT}" \
+    -e "ROBOT_API_TOKEN" \
     -e "NJRH_NAV_LOCAL_STATE_MODE=${NJRH_NAV_LOCAL_STATE_MODE:-}" \
     -e "NJRH_LOCAL_STATE_EKF_PROFILE=${NJRH_LOCAL_STATE_EKF_PROFILE:-}" \
     -e "LOCAL_STATE_EKF_PROFILE=${LOCAL_STATE_EKF_PROFILE:-}" \
     -e "NJRH_FORCE_RESTART_CANONICAL_TF=${NJRH_FORCE_RESTART_CANONICAL_TF:-}" \
     -e "NJRH_FORCE_RESTART_NAV_HELPERS=${NJRH_FORCE_RESTART_NAV_HELPERS:-}" \
-    /bin/bash -lc "mkdir -p '${DASHBOARD_RUNTIME_ROOT}/web_dashboard/runtime_logs'; cd '${DASHBOARD_RUNTIME_ROOT}'; nohup env ROBOT_API_TOKEN='${ROBOT_API_TOKEN:-}' ROBOT_API_SERVER_PORT='${ROBOT_API_SERVER_PORT}' bash scripts/run_common_services.sh > '${DASHBOARD_RUNTIME_ROOT}/web_dashboard/runtime_logs/common_services.out.log' 2>&1 </dev/null &"
+    "$CONTAINER_NAME" \
+    /bin/bash -lc "mkdir -p '${DASHBOARD_RUNTIME_ROOT}/web_dashboard/runtime_logs'; cd '${DASHBOARD_RUNTIME_ROOT}'; nohup env ROBOT_API_SERVER_PORT='${ROBOT_API_SERVER_PORT}' bash scripts/run_common_services.sh > '${DASHBOARD_RUNTIME_ROOT}/web_dashboard/runtime_logs/common_services.out.log' 2>&1 </dev/null &"
   sleep 2
   if common_services_running; then
     wait_for_robot_api
@@ -916,6 +954,7 @@ case "$ACTION" in
     stop_dashboard
     ;;
   start-common)
+    require_motion_unlocked
     start_common_services
     print_status
     ;;
@@ -934,11 +973,13 @@ case "$ACTION" in
     show_logs
     ;;
   start-runtime)
+    require_motion_unlocked
     start_container
     start_common_services
     print_status
     ;;
   start-debug-runtime)
+    require_motion_unlocked
     start_container
     start_common_services
     start_dashboard

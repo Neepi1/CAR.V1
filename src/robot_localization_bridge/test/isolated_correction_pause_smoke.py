@@ -54,8 +54,13 @@ def main() -> None:
         acquire.transaction_id = "elevator-isolated"
         acquire.reason = "elevator_ride"
         acquire.operation = SetCorrectionPause.Request.OP_ACQUIRE
+        acquire.command_sequence = 1
         acquired = node.call(node.lease_client, acquire)
-        if not acquired.success or not acquired.state.paused:
+        if (
+            not acquired.success
+            or acquired.applied_sequence != acquire.command_sequence
+            or not acquired.state.paused
+        ):
             raise AssertionError(f"lease acquire failed: {acquired}")
 
         for owner, transaction_id in (
@@ -67,6 +72,7 @@ def main() -> None:
             reserved.transaction_id = transaction_id
             reserved.reason = "reserved_identifier_probe"
             reserved.operation = SetCorrectionPause.Request.OP_ACQUIRE
+            reserved.command_sequence = 1
             rejected = node.call(node.lease_client, reserved)
             if rejected.success or not rejected.state.paused:
                 raise AssertionError(
@@ -89,8 +95,13 @@ def main() -> None:
         release.transaction_id = acquire.transaction_id
         release.reason = acquire.reason
         release.operation = SetCorrectionPause.Request.OP_RELEASE
+        release.command_sequence = 2
         released = node.call(node.lease_client, release)
-        if not released.success or released.state.paused:
+        if (
+            not released.success
+            or released.applied_sequence != release.command_sequence
+            or released.state.paused
+        ):
             raise AssertionError(f"exact release failed: {released}")
 
         print(

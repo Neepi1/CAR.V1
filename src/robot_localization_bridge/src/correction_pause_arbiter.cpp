@@ -8,11 +8,15 @@ namespace robot_localization_bridge
 PauseDecision CorrectionPauseArbiter::apply(const PauseCommand & command)
 {
   const auto reject =
-    [this](const PauseDecisionCode code, const std::string & message)
+    [this](
+      const PauseDecisionCode code,
+      const std::string & message,
+      const std::uint64_t applied_sequence = 0U)
     {
       PauseDecision decision;
       decision.code = code;
       decision.message = message;
+      decision.applied_sequence = applied_sequence;
       decision.state = snapshot();
       return decision;
     };
@@ -28,6 +32,27 @@ PauseDecision CorrectionPauseArbiter::apply(const PauseCommand & command)
   {
     return reject(PauseDecisionCode::kInvalidRequest, "unsupported pause operation");
   }
+  if (command.command_sequence == 0U) {
+    return reject(
+      PauseDecisionCode::kInvalidRequest,
+      "correction pause command_sequence must be non-zero");
+  }
+
+  const auto key = command.owner + ":" + command.transaction_id;
+  const auto previous_sequence = last_command_sequences_.find(key);
+  if (
+    previous_sequence != last_command_sequences_.cend() &&
+    command.command_sequence <= previous_sequence->second)
+  {
+    return reject(
+      PauseDecisionCode::kStaleCommand,
+      "correction pause command_sequence is stale",
+      previous_sequence->second);
+  }
+  // Consume every syntactically valid sequence, including a semantic
+  // rejection. A delayed older request can therefore never become valid after
+  // the conflicting lease changes.
+  last_command_sequences_[key] = command.command_sequence;
 
   const auto exact = std::find_if(
     records_.begin(), records_.end(),
@@ -35,25 +60,13 @@ PauseDecision CorrectionPauseArbiter::apply(const PauseCommand & command)
       return record.owner == command.owner &&
              record.transaction_id == command.transaction_id;
     });
-  const auto same_transaction = std::find_if(
-    records_.cbegin(), records_.cend(),
-    [&command](const Record & record) {
-      return record.transaction_id == command.transaction_id;
-    });
 
   if (command.operation == PauseOperation::kAcquire) {
     if (command.reason.empty()) {
       return reject(
         PauseDecisionCode::kInvalidRequest,
-        "correction pause acquisition requires reason");
-    }
-    if (
-      same_transaction != records_.cend() &&
-      same_transaction->owner != command.owner)
-    {
-      return reject(
-        PauseDecisionCode::kConflict,
-        "transaction is already owned by another correction pause client");
+        "correction pause acquisition requires reason",
+        command.command_sequence);
     }
     if (exact != records_.end()) {
       const bool changed = exact->reason != command.reason;
@@ -68,6 +81,7 @@ PauseDecision CorrectionPauseArbiter::apply(const PauseCommand & command)
       decision.code = PauseDecisionCode::kOk;
       decision.message = changed ?
         "correction pause updated" : "correction pause already acquired";
+      decision.applied_sequence = command.command_sequence;
       decision.state = snapshot();
       return decision;
     }
@@ -80,14 +94,23 @@ PauseDecision CorrectionPauseArbiter::apply(const PauseCommand & command)
     decision.changed = true;
     decision.code = PauseDecisionCode::kOk;
     decision.message = "correction pause acquired";
+    decision.applied_sequence = command.command_sequence;
     decision.state = snapshot();
     return decision;
   }
 
   if (exact == records_.end()) {
-    return reject(
-      PauseDecisionCode::kNotOwner,
-      "only the exact owner and transaction can release correction pause");
+    generation_ += 1U;
+    transition_reason_ = "correction_pause_release_fenced";
+    PauseDecision decision;
+    decision.accepted = true;
+    decision.changed = true;
+    decision.code = PauseDecisionCode::kOk;
+    decision.message =
+      "exact owner correction pause was already released";
+    decision.applied_sequence = command.command_sequence;
+    decision.state = snapshot();
+    return decision;
   }
   records_.erase(exact);
   generation_ += 1U;
@@ -97,6 +120,7 @@ PauseDecision CorrectionPauseArbiter::apply(const PauseCommand & command)
   decision.changed = true;
   decision.code = PauseDecisionCode::kOk;
   decision.message = "correction pause released";
+  decision.applied_sequence = command.command_sequence;
   decision.state = snapshot();
   return decision;
 }

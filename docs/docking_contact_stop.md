@@ -14,6 +14,10 @@ This contract governs the transition from the final charging-contact push to the
 
 The timeout is diagnostic only. Missing or moving feedback never authorizes Park; the node keeps publishing zero until a valid stop is confirmed. A stop-service request or undock request cannot bypass `ContactStopping`.
 
+`/docking/status` uses a structured text contract: the first whitespace-delimited token is the state/event code and every later token is diagnostic metadata. API terminal-state classification must inspect only that leading code. Therefore both `contact_stopping ... contact_stop_feedback_timeout=false` and `contact_stopping ... contact_stop_feedback_timeout=true` remain non-terminal while zero commands continue; only an explicit failure code such as `contact_verify_timeout`, `contact_verify_failed_*`, or `undock_failed_*` may fail the job. This prevents field names or values containing `timeout`, `failed`, `not_found`, or `rejected` from changing the state-machine outcome.
+
+After a terminal docking success, `robot_api_server` releases the localization bridge correction pause on a deferred worker rather than waiting inside the `/docking/status` subscription callback. The API uses a single-threaded ROS executor, and a synchronous service wait inside that callback would starve its own response completion for `service_timeout_sec` and leave a false delayed-side-effect record even when the bridge applied the request immediately. This service-response bound is independent of the physical contact-confirmation timeout; increasing the latter does not repair executor starvation.
+
 ## Runtime parameters
 
 | Parameter | Runtime value | Purpose |
@@ -26,6 +30,19 @@ The timeout is diagnostic only. Missing or moving feedback never authorizes Park
 | `contact_stop.stable_duration_s` | `0.50` | Required continuous stopped duration |
 | `contact_stop.stable_samples` | `5` | Required distinct stopped wheel-odom samples |
 | `contact_stop.feedback_timeout_s` | `3.0` | Warning threshold; it does not force completion |
+
+## API BMS configuration ownership
+
+`robot_api_server/features/power/power_configuration_module` is the sole ROS
+parameter declaration owner for the BMS topic, freshness, electrical-contact
+thresholds, full-SOC interpretation, and
+`dock_contact_latch_bms_require_contact_sec`. Docking receives the validated
+current/SOC values as immutable inputs; it does not redeclare them. The
+historical `teleop_charging_current_min_a` parameter name is retained for
+deployed YAML compatibility, but it represents shared BMS contact evidence.
+The separate `teleop_stop_on_charging` switch remains a teleop policy. This
+ownership move does not alter any default, clamp, contact decision, latch clear
+rule, or command path.
 
 ## Telemetry
 

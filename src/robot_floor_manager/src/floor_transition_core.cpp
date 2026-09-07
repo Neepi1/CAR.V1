@@ -107,6 +107,7 @@ FloorTransitionOutput FloorTransitionCore::dispatch(
     return inert("foreign floor transaction event ignored", true);
   }
   if (state_ == FloorTransitionState::kComplete ||
+    state_ == FloorTransitionState::kFailed ||
     state_ == FloorTransitionState::kFailedLocked)
   {
     return inert("floor transaction is terminal", true);
@@ -119,7 +120,17 @@ FloorTransitionOutput FloorTransitionCore::dispatch(
   }
   if (state_ == FloorTransitionState::kFailureCleanup) {
     if (event.kind == FloorTransitionEventKind::kEffectSucceeded) {
-      state_ = FloorTransitionState::kFailedLocked;
+      // Runtime cleanup is authoritative for both pre- and post-BEGIN
+      // failures. A successful cleanup may clear recovery only when exact
+      // bridge ABORT, a fresh source-identity health sample, durable source
+      // context restoration, and exact lease release were all proven by the
+      // runtime port. Otherwise it reports runtime_context_invalid=true and
+      // the stop remains retained.
+      recovery_required_ = event.evidence.runtime_context_invalid;
+      runtime_context_valid_ = !recovery_required_;
+      state_ = recovery_required_ ?
+        FloorTransitionState::kFailedLocked :
+        FloorTransitionState::kFailed;
       pending_effect_ = FloorTransitionEffect{};
       FloorTransitionOutput output;
       output.accepted = true;
@@ -127,8 +138,14 @@ FloorTransitionOutput FloorTransitionCore::dispatch(
       output.state = state_;
       output.runtime_context_valid = runtime_context_valid_;
       output.recovery_required = recovery_required_;
-      output.message = "failure cleanup acknowledged; recovery lock retained";
+      output.message = recovery_required_ ?
+        "failure cleanup acknowledged; recovery lock retained" :
+        "failure cleanup acknowledged; source runtime context is ready";
       return output;
+    }
+    if (event.evidence.runtime_context_invalid) {
+      runtime_context_valid_ = false;
+      recovery_required_ = true;
     }
     return fail(
       event.detail.empty() ?
@@ -256,11 +273,13 @@ FloorTransitionOutput FloorTransitionCore::advance(
     case FloorTransitionState::kVerifyingBridgeReady:
       if (
         !evidence.bridge_ready ||
+        !evidence.amcl_ready ||
         !evidence.runtime_context_invalid ||
         !target_context_matches(evidence) ||
         evidence.explicit_relocalization_sequence == 0U)
       {
-        return fail("bridge readiness did not match the pending target context");
+        return fail(
+          "bridge/AMCL readiness did not match the pending target context");
       }
       return transition(
         FloorTransitionState::kClearingCostmaps,
@@ -322,6 +341,7 @@ FloorTransitionOutput FloorTransitionCore::advance(
     case FloorTransitionState::kIdle:
     case FloorTransitionState::kComplete:
     case FloorTransitionState::kFailureCleanup:
+    case FloorTransitionState::kFailed:
     case FloorTransitionState::kFailedLocked:
       break;
   }
@@ -359,7 +379,10 @@ FloorTransitionOutput FloorTransitionCore::transition(
 FloorTransitionOutput FloorTransitionCore::fail(const std::string & reason)
 {
   state_ = FloorTransitionState::kFailureCleanup;
-  recovery_required_ = mutation_started_;
+  recovery_required_ = recovery_required_ || mutation_started_;
+  if (recovery_required_) {
+    runtime_context_valid_ = false;
+  }
   pending_effect_.kind = FloorTransitionEffectKind::kHoldAndLock;
   pending_effect_.transaction_id = request_.has_value() ? request_->transaction_id : "";
   pending_effect_.sequence = next_effect_sequence_++;
@@ -456,6 +479,7 @@ const char * to_string(const FloorTransitionState state) noexcept
     case FloorTransitionState::kCompleting: return "COMPLETING";
     case FloorTransitionState::kComplete: return "COMPLETE";
     case FloorTransitionState::kFailureCleanup: return "FAILURE_CLEANUP";
+    case FloorTransitionState::kFailed: return "FAILED";
     case FloorTransitionState::kFailedLocked: return "FAILED_LOCKED";
   }
   return "UNKNOWN";

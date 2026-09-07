@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/commercial_runtime_helpers.sh"
 source "${SCRIPT_DIR}/floor_asset_helpers.sh"
 source "${SCRIPT_DIR}/cpu_affinity.sh"
+source "${SCRIPT_DIR}/scan_ownership_helpers.sh"
 
 building_id="${1:-${NJRH_BUILDING_ID:-building_1}}"
 floor_id="${2:-${NJRH_FLOOR_ID:-}}"
@@ -14,8 +15,15 @@ export NJRH_RUNTIME_FAILURE_CODE=""
 export NJRH_RUNTIME_LOCALIZATION_MODE="${NJRH_ISAAC_LOCALIZATION_MODE:-triggered}"
 export NJRH_RUNTIME_LAST_TRIGGERED_RELOCALIZATION_OK=""
 export NJRH_RUNTIME_MAP_TO_ODOM_AGE_MS=""
+export NJRH_RUNTIME_EXPLICIT_RELOCALIZATION_SEQUENCE=""
 export NJRH_AMCL_RUNTIME_STATUS_FILE="${NJRH_AMCL_RUNTIME_STATUS_FILE:-/tmp/njrh_amcl_runtime_status.env}"
 export NJRH_LOCALIZATION_MAP_EXTERNAL_LIFECYCLE_BRINGUP="${NJRH_LOCALIZATION_MAP_EXTERNAL_LIFECYCLE_BRINGUP:-true}"
+navigation_start_source="${NJRH_NAVIGATION_START_SOURCE:-direct}"
+
+njrh_apply_affinity_to_current_process navigation_runtime_owner || {
+  echo "[runtime-overlay] ERROR: navigation runtime owner could not leave its inherited CPU affinity" >&2
+  exit 1
+}
 
 [[ -n "${floor_id}" ]] || {
   echo "[runtime-overlay] floor_id is required for resident navigation runtime" >&2
@@ -39,6 +47,7 @@ exit_code=0
 runtime_ready=0
 cleanup_started=0
 localization_ready_failure_reason=""
+common_local_state_ready=0
 
 stale_amcl_heartbeat_pids() {
   ps -eo pid=,args= |
@@ -79,9 +88,68 @@ log_startup_stage() {
   export NJRH_RUNTIME_STARTUP_STAGE="${stage}"
   export NJRH_RUNTIME_STARTUP_ELAPSED_SEC="${elapsed_sec}"
   echo "[runtime-overlay] STARTUP_STAGE stage=${stage} elapsed_sec=${elapsed_sec}" >&2
-  if [[ "${runtime_ready}" -eq 0 && "${cleanup_started}" -eq 0 ]]; then
+  if [[ "${stage}" != "script_start" &&
+    "${runtime_ready}" -eq 0 &&
+    "${cleanup_started}" -eq 0 ]]; then
     write_runtime_map_context "starting" "false" "resident navigation runtime starting: ${stage}"
   fi
+}
+
+commit_runtime_ready_context() {
+  local message="$1"
+  local expected_sequence="${NJRH_RUNTIME_EXPLICIT_RELOCALIZATION_SEQUENCE:-}"
+  local explicit_sequence
+  if [[ ! "${expected_sequence}" =~ ^[1-9][0-9]*$ ]]; then
+    expected_sequence="$(runtime_context_explicit_relocalization_sequence)"
+  fi
+  if [[ ! "${expected_sequence}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[runtime-overlay] ERROR: no transaction-scoped explicit relocalization sequence is available; refusing strong ready context" >&2
+    return 1
+  fi
+  if ! explicit_sequence="$(
+    wait_for_bridge_relocalization_sequence_after \
+      "${NJRH_RUNTIME_READY_BRIDGE_STATUS_WAIT_SEC:-15}" \
+      "$((expected_sequence - 1))" \
+      "true"
+  )"; then
+    if [[ "${NJRH_RUNTIME_LAST_TRIGGERED_RELOCALIZATION_OK:-}" != "true" ]]; then
+      echo "[runtime-overlay] ERROR: live bridge did not confirm the accepted explicit relocalization sequence and this runtime has no accepted trigger transaction; refusing strong ready context" >&2
+      return 1
+    fi
+    ensure_localization_layer_alive || {
+      echo "[runtime-overlay] ERROR: localization owner exited after accepted trigger transaction; refusing strong ready context" >&2
+      return 1
+    }
+    if ! wait_for_fresh_tf_transform "map" "odom" \
+      "${NJRH_RUNTIME_READY_MAP_ODOM_WAIT_SEC:-5}" \
+      "${NJRH_RUNTIME_READY_MAP_ODOM_MAX_AGE_SEC:-0.5}"; then
+      echo "[runtime-overlay] ERROR: accepted trigger transaction no longer has a fresh map->odom transform; refusing strong ready context" >&2
+      return 1
+    fi
+    explicit_sequence="${expected_sequence}"
+    echo "[runtime-overlay] WARN: transient bridge-status CLI observation missed; using transaction-scoped sequence plus live map->odom and localization-owner evidence" >&2
+  fi
+  if [[ "${explicit_sequence}" != "${expected_sequence}" ]]; then
+    echo "[runtime-overlay] ERROR: live bridge explicit sequence=${explicit_sequence} does not exactly match transaction sequence=${expected_sequence}; refusing concurrent or replaced relocalization evidence" >&2
+    return 1
+  fi
+  export NJRH_RUNTIME_EXPLICIT_RELOCALIZATION_SEQUENCE="${explicit_sequence}"
+  export NJRH_RUNTIME_LOCALIZER_GENERATION="${NJRH_RUNTIME_LOCALIZER_GENERATION:-1}"
+  export NJRH_RUNTIME_TRANSACTION_ID="$(
+    printf 'startup_%s_%s_%s' \
+      "${NJRH_MAP_CONTEXT_BUILDING_ID:-${NJRH_BUILDING_ID:-building_1}}" \
+      "${NJRH_MAP_CONTEXT_FLOOR_ID:-${NJRH_FLOOR_ID:-unknown}}" \
+      "${NJRH_MAP_ASSET_EPOCH:-0}"
+  )"
+  if ! write_runtime_map_context "ready" "true" "${message}"; then
+    echo "[runtime-overlay] ERROR: failed to persist confirmed runtime map context; refusing to mark runtime ready" >&2
+    return 1
+  fi
+  if ! runtime_map_context_matches_current_floor; then
+    echo "[runtime-overlay] ERROR: persisted runtime map context does not confirm the selected floor; refusing to mark runtime ready" >&2
+    return 1
+  fi
+  runtime_ready=1
 }
 
 log_startup_stage "script_start"
@@ -124,7 +192,7 @@ stop_navigation_layer_after_failure() {
     terminate_child "${navigation_pid}" "resident Nav2 layer"
     navigation_pid=""
   fi
-  echo "[runtime-overlay] sweeping standard Nav2 stack after resident Nav2 ${reason}; localization layer remains running" >&2
+  echo "[runtime-overlay] sweeping standard Nav2 stack after resident Nav2 ${reason}; stopping the localization layer so a later /navigation/start begins from a clean process set" >&2
   stop_existing_standard_nav_stack
 }
 
@@ -160,7 +228,9 @@ on_signal() {
 on_exit() {
   local status=$?
   if [[ "${status}" -ne 0 && "${runtime_ready}" -ne 1 ]]; then
-    write_runtime_map_context "failed" "false" "resident navigation runtime failed; check ${NJRH_NAVIGATION_RESUME_LOG_FILE:-/tmp/njrh_navigation_resume.log}"
+    if ! write_runtime_map_context "failed" "false" "resident navigation runtime failed; check ${NJRH_NAVIGATION_RESUME_LOG_FILE:-/tmp/njrh_navigation_resume.log}"; then
+      echo "[runtime-overlay] WARN: failed to persist runtime failure context; cleanup will still run" >&2
+    fi
   fi
   cleanup
   exit "${status}"
@@ -197,7 +267,15 @@ resident_navigation_ready() {
 }
 
 bridge_status_once() {
-  timeout 5 ros2 topic echo /localization/bridge_status --once --field data 2>/dev/null || true
+  local timeout_sec="${1:-5}"
+  timeout "${timeout_sec}" ros2 topic echo \
+    /localization/bridge_status \
+    std_msgs/msg/String \
+    --once \
+    --field data \
+    --qos-reliability reliable \
+    --qos-durability volatile 2>/dev/null |
+    awk '/^\{/ {print; exit}' || true
 }
 
 bridge_status_field() {
@@ -231,16 +309,113 @@ else:
 PY
 }
 
+runtime_context_explicit_relocalization_sequence() {
+  python3 - <<'PY'
+import json
+import os
+
+path = os.environ.get("NJRH_RUNTIME_MAP_CONTEXT_FILE", "")
+try:
+    with open(path, "r", encoding="utf-8") as file:
+        data = json.load(file)
+except Exception:
+    print("")
+    raise SystemExit(0)
+
+value = data.get("explicit_relocalization_sequence", 0)
+if (
+    data.get("confirmed") is True
+    and data.get("state") == "ready"
+    and isinstance(value, int)
+    and not isinstance(value, bool)
+    and value > 0
+):
+    print(value)
+else:
+    print("")
+PY
+}
+
+wait_for_bridge_relocalization_sequence_after() {
+  local timeout_sec="${1:-${NJRH_RUNTIME_READY_BRIDGE_STATUS_WAIT_SEC:-15}}"
+  local minimum_sequence="${2:--1}"
+  local require_map_to_odom="${3:-false}"
+  local poll_sec="${NJRH_RUNTIME_READY_BRIDGE_STATUS_POLL_SEC:-0.2}"
+  local deadline
+  local remaining
+  local bridge_status
+  local explicit_sequence
+  local has_map_to_odom
+  local owner
+
+  if [[ ! "${timeout_sec}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[runtime-overlay] invalid ready-context bridge status wait: ${timeout_sec}" >&2
+    return 2
+  fi
+  if [[ ! "${minimum_sequence}" =~ ^-1$|^(0|[1-9][0-9]*)$ ]]; then
+    echo "[runtime-overlay] invalid ready-context minimum relocalization sequence: ${minimum_sequence}" >&2
+    return 2
+  fi
+  if [[ "${require_map_to_odom}" != "true" && "${require_map_to_odom}" != "false" ]]; then
+    echo "[runtime-overlay] invalid ready-context map->odom requirement: ${require_map_to_odom}" >&2
+    return 2
+  fi
+
+  deadline=$((SECONDS + timeout_sec))
+  while (( SECONDS < deadline )); do
+    remaining=$((deadline - SECONDS))
+    if (( remaining <= 0 )); then
+      break
+    fi
+    bridge_status="$(bridge_status_once "${remaining}")"
+    explicit_sequence="$(
+      bridge_status_field "${bridge_status}" "last_explicit_relocalization_sequence"
+    )"
+    if [[ "${explicit_sequence}" =~ ^(0|[1-9][0-9]*)$ ]] &&
+      (( explicit_sequence > minimum_sequence )); then
+      if [[ "${require_map_to_odom}" == "true" ]]; then
+        has_map_to_odom="$(bridge_status_field "${bridge_status}" has_map_to_odom)"
+        owner="$(bridge_status_field "${bridge_status}" map_to_odom_publisher_owner)"
+        if [[ "${has_map_to_odom}" != "true" ||
+          "${owner}" != "robot_localization_bridge" ]]; then
+          sleep "${poll_sec}"
+          continue
+        fi
+      fi
+      printf '%s\n' "${explicit_sequence}"
+      return 0
+    fi
+    sleep "${poll_sec}"
+  done
+  return 1
+}
+
+wait_for_bridge_explicit_relocalization_sequence() {
+  wait_for_bridge_relocalization_sequence_after "${1:-15}" 0 true
+}
+
+trigger_output_explicit_relocalization_sequence() {
+  local output="$1"
+  grep -Eo 'explicit_sequence=[1-9][0-9]*' <<<"${output}" |
+    tail -n 1 |
+    cut -d= -f2 || true
+}
+
 extract_failure_code() {
   local text="$1"
-  grep -Eo 'failure_code=[A-Z_]+' <<<"${text}" | head -n 1 | cut -d= -f2
+  grep -Eo 'failure_code=[A-Z_]+' <<<"${text}" |
+    head -n 1 |
+    cut -d= -f2 || true
 }
 
 runtime_failure_code_for_wrapper_code() {
   local wrapper_code="$1"
   case "${wrapper_code}" in
-    ISAAC_SERVICE_TIMEOUT)
+    ISAAC_SERVICE_UNAVAILABLE|ISAAC_DISPATCH_FAILED|ISAAC_DISPATCH_TIMEOUT|ISAAC_SERVICE_TIMEOUT)
       printf '%s\n' "GLOBAL_LOCALIZATION_TRIGGER_TIMEOUT"
+      ;;
+    BRIDGE_FORCE_ACCEPT_UNAVAILABLE|BRIDGE_FORCE_ACCEPT_TIMEOUT|BRIDGE_FORCE_ACCEPT_FAILED)
+      printf '%s\n' "BRIDGE_FORCE_ACCEPT_FAILED"
       ;;
     LOCALIZATION_RESULT_TIMEOUT)
       printf '%s\n' "LOCALIZATION_RESULT_TIMEOUT"
@@ -257,8 +432,8 @@ runtime_failure_code_for_wrapper_code() {
     BRIDGE_REJECTED_RESULT)
       printf '%s\n' "BRIDGE_REJECTED_RESULT"
       ;;
-    FRESH_LOCALIZATION_RETRY_REQUIRED)
-      printf '%s\n' "FRESH_LOCALIZATION_RETRY_REQUIRED"
+    AMCL_POSE_STALE)
+      printf '%s\n' "AMCL_POSE_STALE"
       ;;
     BRIDGE_ACCEPT_TIMEOUT)
       printf '%s\n' "BRIDGE_ACCEPT_TIMEOUT"
@@ -304,50 +479,39 @@ trigger_output_reports_map_to_odom_ready() {
   grep -Eq 'map->odom ready owner=robot_localization_bridge' <<<"${output}"
 }
 
-trigger_output_reports_startup_service_race() {
+trigger_output_reports_retryable_before_dispatch() {
   local output="$1"
-  grep -Eiq 'waiting for service to become available|service[^[:cntrl:]]*not[^[:cntrl:]]*available|service is not available' <<<"${output}"
-}
-
-trigger_output_reports_transient_stale_bridge_timeout() {
-  local output="$1"
-  if grep -Eiq 'failure_code=FRESH_LOCALIZATION_RETRY_REQUIRED' <<<"${output}"; then
-    return 0
+  local failure_code
+  failure_code="$(extract_failure_code "${output}")"
+  if [[ -z "${failure_code}" ]]; then
+    if grep -Eiq \
+      'waiting for service to become available|service[^[:cntrl:]]*not[^[:cntrl:]]*available|service is not available' \
+      <<<"${output}"
+    then
+      return 0
+    fi
+    return 1
   fi
-  grep -Eiq 'failure_code=BRIDGE_ACCEPT_TIMEOUT' <<<"${output}" &&
-    grep -Eiq 'isaac_triggered_pose_stale_ms' <<<"${output}"
-}
-
-trigger_output_reports_fresh_localization_retry_required() {
-  local output="$1"
-  grep -Eiq 'failure_code=FRESH_LOCALIZATION_RETRY_REQUIRED' <<<"${output}"
-}
-
-trigger_output_reports_transient_map_to_odom_timeout() {
-  local output="$1"
-  grep -Eiq 'failure_code=MAP_TO_ODOM_TIMEOUT' <<<"${output}" &&
-    grep -Eiq 'has_map_to_odom=true' <<<"${output}" &&
-    grep -Eiq 'owner=robot_localization_bridge' <<<"${output}"
-}
-
-trigger_output_reports_transient_localization_result_timeout() {
-  local output="$1"
-  grep -Eiq 'failure_code=LOCALIZATION_RESULT_TIMEOUT' <<<"${output}"
-}
-
-trigger_output_reports_transient_amcl_pose_stale_reject() {
-  local output="$1"
-  grep -Eiq 'failure_code=BRIDGE_REJECTED_RESULT' <<<"${output}" &&
-    grep -Eiq 'AMCL_POSE_STALE' <<<"${output}"
+  grep -Eq 'dispatch_state=not_dispatched' <<<"${output}" || return 1
+  case "${failure_code}" in
+    LOCALIZER_OPERATION_BUSY|LOCALIZER_POST_RELOAD_NOT_READY|LOCALIZER_INPUT_NOT_FRESH|ISAAC_SERVICE_UNAVAILABLE|BRIDGE_FORCE_ACCEPT_UNAVAILABLE|BRIDGE_FORCE_ACCEPT_TIMEOUT)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 initial_localization_ready_from_bridge_after_wrapper_failure() {
   local bridge_timeout="${1:-8}"
   local tf_timeout="${2:-8}"
   local wrapper_code="${3:-none}"
+  local baseline_explicit_sequence="${4:-}"
   local max_tf_age_sec="${NJRH_INITIAL_LOCALIZATION_MAP_ODOM_MAX_AGE_SEC:-0.5}"
   local bridge_status_ready=false
   local bridge_status_rc=0
+  local observed_explicit_sequence
   if wait_for_bridge_has_map_to_odom "${bridge_timeout}"; then
     bridge_status_ready=true
   else
@@ -369,6 +533,20 @@ initial_localization_ready_from_bridge_after_wrapper_failure() {
     fi
     echo "[runtime-overlay] fresh map->odom TF probe failed but plain TF edge exists; continuing because active bridge/map->odom ownership was already verified" >&2
   fi
+  if [[ ! "${baseline_explicit_sequence}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "[runtime-overlay] wrapper-timeout fallback has no pre-trigger bridge sequence baseline; refusing stale map->odom evidence" >&2
+    return 1
+  fi
+  if ! observed_explicit_sequence="$(
+    wait_for_bridge_relocalization_sequence_after \
+      "${bridge_timeout}" \
+      "${baseline_explicit_sequence}" \
+      "true"
+  )"; then
+    echo "[runtime-overlay] wrapper-timeout fallback did not observe an explicit relocalization sequence newer than baseline=${baseline_explicit_sequence}; refusing stale map->odom evidence" >&2
+    return 1
+  fi
+  export NJRH_RUNTIME_EXPLICIT_RELOCALIZATION_SEQUENCE="${observed_explicit_sequence}"
   export NJRH_RUNTIME_FAILURE_CODE=""
   export NJRH_RUNTIME_LAST_TRIGGERED_RELOCALIZATION_OK="true"
   echo "[runtime-overlay] global localization wrapper did not return accepted before timeout, but bridge map->odom and fresh TF are ready; continuing startup: wrapper_code=${wrapper_code} bridge_status_ready=${bridge_status_ready}" >&2
@@ -382,17 +560,32 @@ trigger_global_localization_for_navigation() {
   local bridge_timeout="${NJRH_INITIAL_LOCALIZATION_BRIDGE_ACCEPT_WAIT_SEC:-8}"
   local tf_timeout="${NJRH_INITIAL_LOCALIZATION_MAP_ODOM_WAIT_SEC:-8}"
   local payload="{reason: '${reason}'}"
-  local trigger_output
+  local trigger_output=""
   local wrapper_code
   local runtime_code
   local deadline=$((SECONDS + call_timeout))
   local attempt=1
   local remaining
   local this_timeout
+  local process_timeout_sec
+  local process_grace_sec=5
+  local process_kill_after_sec=2
   local trigger_rc=1
   local accepted=false
+  local baseline_explicit_sequence=""
 
   echo "[runtime-overlay] requesting global localization through wrapper and waiting for bridge/map->odom" >&2
+  baseline_explicit_sequence="$(
+    wait_for_bridge_relocalization_sequence_after \
+      "${NJRH_INITIAL_LOCALIZATION_SEQUENCE_BASELINE_WAIT_SEC:-8}" \
+      "-1" \
+      "false"
+  )" || true
+  if [[ "${baseline_explicit_sequence}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "[runtime-overlay] captured pre-trigger bridge explicit sequence baseline=${baseline_explicit_sequence}" >&2
+  else
+    echo "[runtime-overlay] pre-trigger bridge sequence baseline unavailable; accepted wrapper output remains valid, but timeout fallback will stay disabled" >&2
+  fi
   while (( SECONDS < deadline )); do
     remaining=$((deadline - SECONDS))
     this_timeout="${attempt_timeout}"
@@ -402,8 +595,10 @@ trigger_global_localization_for_navigation() {
     if (( this_timeout < 5 )); then
       this_timeout=5
     fi
+    process_timeout_sec=$((this_timeout + process_grace_sec))
     echo "[runtime-overlay] global localization trigger attempt=${attempt} timeout=${this_timeout}s remaining=${remaining}s" >&2
-    if trigger_output="$(python3 "${SCRIPT_DIR}/call_global_localization_trigger.py" \
+    if trigger_output="$(timeout --signal=TERM --kill-after="${process_kill_after_sec}s" "${process_timeout_sec}s" \
+      python3 "${SCRIPT_DIR}/call_global_localization_trigger.py" \
       --reason "${reason}" \
       --timeout-sec "${this_timeout}" 2>&1)"; then
       trigger_rc=0
@@ -412,34 +607,8 @@ trigger_global_localization_for_navigation() {
         break
       fi
       wrapper_code="$(extract_failure_code "${trigger_output}")"
-      if trigger_output_reports_startup_service_race "${trigger_output}" && (( SECONDS < deadline )); then
-        echo "[runtime-overlay] global localization trigger attempt=${attempt} hit startup service race; retrying: wrapper_code=${wrapper_code:-none}" >&2
-        sleep "${NJRH_GLOBAL_LOCALIZATION_TRIGGER_RETRY_SLEEP_SEC:-1}"
-        attempt=$((attempt + 1))
-        continue
-      fi
-      if trigger_output_reports_transient_stale_bridge_timeout "${trigger_output}" && (( SECONDS < deadline )); then
-        echo "[runtime-overlay] global localization trigger attempt=${attempt} saw transient stale Isaac result; retrying for fresh result: wrapper_code=${wrapper_code:-none}" >&2
-        if ! trigger_output_reports_fresh_localization_retry_required "${trigger_output}"; then
-          sleep "${NJRH_GLOBAL_LOCALIZATION_TRIGGER_RETRY_SLEEP_SEC:-1}"
-        fi
-        attempt=$((attempt + 1))
-        continue
-      fi
-      if trigger_output_reports_transient_map_to_odom_timeout "${trigger_output}" && (( SECONDS < deadline )); then
-        echo "[runtime-overlay] global localization trigger attempt=${attempt} saw transient stale map->odom during startup; retrying: wrapper_code=${wrapper_code:-none}" >&2
-        sleep "${NJRH_GLOBAL_LOCALIZATION_TRIGGER_RETRY_SLEEP_SEC:-1}"
-        attempt=$((attempt + 1))
-        continue
-      fi
-      if trigger_output_reports_transient_localization_result_timeout "${trigger_output}" && (( SECONDS < deadline )); then
-        echo "[runtime-overlay] global localization trigger attempt=${attempt} saw transient localization result timeout during startup; retrying: wrapper_code=${wrapper_code:-none}" >&2
-        sleep "${NJRH_GLOBAL_LOCALIZATION_TRIGGER_RETRY_SLEEP_SEC:-1}"
-        attempt=$((attempt + 1))
-        continue
-      fi
-      if trigger_output_reports_transient_amcl_pose_stale_reject "${trigger_output}" && (( SECONDS < deadline )); then
-        echo "[runtime-overlay] global localization trigger attempt=${attempt} saw transient stale AMCL pose reject during startup; retrying: wrapper_code=${wrapper_code:-none}" >&2
+      if trigger_output_reports_retryable_before_dispatch "${trigger_output}" && (( SECONDS < deadline )); then
+        echo "[runtime-overlay] global localization trigger attempt=${attempt} proved Isaac was not dispatched; retrying: wrapper_code=${wrapper_code:-none}" >&2
         sleep "${NJRH_GLOBAL_LOCALIZATION_TRIGGER_RETRY_SLEEP_SEC:-1}"
         attempt=$((attempt + 1))
         continue
@@ -448,34 +617,8 @@ trigger_global_localization_for_navigation() {
     else
       trigger_rc=$?
       wrapper_code="$(extract_failure_code "${trigger_output}")"
-      if trigger_output_reports_startup_service_race "${trigger_output}" && (( SECONDS < deadline )); then
-        echo "[runtime-overlay] global localization trigger attempt=${attempt} could not reach service; retrying: wrapper_code=${wrapper_code:-none}" >&2
-        sleep "${NJRH_GLOBAL_LOCALIZATION_TRIGGER_RETRY_SLEEP_SEC:-1}"
-        attempt=$((attempt + 1))
-        continue
-      fi
-      if trigger_output_reports_transient_stale_bridge_timeout "${trigger_output}" && (( SECONDS < deadline )); then
-        echo "[runtime-overlay] global localization trigger attempt=${attempt} timed out on transient stale Isaac result; retrying for fresh result: wrapper_code=${wrapper_code:-none}" >&2
-        if ! trigger_output_reports_fresh_localization_retry_required "${trigger_output}"; then
-          sleep "${NJRH_GLOBAL_LOCALIZATION_TRIGGER_RETRY_SLEEP_SEC:-1}"
-        fi
-        attempt=$((attempt + 1))
-        continue
-      fi
-      if trigger_output_reports_transient_map_to_odom_timeout "${trigger_output}" && (( SECONDS < deadline )); then
-        echo "[runtime-overlay] global localization trigger attempt=${attempt} timed out on transient stale map->odom during startup; retrying: wrapper_code=${wrapper_code:-none}" >&2
-        sleep "${NJRH_GLOBAL_LOCALIZATION_TRIGGER_RETRY_SLEEP_SEC:-1}"
-        attempt=$((attempt + 1))
-        continue
-      fi
-      if trigger_output_reports_transient_localization_result_timeout "${trigger_output}" && (( SECONDS < deadline )); then
-        echo "[runtime-overlay] global localization trigger attempt=${attempt} timed out on transient localization result timeout during startup; retrying: wrapper_code=${wrapper_code:-none}" >&2
-        sleep "${NJRH_GLOBAL_LOCALIZATION_TRIGGER_RETRY_SLEEP_SEC:-1}"
-        attempt=$((attempt + 1))
-        continue
-      fi
-      if trigger_output_reports_transient_amcl_pose_stale_reject "${trigger_output}" && (( SECONDS < deadline )); then
-        echo "[runtime-overlay] global localization trigger attempt=${attempt} timed out on transient stale AMCL pose reject during startup; retrying: wrapper_code=${wrapper_code:-none}" >&2
+      if trigger_output_reports_retryable_before_dispatch "${trigger_output}" && (( SECONDS < deadline )); then
+        echo "[runtime-overlay] global localization trigger attempt=${attempt} proved Isaac was not dispatched; retrying: wrapper_code=${wrapper_code:-none}" >&2
         sleep "${NJRH_GLOBAL_LOCALIZATION_TRIGGER_RETRY_SLEEP_SEC:-1}"
         attempt=$((attempt + 1))
         continue
@@ -486,7 +629,11 @@ trigger_global_localization_for_navigation() {
 
   if [[ "${accepted}" != "true" ]]; then
     wrapper_code="$(extract_failure_code "${trigger_output}")"
-    if initial_localization_ready_from_bridge_after_wrapper_failure "${bridge_timeout}" "${tf_timeout}" "${wrapper_code:-none}"; then
+    if initial_localization_ready_from_bridge_after_wrapper_failure \
+      "${bridge_timeout}" \
+      "${tf_timeout}" \
+      "${wrapper_code:-none}" \
+      "${baseline_explicit_sequence}"; then
       return 0
     fi
     if [[ "${trigger_rc}" -ne 0 ]]; then
@@ -508,6 +655,27 @@ trigger_global_localization_for_navigation() {
   fi
 
   export NJRH_RUNTIME_LAST_TRIGGERED_RELOCALIZATION_OK="true"
+  local accepted_explicit_sequence
+  accepted_explicit_sequence="$(
+    trigger_output_explicit_relocalization_sequence "${trigger_output}"
+  )"
+  if [[ "${accepted_explicit_sequence}" =~ ^[1-9][0-9]*$ ]]; then
+    if [[ "${baseline_explicit_sequence}" =~ ^(0|[1-9][0-9]*)$ ]] &&
+      (( accepted_explicit_sequence <= baseline_explicit_sequence )); then
+      export NJRH_RUNTIME_FAILURE_CODE="BRIDGE_ACCEPT_SEQUENCE_NOT_FRESH"
+      set_localization_ready_failure \
+        "BRIDGE_ACCEPT_SEQUENCE_NOT_FRESH" \
+        "accepted trigger sequence=${accepted_explicit_sequence} did not advance pre-trigger baseline=${baseline_explicit_sequence}"
+      return 1
+    fi
+    export NJRH_RUNTIME_EXPLICIT_RELOCALIZATION_SEQUENCE="${accepted_explicit_sequence}"
+  else
+    export NJRH_RUNTIME_FAILURE_CODE="BRIDGE_ACCEPT_SEQUENCE_MISSING"
+    set_localization_ready_failure \
+      "BRIDGE_ACCEPT_SEQUENCE_MISSING" \
+      "accepted trigger output did not expose the transaction explicit relocalization sequence"
+    return 1
+  fi
   echo "[runtime-overlay] global localization wrapper accepted: ${trigger_output}" >&2
   if trigger_output_reports_map_to_odom_ready "${trigger_output}"; then
     echo "[runtime-overlay] wrapper already verified bridge map->odom readiness" >&2
@@ -572,6 +740,15 @@ wait_for_initial_global_localization() {
     return "${rc}"
   fi
   export NJRH_RUNTIME_LAST_TRIGGERED_RELOCALIZATION_OK="true"
+  local joined_explicit_sequence
+  if ! joined_explicit_sequence="$(
+    wait_for_bridge_explicit_relocalization_sequence \
+      "${NJRH_RUNTIME_READY_BRIDGE_STATUS_WAIT_SEC:-15}"
+  )"; then
+    echo "[runtime-overlay] initial global localization background joined without a live positive bridge sequence" >&2
+    return 1
+  fi
+  export NJRH_RUNTIME_EXPLICIT_RELOCALIZATION_SEQUENCE="${joined_explicit_sequence}"
   wait_for_bridge_has_map_to_odom 1 >/dev/null 2>&1 || true
   echo "[runtime-overlay] initial global localization background joined successfully" >&2
 }
@@ -763,8 +940,7 @@ start_amcl_readiness_background_if_enabled_for_navigation() {
     if amcl_resident_runtime_status_ready_for_seed; then
       echo "[runtime-overlay] AMCL resident already warm from status file; skipping repeated resident warmup before readiness seed" >&2
     elif ! NJRH_RUNTIME_NONFATAL_LOCALIZATION_FAILURE=true start_amcl_resident_if_enabled_for_navigation; then
-      echo "[runtime-overlay] AMCL readiness background could not finish start-resident; complete-readiness will retry in foreground" >&2
-      exit 1
+      echo "[runtime-overlay] AMCL readiness background could not finish start-resident; continuing into bounded complete-readiness retries so a transient lifecycle timeout can recover without a runtime restart" >&2
     fi
     if complete_amcl_readiness_with_retries_for_navigation; then
       echo "[runtime-overlay] AMCL readiness completed in background" >&2
@@ -793,6 +969,38 @@ wait_for_amcl_readiness_background_if_running() {
   fi
   echo "[runtime-overlay] AMCL readiness background returned rc=${rc}; foreground readiness will retry" >&2
   return "${rc}"
+}
+
+maintain_amcl_readiness_background_for_navigation() {
+  local mode="${NJRH_AMCL_LOCALIZATION_MODE:-disabled}"
+  mode="$(amcl_mode_for_navigation)" || return 1
+  if [[ "${mode}" == "disabled" ]]; then
+    return 0
+  fi
+
+  if [[ -n "${amcl_readiness_pid}" ]] && kill -0 "${amcl_readiness_pid}" 2>/dev/null; then
+    return 0
+  fi
+
+  local completed_rc=0
+  if [[ -n "${amcl_readiness_pid}" ]]; then
+    set +e
+    wait "${amcl_readiness_pid}"
+    completed_rc=$?
+    set -e
+    amcl_readiness_pid=""
+  fi
+
+  load_amcl_runtime_status
+  if [[ "${AMCL_READY:-false}" == "true" ]]; then
+    if [[ "${completed_rc}" -eq 0 ]]; then
+      echo "[runtime-overlay] AMCL readiness background completed and reported ready" >&2
+    fi
+    return 0
+  fi
+
+  echo "[runtime-overlay] AMCL readiness background is not running and status is not ready; starting a new bounded recovery attempt after rc=${completed_rc}" >&2
+  start_amcl_readiness_background_if_enabled_for_navigation
 }
 
 start_amcl_status_heartbeat_if_enabled_for_navigation() {
@@ -1032,12 +1240,24 @@ set_localization_ready_failure() {
 }
 
 ensure_common_local_state_ready_for_navigation_start() {
+  local readiness_mode="${1:-fresh}"
   local timeout_sec="${NJRH_INITIAL_LOCAL_STATE_READY_TIMEOUT_SEC:-12}"
   local max_odom_age_sec="${NJRH_NAV_LOCAL_ODOM_MAX_AGE_SEC:-0.75}"
   local max_odom_future_sec="${NJRH_NAV_LOCAL_ODOM_MAX_FUTURE_SEC:-0.25}"
   local max_tf_age_sec="${NJRH_NAV_TF_MAX_AGE_SEC:-0.25}"
+  local required_stable_samples="${NJRH_NAV_API_RESUME_STABLE_LOCAL_STATE_SAMPLES:-3}"
 
-  if runtime_health_check "local_state_ready" >/dev/null 2>&1; then
+  case "${readiness_mode}" in
+    fresh|stable)
+      ;;
+    *)
+      echo "[runtime-overlay] invalid local_state readiness mode: ${readiness_mode}" >&2
+      return 2
+      ;;
+  esac
+
+  if [[ "${readiness_mode}" == "fresh" ]] &&
+    runtime_health_check "local_state_ready" >/dev/null 2>&1; then
     echo "[runtime-overlay] common local_state ready from runtime health snapshot before navigation startup" >&2
     return 0
   fi
@@ -1050,6 +1270,23 @@ ensure_common_local_state_ready_for_navigation_start() {
         "resident robot_local_state endpoint was not ready before AMCL/global localization startup"
       return 1
     }
+
+  if [[ "${readiness_mode}" == "stable" ]]; then
+    wait_for_stable_local_state_observations \
+      "${timeout_sec}" \
+      "${required_stable_samples}" \
+      "${max_odom_age_sec}" \
+      "${max_odom_future_sec}" \
+      "${max_tf_age_sec}" || {
+        export NJRH_RUNTIME_FAILURE_CODE="LOCAL_STATE_ODOM_TF_NOT_STABLE"
+        set_localization_ready_failure \
+          "LOCAL_STATE_ODOM_TF_NOT_STABLE" \
+          "/local_state/odometry and odom->base_link did not remain fresh with advancing timestamps before API navigation resume"
+        return 1
+      }
+    echo "[runtime-overlay] common local_state stable for API navigation resume: samples=${required_stable_samples}" >&2
+    return 0
+  fi
 
   wait_for_fresh_header_topic_message \
     "/local_state/odometry" \
@@ -1307,6 +1544,7 @@ activate_prestarted_nav2_lifecycle() {
     bt_navigator
   )
   ensure_navigation_layer_alive || return 1
+  wait_for_prestarted_nav2_launch_hold_ready || return 1
   echo "[runtime-overlay] activating prestarted Nav2 lifecycle with retrying lifecycle sequence timeout=${timeout_sec}s" >&2
   log_startup_stage "nav2_lifecycle_activation_started"
   run_nav2_lifecycle_sequence "${timeout_sec}" "${nodes[@]}" || {
@@ -1494,17 +1732,39 @@ ensure_navigation_layer_alive() {
   return 1
 }
 
+# A killed mapping launcher cannot leave the resident scan publisher disabled
+# forever.  Navigation startup explicitly reacquires and proves unique /scan
+# ownership before any localization or Nav2 readiness checks.
+restore_navigation_scan_owner "/scan" || {
+  echo "[runtime-overlay] navigation startup blocked: canonical /scan ownership recovery failed" >&2
+  exit 1
+}
+log_startup_stage "navigation_scan_owner_ready"
+
 if resident_navigation_ready; then
   echo "[runtime-overlay] resident navigation runtime already ready for ${NJRH_BUILDING_ID}/${NJRH_FLOOR_ID}" >&2
+  if ! commit_runtime_ready_context "existing resident navigation context matches selected floor"; then
+    echo "[runtime-overlay] existing resident runtime could not persist its confirmed map context; stopping it fail-closed" >&2
+    exit 1
+  fi
   log_startup_stage "resident_context_reused"
-  write_runtime_map_context "ready" "true" "existing resident navigation context matches selected floor"
-  runtime_ready=1
   while true; do
     sleep 3600
   done
 fi
 
+echo "[runtime-overlay] navigation start source=${navigation_start_source}" >&2
 write_runtime_map_context "starting" "false" "resident navigation runtime starting"
+if [[ "${navigation_start_source}" == "api_resume" ]]; then
+  echo "[runtime-overlay] API navigation resume requires stable local_state before localization process startup" >&2
+  log_startup_stage "api_resume_local_state_preflight"
+  ensure_common_local_state_ready_for_navigation_start "stable" || {
+    write_runtime_map_context "failed" "false" "${localization_ready_failure_reason:-resident robot_local_state was not stable before API navigation resume}"
+    exit 1
+  }
+  common_local_state_ready=1
+  log_startup_stage "common_local_state_ready"
+fi
 echo "[runtime-overlay] starting resident navigation localization layer for ${NJRH_BUILDING_ID}/${NJRH_FLOOR_ID}" >&2
 NJRH_BUILDING_ID="${NJRH_BUILDING_ID}" \
 NJRH_FLOOR_ID="${NJRH_FLOOR_ID}" \
@@ -1535,36 +1795,13 @@ if [[ "${NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION:-false}" == "true" ]]; t
   fi
 fi
 
-ensure_common_local_state_ready_for_navigation_start || {
-  write_runtime_map_context "failed" "false" "${localization_ready_failure_reason:-resident robot_local_state was not ready before initial localization}"
-  exit 1
-}
-log_startup_stage "common_local_state_ready"
-
-if [[ -z "${navigation_pid}" ]] && env_flag_true "${NJRH_NAV2_HELD_PRESTART_AFTER_LOCAL_STATE:-true}"; then
-  if env_flag_true "${NJRH_NAV2_HELD_PRESTART_WAIT_FOR_LOCALIZER_SERVICE:-true}"; then
-    localizer_prestart_service_timeout="${NJRH_NAV2_HELD_PRESTART_LOCALIZER_SERVICE_WAIT_SEC:-45}"
-    echo "[runtime-overlay] prioritizing localization startup until Isaac service and bridge odom are ready before held Nav2 prestart" >&2
-    ensure_localization_layer_alive || exit 1
-    if ! runtime_readiness_probe localization-prestart "${localizer_prestart_service_timeout}"; then
-      set_localization_ready_failure \
-        "LOCALIZATION_PRESTART_NOT_READY" \
-        "Isaac service or localization bridge odom not ready before held Nav2 prestart within ${localizer_prestart_service_timeout}s"
-      write_runtime_map_context "failed" "false" "${localization_ready_failure_reason}"
-      exit 1
-    fi
-    log_startup_stage "localizer_service_ready_for_nav2_prestart"
-  fi
-  start_resident_navigation_layer "true" "nav2_layer_prestarted_held" "prestarting held"
-  nav2_prestarted=1
-  sleep "${NJRH_NAV2_PRESTART_SETTLE_SEC:-0.1}"
-  ensure_navigation_layer_alive || exit 1
-fi
-
-if env_flag_true "${NJRH_INITIAL_GLOBAL_LOCALIZATION_BACKGROUND_START:-false}"; then
-  start_initial_global_localization_background
-else
-  echo "[runtime-overlay] initial global localization trigger will run after localization stack and floor context are ready" >&2
+if [[ "${common_local_state_ready}" -ne 1 ]]; then
+  ensure_common_local_state_ready_for_navigation_start "fresh" || {
+    write_runtime_map_context "failed" "false" "${localization_ready_failure_reason:-resident robot_local_state was not ready before initial localization}"
+    exit 1
+  }
+  common_local_state_ready=1
+  log_startup_stage "common_local_state_ready"
 fi
 
 sleep "${NJRH_NAV_LOCALIZATION_START_SETTLE_SEC:-0.1}"
@@ -1586,19 +1823,43 @@ if [[ "${nav2_prestarted}" -eq 1 ]] \
 fi
 
 ensure_helper_process_no_probe "floor_manager" bash "${SCRIPT_DIR}/run_floor_manager.sh"
+ensure_helper_process_no_probe "mode_manager" bash "${SCRIPT_DIR}/run_mode_manager.sh"
 
-echo "[runtime-overlay] selecting floor context in floor_manager; resident localization layer already owns map/localizer loading" >&2
-payload="{building_id: '${NJRH_BUILDING_ID}', floor_id: '${NJRH_FLOOR_ID}', resume_navigation: false}"
-timeout "${NJRH_FLOOR_MANAGER_SWITCH_CALL_TIMEOUT:-0.2}" ros2 service call /floor_manager/switch_floor robot_interfaces/srv/SwitchFloor "${payload}" >/dev/null 2>&1 || {
-  echo "[runtime-overlay] floor switch request did not complete; continuing because selected floor assets were already resolved by runtime" >&2
-}
-log_startup_stage "floor_context_selected"
+echo "[runtime-overlay] resident localization layer already owns map/localizer loading; floor_manager source preflight is not repeated during runtime startup because current/ was committed and verified before launch" >&2
+log_startup_stage "floor_asset_context_verified"
+
+if env_flag_true "${NJRH_INITIAL_GLOBAL_LOCALIZATION_BACKGROUND_START:-false}"; then
+  start_initial_global_localization_background
+else
+  echo "[runtime-overlay] initial global localization trigger is starting after full localization-stack and floor-context readiness" >&2
+fi
 
 wait_for_initial_global_localization || {
   write_runtime_map_context "failed" "false" "initial global localization did not pass trigger wrapper, bridge, and map->odom gates"
   exit 1
 }
 log_startup_stage "initial_global_localization_ready"
+
+if [[ -z "${navigation_pid}" ]] && env_flag_true "${NJRH_NAV2_HELD_PRESTART_AFTER_LOCAL_STATE:-true}"; then
+  if env_flag_true "${NJRH_NAV2_HELD_PRESTART_WAIT_FOR_LOCALIZER_SERVICE:-true}"; then
+    localizer_prestart_service_timeout="${NJRH_NAV2_HELD_PRESTART_LOCALIZER_SERVICE_WAIT_SEC:-45}"
+    echo "[runtime-overlay] initial localization is accepted; reconfirming Isaac service and bridge odom before held Nav2 prestart" >&2
+    ensure_localization_layer_alive || exit 1
+    if ! runtime_readiness_probe localization-prestart "${localizer_prestart_service_timeout}"; then
+      set_localization_ready_failure \
+        "LOCALIZATION_PRESTART_NOT_READY" \
+        "Isaac service or localization bridge odom was lost before held Nav2 prestart within ${localizer_prestart_service_timeout}s"
+      write_runtime_map_context "failed" "false" "${localization_ready_failure_reason}"
+      exit 1
+    fi
+    log_startup_stage "localizer_service_ready_for_nav2_prestart"
+  fi
+  start_resident_navigation_layer "true" "nav2_layer_prestarted_held" "prestarting held"
+  nav2_prestarted=1
+  sleep "${NJRH_NAV2_PRESTART_SETTLE_SEC:-0.1}"
+  ensure_navigation_layer_alive || exit 1
+fi
+
 if env_flag_true "${NJRH_REQUIRE_AMCL_TRACKING_FOR_NAV_READY:-false}" || \
   env_flag_true "${NJRH_AMCL_READINESS_BEFORE_NAV2_LIFECYCLE:-false}"; then
   echo "[runtime-overlay] starting AMCL readiness in parallel with Nav2 lifecycle activation" >&2
@@ -1627,13 +1888,15 @@ ensure_localization_layer_alive || exit 1
 ensure_navigation_layer_alive || exit 1
 if ! activate_prestarted_nav2_lifecycle; then
   write_runtime_map_context "failed" "false" "prestarted resident Nav2 lifecycle activation failed after initial relocalization"
-  echo "[runtime-overlay] prestarted resident Nav2 lifecycle activation failed; localization layer remains running for diagnostics and retry" >&2
+  echo "[runtime-overlay] prestarted resident Nav2 lifecycle activation failed; tearing down the incomplete navigation runtime" >&2
   stop_navigation_layer_after_failure "lifecycle activation failure"
+  exit 1
 fi
 if ! wait_for_nav2_layer_ready; then
   write_runtime_map_context "failed" "false" "resident Nav2 layer did not become ready after initial relocalization"
-  echo "[runtime-overlay] resident Nav2 layer failed startup; localization layer remains running for diagnostics and retry" >&2
+  echo "[runtime-overlay] resident Nav2 layer failed startup; tearing down the incomplete navigation runtime" >&2
   stop_navigation_layer_after_failure "startup failure"
+  exit 1
 else
   log_startup_stage "nav2_layer_ready"
   if env_flag_true "${NJRH_REQUIRE_AMCL_TRACKING_FOR_NAV_READY:-false}"; then
@@ -1653,11 +1916,9 @@ else
     fi
     log_startup_stage "amcl_tracking_ready"
   else
-    if [[ -z "${amcl_readiness_pid}" ]]; then
-      start_amcl_readiness_background_if_enabled_for_navigation || {
-        echo "[runtime-overlay] AMCL readiness background failed to launch after Nav2 ready; continuing with bridge map->odom and Nav2 active runtime ready" >&2
-      }
-    fi
+    maintain_amcl_readiness_background_for_navigation || {
+      echo "[runtime-overlay] AMCL readiness background failed to launch after Nav2 ready; continuing with bridge map->odom and Nav2 active runtime ready" >&2
+    }
     load_amcl_runtime_status
     local_ready_message="resident navigation runtime ready after trigger wrapper, bridge map->odom, and Nav2 activation; AMCL tracking continues in background"
   fi
@@ -1671,11 +1932,16 @@ else
     echo "[runtime-overlay] resident global localization wrapper failed to stay available after startup" >&2
     exit 1
   }
-  runtime_ready=1
   if env_flag_true "${NJRH_REQUIRE_AMCL_TRACKING_FOR_NAV_READY:-false}"; then
-    write_runtime_map_context "ready" "true" "resident navigation runtime ready after trigger wrapper, bridge map->odom, Nav2 activation, and AMCL tracking readiness"
+    ready_context_message="resident navigation runtime ready after trigger wrapper, bridge map->odom, Nav2 activation, and AMCL tracking readiness"
   else
-    write_runtime_map_context "ready" "true" "${local_ready_message}"
+    ready_context_message="${local_ready_message}"
+  fi
+  if ! commit_runtime_ready_context "${ready_context_message}"; then
+    echo "[runtime-overlay] resident navigation runtime could not durably confirm its map context; tearing down the incomplete runtime" >&2
+    exit 1
+  fi
+  if ! env_flag_true "${NJRH_REQUIRE_AMCL_TRACKING_FOR_NAV_READY:-false}"; then
     if [[ "${NJRH_AMCL_LOCALIZATION_MODE:-disabled}" != "disabled" && "${AMCL_READY:-false}" == "true" ]]; then
       log_startup_stage "amcl_tracking_ready"
     else
@@ -1687,6 +1953,9 @@ else
 fi
 
 while true; do
+  maintain_amcl_readiness_background_for_navigation || {
+    echo "[runtime-overlay] AMCL background readiness maintenance could not launch a recovery attempt; the next runtime supervision cycle will retry" >&2
+  }
   if [[ -n "${amcl_status_heartbeat_pid}" ]] && ! kill -0 "${amcl_status_heartbeat_pid}" 2>/dev/null; then
     wait "${amcl_status_heartbeat_pid}" || exit_code=$?
     echo "[runtime-overlay] AMCL runtime status heartbeat exited with ${exit_code}" >&2
@@ -1702,11 +1971,16 @@ while true; do
     exit "${exit_code}"
   fi
   if [[ -n "${navigation_pid}" ]] && ! kill -0 "${navigation_pid}" 2>/dev/null; then
+    exit_code=0
     wait "${navigation_pid}" || exit_code=$?
+    if [[ "${exit_code}" -eq 0 ]]; then
+      exit_code=1
+    fi
     echo "[runtime-overlay] resident Nav2 layer exited with ${exit_code}" >&2
     write_runtime_map_context "failed" "false" "resident Nav2 layer exited with ${exit_code}"
     runtime_ready=0
     stop_navigation_layer_after_failure "exit"
+    exit "${exit_code}"
   fi
   sleep 2
 done

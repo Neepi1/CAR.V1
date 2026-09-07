@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -30,14 +31,29 @@ MotionInterlockArbiter::MotionInterlockArbiter(
 InterlockDecision MotionInterlockArbiter::apply_hold(
   const HoldCommand & command, const double now_sec)
 {
-  (void)expire(now_sec);
+  std::lock_guard<std::mutex> lock(mutex_);
+  return apply_hold_locked(command, now_sec);
+}
+
+InterlockDecision MotionInterlockArbiter::apply_hold_locked(
+  const HoldCommand & command, const double now_sec)
+{
+  (void)expire_locked(now_sec);
+  const auto key =
+    hold_command_key(command.owner, command.transaction_id);
+  const auto accepted_command = accepted_hold_commands_.find(key);
+  const auto applied_sequence =
+    accepted_command == accepted_hold_commands_.cend() ?
+    0U : accepted_command->second.sequence;
   const auto reject =
-    [this, now_sec](const InterlockDecisionCode code, const std::string & message)
+    [this, now_sec, applied_sequence](
+    const InterlockDecisionCode code, const std::string & message)
     {
       InterlockDecision decision;
       decision.code = code;
       decision.message = message;
-      decision.state = snapshot(now_sec);
+      decision.applied_sequence = applied_sequence;
+      decision.state = snapshot_locked(now_sec);
       return decision;
     };
 
@@ -47,6 +63,42 @@ InterlockDecision MotionInterlockArbiter::apply_hold(
     command.transaction_id.empty())
   {
     return reject(InterlockDecisionCode::kInvalidRequest, "hold requires owner and transaction");
+  }
+  if (command.command_sequence > 0U) {
+    // Once a client has announced sequencing for a key, even a malformed
+    // sequenced command fences out a delayed legacy command for that key.
+    sequenced_hold_keys_.insert(key);
+  } else if (sequenced_hold_keys_.count(key) != 0U) {
+    return reject(
+      InterlockDecisionCode::kStaleCommand,
+      "legacy hold command rejected after sequencing was observed");
+  }
+  if (accepted_command != accepted_hold_commands_.cend()) {
+    const auto & previous = accepted_command->second;
+    if (command.command_sequence < previous.sequence) {
+      return reject(
+        InterlockDecisionCode::kStaleCommand,
+        "hold command sequence is older than the accepted sequence");
+    }
+    if (command.command_sequence == previous.sequence &&
+      command.command_sequence > 0U)
+    {
+      if (
+        command.operation == previous.operation &&
+        command.reason == previous.reason)
+      {
+        InterlockDecision decision;
+        decision.accepted = true;
+        decision.code = InterlockDecisionCode::kOk;
+        decision.message = "sequenced hold command already applied";
+        decision.applied_sequence = previous.sequence;
+        decision.state = snapshot_locked(now_sec);
+        return decision;
+      }
+      return reject(
+        InterlockDecisionCode::kStaleCommand,
+        "hold command sequence was reused for different content");
+    }
   }
   if (
     command.operation != HoldOperation::kAcquire &&
@@ -60,20 +112,10 @@ InterlockDecision MotionInterlockArbiter::apply_hold(
     [&command](const HoldRecord & hold) {
       return hold.owner == command.owner && hold.transaction_id == command.transaction_id;
     });
-  const auto same_transaction = std::find_if(
-    holds_.cbegin(), holds_.cend(),
-    [&command](const HoldRecord & hold) {
-      return hold.transaction_id == command.transaction_id;
-    });
 
   if (command.operation == HoldOperation::kAcquire) {
     if (command.reason.empty()) {
       return reject(InterlockDecisionCode::kInvalidRequest, "hold acquisition requires a reason");
-    }
-    if (same_transaction != holds_.cend() && same_transaction->owner != command.owner) {
-      return reject(
-        InterlockDecisionCode::kConflict,
-        "transaction is already held by another owner");
     }
     if (exact != holds_.end()) {
       const bool changed = exact->reason != command.reason;
@@ -87,7 +129,12 @@ InterlockDecision MotionInterlockArbiter::apply_hold(
       decision.changed = changed;
       decision.code = InterlockDecisionCode::kOk;
       decision.message = changed ? "motion hold updated" : "motion hold already active";
-      decision.state = snapshot(now_sec);
+      decision.applied_sequence = command.command_sequence;
+      decision.state = snapshot_locked(now_sec);
+      if (command.command_sequence > 0U) {
+        accepted_hold_commands_[key] = {
+          command.command_sequence, command.operation, command.reason};
+      }
       return decision;
     }
 
@@ -99,11 +146,36 @@ InterlockDecision MotionInterlockArbiter::apply_hold(
     decision.changed = true;
     decision.code = InterlockDecisionCode::kOk;
     decision.message = "motion hold acquired";
-    decision.state = snapshot(now_sec);
+    decision.applied_sequence = command.command_sequence;
+    decision.state = snapshot_locked(now_sec);
+    if (command.command_sequence > 0U) {
+      accepted_hold_commands_[key] = {
+        command.command_sequence, command.operation, command.reason};
+    }
     return decision;
   }
 
   if (exact == holds_.end()) {
+    if (command.command_sequence > 0U) {
+      if (generation_ == std::numeric_limits<std::uint64_t>::max()) {
+        return reject(
+          InterlockDecisionCode::kConflict,
+          "motion interlock generation is exhausted");
+      }
+      accepted_hold_commands_[key] = {
+        command.command_sequence, command.operation, command.reason};
+      generation_ += 1U;
+      transition_reason_ = "motion_hold_release_fenced";
+      InterlockDecision decision;
+      decision.accepted = true;
+      decision.changed = true;
+      decision.code = InterlockDecisionCode::kOk;
+      decision.message =
+        "motion hold was already absent and is fenced from a delayed acquire";
+      decision.applied_sequence = command.command_sequence;
+      decision.state = snapshot_locked(now_sec);
+      return decision;
+    }
     return reject(
       InterlockDecisionCode::kNotOwner,
       "only the exact owner and transaction can release a hold");
@@ -116,21 +188,142 @@ InterlockDecision MotionInterlockArbiter::apply_hold(
   decision.changed = true;
   decision.code = InterlockDecisionCode::kOk;
   decision.message = "motion hold released";
-  decision.state = snapshot(now_sec);
+  decision.applied_sequence = command.command_sequence;
+  decision.state = snapshot_locked(now_sec);
+  if (command.command_sequence > 0U) {
+    accepted_hold_commands_[key] = {
+      command.command_sequence, command.operation, command.reason};
+  }
   return decision;
+}
+
+InterlockDecision MotionInterlockArbiter::release_hold_if_execution_idle(
+  const ConditionalHoldReleaseCommand & command,
+  const double now_sec)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  return release_hold_if_execution_idle_locked(command, now_sec);
+}
+
+InterlockDecision MotionInterlockArbiter::release_hold_if_execution_idle_locked(
+  const ConditionalHoldReleaseCommand & command,
+  const double now_sec)
+{
+  // Expiration is part of the same critical section. If expiration changes
+  // the state, its generation change fences a caller holding older evidence.
+  (void)expire_locked(now_sec);
+  const auto key =
+    hold_command_key(command.owner, command.transaction_id);
+  const auto accepted_command = accepted_hold_commands_.find(key);
+  const auto applied_sequence =
+    accepted_command == accepted_hold_commands_.cend() ?
+    0U : accepted_command->second.sequence;
+  const auto reject =
+    [this, now_sec, applied_sequence](
+    const InterlockDecisionCode code, const std::string & message)
+    {
+      InterlockDecision decision;
+      decision.code = code;
+      decision.message = message;
+      decision.applied_sequence = applied_sequence;
+      decision.state = snapshot_locked(now_sec);
+      return decision;
+    };
+
+  if (
+    !std::isfinite(now_sec) ||
+    command.owner.empty() ||
+    command.transaction_id.empty() ||
+    command.reason.empty() ||
+    command.command_sequence == 0U)
+  {
+    return reject(
+      InterlockDecisionCode::kInvalidRequest,
+      "conditional hold release requires owner, transaction, reason, and "
+      "a non-zero command sequence");
+  }
+
+  // Announcing a sequenced recovery command permanently fences legacy
+  // commands for this exact hold key, including when this attempt is stale.
+  sequenced_hold_keys_.insert(key);
+  if (
+    accepted_command != accepted_hold_commands_.cend() &&
+    command.command_sequence <= accepted_command->second.sequence)
+  {
+    return reject(
+      InterlockDecisionCode::kStaleCommand,
+      "conditional hold release sequence is not newer than the accepted sequence");
+  }
+  if (command.expected_generation != generation_) {
+    return reject(
+      InterlockDecisionCode::kGenerationMismatch,
+      "motion interlock generation changed after recovery evidence was observed");
+  }
+  if (execution_session_engaged_ || execution_lease_active_) {
+    return reject(
+      InterlockDecisionCode::kExecutionActive,
+      "execution session or lease is active");
+  }
+
+  const auto exact = std::find_if(
+    holds_.begin(), holds_.end(),
+    [&command](const HoldRecord & hold) {
+      return hold.owner == command.owner &&
+             hold.transaction_id == command.transaction_id;
+    });
+  if (exact == holds_.end()) {
+    return reject(
+      InterlockDecisionCode::kNotOwner,
+      "exact owner and transaction hold is not present");
+  }
+  if (generation_ == std::numeric_limits<std::uint64_t>::max()) {
+    return reject(
+      InterlockDecisionCode::kConflict,
+      "motion interlock generation is exhausted");
+  }
+
+  holds_.erase(exact);
+  accepted_hold_commands_[key] = {
+    command.command_sequence, HoldOperation::kRelease, command.reason};
+  generation_ += 1U;
+  transition_reason_ = "motion_hold_released_if_execution_idle";
+
+  InterlockDecision decision;
+  decision.accepted = true;
+  decision.changed = true;
+  decision.code = InterlockDecisionCode::kOk;
+  decision.message =
+    "motion hold released atomically while execution remained idle";
+  decision.applied_sequence = command.command_sequence;
+  decision.state = snapshot_locked(now_sec);
+  return decision;
+}
+
+std::string MotionInterlockArbiter::hold_command_key(
+  const std::string & owner,
+  const std::string & transaction_id)
+{
+  return owner + '\x1f' + transaction_id;
 }
 
 InterlockDecision MotionInterlockArbiter::apply_execution(
   const ExecutionCommand & command, const double now_sec)
 {
-  (void)expire(now_sec);
+  std::lock_guard<std::mutex> lock(mutex_);
+  return apply_execution_locked(command, now_sec);
+}
+
+InterlockDecision MotionInterlockArbiter::apply_execution_locked(
+  const ExecutionCommand & command, const double now_sec)
+{
+  (void)expire_locked(now_sec);
   const auto reject =
     [this, now_sec](const InterlockDecisionCode code, const std::string & message)
     {
       InterlockDecision decision;
       decision.code = code;
       decision.message = message;
-      decision.state = snapshot(now_sec);
+      decision.state = snapshot_locked(now_sec);
       return decision;
     };
 
@@ -151,34 +344,48 @@ InterlockDecision MotionInterlockArbiter::apply_execution(
   {
     return reject(InterlockDecisionCode::kInvalidRequest, "unsupported execution operation");
   }
-  if (lease_is_retired(command.lease_id)) {
-    return reject(InterlockDecisionCode::kStaleLease, "execution lease has retired");
-  }
 
   if (command.operation == ExecutionOperation::kRelease) {
-    if (!execution_lease_active_ || !execution_tuple_matches(command)) {
+    const bool same_active_id =
+      execution_session_engaged_ &&
+      execution_lease_id_ == command.lease_id;
+    if (same_active_id && !execution_tuple_matches(command)) {
       return reject(
         InterlockDecisionCode::kNotOwner,
-        "only the exact active execution lease can close the session");
+        "only the exact execution tuple can close the current session");
     }
-    retire_execution_lease();
-    execution_session_engaged_ = false;
-    execution_lease_active_ = false;
-    execution_owner_.clear();
-    execution_mission_id_.clear();
-    execution_transaction_id_.clear();
-    execution_lease_id_.clear();
-    execution_expires_at_sec_ = 0.0;
-    generation_ += 1U;
-    transition_reason_ = "execution_session_released";
+    const bool newly_retired =
+      retired_execution_lease_ids_.insert(command.lease_id).second;
+    const bool exact_session =
+      execution_session_engaged_ && execution_tuple_matches(command);
+    if (exact_session) {
+      execution_session_engaged_ = false;
+      execution_lease_active_ = false;
+      execution_owner_.clear();
+      execution_mission_id_.clear();
+      execution_transaction_id_.clear();
+      execution_lease_id_.clear();
+      execution_expires_at_sec_ = 0.0;
+    }
+    if (newly_retired || exact_session) {
+      generation_ += 1U;
+      transition_reason_ = exact_session ?
+        "execution_session_released" :
+        "execution_lease_release_fenced";
+    }
 
     InterlockDecision decision;
     decision.accepted = true;
-    decision.changed = true;
+    decision.changed = newly_retired || exact_session;
     decision.code = InterlockDecisionCode::kOk;
-    decision.message = "execution session released";
-    decision.state = snapshot(now_sec);
+    decision.message = exact_session ?
+      "execution session released" :
+      "execution lease was already absent and is now fenced from late set";
+    decision.state = snapshot_locked(now_sec);
     return decision;
+  }
+  if (lease_is_retired(command.lease_id)) {
+    return reject(InterlockDecisionCode::kStaleLease, "execution lease has retired");
   }
 
   if (
@@ -197,7 +404,7 @@ InterlockDecision MotionInterlockArbiter::apply_execution(
       decision.accepted = true;
       decision.code = InterlockDecisionCode::kOk;
       decision.message = "execution lease renewed";
-      decision.state = snapshot(now_sec);
+      decision.state = snapshot_locked(now_sec);
       return decision;
     }
     if (execution_lease_active_ || !command.recovery || command.owner != recovery_owner_) {
@@ -224,11 +431,18 @@ InterlockDecision MotionInterlockArbiter::apply_execution(
   decision.code = InterlockDecisionCode::kOk;
   decision.message = command.recovery ?
     "execution session recovered" : "execution session acquired";
-  decision.state = snapshot(now_sec);
+  decision.state = snapshot_locked(now_sec);
   return decision;
 }
 
 std::optional<MotionInterlockSnapshot> MotionInterlockArbiter::expire(const double now_sec)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  return expire_locked(now_sec);
+}
+
+std::optional<MotionInterlockSnapshot> MotionInterlockArbiter::expire_locked(
+  const double now_sec)
 {
   if (
     !execution_lease_active_ ||
@@ -242,14 +456,21 @@ std::optional<MotionInterlockSnapshot> MotionInterlockArbiter::expire(const doub
   execution_expires_at_sec_ = 0.0;
   generation_ += 1U;
   transition_reason_ = "execution_lease_expired";
-  return snapshot(now_sec);
+  return snapshot_locked(now_sec);
 }
 
 MotionInterlockSnapshot MotionInterlockArbiter::snapshot(const double now_sec) const
 {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return snapshot_locked(now_sec);
+}
+
+MotionInterlockSnapshot MotionInterlockArbiter::snapshot_locked(
+  const double now_sec) const
+{
   MotionInterlockSnapshot state;
   state.generation = generation_;
-  state.motion_blocked = !motion_permitted(now_sec);
+  state.motion_blocked = !motion_permitted_locked(now_sec);
   state.hold_keys.reserve(holds_.size());
   for (const auto & hold : holds_) {
     state.hold_keys.push_back(hold.owner + ":" + hold.transaction_id);
@@ -268,6 +489,12 @@ MotionInterlockSnapshot MotionInterlockArbiter::snapshot(const double now_sec) c
 }
 
 bool MotionInterlockArbiter::motion_permitted(const double now_sec) const
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  return motion_permitted_locked(now_sec);
+}
+
+bool MotionInterlockArbiter::motion_permitted_locked(const double now_sec) const
 {
   if (!holds_.empty()) {
     return false;

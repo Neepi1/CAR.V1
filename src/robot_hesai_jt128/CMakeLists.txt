@@ -8,6 +8,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 
@@ -18,6 +19,7 @@ ament_export_dependencies(
   rclcpp
   sensor_msgs
   std_msgs
+  std_srvs
   tf2
   tf2_ros)
 ament_export_libraries(pointcloud_accel_core)
@@ -35,6 +37,7 @@ ament_target_dependencies(
   rclcpp
   sensor_msgs
   std_msgs
+  std_srvs
   tf2
   tf2_ros)
 
@@ -65,6 +68,12 @@ add_executable(imu_axis_remap_node src/imu_axis_remap_node.cpp)
 ament_target_dependencies(imu_axis_remap_node rclcpp sensor_msgs tf2)
 add_executable(scan_republisher_node src/scan_republisher_node.cpp)
 ament_target_dependencies(scan_republisher_node rclcpp sensor_msgs)
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_scan_self_mask test/test_scan_self_mask.cpp)
+  target_include_directories(test_scan_self_mask PRIVATE include)
+endif()
 
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)

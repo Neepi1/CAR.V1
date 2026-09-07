@@ -262,6 +262,9 @@ FLOOR_TESTING_METHODS = """    @staticmethod
                 'selected': {
                     'building_id': env_updates.get('NJRH_BUILDING_ID', safe_building),
                     'floor_id': env_updates.get('NJRH_FLOOR_ID', safe_floor),
+                    'map_id': env_updates.get('NJRH_NAV_MAP_ID', ''),
+                    'asset_epoch': env_updates.get('NJRH_MAP_ASSET_EPOCH', ''),
+                    'asset_digest': env_updates.get('NJRH_MAP_ASSET_DIGEST', ''),
                     'floor_root': env_updates.get('NJRH_CURRENT_FLOOR_ROOT', ''),
                     'nav_map': env_updates.get('NAV2_MAP_YAML', ''),
                     'localizer_map': env_updates.get('NAV2_LOCALIZER_MAP_YAML', ''),
@@ -308,8 +311,32 @@ FLOOR_TESTING_METHODS = """    @staticmethod
                 if not select_result.get('ok'):
                     return select_result
                 actions.append(select_result.get('message', 'floor assets selected'))
+                selected = select_result.get('selected') or {}
+                safe_map_id = self._sanitize_floor_token(
+                    selected.get('map_id', ''),
+                    'map_id',
+                )
+                asset_epoch = str(selected.get('asset_epoch', '')).strip()
+                if not asset_epoch.isdigit() or int(asset_epoch) <= 0:
+                    raise RuntimeError('asset_epoch must be a positive integer')
+                asset_digest = str(selected.get('asset_digest', '')).strip()
+                if (
+                    len(asset_digest) != 71 or
+                    not asset_digest.startswith('sha256:') or
+                    any(ch not in '0123456789abcdef' for ch in asset_digest[7:])
+                ):
+                    raise RuntimeError(
+                        'asset_digest must use sha256:<64 lowercase hex>',
+                    )
                 actions.extend(self._ensure_floor_manager_ready())
-                payload = "{building_id: '" + safe_building + "', floor_id: '" + safe_floor + "', resume_navigation: false}"
+                payload = (
+                    "{building_id: '" + safe_building +
+                    "', floor_id: '" + safe_floor +
+                    "', map_id: '" + safe_map_id +
+                    "', expected_asset_epoch: " + asset_epoch +
+                    ", expected_asset_digest: '" + asset_digest +
+                    "', resume_navigation: false}"
+                )
                 ros_command = (
                     'PROJECT_ROOT="${NJRH_PROJECT_ROOT:-/workspaces/njrh-v3/workspace1}"; '
                     'cd "${PROJECT_ROOT}" && '

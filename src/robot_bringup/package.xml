@@ -42,5 +42,7 @@
   <exec_depend>robot_nav_config</exec_depend>
   <exec_depend>robot_safety</exec_depend>
 
-  <export/>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
 </package>

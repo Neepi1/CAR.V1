@@ -54,6 +54,8 @@ log/
 *.ply
 
 # Jetson runtime-generated assets and logs
+/.deploy/
+/.runtime/
 /maps/
 /maps3d/
 /maps_release/

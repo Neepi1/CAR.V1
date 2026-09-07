@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace robot_localization_bridge
@@ -19,6 +20,7 @@ enum class PauseDecisionCode
   kInvalidRequest,
   kConflict,
   kNotOwner,
+  kStaleCommand,
 };
 
 struct PauseCommand
@@ -27,6 +29,7 @@ struct PauseCommand
   std::string owner;
   std::string transaction_id;
   std::string reason;
+  std::uint64_t command_sequence{0U};
 };
 
 struct CorrectionPauseSnapshot
@@ -43,6 +46,7 @@ struct PauseDecision
   bool changed{false};
   PauseDecisionCode code{PauseDecisionCode::kInvalidRequest};
   std::string message;
+  std::uint64_t applied_sequence{0U};
   CorrectionPauseSnapshot state;
 };
 
@@ -61,6 +65,9 @@ private:
   };
 
   std::vector<Record> records_;
+  // Tombstones are intentionally retained after release so a delayed acquire
+  // from the same owner/transaction cannot resurrect a pause lease.
+  std::unordered_map<std::string, std::uint64_t> last_command_sequences_;
   std::uint64_t generation_{0U};
   std::string transition_reason_{"startup"};
 };

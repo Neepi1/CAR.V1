@@ -62,12 +62,12 @@ rm -f "${latch_file}"
 node_pid=$!
 
 for _ in $(seq 1 50); do
-  if ros2 node list 2>/dev/null | grep -Fxq "/${node_name}"; then
+  if ros2 node list --no-daemon --spin-time 0.2 2>/dev/null | grep -Fxq "/${node_name}"; then
     break
   fi
   sleep 0.1
 done
-ros2 node list | grep -Fxq "/${node_name}" || {
+ros2 node list --no-daemon --spin-time 0.5 | grep -Fxq "/${node_name}" || {
   echo "isolated robot_safety node did not become ready" >&2
   cat "${log_file}" >&2
   exit 1
@@ -232,11 +232,44 @@ try:
     if not any(msg.linear.x > 0.04 for msg in released_outputs):
         raise RuntimeError("BMS interlock did not release after a confirmed undock session")
 
+    # Reproduce the opposite callback order seen in the field: the undock owner
+    # drops its reverse permit before the next BMS sample reports no contact.
+    # Release must converge when that later no-contact sample arrives; otherwise
+    # the stale contact latch blocks the next docking attempt indefinitely.
+    node.publish_battery_contact()
+    node.publish_for(node.reverse_pub, reverse_enable, 0.20)
+    node.publish_for(node.reverse_pub, reverse_disable, 0.20)
+
+    still_latched_mark = time.monotonic()
+    node.publish_for(node.push_owner, push, 0.35)
+    still_latched_outputs = [
+        msg for stamp, msg in node.outputs if stamp >= still_latched_mark
+    ]
+    if not still_latched_outputs or any(
+        not is_zero(msg) for msg in still_latched_outputs
+    ):
+        raise RuntimeError(
+            "BMS interlock released before post-undock no-contact feedback"
+        )
+
+    node.publish_for(node.battery_pub, no_contact, 0.20)
+    late_no_contact_mark = time.monotonic()
+    node.publish_for(node.push_owner, push, 0.35)
+    late_no_contact_outputs = [
+        msg for stamp, msg in node.outputs if stamp >= late_no_contact_mark
+    ]
+    if not any(msg.linear.x > 0.04 for msg in late_no_contact_outputs):
+        raise RuntimeError(
+            "BMS interlock did not release when fresh no-contact arrived "
+            "after reverse permit was already disabled"
+        )
+
     print("PASS: pre-contact docking push is available")
     print("PASS: BMS contact blocks competing forward docking commands")
     print("PASS: BMS interlock survives stale BMS and loss of the zero-command owner")
     print("PASS: explicit pure-reverse undock remains available")
     print("PASS: fresh no-contact plus reverse-permit release clears the interlock")
+    print("PASS: reverse-permit release plus later fresh no-contact clears the interlock")
 finally:
     node.destroy_node()
     rclpy.shutdown()

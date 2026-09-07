@@ -9,6 +9,7 @@ find_package(ament_cmake REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
 add_library(robot_elevator_core
+  src/elevator_execution_module.cpp
   src/elevator_fsm.cpp
   src/elevator_release_loader.cpp
   src/elevator_topology.cpp
@@ -61,6 +62,12 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_elevator_fsm test/test_elevator_fsm.cpp)
   target_link_libraries(test_elevator_fsm robot_elevator_core)
+
+  ament_add_gtest(
+    test_elevator_execution_module
+    test/test_elevator_execution_module.cpp
+  )
+  target_link_libraries(test_elevator_execution_module robot_elevator_core)
 
   ament_add_gtest(
     test_elevator_release_loader

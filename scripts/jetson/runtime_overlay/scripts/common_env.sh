@@ -216,8 +216,14 @@ runtime_readiness_probe_output_reports_success() {
     topic-publisher)
       [[ "${output}" == *"[runtime-overlay] topic publisher ready:"* ]]
       ;;
+    publisher-count)
+      [[ "${output}" == *"[runtime-overlay] exact publisher count ready:"* ]]
+      ;;
     publisher-from-node)
       [[ "${output}" == *"[runtime-overlay] publisher ready:"* ]]
+      ;;
+    exact-publisher-owner)
+      [[ "${output}" == *"[runtime-overlay] exact publisher owner ready:"* ]]
       ;;
     topic)
       [[ "${output}" == *"[runtime-overlay] topic message ready:"* ]]
@@ -236,6 +242,15 @@ runtime_readiness_probe_output_reports_success() {
       ;;
     fresh-tf)
       [[ "${output}" == *"[runtime-overlay] fresh TF ready:"* ]]
+      ;;
+    stable-local-state)
+      [[ "${output}" == *"[runtime-overlay] stable local_state ready:"* ]]
+      ;;
+    mapping-preflight)
+      [[ "${output}" == *"[runtime-overlay] mapping preflight ready:"* ]]
+      ;;
+    stamped-scan-tf)
+      [[ "${output}" == *"[runtime-overlay] original-stamp scan TF ready:"* ]]
       ;;
     transformable-scan)
       [[ "${output}" == *"[runtime-overlay] transformable scan observations ready:"* ]]
@@ -278,11 +293,24 @@ runtime_readiness_probe() {
       service|node|topic-publisher|topic|fresh-header-topic|lifecycle-active|occupancy-grid|map-topic-matches-yaml)
         requested_timeout="${3:-}"
         ;;
-      publisher-from-node|tf|fresh-tf|imu-bias-filter|localization-stack)
+      publisher-from-node|publisher-count|tf|fresh-tf|imu-bias-filter|localization-stack)
         requested_timeout="${4:-}"
         ;;
-      transformable-scan|local-state-endpoint|ranger-chassis|localization-prestart)
+      exact-publisher-owner)
+        requested_timeout="${5:-}"
+        ;;
+      transformable-scan|local-state-endpoint|ranger-chassis|localization-prestart|stable-local-state)
         requested_timeout="${2:-}"
+        ;;
+      mapping-preflight)
+        requested_timeout="$(awk \
+          -v tf_timeout="${7:-0}" \
+          -v scan_timeout="${8:-0}" \
+          -v odom_timeout="${9:-0}" \
+          'BEGIN {timeout=tf_timeout; if (scan_timeout > timeout) timeout=scan_timeout; if (odom_timeout > timeout) timeout=odom_timeout; printf "%.3f", timeout}')"
+        ;;
+      stamped-scan-tf)
+        requested_timeout="${5:-}"
         ;;
       global-costmap)
         requested_timeout="$(awk \

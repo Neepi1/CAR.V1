@@ -30,7 +30,11 @@ independently from the navigation chain.
   pause record, defaults to `robot_floor_manager`.
 - Startup supervision does not subscribe to `health_topic`; bridge readiness is checked with graph endpoints plus live `map -> odom` to avoid QoS-durability probe false negatives.
 - `jump_threshold_m`, `timeout_sec`: active runtime gating controls
-- `forced_jump_threshold_m`: maximum one-shot correction accepted after the API arms `force_accept_service`
+- `forced_jump_threshold_m`: maximum one-shot correction accepted after
+  `robot_global_localization` arms `force_accept_service` for startup, manual,
+  same-map, and other ordinary explicit relocalization. An exact active
+  cross-map `FloorSwitch` target uses the transaction-scoped exception below;
+  the parameter is not increased globally.
 - `force_accept_service`: `std_srvs/Trigger` service, defaults to `/robot_localization_bridge/force_accept_next_localization`
 - `correction_pause_service`: legacy `std_srvs/SetBool` endpoint, defaults to `/robot_localization_bridge/set_correction_paused`
 - `correction_pause_lease_service`: owner-scoped `robot_interfaces/srv/SetCorrectionPause` endpoint, defaults to `/robot_localization_bridge/set_correction_pause_lease`
@@ -47,20 +51,22 @@ independently from the navigation chain.
 - `two_d_mode`: defaults to `true`
 - `continuous_localization_mode`: legacy compatibility parameter. Phase A2 supports `triggered` only; any other value is ignored and reset to `triggered`.
 - `status_topic`: JSON status output, defaults to `/localization/bridge_status`
-- `triggered_max_result_age_ms`: bounded Isaac grid-search latency gate for service-triggered `/localization_result`; defaults to `5000.0`
+- `triggered_max_result_age_ms`: diagnostic/ordinary-trigger age limit, defaults to `5000.0`. A currently armed explicit transaction is not rejected from wall-clock age alone; it retains its original stamp and must pass historical `odom -> base_link` lookup plus latest-odom freshness.
 - `force_accept_min_pose_stamp_slack_sec`: when `force_accept_service` is armed, ignore `/localization_result` messages whose header stamp predates the force-accept request by more than this slack instead of counting them as rejected stale results
+- Isaac `/localization_result` may modify canonical state only while the explicit force-accept arm is active. An unarmed late/background result increments `unarmed_isaac_result_ignored_count` and remains diagnostic-only.
+- `odom_tf_history_duration_sec`: tf2 history retained for original-stamp `odom -> base_link` lookup; defaults to `30.0` and must be at least `20.0`. The Jetson profile keeps `30.0` so the wrapper's 20-second Isaac result window has scheduling margin without restamping or latest-TF fallback.
 - `max_odom_tf_age_ms`: freshness gate for the latest `odom -> base_link`, while candidate correction lookup uses `odom -> base_link` at the localization result stamp
 - `triggered_allow_large_correction`: keeps explicit trigger relocalization eligible for the force-accept path; normal triggered updates still obey jump gating
 - `amcl_input_enabled`: defaults to `false`; enables `/amcl_pose` as a continuous candidate input only when `NJRH_AMCL_LOCALIZATION_MODE` is `shadow` or `gated`
 - `amcl_pose_topic`: defaults to `/amcl_pose`
 - `amcl_runtime_status_file`: defaults to `/tmp/njrh_amcl_runtime_status.env`; read-only AMCL runtime contract exported by `run_amcl_shadow_localization.sh`
 - `amcl_gate_mode`: `shadow` or `gated`; shadow records candidates only, gated accepts bounded AMCL corrections
-- `amcl_max_result_age_ms`, `amcl_small_correction_translation_m`, `amcl_small_correction_yaw_rad`: AMCL-specific freshness and direct small-correction gates. Translation and yaw are the measured-versus-predicted `map -> base_link` pose innovation at the localization result timestamp, not raw `map -> odom` parameter deltas. The field profile directly accepts physical translation corrections up to `0.07 m` and yaw corrections up to `0.20 rad`.
-- `amcl_medium_correction_translation_m`, `amcl_medium_correction_yaw_rad`, `amcl_medium_correction_consistency_count`: medium AMCL gate. The field profile accepts corrections up to `0.15 m` and `0.20 rad` only after 3 consecutive consistent candidates.
+- `amcl_max_result_age_ms`, `amcl_small_correction_translation_m`, `amcl_small_correction_yaw_rad`: AMCL-specific freshness and direct small-correction gates. Translation and yaw are the measured-versus-predicted `map -> base_link` pose innovation at the localization result timestamp, not raw `map -> odom` parameter deltas. The field profile directly accepts physical translation corrections up to `0.12 m` and yaw corrections up to `0.20 rad`.
+- `amcl_medium_correction_translation_m`, `amcl_medium_correction_yaw_rad`, `amcl_medium_correction_consistency_count`: medium AMCL gate. The field profile accepts corrections up to `0.28 m` and `0.35 rad` only after 3 consecutive consistent candidates.
 - `amcl_accept_corrections_while_moving`, `amcl_moving_linear_speed_mps`, `amcl_moving_angular_speed_radps`: field runtime accepts bounded AMCL corrections while moving in `gated` mode, so navigation can continuously correct `map -> odom`. Set `NJRH_AMCL_ACCEPT_CORRECTIONS_WHILE_MOVING=false` or `NJRH_AMCL_LOCALIZATION_MODE=shadow` for odometry audit / observe-only rollback.
-- `amcl_hard_reject_translation_m`, `amcl_hard_reject_yaw_rad`: hard reject / Isaac recovery gate. The field profile hard-rejects AMCL translation corrections above `0.30 m` or yaw corrections above `0.8 rad`.
+- `amcl_hard_reject_translation_m`, `amcl_hard_reject_yaw_rad`: hard reject / Isaac recovery gate. Candidates outside the medium gate but no greater than `0.60 m` and `0.8 rad` are not continuously applied and require explicit Isaac recovery. The field profile hard-rejects AMCL translation corrections above `0.60 m` or yaw corrections above `0.8 rad`.
 - `amcl_max_xy_covariance`, `amcl_max_yaw_covariance`: covariance gates for AMCL pose input
-- `amcl_post_isaac_refine_*`: after a force-accepted Isaac relocalization seeds AMCL, gated AMCL may apply one stationary, short-window residual correction before the normal post-Isaac suppression resumes. The Isaac `map -> odom` target must finish smoothing first. A refine candidate must be received after the seed, carry a pose stamp newer than the seed, and pass `amcl_post_isaac_refine_min_delay_sec` (`0.25 s` in the field profile) before it can enter the `2`-candidate consistency gate. Because AMCL is event-driven and may stay silent while the robot is stationary, the bridge then requests `/request_nomotion_update` every `0.5 s`, at most `4` times. Requests stop after refine acceptance, window expiry, or robot motion. This prevents queued pre-seed callbacks from replacing the active Isaac target while still giving the new particle generation a bounded chance to publish. The field profile allows one correction within `10.0 s`, capped at `0.12 m` and `0.10 rad`, after candidates that agree within `0.08 m` and `0.08 rad`.
+- `amcl_post_isaac_refine_*`: after a force-accepted Isaac relocalization seeds AMCL, gated AMCL may apply one stationary, short-window residual correction before the normal post-Isaac suppression resumes. The Isaac `map -> odom` target must finish smoothing first. A refine candidate must be received after the seed, carry a pose stamp newer than the seed, and pass `amcl_post_isaac_refine_min_delay_sec` (`0.25 s` in the field profile) before it can enter the `2`-candidate consistency gate. Because AMCL is event-driven and may stay silent while the robot is stationary, the bridge then requests `/request_nomotion_update` every `0.5 s`, at most `4` times. Requests stop after refine acceptance, window expiry, or robot motion. This prevents queued pre-seed callbacks from replacing the active Isaac target while still giving the new particle generation a bounded chance to publish. The field profile allows one correction within `10.0 s`, capped at `10.0 m` and `0.872664626 rad` (`50 deg`), after candidates that agree within `0.08 m` and `0.08 rad`. These wider limits apply only to the stationary post-Isaac refinement path; the normal moving AMCL small/medium/hard gates are unchanged.
 - `amcl_seed_service`: defaults to `/robot_localization_bridge/seed_amcl_initial_pose` and publishes `/initialpose` from the current reliable `map -> base_link`
 
 ## Correction Pause Ownership
@@ -74,10 +80,13 @@ a second TF owner.
 ### Owner-scoped API
 
 `SetCorrectionPause(OP_ACQUIRE)` requires a non-empty
-`owner + transaction_id + reason`. Records from different transactions compose.
-An exact repeated acquire is idempotent, and only the exact owner/transaction
-can release its record. Reusing one transaction ID under another owner is a
-conflict.
+`owner + transaction_id + reason`. Records are keyed by the exact
+`owner + transaction_id`, so independent owners may deliberately use the same
+transaction ID during a handoff and their pauses compose. An exact repeated
+acquire is idempotent, and only the exact owner/transaction can release its
+record. Every acquire/release also carries a durable monotonic command
+sequence. A release against an already absent exact key records a tombstone,
+which prevents an older delayed acquire from recreating that pause.
 
 The owner-scoped pause currently has no TTL. It remains until exact release or
 bridge process restart. Consequently an elevator recovery path must inspect
@@ -132,16 +141,25 @@ health. BEGIN requires the exact floor-manager pause and invalidates the source
 runtime context. COMMIT requires every pause released, a newer explicit
 localization sequence, and a settled/published `map -> odom`. ABORT keeps the
 context invalid as `FAILED_LOCKED`; force-accept cannot bypass that lock.
-Production BEGIN/COMMIT remain gated off by
-`live_floor_transition_service_enabled=false`, so a direct ROS client cannot
-bypass the preflight-only FloorManager and invalidate runtime context.
 
-This remains a non-production seam because the floor-manager Action is still
-preflight-only and is not connected to the bridge service or the real asset and
-costmap adapters. The typed health deliberately reports
-`localizer_ready=false`, `tf_unique=false`, and generation zero until another
-authoritative component can prove them; consumers must not reinterpret these
-conservative fields as success.
+BEGIN/COMMIT/ABORT commands share a monotonic transaction command sequence.
+The bridge consumes the sequence even for a semantic rejection and retains a
+per-transaction tombstone, so a delayed lower-sequence BEGIN cannot execute
+after cleanup. `OP_ABORT_PREMUTATION` is the sole non-locking compensation:
+it carries the exact source identity and a higher sequence. It restores the
+source context only when the exact floor pause remains owned, the source
+localizer and map-to-odom are still ready, and no new explicit localization
+sequence has occurred. If it arrives before a delayed BEGIN, it is an
+idempotent source-ready no-op whose tombstone rejects that later BEGIN. Normal
+ABORT and every unproven source/mutation state remain `FAILED_LOCKED`.
+
+The packaged bridge configuration keeps
+`live_floor_transition_service_enabled=false` as a safe standalone default.
+The production Jetson wrapper explicitly enables it only together with the
+strict FloorManager Action and its real asset, localization, costmap, hold, and
+sequence-fence adapters. A direct caller still cannot bypass those proofs:
+BEGIN requires the exact floor-manager pause plus the verified current source
+identity, and COMMIT requires the complete target evidence contract.
 
 If a legacy or unrelated owner still holds correction pause, floor switching
 must fail locked. It must not clear that record or release motion. After the
@@ -152,8 +170,9 @@ context.
 ### Validation
 
 The pure arbiter tests in `test/test_correction_pause_arbiter.cpp` cover
-multi-owner composition, exact-owner release, idempotence, transaction
-collision, and rejected malformed requests.
+multi-owner composition (including a shared transaction ID), exact-owner
+release, idempotence, release-before-delayed-acquire tombstones, and rejected
+malformed requests.
 
 The only recommended command for the isolated correction-pause ROS smoke is:
 
@@ -196,13 +215,25 @@ every exit path; never point it at the live navigation process.
 
 - Sole publisher of `map -> odom`
 - Consumes `robot_global_localization` pose and `robot_local_state` odometry
-- The current implementation is C++, computes `map -> odom` from planar `map -> base_link` and the TF `odom -> base_link` at the localization result stamp, latches one-shot localization results, republishes at the configured rate, and rejects large jumps
+- The current implementation is C++, computes `map -> odom` from planar `map -> base_link` and the TF `odom -> base_link` at the localization result stamp, retains an explicit 30-second odom TF history for the 20-second Isaac result window, latches one-shot localization results, republishes at the configured rate, and rejects large jumps
 - Correction handling and TF broadcasting are separate. Isaac explicit relocalization, AMCL gated corrections, and manual force-accept update a locked `MapOdomState`; the independent publisher callback group is the only code path that calls `sendTransform()`. Correction pause rejects new global corrections but keeps broadcasting the last accepted `map -> odom`.
-- Explicit business relocalization calls, such as startup, floor switch, manual recovery, localization-degraded recovery, and post-undock recovery, arm `force_accept_service` first. Ordinary point-navigation goals and default predock docking do not arm force-accept in their normal paths.
+- Explicit business relocalization calls, such as startup, floor switch, manual recovery, localization-degraded recovery, and post-undock recovery, call `/global_localization/trigger`; that wrapper alone arms `force_accept_service`, dispatches Isaac once, and waits for completion. API/floor/startup callers do not pre-arm the bridge. Ordinary point-navigation goals and default predock docking do not trigger or arm force-accept in their normal paths.
 - Each accepted explicit Isaac force-accept relocalization increments `last_explicit_relocalization_sequence` on `/localization/bridge_status` and records `last_explicit_relocalization_accept_time` plus `last_explicit_relocalization_source`. AMCL small/medium gated corrections do not increment this sequence, so runtime settle barriers are triggered only by business relocalization, not every continuous AMCL correction.
 - Field runtime publishes at 50 Hz with `tf_future_stamp_offset_sec=0.0`, so the canonical transform remains measurement-time truthful; this does not change the canonical TF owner.
 - AMCL is a continuous candidate source only. It must run with `tf_broadcast=false`; this bridge computes AMCL candidates from `/amcl_pose` and historical `odom -> base_link`.
 - Candidate gating first predicts `map -> base_link` as `current(map -> odom) * odom -> base_link(t)` and compares that pose with the AMCL/Isaac measurement at the same timestamp. Only this robot-pose innovation drives small/medium/hard gates. The separately reported `map_odom_parameter_*` values are diagnostic transform-parameter changes; they can be much larger because a yaw correction at odom radius `r` requires approximately `r * delta_yaw` of compensating `map -> odom` translation.
 - Isaac triggered relocalization has the highest priority and can seed AMCL through `/initialpose`. While its correction is active, all AMCL target changes are held. Once the Isaac target is current, at most one genuinely post-seed stationary AMCL refine correction may remove a small scan-map residual. If navigation starts first, the static refine generation is abandoned and normal gated AMCL resumes; the refine state cannot block moving corrections. Outside that short refine window, AMCL gated corrections directly accept small covariance-gated updates, accept medium corrections only after consecutive consistency, and report large corrections for Isaac recovery instead of applying one-frame TF jumps.
 - `/localization/bridge_status` reports `gate_mode`, result age and gate limit, force-accept arm time, pre-arm ignored result count/reason, original-stamp TF lookup state, latest odom TF freshness, accept/reject reasons, triggered/AMCL counters, `active_correction_source`, `last_accepted_source`, `last_rejected_source`, `last_explicit_relocalization_sequence`, `last_explicit_relocalization_accept_time`, `last_accepted_correction_translation_m`, `last_accepted_correction_yaw_rad`, `has_map_to_odom`, `map_to_odom_age_ms`, and `map_to_odom_publisher_owner`. `correction_metric_frame=map_base_link` makes the gate metric explicit; signed `*_correction_dx_map_m`, `*_dy_map_m`, and `*_dyaw_rad` expose the physical innovation, while `*_map_odom_parameter_translation_m` and `*_map_odom_parameter_yaw_rad` expose the transform representation separately. It also reports `map_odom_publish_loop_hz`, `map_odom_publish_gap_ms`, `map_odom_publish_gap_max_ms`, `map_odom_publish_callback_duration_us`, `map_odom_current_sequence`, `map_odom_target_sequence`, `map_odom_last_accepted_sequence`, `map_odom_last_published_sequence`, `map_odom_current_source`, `map_odom_target_source`, physical `remaining_translation_error_m` / `remaining_yaw_error_rad`, parameter-space `remaining_map_odom_parameter_*`, `smoothing_total_duration_sec`, `smoothing_remaining_duration_sec`, `smoothing_progress`, `last_step_translation_m`, `last_step_yaw_rad`, `smoothing_policy`, active and configured smoothing rates, `smoothing_enabled`, `correction_active`, `safe_for_goal_start`, `large_correction_rejected_count`, `online_correction_smoothed_count`, `online_correction_snap_count`, `map_odom_correction_paused`, `map_odom_frozen_due_to_pause`, `map_odom_publish_missed_count`, and `publisher_decoupled_from_correction=true`. Post-Isaac diagnostics include the no-motion service readiness, per-sequence and total request counts, request sequence/time, and request state. Default `localization_settle_*` fields remain for compatibility; the live settle barrier is owned by `robot_api_server`.
+- Independent floor maps may use unrelated coordinate origins. The bridge may
+  therefore bypass the ordinary forced-translation limit only while a live
+  floor transition is active, its runtime context is invalid, it is not
+  failure-locked, and the current `LocalizerAssetState` proves the exact
+  pending transaction plus requested and active
+  `building/floor/map/epoch/digest`, a real reload, positive generation, and
+  localizer readiness. Timestamped odom TF, latest-odom freshness, correction
+  pause, finite-pose, explicit-arm, TF ownership, smoothing, publish, and
+  COMMIT gates remain unchanged. Ordinary explicit localization still rejects
+  a 29.671 m correction against the 20 m field limit. Status exposes
+  `floor_transition_translation_limit_bypass_count` and
+  `last_forced_translation_limit_bypassed` for field audit.
 - AMCL bridge readiness also uses the runtime status file. If AMCL input is enabled, `amcl_ready` cannot become true when the AMCL process, lifecycle, `/amcl_pose` publisher, scan-admission process, or `/amcl_scan_admission/status` publisher is missing. In gated mode, `amcl_ready=true` means AMCL is seeded and tracking-ready for startup; `amcl_correction_ready=true` remains the stricter signal that a fresh correction can be applied. A stationary seeded robot may therefore report `amcl_correction_pending=true` without `localization_degraded=true`. The status JSON exposes `amcl_state`, `amcl_process_alive`, `amcl_lifecycle_active`, `amcl_scan_admission_alive`, `amcl_pose_publisher_count`, `amcl_scan_admission_status_publisher_count`, `amcl_upstream_missing`, `amcl_correction_pending`, `localization_degraded`, and `amcl_degraded_reason`.

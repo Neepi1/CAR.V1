@@ -25,10 +25,26 @@ require_text() {
   grep -Fq -- "${needle}" "${path}" || fail "${path} missing: ${needle}"
 }
 
+require_text_any() {
+  local needle="$1"
+  shift
+  local path
+  for path in "$@"; do
+    if grep -Fq -- "${needle}" "${path}"; then
+      return 0
+    fi
+  done
+  fail "docking modules missing: ${needle}"
+}
+
 for path in \
   "${WORKSPACE_ROOT}/src/robot_api_server/src/robot_api_server_node.cpp" \
-  "${WORKSPACE_ROOT}/src/robot_api_server/include/robot_api_server/docking_job_model.hpp" \
-  "${WORKSPACE_ROOT}/src/robot_api_server/src/docking_job_model.cpp" \
+  "${WORKSPACE_ROOT}/src/robot_api_server/include/robot_api_server/features/docking/lifecycle/docking_job_model.hpp" \
+  "${WORKSPACE_ROOT}/src/robot_api_server/src/features/docking/lifecycle/docking_job_model.cpp" \
+  "${WORKSPACE_ROOT}/src/robot_api_server/src/features/docking/lifecycle/docking_job_executor.cpp" \
+  "${WORKSPACE_ROOT}/src/robot_api_server/src/features/docking/lifecycle/docking_status_module.cpp" \
+  "${WORKSPACE_ROOT}/src/robot_api_server/src/features/docking/predock_alignment/predock_alignment_policy.cpp" \
+  "${WORKSPACE_ROOT}/src/robot_api_server/src/features/docking/predock_alignment/predock_control_module.cpp" \
   "${WORKSPACE_ROOT}/src/robot_api_server/config/robot_api_server.yaml" \
   "${WORKSPACE_ROOT}/scripts/jetson/runtime_overlay/config/robot_api_server.yaml" \
   "${WORKSPACE_ROOT}/src/robot_nav_config/behavior_trees/navigate_to_predock.xml" \
@@ -40,7 +56,11 @@ for path in \
 done
 
 api_cpp="${WORKSPACE_ROOT}/src/robot_api_server/src/robot_api_server_node.cpp"
-job_hpp="${WORKSPACE_ROOT}/src/robot_api_server/include/robot_api_server/docking_job_model.hpp"
+job_hpp="${WORKSPACE_ROOT}/src/robot_api_server/include/robot_api_server/features/docking/lifecycle/docking_job_model.hpp"
+executor_cpp="${WORKSPACE_ROOT}/src/robot_api_server/src/features/docking/lifecycle/docking_job_executor.cpp"
+status_cpp="${WORKSPACE_ROOT}/src/robot_api_server/src/features/docking/lifecycle/docking_status_module.cpp"
+predock_policy_cpp="${WORKSPACE_ROOT}/src/robot_api_server/src/features/docking/predock_alignment/predock_alignment_policy.cpp"
+predock_control_cpp="${WORKSPACE_ROOT}/src/robot_api_server/src/features/docking/predock_alignment/predock_control_module.cpp"
 api_cfg="${WORKSPACE_ROOT}/scripts/jetson/runtime_overlay/config/robot_api_server.yaml"
 docking_cfg="${WORKSPACE_ROOT}/scripts/jetson/runtime_overlay/config/docking.yaml"
 bridge_cpp="${WORKSPACE_ROOT}/src/robot_localization_bridge/src/localization_bridge_node.cpp"
@@ -56,15 +76,18 @@ for phase in \
   PREDOCK_YAW_ALIGN_AFTER_BRIDGE_SETTLE PREDOCK_YAW_ALIGN_AFTER_BRIDGE_SETTLE_VERIFY \
   PREDOCK_LATERAL_ALIGN_AFTER_BRIDGE_SETTLE PREDOCK_LATERAL_ALIGN_AFTER_BRIDGE_SETTLE_VERIFY \
   FINE_DOCKING_ENTRY_CHECK FINE_ALIGN RESTAGE_RETRY; do
-  require_text "${api_cpp}" "${phase}"
+  require_text_any "${phase}" "${api_cpp}" "${executor_cpp}" "${status_cpp}" "${predock_control_cpp}"
 done
 
-for symbol in \
-  computeExpectedStagingYaw computePredockYawError computeContactYawError normalizeYawError \
-  run_predock_yaw_align run_predock_lateral_align ensure_predock_lateral_alignment \
-  evaluate_fine_docking_entry classify_fine_docking_failure_code; do
-  require_text "${api_cpp}" "${symbol}"
-done
+require_text "${predock_policy_cpp}" "PredockAlignmentPolicy::expected_staging_yaw"
+require_text "${predock_policy_cpp}" "PredockAlignmentPolicy::predock_yaw_error"
+require_text "${predock_policy_cpp}" "PredockAlignmentPolicy::contact_yaw_error"
+require_text "${predock_policy_cpp}" "PredockAlignmentPolicy::normalize_yaw_error"
+require_text "${predock_control_cpp}" "PredockControlModule::run_yaw_align"
+require_text "${predock_control_cpp}" "PredockControlModule::run_lateral_align"
+require_text "${predock_control_cpp}" "PredockControlModule::ensure_lateral_alignment"
+require_text "${predock_control_cpp}" "PredockControlModule::evaluate_fine_entry"
+require_text "${status_cpp}" "classify_fine_docking_failure_code"
 
 for code in \
   DOCK_FAILED_PREDOCK_NAV DOCK_FAILED_PREDOCK_RELOCALIZATION DOCK_FAILED_PREDOCK_SETTLE \
@@ -80,24 +103,25 @@ for code in \
   FINE_DOCKING_REJECTED_YAW_TOO_LARGE FINE_DOCKING_REJECTED_LATERAL_TOO_LARGE \
   FINE_DOCKING_TIMEOUT FINAL_INSERTION_NO_CONTACT DOCK_FAILED_SAFETY_BLOCKED \
   DOCK_FAILED_PREDOCK_CONTACT_DROPPED; do
-  require_text "${api_cpp}" "${code}"
+  require_text_any "${code}" "${api_cpp}" "${executor_cpp}" "${status_cpp}" "${predock_control_cpp}"
 done
 
 require_text "${api_cpp}" 'predock_yaw_align_cmd_topic_ != "/cmd_vel_docking"'
 require_text "${api_cpp}" "create_publisher<geometry_msgs::msg::Twist>(predock_yaw_align_cmd_topic_"
-require_text "${api_cpp}" "publish_predock_lateral_forced_mode(predock_lateral_align_forced_mode_)"
-require_text "${api_cpp}" "twist.linear.y"
+require_text "${api_cpp}" "publish_predock_lateral_forced_mode(mode)"
+require_text "${predock_control_cpp}" "ports_.publish_forced_mode(config_.lateral_align_forced_mode)"
+require_text "${predock_control_cpp}" "twist.linear.y"
 require_text "${api_cpp}" "mode_controller_status_topic_"
-require_text "${api_cpp}" "actual_motion_mode_code == 2"
+require_text "${predock_control_cpp}" "actual_motion_mode_code == 2"
 require_text "${api_cpp}" "docking_gs2_scan_topic_"
-require_text "${api_cpp}" 'job_id, true, "docking_staging_alignment", pause_detail'
+require_text "${predock_control_cpp}" 'job_id, true, "docking_staging_alignment", pause_detail'
 require_text "${api_cpp}" "set_global_correction_paused_for_docking("
 require_text "${bridge_cpp}" "correction_pause_service"
 require_text "${bridge_cpp}" "GLOBAL_CORRECTION_PAUSED"
 require_text "${bridge_cpp}" "global_correction_paused"
-require_text "${api_cpp}" "goal.behavior_tree = docking_predock_behavior_tree_"
-require_text "${api_cpp}" "bms_charging_contact_snapshot()"
-require_text "${api_cpp}" "wait_for_terminal_actual_stop("
+require_text "${executor_cpp}" "goal.behavior_tree = config_.predock_behavior_tree;"
+require_text "${executor_cpp}" "bms_charging_contact_snapshot()"
+require_text "${executor_cpp}" "wait_for_terminal_actual_stop("
 require_text "${predock_bt}" "<ComputePathToPose"
 require_text "${predock_bt}" "<FollowPath"
 if grep -Eq 'RateController|PipelineSequence' "${predock_bt}"; then

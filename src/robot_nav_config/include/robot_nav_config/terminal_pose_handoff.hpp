@@ -103,6 +103,30 @@ enum class TerminalControlPhase
   kFailed,
 };
 
+enum class TerminalControlFailureReason
+{
+  kNone,
+  kInvalidInput,
+  kClockRegression,
+  kTimeout,
+};
+
+inline const char * terminal_control_failure_reason_name(
+  const TerminalControlFailureReason reason) noexcept
+{
+  switch (reason) {
+    case TerminalControlFailureReason::kNone:
+      return "none";
+    case TerminalControlFailureReason::kInvalidInput:
+      return "invalid_input";
+    case TerminalControlFailureReason::kClockRegression:
+      return "clock_regression";
+    case TerminalControlFailureReason::kTimeout:
+      return "timeout";
+  }
+  return "invalid_input";
+}
+
 struct TerminalVelocityCommand
 {
   double linear_x{0.0};
@@ -128,6 +152,8 @@ struct TerminalControlOutput
   bool failed{false};
   bool lateral_permit{false};
   bool reverse_permit{false};
+  TerminalControlFailureReason failure_reason{
+    TerminalControlFailureReason::kNone};
 };
 
 class TerminalPoseHandoffController
@@ -148,6 +174,7 @@ public:
   void reset()
   {
     phase_ = TerminalControlPhase::kInactive;
+    failure_reason_ = TerminalControlFailureReason::kNone;
     started_at_sec_ = 0.0;
     settle_stable_since_sec_.reset();
   }
@@ -155,6 +182,7 @@ public:
   void begin(const double now_sec)
   {
     phase_ = TerminalControlPhase::kSettling;
+    failure_reason_ = TerminalControlFailureReason::kNone;
     started_at_sec_ = now_sec;
     settle_stable_since_sec_.reset();
   }
@@ -177,12 +205,21 @@ public:
       return make_output();
     }
 
-    if (!input_is_finite(input) ||
-      input.now_sec < started_at_sec_ ||
-      (parameters_.total_timeout_sec > 0.0 &&
-      input.now_sec - started_at_sec_ > parameters_.total_timeout_sec))
+    if (!input_is_finite(input)) {
+      phase_ = TerminalControlPhase::kFailed;
+      failure_reason_ = TerminalControlFailureReason::kInvalidInput;
+      return make_output();
+    }
+    if (input.now_sec < started_at_sec_) {
+      phase_ = TerminalControlPhase::kFailed;
+      failure_reason_ = TerminalControlFailureReason::kClockRegression;
+      return make_output();
+    }
+    if (parameters_.total_timeout_sec > 0.0 &&
+      input.now_sec - started_at_sec_ > parameters_.total_timeout_sec)
     {
       phase_ = TerminalControlPhase::kFailed;
+      failure_reason_ = TerminalControlFailureReason::kTimeout;
       return make_output();
     }
 
@@ -311,6 +348,7 @@ private:
     output.active = active();
     output.complete = phase_ == TerminalControlPhase::kComplete;
     output.failed = phase_ == TerminalControlPhase::kFailed;
+    output.failure_reason = failure_reason_;
     return output;
   }
 
@@ -329,6 +367,8 @@ private:
   TerminalControlPhase phase_{TerminalControlPhase::kInactive};
   double started_at_sec_{0.0};
   std::optional<double> settle_stable_since_sec_;
+  TerminalControlFailureReason failure_reason_{
+    TerminalControlFailureReason::kNone};
 };
 
 }  // namespace robot_nav_config

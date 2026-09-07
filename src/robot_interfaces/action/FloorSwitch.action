@@ -38,3 +38,6 @@ string stage
 float32 progress
 string detail
 uint64 asset_epoch
+string transaction_id
+uint64 stage_sequence
+bool caller_pause_handoff_ready

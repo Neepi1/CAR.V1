@@ -18,6 +18,29 @@ task state         a business mission is currently executing
 App requests must change task state only. They must not directly own long-lived
 process startup or shutdown and must never publish velocity commands.
 
+## API Process Composition Boundary
+
+The API executable has three explicit layers:
+
+```text
+robot_api_server_node.cpp                         six-line main only
+  -> infrastructure/process/robot_api_process    ROS init/node/executor/shutdown
+    -> application/composition/                   object graph and lifecycle
+      -> application + feature + infrastructure modules
+```
+
+`ApplicationCompositionModule` is the only cross-module object graph. It asks
+each dedicated configuration module to declare its existing parameters,
+constructs one top-level aggregate for every feature family, connects narrow
+ports, completes the deliberate Navigation/Docking and Localization/Navigation
+late dependencies, starts the API gateway, and destroys modules in dependency
+order. It owns no navigation, mapping, localization, floor-switch, elevator,
+docking, teleop, power, safety, status, subscription, or HTTP business
+implementation. The process bootstrap owns no feature dependency graph, and
+the top-level main owns neither ROS state nor modules. This is an ownership-only
+refactor: runtime parameters, gates, topic/QoS contracts, TF ownership, command
+paths, and mission ordering are unchanged.
+
 ## Resident Services
 
 These services are expected to be started by the boot supervisor or the
@@ -184,6 +207,110 @@ Undock:
   mode -> NAV_READY only after map->odom is fresh
 ```
 
+The process-level ownership boundary is
+`features/docking/docking_feature_module`. One aggregate owns contact
+classification, the canonical task store, correction-pause lifecycle,
+docking-manager runtime, automatic undock, predock control, task execution,
+pose resolution, HTTP, status reconciliation, its deferred-work queue, and
+start serialization. Construction is explicitly split into a core phase and a
+completion phase only to resolve the real Navigation/Docking dependency cycle;
+both phases finish before the API gateway starts. The composition root owns no
+individual docking submodule or docking Ports object. This is an ownership
+change only: phases, thresholds, BMS semantics, retries, TF ownership, command
+topics, and the final safety chain are unchanged.
+
+The API-side runtime edge for this contract is contained behind
+`features/docking/lifecycle/docking_runtime_module`. It owns docking-manager
+process supervision, `/docking/start|stop|undock` clients, `/docking/status`
+and the selected observation subscription, cached observation evidence,
+predock `/cmd_vel_docking` plus Ranger forced-mode publishers, and the single
+docking worker. `DockingFeatureModule` supplies status/job callbacks and
+cross-domain runtime-state projection. This extraction preserves the
+existing service budgets, undock charging retry, target-source filtering, QoS,
+and command path; it introduces no new admission or motion gate.
+
+The executor-facing application edge is contained behind
+`features/docking/lifecycle/docking_job_execution_module`. It is the single
+concrete `DockingJobExecutionPort`, binds the canonical docking job store,
+serializes pre-dock goal submission on the shared Nav2 action mutex, and keeps a
+timed-out submission classified as an unresolved side effect until independent
+evidence resolves it. Existing localization-settle, BMS-contact, terminal-stop,
+speed-limit, reverse-permit, teleop-zero and runtime-state effects remain
+explicit ports owned by the docking aggregate. This move adds no phase,
+tolerance, retry, command path, or gate.
+
+The parameter-composition edge is contained behind
+`features/docking/configuration/docking_configuration_module`. It alone
+declares the 100 established docking, predock, fine-entry, dock-contact and
+undock parameters, preserves their defaults and dependent clamp order, and
+returns ready-to-consume configs for the existing ten docking units. Shared
+service timeout, Nav2 action name, map frame, pose freshness and BMS thresholds
+remain explicit neighboring-domain inputs. The composition root retains no
+parallel docking scalars, and this extraction changes no runtime value, TF
+owner, command owner, admission rule, or safety path.
+
+The navigation parameter-composition edge is contained behind
+`features/navigation/configuration/navigation_configuration_module`. It is the
+single declaration owner for the 112 established API-side navigation
+parameters and constructs the existing navigation, terminal-runtime,
+goal-execution, and goal-executor configuration graphs. Shared action names,
+map/TF context, pose freshness, service timeout, and predock lateral-control
+settings enter as explicit neighboring-domain inputs. Defaults, clamps,
+compatibility parameters, goal acceptance, terminal correction, TF ownership,
+and the final velocity chain are unchanged.
+
+The API-side localization construction graph is contained behind
+`features/localization/localization_configuration_module`. It uniquely
+declares the 48 localization, TF-observation, AMCL-refinement,
+bridge-acceptance, and settle parameters, normalizes the configured frame IDs,
+and returns the existing localization and post-relocalization-settle configs.
+The floor-health topic is an explicit floor-switch projection; the shared
+service timeout and navigation-owned AMCL no-motion endpoint remain explicit
+cross-domain values. This ownership move changes neither Isaac/AMCL sequencing
+nor result freshness, bridge acceptance, settle policy, TF publishers, or
+motion admission.
+
+Runtime ownership for that graph is contained behind
+`features/localization/localization_feature_module`. The aggregate owns the
+localization facade and post-relocalization settle barrier and performs one
+explicit second-phase attachment after navigation is constructed. This
+resolves the localization-to-navigation costmap dependency before HTTP starts;
+it does not add a runtime fallback, gate, timeout, topic, process, or TF
+publisher. The API composition root owns one localization aggregate rather
+than the two submodules and their port wiring.
+
+The elevator runtime construction graph is contained behind
+`features/elevator/configuration/elevator_runtime_configuration_module`. It
+uniquely declares the 15 established adapter, external-arm-client, scoped-BT,
+collision-bypass permit, and recovery-service parameters, and combines them
+with explicit map, navigation, FloorSwitch, and safety inputs. It does not
+implement or modify the mechanical-arm black box, execute an arm request,
+change the elevator state machine, alter motion admission, or add a gate.
+
+Commissioning-time manual predock selection and validation are contained behind
+`features/docking/configuration/docking_predock_pose_resolver`. It preserves the
+existing explicit-ID, conventional-ID, name-match, and unique-type precedence,
+including conflict status codes, then applies the same optional distance and
+mandatory yaw sanity checks. The composition root injects read-only pose-catalog
+ports; this module writes no map asset and commands no motion.
+
+The `docking_fine` bridge correction-pause lifecycle is contained behind
+`features/docking/lifecycle/docking_correction_pause_module`. It applies and
+releases the configured pause, updates the one canonical docking job and frozen
+display pose, protects a running fine-docking owner, and clears only stale job
+or bridge pause evidence. The original phase set, reason strings, timeout, and
+logging severity are preserved; the module publishes neither TF nor velocity.
+
+Persistent dock occupancy policy is contained behind
+`features/docking/lifecycle/dock_contact_interlock_module`. It owns the latch
+file schema/read-write transaction, evidence-source strength, stable BMS
+charging-session update, weak-latch TTL, strong-session full-charge-idle
+retention, confirmed-undock contradiction clear, final occupancy decision,
+and the exact App JSON projection. The composition root injects immutable
+runtime/BMS/navigation-job snapshots only. This extraction preserves every
+existing threshold and clear condition and does not start undock, publish
+velocity, or add an admission rule.
+
 ## Migration Phases
 
 1. Document and test the target ownership contract.
@@ -203,12 +330,15 @@ Undock:
 ## Current Runtime Entrypoints
 
 `run_navigation_runtime_services.sh` is the selected-floor resident navigation
-entrypoint. It resolves the floor assets, launches localization, sends one
-bounded global-localization trigger request, launches Nav2, and marks the
-runtime context ready once both child processes survive the initial settle
-window. It does not report startup failure solely because a shell probe missed
-`map->odom`, `odom->base_link`, `/global_costmap/costmap`,
-`/perception/obstacle_points`, `/safety/status`, or Nav2 lifecycle state.
+entrypoint. It verifies the already committed exact floor assets, launches
+localization, sends one bounded global-localization trigger request, and
+launches Nav2. It marks the runtime context ready only after fresh
+`odom->base_link`, bridge-accepted `map->odom`, required Nav2 lifecycle states,
+and `/global_costmap/costmap` are confirmed; configured AMCL tracking readiness
+is also enforced. A missing required proof fails startup and tears down the
+incomplete navigation/localization process set. Local perception and
+`/safety/status` are not shell startup gates; safety remains authoritative at
+API task admission and on the final velocity chain.
 FAST-LIO2, `fastlio_odom_bridge`, `robot_local_state`, `robot_safety`, and the
 Ranger chassis core are common resident services. Lower-level localization
 and Nav2 scripts may start missing helper processes, but they must not kill or
@@ -223,7 +353,183 @@ autostart. The wrapper only delegates to the resident entrypoint when
 lower-level repair/building blocks used by the resident runtime; they should not
 be App-owned process lifetimes.
 
+The API-facing mapping lifecycle is contained behind
+`features/mapping/mapping_module`. It owns mapping-route dispatch, the one
+asynchronous start transaction, mapping-owned process cleanup, live `/map`
+cache lifetime, exact restoration proof for the canonical navigation `/scan`
+publisher, and inactive immutable map-bundle saving. The API composition root
+only supplies explicit cross-domain operations: floor/elevator admission,
+navigation cancel/stop, and runtime-map-context clearing. This code boundary
+does not move FAST-LIO2/JT128 ownership into the API and does not change TF,
+DDS, pointcloud, LaserScan, or final velocity-chain contracts.
+
+Aggregate ownership follows the same domain boundaries. `features/maps/
+maps_feature_module` owns the runtime map-context store, cross-asset commit
+mutex and complete maps module; `features/floor_switch/
+floor_switch_feature_module` owns floor-switch configuration projections and
+the atomic floor-switch module; and `features/mapping/mapping_feature_module`
+owns the mapping module plus its navigation handoff ports. Their late provider
+functions only resolve construction cycles before HTTP admission starts. No
+map identity rule, switch timeout, recovery behavior, process command, scan
+owner, or obstacle/TF contract changes with this ownership extraction.
+
+The mapping-only App teleoperation lifecycle is contained behind
+`features/teleop/teleop_module`. It owns `/ws/v1/teleop`, token and WebSocket
+admission, the session/frame loop, command and reverse-permit ROS publishers,
+watchdog repetition, subscription lease refresh, state JSON, and disconnect or
+interlock stop publication. The composition root supplies only read-only
+mapping/pose/BMS/elevator observations plus motion-admission and subscription
+ports. Commands still enter `/cmd_vel_api -> robot_safety -> /cmd_vel ->
+ranger_base`; this boundary move adds no new gate and gives the App no direct
+chassis publisher.
+
+The process-resident BMS input lifecycle is contained behind
+`features/power/power_module`. It is the single owner of the
+`/battery_state` subscription, SOC normalization, charging-contact evaluation,
+contact/no-contact stability timers, freshness expiry, and the immutable BMS
+snapshot. After committing a message and releasing its mutex, it forwards the
+same evidence first to docking-latch policy and then to the teleop charging
+guard. Navigation, docking, status, and teleop consume this one snapshot; the
+API composition root keeps no parallel raw battery cache. This boundary move
+adds no new gate and does not move charger, docking, estop, or velocity-chain
+ownership into the API.
+
+The read-only App status lifecycle is contained behind
+`features/system_status/system_status_module`. It owns
+`GET /api/v1/status`, `GET /api/v1/robot/pose`, the stable aggregate JSON
+projection, and the single process-resident `/floor_manager/status`
+subscription. Runtime mode, maps, navigation, docking, localization, safety,
+power, subscriptions, and HTTP transport remain their own domains. The
+`system_status_wiring` adapter owns the complete immutable observation
+projection into the status ports, so the composition root no longer assembles
+status, pose-runtime-context, or map-identity snapshots. The module does not
+reinterpret those domains or publish any command; moving the response assembly here adds no
+admission gate and leaves TF, safety, and final velocity ownership unchanged.
+
+The API-facing navigation lifecycle is contained behind
+`features/navigation/navigation_module`. It dispatches the complete
+`/api/v1/navigation/*` surface and owns runtime start/reuse, goal admission,
+pre-goal dock inspection, cancel/stop orchestration, and the lightweight
+navigation-state response. The state projection keeps the established
+bridge-over-AMCL precedence and distinguishes a transient localization
+transition from a true recovery requirement; it combines immutable dock,
+safety, post-relocalization, post-undock, goal, and cancel snapshots supplied
+through explicit ports. Polling the state endpoint performs no synchronous
+Nav2 lifecycle probe, no relocalization, and no motion. This extraction changes
+no goal tolerance, controller, TF owner, docking owner, or velocity chain.
+
+The navigation family is composed as one deep runtime module by
+`features/navigation/navigation_feature_module`. That aggregate owns the
+navigation lifecycle/HTTP module, terminal ROS runtime, goal-execution
+transaction, goal executor, their delayed callback cycle, the localization
+bridge-readiness projection, and the pre-navigation undock request adapter.
+The process entry point supplies neighboring feature references once and keeps
+no parallel navigation runtime pointers. This is an ownership-only change: the
+existing admission decisions, stop acknowledgements, relocalization waits,
+commercial pose gate, and command topics remain unchanged.
+
+App page-subscription lifecycle is contained behind
+`application/subscriptions/subscription_module`. It owns all three
+`/api/v1/subscriptions/*` routes, compatibility client identity, TTL clamping,
+lease/refcount expiry, resource transition semantics, and the page-scoped
+high-rate `/scan` subscription/cache. The composition root provides narrow
+ports only: keep status and TF resident, toggle the page-owned live map, and
+clear teleop command state after the final lease. Consequently an App page
+release cannot tear down safety/floor health or localization TF, while a lost
+client still releases `/scan` and teleop through the same bounded TTL behavior.
+
+The final shared bootstrap seam is contained behind
+`application/runtime_configuration/runtime_configuration_module`. It uniquely
+declares the Nav2 action name, action-status topic, and base ROS service
+timeout, then projects the same construction-time values into navigation,
+docking, elevator, localization, floor switch, and system status. The
+composition root therefore declares no ROS parameter and retains no parallel
+shared scalar. This changes no action/topic name, timeout, request, gate, or
+motion owner.
+This is an ownership move only; it changes no scan geometry/QoS/timestamp,
+DDS, TF authority, mapping/navigation behavior, or final velocity chain.
+
+Authenticated robot endpoint precedence is contained behind
+`application/routing/application_router_module`. It captures exactly one
+motion-admission epoch for each request, applies the global elevator execution
+interlock first, and then preserves the established system-status, maps,
+elevator, mapping, metadata, subscriptions, safety, floor-switch, localization,
+navigation, and docking handler order. The routing module also owns the
+reserved mapping/navigation `501` and final `404` responses. Its separate
+wiring adapter binds concrete modules while keeping robot feature dependencies
+out of HTTP transport infrastructure. No endpoint matching, response body,
+authentication rule, motion gate, or feature algorithm changes in this move.
+
+The public HTTP lifecycle is contained behind
+`infrastructure/http/api_gateway_module`. It owns host/port/token resolution,
+the `ROBOT_API_TOKEN` fallback, unauthenticated `OPTIONS`, shared token
+validation, bounded transport startup/shutdown, WebSocket-session shutdown
+ordering, access/event logging, connection counters, and the exact OpenAPI
+catalog. The application router receives only authenticated normal requests;
+socket sessions remain owned by the teleop module. This extraction changes no endpoint result, authentication
+rule, elevator interlock, ROS publisher, TF authority, DDS setting, or velocity
+path.
+
+The ordinary-navigation terminal ROS edge is contained behind
+`features/navigation/terminal_control/navigation_terminal_runtime_module`.
+It implements the controller's runtime port and exclusively owns the final
+command, terminal speed-limit and reverse-permit publishers together with the
+Ranger mode-status, wheel-odometry, local-costmap and `/rosout` subscriptions.
+It also owns their synchronized evidence caches, reverse-permit hysteresis,
+physical-stop waits and MessageFilter-drop accounting. The composition root
+only injects mission, localization, safety, docking-contact and drive-mode
+callbacks, plus thin forwarding methods required by neighboring executor
+interfaces. This is an ownership-only extraction: topic names, QoS, refresh
+periods, stop thresholds/timeouts, zero-command cadence, costmap checks and
+terminal success rules are unchanged, and no admission or motion gate is
+introduced.
+
+Within that aggregate, the post-localization motion handoff is contained behind
+`features/localization/post_relocalization_settle_module`. It owns the full
+accepted-sequence settle state machine: bridge publisher ownership and
+sequence checks, canonical TF freshness, static LiDAR transform proof,
+local-costmap update/drop evidence, large-correction minimum time,
+zero-command cadence, cancellation and timeout reporting. Post-undock keeps
+the existing warning-only treatment for transient costmap/drop/AMCL scan
+evidence while all bridge/TF conditions remain hard. The localization
+aggregate wires snapshots and effects. No threshold, error code, TF publisher, Nav2
+parameter, safety decision, or velocity-chain edge changes with this move.
+
+The controlled handoff from dock occupancy to normal navigation is contained
+behind `features/docking/lifecycle/pre_navigation_undock_module`. It consumes
+the already-classified immutable dock decision, then owns the whole transaction:
+teleop zeroing, one docking-start mutex, concurrent-job rejection or active
+undock reuse, stale fine-pause cleanup, manager readiness, canonical undock-job
+creation, Trigger-service evidence, runtime/status observation, bounded wait,
+and optional post-undock localization-readiness proof. The pending Nav2 goal is
+released only after the established proof succeeds. This is an ownership move;
+it preserves phase names, the 28-second undock budget plus configured
+relocation allowance, charging retry, failure text, and the existing command
+chain.
+
 `robot_api_server` keeps core health subscriptions resident. `/safety/status`
 and `/safety/motion_allowed` are reliable transient-local state topics and are
 not released when an App page lease expires, so `/api/v1/status`, docking,
 navigation, and teleop admission all read the same process-level safety cache.
+That cache and the `/safety/estop` publisher live behind the complete
+`features/safety/safety_module` boundary. Its configuration module uniquely
+owns the three safety topic parameters; the module also owns both safety HTTP
+routes, the floor/elevator-atomic resume transaction, and the ordered emergency
+stop fan-out used for an unproven Nav2 terminal result. Cross-domain checks and
+zero-command effects are injected ports, so the composition root contains no
+parallel safety route or stop sequence. This remains a gateway boundary only
+and does not move final command arbitration, watchdogs, or interlocks out of
+`robot_safety`. The pure `safety_state` policy preserves the existing behavior:
+missing motion evidence defers to the final arbiter, `COMMAND_STALE` is a
+first-command warmup rather than a hard block, and other explicit denials are
+hard blocks.
+
+Ordinary goal execution is contained behind
+`features/navigation/mission/navigation_goal_execution_module`. It is the one
+concrete implementation of both the goal-executor and bridge-wait runtime
+ports, so Nav2 submission/result evidence, final verification and bounded
+recovery, correction-pause lifetime, and predock command-owner exclusion form
+one transaction. `NavigationFeatureModule` composes its floor, undock,
+localization, safety, docking and runtime-state ports; the application
+composition module owns only that aggregate. This boundary adds no gate and changes
+no goal tolerance, speed, TF authority, DDS setting or command-chain edge.

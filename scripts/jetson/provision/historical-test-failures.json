@@ -1,0 +1,13 @@
+{
+  "schema": "njrh.pytest_failure_allowlist.v1",
+  "recorded_at": "2026-07-25T00:00:00Z",
+  "policy": "The observed failure set must equal this list exactly. New, renamed, or unexpectedly disappearing failures block release qualification until reviewed.",
+  "allowed_failures": [
+    "src/robot_system_tests/test/test_workspace_contracts.py::test_phase25_docked_motion_interlock_contract",
+    "src/robot_system_tests/test/test_workspace_contracts.py::test_local_state_uses_robot_localization_ekf_with_system_time_driver",
+    "src/robot_system_tests/test/test_workspace_contracts.py::test_navigation_pose_error_records_read_only_odom_motion_samples",
+    "src/robot_system_tests/test/test_workspace_contracts.py::test_project_runtime_helpers_are_wired",
+    "src/robot_system_tests/test/test_workspace_contracts.py::test_phase_a14_cpp_amcl_scan_admission_contracts",
+    "src/robot_system_tests/test/test_workspace_contracts.py::test_phase_r0_r2_runtime_force_accept_reduction_and_bridge_smoothing_contracts"
+  ]
+}

@@ -28,7 +28,7 @@ constexpr std::uint64_t kTargetEpoch = 202U;
 
 std::uint64_t fnv1a64(const std::string & value)
 {
-  // Must match robot_api_server/storage_models.cpp's legacy release identity.
+  // Must match robot_api_server/features/maps/catalog_activation/storage_models.cpp's legacy release identity.
   std::uint64_t hash = 1469598103934665603ULL;
   for (const unsigned char character : value) {
     hash ^= static_cast<std::uint64_t>(character);
@@ -52,7 +52,7 @@ struct ReleaseTexts
   std::string internal_poses;
 };
 
-ReleaseTexts valid_release_texts()
+ReleaseTexts legacy_release_texts()
 {
   ReleaseTexts texts;
   texts.configuration =
@@ -155,6 +155,165 @@ ReleaseTexts valid_release_texts()
   return texts;
 }
 
+ReleaseTexts valid_release_texts()
+{
+  ReleaseTexts texts;
+  texts.configuration =
+    "schema_version: 2\n"
+    "building_id: building_1\n"
+    "elevators:\n"
+    "  - elevator_id: elevator_west\n"
+    "    floors:\n"
+    "      - floor_id: F1\n"
+    "        map_id: map_f1\n"
+    "        map_asset_epoch: 101\n"
+    "        map_asset_digest: " + std::string(kSourceDigest) + "\n"
+    "        poses:\n"
+    "          hall_call: {x: 1.0, y: 1.1, yaw: 0.1}\n"
+    "          landing: {x: 1.2, y: 1.3, yaw: 0.2}\n"
+    "          cabin: {x: 1.4, y: 1.5, yaw: 0.3}\n"
+    "      - floor_id: F2\n"
+    "        map_id: map_f2\n"
+    "        map_asset_epoch: 202\n"
+    "        map_asset_digest: " + std::string(kTargetDigest) + "\n"
+    "        poses:\n"
+    "          hall_call: {x: 2.0, y: 2.1, yaw: 0.1}\n"
+    "          landing: {x: 2.2, y: 2.3, yaw: 0.2}\n"
+    "          cabin: {x: 2.4, y: 2.5, yaw: 0.3}\n";
+
+  texts.topology =
+    "schema_version: 2\n"
+    "mock_ports_enabled: false\n"
+    "building_id: building_1\n"
+    "elevators:\n"
+    "  - elevator_id: elevator_west\n"
+    "    floors:\n"
+    "      - floor_id: F1\n"
+    "        map_id: map_f1\n"
+    "        poses:\n"
+    "          hall_call: f1_west_hall_call\n"
+    "          landing: f1_west_landing\n"
+    "          cabin: f1_west_cabin\n"
+    "      - floor_id: F2\n"
+    "        map_id: map_f2\n"
+    "        poses:\n"
+    "          hall_call: f2_west_hall_call\n"
+    "          landing: f2_west_landing\n"
+    "          cabin: f2_west_cabin\n";
+
+  const std::array<std::string, 3> roles{"hall_call", "landing", "cabin"};
+  std::ostringstream internal;
+  internal << "schema_version: 2\n"
+           << "building_id: building_1\n"
+           << "poses:\n";
+  for (const auto & floor : {std::string("F1"), std::string("F2")}) {
+    const std::string lower = floor == "F1" ? "f1" : "f2";
+    const double base = floor == "F1" ? 1.0 : 2.0;
+    for (std::size_t index = 0; index < roles.size(); ++index) {
+      internal << "  - pose_id: " << lower << "_west_" << roles[index] << "\n"
+               << "    type: elevator_internal\n"
+               << "    elevator_id: elevator_west\n"
+               << "    floor_id: " << floor << "\n"
+               << "    map_id: " << (floor == "F1" ? "map_f1" : "map_f2") << "\n"
+               << "    role: " << roles[index] << "\n"
+               << "    x: " << base + 0.2 * static_cast<double>(index) << "\n"
+               << "    y: " << base + 0.1 + 0.2 * static_cast<double>(index) << "\n"
+               << "    yaw: " << 0.1 + 0.1 * static_cast<double>(index) << "\n";
+    }
+  }
+  texts.internal_poses = internal.str();
+  return texts;
+}
+
+ReleaseTexts reverse_entry_release_texts()
+{
+  ReleaseTexts texts;
+  texts.configuration =
+    "schema_version: 3\n"
+    "building_id: building_1\n"
+    "elevators:\n"
+    "  - elevator_id: elevator_west\n"
+    "    floors:\n"
+    "      - floor_id: F1\n"
+    "        map_id: map_f1\n"
+    "        map_asset_epoch: 101\n"
+    "        map_asset_digest: " + std::string(kSourceDigest) + "\n"
+    "        hall_call_panel_side: LEFT\n"
+    "        cabin_panel_side: LEFT\n"
+    "        poses:\n"
+    "          hall_call: {x: -0.5, y: 0.0, yaw: 0.0}\n"
+    "          landing: {x: 0.0, y: 0.0, yaw: 3.141592653589793}\n"
+    "          cabin: {x: 1.0, y: 0.0, yaw: 3.141592653589793}\n"
+    "          cabin_panel: {x: 1.0, y: -0.5, yaw: 3.141592653589793}\n"
+    "      - floor_id: F2\n"
+    "        map_id: map_f2\n"
+    "        map_asset_epoch: 202\n"
+    "        map_asset_digest: " + std::string(kTargetDigest) + "\n"
+    "        hall_call_panel_side: RIGHT\n"
+    "        cabin_panel_side: RIGHT\n"
+    "        poses:\n"
+    "          hall_call: {x: -0.5, y: 0.0, yaw: 0.0}\n"
+    "          landing: {x: 0.0, y: 0.0, yaw: 3.141592653589793}\n"
+    "          cabin: {x: 1.0, y: 0.0, yaw: 3.141592653589793}\n"
+    "          cabin_panel: {x: 1.0, y: 0.5, yaw: 3.141592653589793}\n";
+
+  texts.topology =
+    "schema_version: 3\n"
+    "mock_ports_enabled: false\n"
+    "building_id: building_1\n"
+    "elevators:\n"
+    "  - elevator_id: elevator_west\n"
+    "    floors:\n"
+    "      - floor_id: F1\n"
+    "        map_id: map_f1\n"
+    "        hall_call_panel_side: LEFT\n"
+    "        cabin_panel_side: LEFT\n"
+    "        poses:\n"
+    "          hall_call: f1_west_hall_call\n"
+    "          landing: f1_west_landing\n"
+    "          cabin: f1_west_cabin\n"
+    "          cabin_panel: f1_west_cabin_panel\n"
+    "      - floor_id: F2\n"
+    "        map_id: map_f2\n"
+    "        hall_call_panel_side: RIGHT\n"
+    "        cabin_panel_side: RIGHT\n"
+    "        poses:\n"
+    "          hall_call: f2_west_hall_call\n"
+    "          landing: f2_west_landing\n"
+    "          cabin: f2_west_cabin\n"
+    "          cabin_panel: f2_west_cabin_panel\n";
+
+  const std::array<std::string, 4> roles{
+    "hall_call", "landing", "cabin", "cabin_panel"};
+  const std::array<double, 4> xs{-0.5, 0.0, 1.0, 1.0};
+  const std::array<double, 4> source_ys{0.0, 0.0, 0.0, -0.5};
+  const std::array<double, 4> target_ys{0.0, 0.0, 0.0, 0.5};
+  const std::array<double, 4> yaws{
+    0.0, 3.141592653589793, 3.141592653589793, 3.141592653589793};
+  std::ostringstream internal;
+  internal << std::setprecision(17);
+  internal << "schema_version: 3\n"
+           << "building_id: building_1\n"
+           << "poses:\n";
+  for (const auto & floor : {std::string("F1"), std::string("F2")}) {
+    const std::string lower = floor == "F1" ? "f1" : "f2";
+    const auto & ys = floor == "F1" ? source_ys : target_ys;
+    for (std::size_t index = 0; index < roles.size(); ++index) {
+      internal << "  - pose_id: " << lower << "_west_" << roles[index] << "\n"
+               << "    type: elevator_internal\n"
+               << "    elevator_id: elevator_west\n"
+               << "    floor_id: " << floor << "\n"
+               << "    map_id: " << (floor == "F1" ? "map_f1" : "map_f2") << "\n"
+               << "    role: " << roles[index] << "\n"
+               << "    x: " << xs[index] << "\n"
+               << "    y: " << ys[index] << "\n"
+               << "    yaw: " << yaws[index] << "\n";
+    }
+  }
+  texts.internal_poses = internal.str();
+  return texts;
+}
+
 void replace_all(
   std::string & value,
   const std::string & from,
@@ -211,8 +370,19 @@ public:
     const bool select = true,
     const std::string & parent_release_id = "",
     const std::string & rollback_of = "",
-    const std::string & actor_id = "commissioner")
+    const std::string & actor_id = "commissioner",
+    const std::string & source_draft_revision_override = "")
   {
+    const bool schema_v2 =
+      texts.configuration.rfind("schema_version: 2\n", 0U) == 0U;
+    const bool schema_v3 =
+      texts.configuration.rfind("schema_version: 3\n", 0U) == 0U;
+    const std::string draft_revision =
+      source_draft_revision_override.empty() ?
+      (schema_v3 ? "draft-v3-0123456789abcdef" :
+      (schema_v2 ?
+      "draft-v2-0123456789abcdef" : "draft-v1-0123456789abcdef")) :
+      source_draft_revision_override;
     const std::string content_digest = fixed_hex(
       fnv1a64(texts.configuration + texts.topology + texts.internal_poses), 16U);
     const std::string release_digest = fixed_hex(
@@ -242,7 +412,7 @@ public:
       "null" : "\"" + parent_release_id + "\"") << ","
       << "\"source_draft_revision\":"
       << (rollback_of.empty() ?
-      "\"draft-v1-0123456789abcdef\"" : "null") << ","
+      "\"" + draft_revision + "\"" : "null") << ","
       << "\"generation\":" << generation << ","
       << "\"created_at\":\"2026-07-24T00:00:00Z\","
       << "\"actor_id\":\"" << actor_id << "\","
@@ -377,13 +547,104 @@ TEST(ElevatorReleaseLoader, LoadsOnePinnedValidatedRelease)
   EXPECT_EQ(result.release->source.map_asset_digest, kSourceDigest);
   EXPECT_EQ(result.release->target.map_asset_epoch, kTargetEpoch);
   EXPECT_EQ(result.release->target.map_asset_digest, kTargetDigest);
-  ASSERT_EQ(result.release->source.poses.size(), 5U);
+  ASSERT_EQ(result.release->source.poses.size(), 3U);
   EXPECT_EQ(result.release->source.poses[0].role, PoseRole::kHallCall);
   EXPECT_EQ(result.release->source.poses[0].pose_id, "f1_west_hall_call");
   EXPECT_DOUBLE_EQ(result.release->source.poses[0].x, 1.0);
-  EXPECT_EQ(result.release->source.poses[4].role, PoseRole::kExit);
+  EXPECT_EQ(result.release->source.poses[1].role, PoseRole::kLanding);
+  EXPECT_EQ(result.release->source.poses[2].role, PoseRole::kCabin);
   EXPECT_EQ(result.release->target.poses[0].pose_id, "f2_west_hall_call");
-  EXPECT_DOUBLE_EQ(result.release->target.poses[4].yaw, 0.5);
+  EXPECT_DOUBLE_EQ(result.release->target.poses[2].yaw, 0.3);
+}
+
+TEST(ElevatorReleaseLoader, FreezesV3FourPointReverseEntryConfiguration)
+{
+  ReleaseStore store;
+  const auto release_id = store.add_release(reverse_entry_release_texts());
+
+  const auto result = load_elevator_release(valid_request(store.config_root()));
+
+  ASSERT_TRUE(result.ok()) << result.message;
+  ASSERT_TRUE(result.release.has_value());
+  EXPECT_EQ(result.release->release_id, release_id);
+  EXPECT_EQ(result.release->schema_version, 3U);
+  ASSERT_EQ(result.release->source.poses.size(), 4U);
+  ASSERT_EQ(result.release->target.poses.size(), 4U);
+  EXPECT_EQ(result.release->source.hall_call_panel_side, PanelSide::kLeft);
+  EXPECT_EQ(result.release->source.cabin_panel_side, PanelSide::kLeft);
+  EXPECT_EQ(result.release->target.hall_call_panel_side, PanelSide::kRight);
+  EXPECT_EQ(result.release->target.cabin_panel_side, PanelSide::kRight);
+  EXPECT_EQ(result.release->source.poses[3].role, PoseRole::kCabinPanel);
+  EXPECT_EQ(
+    result.release->source.poses[3].pose_id,
+    "f1_west_cabin_panel");
+  EXPECT_DOUBLE_EQ(result.release->source.poses[3].y, -0.5);
+  EXPECT_DOUBLE_EQ(result.release->target.poses[3].y, 0.5);
+}
+
+TEST(ElevatorReleaseLoader, ValidatesLegacyReleaseButRefusesRuntimeExecution)
+{
+  ReleaseStore store;
+  store.add_release(legacy_release_texts());
+
+  const auto result = load_elevator_release(valid_request(store.config_root()));
+
+  EXPECT_FALSE(result.ok());
+  EXPECT_EQ(result.error, ElevatorReleaseLoadError::kLegacyReadOnly);
+  EXPECT_FALSE(result.release.has_value());
+}
+
+TEST(ElevatorReleaseLoader, AcceptsLegacyReleaseWithOmittedDefaultClearances)
+{
+  auto texts = legacy_release_texts();
+  replace_all(texts.configuration, "          clearance_m: 0.05\n", "");
+  replace_all(texts.configuration, "          jamb_clearance_m: 0.05\n", "");
+  ReleaseStore store;
+  store.add_release(texts);
+
+  const auto result = load_elevator_release(valid_request(store.config_root()));
+
+  EXPECT_FALSE(result.ok());
+  EXPECT_EQ(result.error, ElevatorReleaseLoadError::kLegacyReadOnly);
+}
+
+TEST(ElevatorReleaseLoader, RejectsOmittedLegacyClearanceThatWasNotTheDefault)
+{
+  auto texts = legacy_release_texts();
+  replace_all(texts.configuration, "          clearance_m: 0.06\n", "");
+  ReleaseStore store;
+  store.add_release(texts);
+
+  const auto result = load_elevator_release(valid_request(store.config_root()));
+
+  EXPECT_FALSE(result.ok());
+  EXPECT_EQ(result.error, ElevatorReleaseLoadError::kInvalidTopology);
+}
+
+TEST(ElevatorReleaseLoader, RejectsSourceDraftSchemaThatDisagreesWithContent)
+{
+  ReleaseStore store;
+  store.add_release(
+    valid_release_texts(), 1U, true, "", "", "commissioner",
+    "draft-v1-0123456789abcdef");
+
+  const auto result = load_elevator_release(valid_request(store.config_root()));
+
+  EXPECT_FALSE(result.ok());
+  EXPECT_EQ(result.error, ElevatorReleaseLoadError::kInvalidMetadata);
+}
+
+TEST(ElevatorReleaseLoader, RejectsMixedV1AndV2ReleaseContent)
+{
+  auto texts = valid_release_texts();
+  texts.topology = legacy_release_texts().topology;
+  ReleaseStore store;
+  store.add_release(texts);
+
+  const auto result = load_elevator_release(valid_request(store.config_root()));
+
+  EXPECT_FALSE(result.ok());
+  EXPECT_EQ(result.error, ElevatorReleaseLoadError::kInvalidTopology);
 }
 
 TEST(ElevatorReleaseLoader, AcceptsPublisherNormalizedEquivalentYaw)
@@ -1037,7 +1298,7 @@ TEST(ElevatorReleaseLoader, RejectsDuplicateInternalPoseIds)
   auto texts = valid_release_texts();
   replace_all(
     texts.internal_poses,
-    "f1_west_hall_wait",
+    "f1_west_landing",
     "f1_west_hall_call");
   ReleaseStore store;
   store.add_release(texts);

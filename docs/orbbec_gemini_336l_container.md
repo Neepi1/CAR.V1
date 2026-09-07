@@ -25,6 +25,11 @@ another container rebuild or restart.
 | Container architecture | `arm64` |
 | Container | `NJRH-car` |
 
+Runtime ownership is matched by the dedicated `camera336l` process identity.
+The generic `orbbec_camera` executable name is intentionally insufficient:
+another Orbbec used by arm/vision may run at the same time and must not make
+the docking 336L appear ready when its commissioned process is absent.
+
 ## Active close-range preset
 
 The active runtime selects Orbbec's `G336X AMR Default v0.0.5` preset. The
@@ -337,11 +342,13 @@ planar samples the minimum observed forward gap was `0.313 m` and the 0.1%
 quantile was `0.322 m`. This is the effective near-depth floor of the current
 camera/preset/mount, not a software Z crop. Production control therefore uses
 the fixed face only through the settled `0.34 m` handoff. During that visible
-pre-contact approach, yaw must first settle inside `0.5 deg` for three frames
-and is recaptured whenever it reaches `1.0 deg`; yaw-only, lateral-only, and
-forward commands remain serial. At the first-contact handoff the controller
-locks lateral/yaw commands and performs a `0.05 m/s` straight contact crawl,
-stopped by BMS contact and bounded independently by odometry travel and time.
+pre-contact approach, yaw must first settle inside `0.5 deg` for three frames.
+The controller then combines forward and lateral translation in Ranger
+PARALLEL mode; camera yaw noise below `3.0 deg` does not re-enter SPINNING, and
+only one larger yaw recapture is allowed. At the first-contact handoff the
+controller locks lateral/yaw commands and performs a `0.05 m/s` straight
+contact crawl, slowing to `0.02 m/s` only in the final `0.06 m`. BMS contact
+stops it, while odometry travel and a distance-derived time budget bound it.
 Stale observation/odometry or loss of hard alignment fails closed; the crawl
 uses straight retreat and reacquisition rather than any correction while the
 contacts may be touching.

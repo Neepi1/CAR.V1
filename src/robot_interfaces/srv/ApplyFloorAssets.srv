@@ -1,7 +1,24 @@
+string transaction_id
+string building_id
 string floor_id
+string map_id
+uint64 asset_epoch
+string asset_digest
 string nav_map_yaml
 string localizer_map_png
 string localizer_params_yaml
 ---
 bool success
+string code
 string message
+bool idempotent
+bool reloaded
+bool rollback_attempted
+bool rollback_succeeded
+string transaction_id
+string building_id
+string floor_id
+string map_id
+uint64 asset_epoch
+string asset_digest
+uint64 localizer_generation

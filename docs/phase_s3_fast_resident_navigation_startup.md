@@ -6,31 +6,62 @@ chain.
 
 The startup contract is:
 
-1. Common services must provide fresh `/local_state/odometry` and
-   `odom -> base_link`.
-2. The selected-floor localization layer must start and the initial triggered
-   global localization must be accepted by `robot_localization_bridge`.
-3. `robot_localization_bridge` must publish `map -> odom`.
-4. The production path may preload the Nav2 process tree after local-state
-   readiness, but it holds lifecycle activation until the accepted bridge
-   baseline. `NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION=true` remains
+1. Common services must own the canonical `robot_local_state` process and ROS
+   endpoint. The resident runtime always requires fresh
+   `/local_state/odometry` and `odom -> base_link` before initial localization
+   can be triggered or Nav2 can be activated.
+2. Start-source policy controls only when the selected-floor localization
+   process may be prewarmed:
+   - systemd boot sets `NJRH_NAVIGATION_START_SOURCE=systemd_autostart` and
+     keeps the measured cold-start overlap; localization may be spawned while
+     the resident runtime completes its fresh local-state gate;
+   - `POST /api/v1/navigation/start` sets
+     `NJRH_NAVIGATION_START_SOURCE=api_resume` and first requires three
+     consecutive, timestamp-advancing `/local_state/odometry` plus
+     `odom -> base_link` observations. Only then may localization start.
+3. The selected-floor localization layer and exact floor context must be ready
+   before the initial global-localization transaction is dispatched.
+4. The initial `/global_localization/trigger` must be accepted by
+   `robot_localization_bridge`, which evaluates the result at its original
+   timestamp and publishes the canonical `map -> odom`. The bridge retains
+   30 seconds of `odom -> base_link` TF history for the wrapper's 20-second
+   result window; it never restamps the result or substitutes latest TF.
+5. The production path starts the held Nav2 process preload only after that
+   bridge-owned baseline is accepted. Lifecycle activation remains held until
+   the preload is complete.
+   `NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION=true` remains
    available for A/B diagnostics, but it is not the default because field
    startup showed lifecycle helpers and localization repair can race when Nav2
    is prestarted and activated too early.
-5. The initial `/global_localization/trigger` runs after selected-floor
-   localization readiness and floor context selection by default. The overlap
+6. Startup does not repeat the floor-manager source-preflight service after it
+   verifies the already committed exact `current/` asset context. The
+   child-process
    switch `NJRH_INITIAL_GLOBAL_LOCALIZATION_BACKGROUND_START=true` remains
-   available for A/B, but it is not the production default because field startup
-   showed it can produce an invalid FOV/timeout/stale retry sequence when Isaac
-   receives scans before `/flatscan` is fully stable.
-6. AMCL resident warmup before the initial triggered bridge baseline is disabled
+   available for A/B, but it does not bypass localization-stack or exact
+   floor-context readiness.
+   Each trigger-client attempt retains its existing rclpy `--timeout-sec`
+   budget and is additionally wrapped by an operating-system process timeout:
+   the wrapper budget plus 5 seconds for result/shutdown output, then `SIGTERM`
+   with a fixed 2-second `SIGKILL` escalation. A stuck rclpy shutdown therefore
+   cannot leave the resident runtime indefinitely in `starting`; the existing
+   return-code handling and bridge-owned `map -> odom` fallback remain unchanged.
+7. AMCL resident warmup before the initial triggered bridge baseline is disabled
    by default. The AMCL readiness path starts after the bridge baseline is
    accepted so lifecycle failures from missing map/seed context cannot poison the
    resident runtime. Set `NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION=true`
    only for A/B diagnostics. AMCL seed and readiness completion still continue
    in the background by default and are reported through runtime status; set
    `NJRH_REQUIRE_AMCL_TRACKING_FOR_NAV_READY=true` to restore the older hard
-   startup gate.
+    startup gate.
+
+The App resume preflight is an observation gate, not a sleep and not a second
+startup implementation. It uses one `runtime_readiness_probe` participant,
+validates the canonical `odom` / `base_link` frame contract, checks the existing
+age limits, and requires both odometry and TF timestamps to advance. Failure is
+reported as `LOCAL_STATE_ODOM_TF_NOT_STABLE`; localization and Nav2 are not
+started on top of a stale local-state boundary. This branch normally costs only
+the DDS discovery time plus three 50 Hz samples and does not affect the systemd
+cold-boot ordering.
 
 This is not a return to pure odom. Nav2 is not started until a global
 localization result has produced a bridge-owned `map -> odom`; after that,
@@ -124,14 +155,14 @@ or AMCL background readiness.
 Initial global localization is requested by
 `call_global_localization_trigger.py`, a small rclpy client for
 `/global_localization/trigger`. Startup no longer creates a fresh `ros2 service
-call` process for every retry. The default per-attempt timeout is 75 seconds,
-within a 90 second total trigger window. If the bridge rejects a startup result
-only because Isaac returned an old triggered pose
-(`isaac_triggered_pose_stale_ms`), startup retries for a fresh result. It does
-not accept stale localization data, restamp results, or relax the bridge gate.
-The wrapper-side transient stale wait is 3 seconds, so startup can retry a cold
-Isaac result quickly while still giving a near-following fresh result a short
-chance to arrive.
+call` process for every retry. The default process timeout is 75 seconds within
+a 90 second outer window, but another wrapper request is allowed only when the
+response proves `dispatch_state=not_dispatched`. The wrapper owns one immutable
+force-accept/Isaac transaction. A queued result from a previous trigger is
+drained inside that request; it does not move the arm time, end the request, or
+cause startup to issue another trigger. Explicit results are never restamped:
+they must pass historical odom TF and latest-odom freshness, but delivery age
+alone is not a 5-second hard rejection.
 The trigger is normally launched after localization-stack readiness and floor
 context selection, so the first cold Isaac request runs with selected-floor
 assets and input topics already ready. Localization-stack readiness requires the
@@ -153,22 +184,34 @@ that gate consumer-only: it trusts a fresh healthy supervisor status or waits
 for the publisher, but never starts or restarts the common pointcloud owner. It
 still does not trigger global localization until `/flatscan` is observable.
 Common startup treats `robot_local_state` direct readiness as the hard local
-state gate: the helper must expose the endpoint and fresh `odom -> base_link`.
-`runtime_health_guard` starts before `robot_local_state` so its ROS graph and TF
-subscriptions warm while local-state comes up; a delayed `local_state_ready`
-JSON refresh no longer restarts the whole service after the direct local-state
-gate has already passed.
+state gate. The EKF starts in the background while the common sensors
+initialize; `runtime_health_guard` starts after docking-sensor readiness and
+then observes the already-starting local-state stream. A fresh-but-empty health
+snapshot cannot overrule the direct gate by itself: while the EKF process is
+alive, an independent bounded fresh-odom probe must also fail before the
+producer-failure budget can advance.
 `/api/v1/robot/pose` fails fast when that context is still `starting` or
 `failed`; it no longer waits for the generic TF timeout before telling the App
 that resident navigation is not ready.
 
+The resident owner now treats the confirmed runtime-map context as part of the
+ready commit, not as best-effort telemetry. It atomically writes
+`state=ready, confirmed=true`, reads the file back through the exact-current-map
+matcher, and only then sets its internal `runtime_ready=1` cleanup guard. A
+write or read-back failure exits nonzero while the guard is still false. The
+EXIT handler attempts to record `failed`, but that secondary write is
+best-effort so an unwritable context path cannot prevent full Nav2,
+localization, localizer, AMCL, and bridge cleanup.
+
 If Nav2 lifecycle activation fails, the resident runtime writes context
 `failed` for the navigation layer, stops the `run_nav2_navigation.sh` wrapper,
 and then sweeps the standard Nav2 process names from the outer runtime as a
-second cleanup pass. The localization layer remains alive for diagnostics and
-retry. This preserves the expensive map/localizer/bridge state while preventing
-stale controller/planner/BT/lifecycle nodes from poisoning the next startup
-attempt.
+second cleanup pass. It then exits nonzero so the existing trap also tears down
+the incomplete localization/localizer/bridge layer. A later
+`POST /api/v1/navigation/start` therefore starts from a clean process set
+instead of inheriting stale controller/planner/BT/lifecycle or localization
+participants. Failure evidence remains in the runtime log and the failed
+runtime-map context until the next controlled start or stop operation.
 
 The selected-floor localization layer also avoids relying on
 `lifecycle_manager_map` autostart for `/map_server` in the production
@@ -180,8 +223,10 @@ could finish loading `nav_map.pgm` quickly but fail to return the lifecycle
 `change_state` response
 to the manager, leaving `/map` unpublished and causing resident startup to fail
 at `localization_layer_started`. The runtime now launches `/map_server` without
-the map lifecycle manager and activates it with Nav2's
-`nav2_util/lifecycle_bringup map_server` helper. While that helper owns the
+the map lifecycle manager and activates it with the repository-owned one-shot
+lifecycle helper. Its fallback state reads retain late Futures across retry
+intervals instead of replacing them, so ordinary Fast DDS response latency is
+not amplified into a 30-second configure wait. While that helper owns the
 transition, the readiness gate only observes lifecycle active state or a
 selected `/map` publication; it does not concurrently send configure/activate
 requests.
@@ -238,11 +283,19 @@ initial triggered localization and before Nav2 lifecycle activation. Set the
 flag to `false` to return to the older common sequence where resident navigation
 starts only after common local-state readiness.
 
-The production path defaults to `NJRH_NAV2_HELD_PRESTART_AFTER_LOCAL_STATE=true`:
-once `robot_local_state` has a fresh `/local_state/odometry` and
-`odom -> base_link`, the Nav2 process tree is preloaded with lifecycle
-activation held. Controller/local-costmap and BT activation still wait until the
-initial triggered localization has produced a bridge-owned `map -> odom`.
+The production path retains the compatibility flag
+`NJRH_NAV2_HELD_PRESTART_AFTER_LOCAL_STATE=true`, but local-state readiness is
+only its first prerequisite. The resident runtime proves the complete
+selected-floor localization stack and exact floor context, completes the
+initial triggered localization, and requires the bridge-owned `map -> odom`
+baseline before it starts the held Nav2 process tree. This keeps Nav2 process
+and DDS-discovery load out of the map-server/Isaac request window and prevents
+the result from aging out of the bridge's historical TF cache. Controller,
+local-costmap, and BT lifecycle activation still wait until the held process
+tree is ready. The foreground production path and optional background path both
+consume the current wrapper's atomic held-ready record before starting the
+lifecycle client; neither may infer launch readiness from the wrapper process
+alone.
 `NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK=false` is the production
 default. A/B testing showed that starting lifecycle activation immediately after
 the localization stack is ready can make the `global_costmap` wait on the
@@ -297,19 +350,14 @@ probe bounded (`LOCAL_STATE_START_READY_TIMEOUT_SEC=12`,
 its own local-state and `map -> odom` gates; the common phase does not spend
 tens of seconds waiting on a transient fresh-TF sample before resident startup.
 
-Initial global localization is still a hard startup gate, but the wrapper now
-retries only the specific startup race where the ROS graph advertises the
-service before the underlying Isaac grid-search service is callable. The retry
-window is bounded (`NJRH_GLOBAL_LOCALIZATION_TRIGGER_CALL_TIMEOUT`, default
-90s; per-attempt default 75s). During startup, bridge rejections containing
-`isaac_triggered_pose_stale_ms` with `gate_mode=triggered` are treated as
-transient old Isaac results: the wrapper refuses the stale pose, shortens the
-active bridge-accept deadline to
-`transient_stale_bridge_accept_timeout_sec` (8 seconds by default). A result
-stamped before force-accept was armed is also ignored without ending the
-request; the wrapper keeps the same trigger armed for the following fresh
-result. Only expiry of that same-trigger window lets the resident runtime
-re-trigger Isaac. Other bridge rejections remain terminal. Common
+Initial global localization is still a hard startup gate. The bounded outer
+window (`NJRH_GLOBAL_LOCALIZATION_TRIGGER_CALL_TIMEOUT`, default 90s;
+per-process default 75s) may create another wrapper request only for a proven
+pre-dispatch readiness/service race. After dispatch, a result stamped before
+the immutable force-accept arm is drained without ending the request; the
+wrapper waits for the current-arm result and never creates a one-result-behind
+trigger loop. Any post-dispatch failure is terminal unless exact newer bridge
+evidence reconciles it. Other bridge rejections remain terminal. Common
 startup also removes stale diagnostics plus exact AMCL lifecycle
 `ros2 service call /amcl/(change_state|get_state)` clients before resident
 navigation starts, so one-shot CLI clients cannot survive into the next boot and
@@ -349,19 +397,25 @@ Hardware validation:
 - Confirm common startup logs show `/flatscan publisher ready before resident
   navigation autostart`; resident readiness should normally only perform the
   second publisher-owner confirmation.
-- Confirm startup logs show either one accepted global localization trigger
-  attempt, transient stale-result wait messages before a fresh accept, or
-  bounded retry messages only for a service-availability race.
-- Confirm default startup logs show
-  `initial global localization trigger will run after localization stack and
-  floor context are ready`, and `initial_global_localization_ready` appears only
-  after the serial trigger has produced a bridge-owned `map -> odom`. When
+- Confirm startup logs show either one accepted global localization transaction,
+  same-transaction pre-arm drain messages before the current-arm accept, or
+  bounded retries only for failures marked `dispatch_state=not_dispatched`.
+- Confirm default startup reaches `localization_stack_ready`, followed by
+  `floor_asset_context_verified`; then it logs `initial global localization
+  trigger is starting after full localization-stack and floor-context
+  readiness`. `initial_global_localization_ready` must appear only after the
+  serial trigger has produced a bridge-owned `map -> odom`, and before
+  `nav2_layer_prestarted_held`. When
   `NJRH_INITIAL_GLOBAL_LOCALIZATION_BACKGROUND_START=true` is explicitly set for
   A/B, `initial_global_localization_trigger_started` must appear after
-  `common_local_state_ready` and before the background trigger is joined.
+  `floor_asset_context_verified` and before the background trigger is joined.
 - Confirm default startup logs do not launch `speed_filter_mask_server`; enable
   `NJRH_ENABLE_SPEED_FILTER=true` only for a deliberate speed-zone A/B test.
-- If Nav2 activation fails, confirm occupancy localization and
-  `robot_localization_bridge` remain alive, and confirm stale
-  `controller_server`, `planner_server`, `bt_navigator`, and
-  `lifecycle_manager_navigation` processes are gone before retrying.
+- If Nav2 activation fails, confirm the incomplete occupancy-localization,
+  `robot_localization_bridge`, `controller_server`, `planner_server`,
+  `bt_navigator`, and lifecycle-manager processes are all gone before retrying.
+- On a normal full-service hardware restart, confirm the exact selected-map
+  context reaches `state=ready, confirmed=true` before the API reports the
+  runtime ready. In an isolated non-motion test container, inject an unwritable
+  `NJRH_RUNTIME_MAP_CONTEXT_FILE` and confirm startup exits nonzero and leaves
+  no Nav2, occupancy-localization, localizer, AMCL, or bridge child process.

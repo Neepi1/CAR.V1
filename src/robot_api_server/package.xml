@@ -19,6 +19,7 @@
   <depend>robot_elevator_manager</depend>
   <depend>robot_interfaces</depend>
   <depend>robot_map_asset_identity</depend>
+  <depend>robot_safety</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>

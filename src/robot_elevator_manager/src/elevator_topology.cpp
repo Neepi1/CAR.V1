@@ -76,9 +76,9 @@ bool valid_threshold(const DoorThreshold & threshold) noexcept
   return cabin_distance > kGeometryEpsilon;
 }
 
-bool supported_pose_role(const PoseRole role)
+bool supported_pose_role(const PoseRole role, const std::uint32_t schema_version)
 {
-  const auto & roles = required_pose_roles();
+  const auto & roles = required_pose_roles(schema_version);
   return std::find(roles.begin(), roles.end(), role) != roles.end();
 }
 
@@ -118,6 +118,8 @@ std::string to_string(const PoseRole role)
   switch (role) {
     case PoseRole::kHallCall:
       return "hall_call";
+    case PoseRole::kLanding:
+      return "landing";
     case PoseRole::kHallWait:
       return "hall_wait";
     case PoseRole::kDoorway:
@@ -126,20 +128,67 @@ std::string to_string(const PoseRole role)
       return "cabin";
     case PoseRole::kExit:
       return "exit";
+    case PoseRole::kCabinPanel:
+      return "cabin_panel";
   }
   return "unknown";
 }
 
-const std::vector<PoseRole> & required_pose_roles()
+std::string to_string(const PanelSide side)
 {
-  static const std::vector<PoseRole> roles{
+  switch (side) {
+    case PanelSide::kLeft:
+      return "LEFT";
+    case PanelSide::kRight:
+      return "RIGHT";
+    case PanelSide::kUnknown:
+      return "UNKNOWN";
+  }
+  return "UNKNOWN";
+}
+
+std::optional<PanelSide> panel_side_from_string(const std::string & value)
+{
+  if (value == "LEFT") {
+    return PanelSide::kLeft;
+  }
+  if (value == "RIGHT") {
+    return PanelSide::kRight;
+  }
+  return std::nullopt;
+}
+
+const std::vector<PoseRole> & required_pose_roles(const std::uint32_t schema_version)
+{
+  static const std::vector<PoseRole> legacy_roles{
     PoseRole::kHallCall,
     PoseRole::kHallWait,
     PoseRole::kDoorway,
     PoseRole::kCabin,
     PoseRole::kExit,
   };
-  return roles;
+  static const std::vector<PoseRole> current_roles{
+    PoseRole::kHallCall,
+    PoseRole::kLanding,
+    PoseRole::kCabin,
+  };
+  static const std::vector<PoseRole> reverse_entry_roles{
+    PoseRole::kHallCall,
+    PoseRole::kLanding,
+    PoseRole::kCabin,
+    PoseRole::kCabinPanel,
+  };
+  static const std::vector<PoseRole> no_roles;
+  if (schema_version == 1U) {
+    return legacy_roles;
+  }
+  if (schema_version == 2U) {
+    return current_roles;
+  }
+  if (schema_version == 3U) {
+    return reverse_entry_roles;
+  }
+  return no_roles;
 }
 
 TopologyValidation validate_topology(const ElevatorTopology & topology)
@@ -154,6 +203,14 @@ TopologyValidation validate_topology(const ElevatorTopology & topology)
     append_issue(
       result, TopologyIssueCode::kUnsafeBuildingId, "building_id",
       "building_id must be a bounded path-safe identifier");
+  }
+  if (
+    topology.schema_version != 1U && topology.schema_version != 2U &&
+    topology.schema_version != 3U)
+  {
+    append_issue(
+      result, TopologyIssueCode::kUnsupportedSchema, "schema_version",
+      "elevator topology schema_version must be 1, 2, or 3");
   }
   if (topology.floors.size() < 2U) {
     append_issue(
@@ -192,7 +249,7 @@ TopologyValidation validate_topology(const ElevatorTopology & topology)
           result, TopologyIssueCode::kUnsafePoseId, pose_path + ".pose_id",
           "pose_id must be a bounded path-safe identifier");
       }
-      if (!supported_pose_role(pose.role)) {
+      if (!supported_pose_role(pose.role, topology.schema_version)) {
         append_issue(
           result, TopologyIssueCode::kUnknownPoseRole, pose_path + ".role",
           "pose role is not part of the elevator topology contract");
@@ -208,7 +265,7 @@ TopologyValidation validate_topology(const ElevatorTopology & topology)
           "one pose_id cannot satisfy multiple elevator roles on the same floor");
       }
     }
-    for (const auto required_role : required_pose_roles()) {
+    for (const auto required_role : required_pose_roles(topology.schema_version)) {
       if (roles.count(required_role) == 0U) {
         append_issue(
           result, TopologyIssueCode::kMissingPoseRole,
@@ -216,10 +273,29 @@ TopologyValidation validate_topology(const ElevatorTopology & topology)
           "required elevator pose role is missing");
       }
     }
-    if (!valid_threshold(floor.threshold)) {
+    if (
+      topology.schema_version == 1U &&
+      (!floor.threshold || !valid_threshold(*floor.threshold)))
+    {
       append_issue(
         result, TopologyIssueCode::kInvalidThreshold, floor_path + ".threshold",
-        "threshold must be finite, non-degenerate, and have a cabin reference off the line");
+        "schema v1 threshold must be finite, non-degenerate, and have a cabin reference off the line");
+    }
+    if (topology.schema_version >= 2U && floor.threshold) {
+      append_issue(
+        result, TopologyIssueCode::kInvalidThreshold, floor_path + ".threshold",
+        "schema v2+ forbids legacy threshold geometry");
+    }
+    if (
+      topology.schema_version == 3U &&
+      (floor.hall_call_panel_side == PanelSide::kUnknown ||
+      floor.cabin_panel_side == PanelSide::kUnknown))
+    {
+      append_issue(
+        result, TopologyIssueCode::kMissingPanelSide,
+        floor_path + ".panel_side",
+        "schema v3 requires LEFT or RIGHT for hall_call_panel_side and "
+        "cabin_panel_side");
     }
   }
   return result;
@@ -292,7 +368,13 @@ RouteResolution resolve_route(
   return RouteResolution{
     RouteError::kNone,
     "",
-    ElevatorRoute{topology.elevator_id, topology.building_id, *source, *target},
+    ElevatorRoute{
+      topology.elevator_id,
+      topology.building_id,
+      *source,
+      *target,
+      topology.schema_version,
+    },
   };
 }
 

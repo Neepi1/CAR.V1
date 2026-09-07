@@ -8,6 +8,7 @@ WORKSPACE_CONTAINER="${NJRH_WORKSPACE_CONTAINER:-/workspaces/njrh-v3/workspace1}
 UPSTREAM_WORKSPACE_HOST="${NJRH_UPSTREAM_WORKSPACE_HOST:-/home/nvidia/workspaces/isaac_ros-dev}"
 UPSTREAM_WORKSPACE_CONTAINER="${NJRH_UPSTREAM_WORKSPACE_CONTAINER:-/workspaces/isaac_ros-dev}"
 CONTAINER_NAME="${NJRH_CONTAINER_NAME:-NJRH-car}"
+PROVISION_MOTION_LOCK="${NJRH_PROVISION_MOTION_LOCK:-/var/lib/njrh/provision/motion.lock}"
 RUNTIME_USER="${NJRH_RUNTIME_USER:-root}"
 RUNTIME_GROUP="${NJRH_RUNTIME_GROUP:-${RUNTIME_USER}}"
 RUNTIME_HOME="${NJRH_RUNTIME_HOME:-}"
@@ -61,7 +62,7 @@ else
 fi
 
 container_env=(
-  "-e" "ROBOT_API_TOKEN=${ROBOT_API_TOKEN:-}"
+  "-e" "ROBOT_API_TOKEN"
   "-e" "NJRH_REUSE_COMMON_SERVICES=${NJRH_REUSE_COMMON_SERVICES:-true}"
   "-e" "NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION=${NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION:-false}"
   "-e" "NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION=${NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION:-false}"
@@ -71,6 +72,8 @@ container_env=(
   "-e" "NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK=${NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK:-false}"
   "-e" "NJRH_NAV2_HELD_PRESTART_WAIT_FOR_LOCALIZER_SERVICE=${NJRH_NAV2_HELD_PRESTART_WAIT_FOR_LOCALIZER_SERVICE:-true}"
   "-e" "NJRH_NAV2_PLANNER_PROFILE=${NJRH_NAV2_PLANNER_PROFILE:-smac2d}"
+  "-e" "NJRH_AMCL_LOCALIZATION_MODE=${NJRH_AMCL_LOCALIZATION_MODE:-gated}"
+  "-e" "NJRH_ORBBEC_SERIAL_NUMBER=${NJRH_ORBBEC_SERIAL_NUMBER:-}"
   "-e" "NJRH_NAV2_PLANNER_PROFILE_FILE=${NJRH_NAV2_PLANNER_PROFILE_FILE:-}"
   "-e" "NJRH_RANGER_LATTICE_FILE=${NJRH_RANGER_LATTICE_FILE:-}"
   "-e" "NJRH_NAV2_BT_XML=${NJRH_NAV2_BT_XML:-}"
@@ -113,12 +116,9 @@ clear_runtime_status_files() {
     2>/dev/null || true
 }
 
-container_runtime_processes_present() {
-  local process_table
-  if ! process_table="$(docker top "${CONTAINER_NAME}" -eo pid,args 2>/dev/null)"; then
-    return 2
-  fi
-  grep -Eq "run_common_services[.]sh|run_driver[.]sh|run_pointcloud_accel_pipeline[.]sh|laser_scan_to_flatscan|ranger_base_node|hesai_ros_driver_node|runtime_health_guard[.]py|robot_localization/ekf_node|run_navigation_runtime_services[.]sh|run_occupancy_grid_localization[.]sh|standard_navigation[.]launch[.]py|occupancy_localization_stack[.]launch[.]py|global_localization_node|localization_bridge_node|robot_api_server_node|__node:=controller_server|__node:=planner_server|__node:=map_server" <<<"${process_table}"
+verify_container_runtime_processes_absent() {
+  docker exec "${CONTAINER_NAME}" /bin/bash \
+    "${OVERLAY_CONTAINER}/scripts/stop_runtime_processes.sh" --check
 }
 
 prepare_container_permissions() {
@@ -175,29 +175,36 @@ prepare_container_permissions() {
 }
 
 stop_container_common_processes() {
-  local process_state=0
   if ! docker ps --format '{{.Names}}' | grep -Fx "${CONTAINER_NAME}" >/dev/null 2>&1; then
     clear_runtime_status_files
     return 0
   fi
-  container_runtime_processes_present || process_state=$?
-  if [[ "${process_state}" -eq 1 ]]; then
-    echo "[njrh-systemd] no stale runtime processes found; skipping container cleanup sweep" >&2
+  # Always run the idempotent complete-runtime sweep. A pre-check must never
+  # skip cleanup because a stale service omitted from a host regex could still
+  # execute a timed-out ROS request after the API process restarts.
+  if ! docker exec "${CONTAINER_NAME}" /bin/bash \
+    "${OVERLAY_CONTAINER}/scripts/stop_runtime_processes.sh"; then
+    echo "[njrh-systemd] runtime cleanup command failed" >&2
     clear_runtime_status_files
+    return 1
+  fi
+  clear_runtime_status_files
+  if verify_container_runtime_processes_absent; then
     return 0
   fi
-  if [[ "${process_state}" -eq 2 ]]; then
-    echo "[njrh-systemd] container process table unavailable; running conservative cleanup sweep" >&2
-  fi
-  docker exec "${CONTAINER_NAME}" /bin/bash \
-    "${OVERLAY_CONTAINER}/scripts/stop_runtime_processes.sh" || true
-  clear_runtime_status_files
+  echo "[njrh-systemd] unable to prove that every runtime process stopped" >&2
+  return 1
 }
 
 cd "${WORKSPACE_HOST}"
 
 case "${ACTION}" in
   run)
+    if [[ -e "${PROVISION_MOTION_LOCK}" ]]; then
+      echo "[njrh-systemd] provisioning motion lock is present: ${PROVISION_MOTION_LOCK}" >&2
+      echo "[njrh-systemd] refusing to start the production runtime" >&2
+      exit 1
+    fi
     NJRH_WORKSPACE_HOST="${WORKSPACE_HOST}" \
     NJRH_WORKSPACE_CONTAINER="${WORKSPACE_CONTAINER}" \
     NJRH_UPSTREAM_WORKSPACE_HOST="${UPSTREAM_WORKSPACE_HOST}" \

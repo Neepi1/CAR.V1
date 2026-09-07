@@ -7,12 +7,46 @@ robot_floor_manager:
     transition_status_topic: /floor_manager/transition_status
     live_floor_switch_enabled: false
     map_server_load_service: /map_server/load_map
+    keepout_mask_load_service: /keepout_filter_mask_server/load_map
+    speed_mask_load_service: /speed_filter_mask_server/load_map
     localizer_apply_service: /global_localization/apply_floor_assets
+    localizer_asset_state_topic: /global_localization/asset_state
     localization_trigger_service: /global_localization/trigger
+    localization_health_topic: /localization/floor_health
+    motion_hold_service: /safety/set_motion_hold
+    motion_hold_sequence_state_file: /tmp/njrh_floor_manager_hold_sequence.state
+    motion_interlock_state_topic: /safety/motion_interlock_state
+    navigate_to_pose_action: /navigate_to_pose
+    navigate_to_pose_status_topic: /navigate_to_pose/_action/status
+    # GoalStatusArray has no initial empty sample when Nav2 has never accepted
+    # a goal. Require the action server and status writer to remain discovered
+    # for this grace period before treating that cold-start state as idle.
+    nav_idle_bootstrap_grace_sec: 2.0
+    wheel_odom_topic: /wheel/odom
+    local_odom_topic: /local_state/odometry
+    correction_pause_service: /robot_localization_bridge/set_correction_pause_lease
+    correction_pause_state_topic: /localization/correction_pause_state
+    begin_floor_transition_service: /robot_localization_bridge/begin_floor_transition
+    global_costmap_topic: /global_costmap/costmap
+    local_costmap_topic: /local_costmap/costmap
     global_costmap_clear_service: /global_costmap/clear_entirely_global_costmap
     local_costmap_clear_service: /local_costmap/clear_entirely_local_costmap
+    runtime_map_context_file: /tmp/njrh_runtime_map_context.json
     service_timeout_sec: 10.0
+    # Isaac component capture/unload/load is a composite operation. A delayed
+    # RPC is reconciled against the exact transaction-scoped typed asset state.
+    localizer_apply_timeout_sec: 30.0
+    localization_trigger_timeout_sec: 75.0
+    evidence_timeout_sec: 10.0
+    evidence_max_age_sec: 0.75
+    stopped_stable_duration_sec: 0.30
+    stopped_linear_threshold_mps: 0.02
+    stopped_angular_threshold_radps: 0.02
     call_map_server_load: true
+    call_filter_mask_load: true
+    # Runtime speed costmap filter is not launched in the current Jetson
+    # profile. The immutable bundle still requires and verifies speed assets.
+    speed_filter_enabled: false
     call_localizer_apply: true
     call_localization_trigger: true
     clear_costmaps_after_switch: true

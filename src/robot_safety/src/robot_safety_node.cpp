@@ -17,9 +17,13 @@
 #include "rclcpp/rclcpp.hpp"
 #include "robot_interfaces/msg/motion_interlock_state.hpp"
 #include "robot_interfaces/msg/operating_mode_state.hpp"
+#include "robot_interfaces/srv/release_motion_hold_if_execution_idle.hpp"
 #include "robot_interfaces/srv/set_execution_lease.hpp"
 #include "robot_interfaces/srv/set_motion_hold.hpp"
+#include "robot_safety/dock_contact_policy.hpp"
+#include "robot_safety/elevator_entry_collision_bypass_policy.hpp"
 #include "robot_safety/motion_interlock_arbiter.hpp"
+#include "robot_safety/navigation_speed_envelope.hpp"
 #include "sensor_msgs/msg/battery_state.hpp"
 #include "sensor_msgs/msg/imu.hpp"
 #include "std_msgs/msg/bool.hpp"
@@ -158,6 +162,9 @@ public:
       "execution_recovery_owner", "robot_mission_manager");
     motion_hold_service_name_ = declare_parameter<std::string>(
       "motion_hold_service", "/safety/set_motion_hold");
+    recovery_hold_release_service_name_ = declare_parameter<std::string>(
+      "recovery_hold_release_service",
+      "/safety/release_motion_hold_if_execution_idle");
     execution_lease_service_name_ = declare_parameter<std::string>(
       "execution_lease_service", "/safety/set_execution_lease");
     motion_interlock_state_topic_ = declare_parameter<std::string>(
@@ -172,6 +179,19 @@ public:
     cmd_vel_in_topic_ = declare_parameter<std::string>("cmd_vel_in_topic", "/cmd_vel_collision_checked");
     api_cmd_vel_in_topic_ = declare_parameter<std::string>("api_cmd_vel_in_topic", "/cmd_vel_api");
     docking_cmd_vel_in_topic_ = declare_parameter<std::string>("docking_cmd_vel_in_topic", "/cmd_vel_docking");
+    elevator_entry_cmd_vel_in_topic_ = declare_parameter<std::string>(
+      "elevator_entry_cmd_vel_in_topic", "/cmd_vel_nav");
+    elevator_entry_collision_bypass_permit_topic_ =
+      declare_parameter<std::string>(
+      "elevator_entry_collision_bypass_permit_topic",
+      "/ranger_mini3/elevator_entry_collision_bypass");
+    elevator_entry_collision_bypass_permit_timeout_sec_ = std::max(
+      0.05,
+      declare_parameter<double>(
+        "elevator_entry_collision_bypass_permit_timeout_sec", 0.75));
+    elevator_entry_cmd_timeout_sec_ = std::max(
+      0.05,
+      declare_parameter<double>("elevator_entry_cmd_timeout_sec", 0.25));
     cmd_vel_out_topic_ = declare_parameter<std::string>("cmd_vel_out_topic", "/cmd_vel");
     cmd_vel_mirror_topic_ = declare_parameter<std::string>("cmd_vel_mirror_topic", "/cmd_vel_safe");
     cmd_vel_qos_depth_ =
@@ -241,6 +261,8 @@ public:
       std::max(0.05, declare_parameter<double>("reverse_enable_timeout_sec", 0.75));
     normal_navigation_reverse_max_mps_ =
       std::max(0.0, declare_parameter<double>("normal_navigation_reverse_max_mps", 0.08));
+    elevator_navigation_reverse_max_mps_ =
+      std::max(0.0, declare_parameter<double>("elevator_navigation_reverse_max_mps", 0.40));
     final_cmd_lateral_deadband_mps_ =
       std::max(0.0, declare_parameter<double>("final_cmd_lateral_deadband_mps", 0.001));
     allow_api_lateral_cmd_ = declare_parameter<bool>("allow_api_lateral_cmd", false);
@@ -248,6 +270,8 @@ public:
       std::max(0.0, declare_parameter<double>("api_lateral_max_mps", 0.10));
     normal_navigation_lateral_max_mps_ = std::max(
       0.0, declare_parameter<double>("normal_navigation_lateral_max_mps", 0.05));
+    elevator_navigation_lateral_max_mps_ = std::max(
+      0.0, declare_parameter<double>("elevator_navigation_lateral_max_mps", 0.40));
     estop_topic_ = declare_parameter<std::string>("estop_topic", "/safety/estop");
     localization_ok_topic_ = declare_parameter<std::string>("localization_ok_topic", "/localization/health");
     require_localization_health_ = declare_parameter<bool>("require_localization_health", false);
@@ -312,6 +336,14 @@ public:
         this,
         std::placeholders::_1,
         std::placeholders::_2));
+    recovery_hold_release_service_ =
+      create_service<robot_interfaces::srv::ReleaseMotionHoldIfExecutionIdle>(
+      recovery_hold_release_service_name_,
+      std::bind(
+        &RobotSafetyNode::on_recovery_hold_release,
+        this,
+        std::placeholders::_1,
+        std::placeholders::_2));
     execution_lease_service_ = create_service<robot_interfaces::srv::SetExecutionLease>(
       execution_lease_service_name_,
       std::bind(
@@ -334,6 +366,15 @@ public:
       cmd_vel_in_topic_,
       command_qos,
       std::bind(&RobotSafetyNode::on_normal_cmd, this, std::placeholders::_1));
+    if (!elevator_entry_cmd_vel_in_topic_.empty()) {
+      elevator_entry_cmd_sub_ = create_subscription<geometry_msgs::msg::Twist>(
+        elevator_entry_cmd_vel_in_topic_,
+        command_qos,
+        std::bind(
+          &RobotSafetyNode::on_elevator_entry_cmd,
+          this,
+          std::placeholders::_1));
+    }
     if (!api_cmd_vel_in_topic_.empty()) {
       api_cmd_sub_ = create_subscription<geometry_msgs::msg::Twist>(
         api_cmd_vel_in_topic_,
@@ -427,6 +468,16 @@ public:
           update_reverse_permit(nav_terminal_lateral_permit_, msg->data);
         });
     }
+    if (!elevator_entry_collision_bypass_permit_topic_.empty()) {
+      elevator_entry_collision_bypass_permit_sub_ =
+        create_subscription<std_msgs::msg::String>(
+        elevator_entry_collision_bypass_permit_topic_,
+        rclcpp::QoS(10).reliable(),
+        std::bind(
+          &RobotSafetyNode::on_elevator_entry_collision_bypass_permit,
+          this,
+          std::placeholders::_1));
+    }
 
     timer_ = create_wall_timer(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -479,18 +530,22 @@ private:
     state.execution_lease_id = snapshot.execution_lease_id;
     state.execution_lease_remaining =
       make_duration(snapshot.execution_lease_remaining_sec);
+    const bool managed_contract_required =
+      execution_contract_required(snapshot);
     state.execution_mode_contract_valid =
       execution_mode_contract_valid(snapshot, steady_now_sec());
     state.normal_source_only =
-      snapshot.execution_session_engaged &&
-      snapshot.execution_lease_active &&
+      managed_contract_required &&
       state.execution_mode_contract_valid;
     state.interlock_effective_motion_blocked =
-      snapshot.motion_blocked || !state.execution_mode_contract_valid;
+      snapshot.motion_blocked ||
+      (managed_contract_required && !state.execution_mode_contract_valid);
     if (snapshot.motion_blocked) {
       state.interlock_effective_block_reason = !snapshot.hold_keys.empty() ?
         "motion_hold_active" : "execution_lease_missing";
-    } else if (!state.execution_mode_contract_valid) {
+    } else if (
+      managed_contract_required && !state.execution_mode_contract_valid)
+    {
       state.interlock_effective_block_reason = "execution_mode_invalid";
     } else {
       state.interlock_effective_block_reason = "none";
@@ -509,10 +564,16 @@ private:
   {
     have_last_api_cmd_ = false;
     have_last_docking_cmd_ = false;
+    have_last_elevator_entry_cmd_ = false;
     last_cmd_was_api_ = false;
     last_cmd_was_docking_ = false;
     last_api_cmd_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
     last_docking_cmd_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    last_elevator_entry_cmd_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    elevator_entry_collision_bypass_permit_ =
+      robot_safety::ElevatorEntryCollisionBypassPermit{};
+    elevator_entry_collision_bypass_active_ = false;
+    elevator_transaction_permit_latched_ = false;
     legacy_reverse_permit_ = ReversePermit{};
     docking_reverse_permit_ = ReversePermit{};
     teleop_reverse_permit_ = ReversePermit{};
@@ -546,10 +607,12 @@ private:
     command.owner = request->owner;
     command.transaction_id = request->transaction_id;
     command.reason = request->reason;
+    command.command_sequence = request->command_sequence;
     const auto decision = motion_interlock_->apply_hold(command, steady_now_sec());
     response->success = decision.accepted;
     response->result_code = static_cast<std::uint8_t>(decision.code);
     response->message = decision.message;
+    response->applied_sequence = decision.applied_sequence;
     response->state = make_motion_interlock_state(decision.state);
     apply_interlock_decision_side_effects(decision);
   }
@@ -576,6 +639,29 @@ private:
     apply_interlock_decision_side_effects(decision);
   }
 
+  void on_recovery_hold_release(
+    const std::shared_ptr<
+      robot_interfaces::srv::ReleaseMotionHoldIfExecutionIdle::Request> request,
+    std::shared_ptr<
+      robot_interfaces::srv::ReleaseMotionHoldIfExecutionIdle::Response> response)
+  {
+    robot_safety::ConditionalHoldReleaseCommand command;
+    command.owner = request->owner;
+    command.transaction_id = request->transaction_id;
+    command.reason = request->reason;
+    command.command_sequence = request->command_sequence;
+    command.expected_generation = request->expected_generation;
+    const auto decision =
+      motion_interlock_->release_hold_if_execution_idle(
+      command, steady_now_sec());
+    response->success = decision.accepted;
+    response->result_code = static_cast<std::uint8_t>(decision.code);
+    response->message = decision.message;
+    response->applied_sequence = decision.applied_sequence;
+    response->state = make_motion_interlock_state(decision.state);
+    apply_interlock_decision_side_effects(decision);
+  }
+
   static bool execution_mode_requires_session(const std::string & mode)
   {
     return mode == "ELEVATOR_WAIT" ||
@@ -588,8 +674,23 @@ private:
     const robot_safety::MotionInterlockSnapshot & interlock) const
   {
     return interlock.execution_session_engaged ||
+           elevator_mode_contract_latched_ ||
+           elevator_transaction_permit_latched_ ||
            (execution_mode_state_seen_ &&
            execution_mode_requires_session(execution_mode_state_.mode));
+  }
+
+  bool operating_mode_lease_fresh(const double steady_now) const
+  {
+    const double mode_age_sec =
+      steady_now - execution_mode_state_last_seen_sec_;
+    return execution_mode_state_seen_ &&
+           std::isfinite(mode_age_sec) &&
+           mode_age_sec >= 0.0 &&
+           mode_age_sec <= execution_mode_state_timeout_sec_ &&
+           steady_now < execution_mode_lease_expires_at_sec_ &&
+           execution_mode_state_.lease_active &&
+           execution_mode_requires_session(execution_mode_state_.mode);
   }
 
   bool execution_mode_contract_valid(
@@ -599,19 +700,44 @@ private:
     if (!execution_contract_required(interlock)) {
       return true;
     }
-    const double mode_age_sec =
-      steady_now - execution_mode_state_last_seen_sec_;
-    return interlock.execution_session_engaged &&
-           interlock.execution_lease_active &&
-           execution_mode_state_seen_ &&
-           std::isfinite(mode_age_sec) &&
-           mode_age_sec >= 0.0 &&
-           mode_age_sec <= execution_mode_state_timeout_sec_ &&
-           steady_now < execution_mode_lease_expires_at_sec_ &&
-           execution_mode_state_.lease_active &&
-           execution_mode_requires_session(execution_mode_state_.mode) &&
-           execution_mode_state_.owner == interlock.execution_owner &&
-           execution_mode_state_.mission_id == interlock.execution_mission_id;
+    if (!operating_mode_lease_fresh(steady_now)) {
+      return false;
+    }
+    if (interlock.execution_session_engaged) {
+      return interlock.execution_lease_active &&
+             execution_mode_state_.owner == interlock.execution_owner &&
+             execution_mode_state_.mission_id ==
+             interlock.execution_mission_id;
+    }
+    if (
+      execution_mode_state_.mode == "RECOVERY" ||
+      execution_mode_state_.owner != "robot_elevator_manager" ||
+      execution_mode_state_.mission_id.rfind("elevator_", 0U) != 0U ||
+      execution_mode_state_.mission_id.size() <=
+      std::string("elevator_").size())
+    {
+      return false;
+    }
+    if (
+      elevator_mode_contract_latched_ &&
+      (execution_mode_state_.owner != elevator_mode_contract_owner_ ||
+      execution_mode_state_.mission_id != elevator_mode_contract_mission_id_))
+    {
+      return false;
+    }
+    if (!elevator_transaction_permit_latched_) {
+      return true;
+    }
+    const double permit_age_sec =
+      steady_now - elevator_entry_collision_bypass_permit_.received_at_sec;
+    return !elevator_entry_collision_bypass_permit_.transaction_id.empty() &&
+           std::isfinite(permit_age_sec) &&
+           permit_age_sec >= 0.0 &&
+           permit_age_sec <=
+           elevator_entry_collision_bypass_permit_timeout_sec_ &&
+           execution_mode_state_.mission_id ==
+           "elevator_" +
+           elevator_entry_collision_bypass_permit_.transaction_id;
   }
 
   void on_execution_mode_state(
@@ -636,6 +762,26 @@ private:
     if (changed) {
       clear_cached_commands_for_interlock_transition();
     }
+    const bool exact_elevator_mode =
+      message->lease_active &&
+      execution_mode_requires_session(message->mode) &&
+      message->mode != "RECOVERY" &&
+      message->owner == "robot_elevator_manager" &&
+      message->mission_id.rfind("elevator_", 0U) == 0U &&
+      message->mission_id.size() > std::string("elevator_").size();
+    if (exact_elevator_mode) {
+      elevator_mode_contract_latched_ = true;
+      elevator_mode_contract_owner_ = message->owner;
+      elevator_mode_contract_mission_id_ = message->mission_id;
+    } else if (
+      !message->lease_active &&
+      (message->transition_reason == "lease_released" ||
+      message->transition_reason == "lease_release_fenced"))
+    {
+      elevator_mode_contract_latched_ = false;
+      elevator_mode_contract_owner_.clear();
+      elevator_mode_contract_mission_id_.clear();
+    }
     const auto snapshot = current_snapshot();
     if (changed || !snapshot.motion_allowed) {
       publish_command(geometry_msgs::msg::Twist{}, snapshot);
@@ -657,8 +803,8 @@ private:
     const bool requires_execution_contract =
       execution_contract_required(interlock);
     if (
-      requires_execution_contract &&
-      (!interlock.execution_session_engaged || !interlock.execution_lease_active))
+      interlock.execution_session_engaged &&
+      !interlock.execution_lease_active)
     {
       return {SafetyState::EXECUTION_LEASE_MISSING, false};
     }
@@ -669,8 +815,8 @@ private:
       return {SafetyState::EXECUTION_MODE_INVALID, false};
     }
     if (
-      interlock.execution_session_engaged &&
-      interlock.execution_lease_active &&
+      requires_execution_contract &&
+      execution_mode_contract_valid(interlock, steady_now_sec()) &&
       source != CommandSource::NORMAL)
     {
       return {SafetyState::EXECUTION_SOURCE_BLOCKED, false};
@@ -690,6 +836,93 @@ private:
       return {SafetyState::COMMAND_STALE, false};
     }
     return {SafetyState::OK, true};
+  }
+
+  bool elevator_entry_collision_bypass_authorized_now() const
+  {
+    const double now_sec = steady_now_sec();
+    const auto interlock = motion_interlock_->snapshot(now_sec);
+    robot_safety::ElevatorEntryCollisionBypassContext context;
+    context.hold_clear = interlock.hold_keys.empty();
+    context.operating_mode_contract_valid =
+      execution_mode_contract_valid(interlock, now_sec);
+    context.operating_mode_owner = execution_mode_state_seen_ ?
+      execution_mode_state_.owner : "";
+    context.operating_mode_mission_id = execution_mode_state_seen_ ?
+      execution_mode_state_.mission_id : "";
+    context.operating_mode =
+      execution_mode_state_seen_ ? execution_mode_state_.mode : "";
+    return robot_safety::elevator_entry_collision_bypass_authorized(
+      elevator_entry_collision_bypass_permit_,
+      context,
+      now_sec,
+      elevator_entry_collision_bypass_permit_timeout_sec_);
+  }
+
+  bool elevator_entry_command_fresh() const
+  {
+    if (
+      !have_last_elevator_entry_cmd_ ||
+      last_elevator_entry_cmd_time_.nanoseconds() <= 0)
+    {
+      return false;
+    }
+    const double age_sec =
+      (now() - last_elevator_entry_cmd_time_).seconds();
+    return std::isfinite(age_sec) && age_sec >= 0.0 &&
+           age_sec <= elevator_entry_cmd_timeout_sec_;
+  }
+
+  void publish_elevator_entry_transition_stop()
+  {
+    const auto stamp = now();
+    last_cmd_time_ = stamp;
+    if (zero_cmd_priority_burst_sec_ > 0.0) {
+      zero_cmd_priority_until_time_ =
+        stamp + rclcpp::Duration::from_seconds(zero_cmd_priority_burst_sec_);
+    } else {
+      zero_cmd_priority_until_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    }
+    publish_command(
+      geometry_msgs::msg::Twist{},
+      current_snapshot(CommandSource::NORMAL));
+  }
+
+  void on_elevator_entry_collision_bypass_permit(
+    const std_msgs::msg::String::SharedPtr message)
+  {
+    const bool was_marked_active =
+      elevator_entry_collision_bypass_active_;
+    const bool was_latched = elevator_transaction_permit_latched_;
+    const bool was_authorized =
+      elevator_entry_collision_bypass_authorized_now();
+    if (message->data.empty()) {
+      elevator_entry_collision_bypass_permit_ =
+        robot_safety::ElevatorEntryCollisionBypassPermit{};
+      elevator_transaction_permit_latched_ = false;
+    } else {
+      elevator_entry_collision_bypass_permit_ = {
+        message->data,
+        steady_now_sec(),
+      };
+      elevator_transaction_permit_latched_ = true;
+    }
+    const bool active = elevator_entry_collision_bypass_authorized_now();
+    if (
+      active != was_marked_active ||
+      was_latched != elevator_transaction_permit_latched_ ||
+      (was_marked_active && !was_authorized))
+    {
+      have_last_elevator_entry_cmd_ = false;
+      last_elevator_entry_cmd_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+      elevator_entry_collision_bypass_active_ = active;
+      publish_elevator_entry_transition_stop();
+      RCLCPP_WARN(
+        get_logger(),
+        "elevator entry collision-monitor bypass %s transaction=%s",
+        active ? "enabled" : "disabled",
+        active ? message->data.c_str() : "none");
+    }
   }
 
   void publish_snapshot(const SafetySnapshot & snapshot)
@@ -730,6 +963,15 @@ private:
       return false;
     }
     return (now() - last_api_cmd_time_).seconds() <= api_cmd_priority_timeout_sec_;
+  }
+
+  bool normal_command_fresh() const
+  {
+    if (last_normal_cmd_time_.nanoseconds() <= 0) {
+      return false;
+    }
+    const double age_sec = (now() - last_normal_cmd_time_).seconds();
+    return std::isfinite(age_sec) && age_sec >= 0.0 && age_sec <= watchdog_timeout_sec_;
   }
 
   bool fresh_docking_command_active() const
@@ -840,8 +1082,27 @@ private:
       snapshot);
   }
 
+  void on_elevator_entry_cmd(
+    const geometry_msgs::msg::Twist::SharedPtr message)
+  {
+    if (!elevator_entry_collision_bypass_authorized_now()) {
+      return;
+    }
+    last_elevator_entry_cmd_ = *message;
+    have_last_elevator_entry_cmd_ = true;
+    last_elevator_entry_cmd_time_ = now();
+    last_normal_cmd_time_ = last_elevator_entry_cmd_time_;
+    if (handle_zero_priority_command(*message, CommandSource::NORMAL)) {
+      return;
+    }
+    publish_checked_command(*message, CommandSource::NORMAL);
+  }
+
   void on_normal_cmd(const geometry_msgs::msg::Twist::SharedPtr msg)
   {
+    if (elevator_entry_collision_bypass_authorized_now()) {
+      return;
+    }
     last_normal_cmd_time_ = now();
     if (handle_zero_priority_command(*msg, CommandSource::NORMAL)) {
       return;
@@ -914,6 +1175,45 @@ private:
     } else {
       publish_motion_interlock_state(motion_interlock_->snapshot(steady_now_sec()));
     }
+    const bool elevator_entry_bypass =
+      elevator_entry_collision_bypass_authorized_now();
+    if (elevator_entry_collision_bypass_active_ && !elevator_entry_bypass) {
+      elevator_entry_collision_bypass_active_ = false;
+      have_last_elevator_entry_cmd_ = false;
+      last_elevator_entry_cmd_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+      publish_elevator_entry_transition_stop();
+      RCLCPP_WARN(
+        get_logger(),
+        "elevator entry collision-monitor bypass expired or lost its exact runtime contract");
+      return;
+    }
+    if (elevator_entry_bypass) {
+      if (!elevator_entry_collision_bypass_active_) {
+        elevator_entry_collision_bypass_active_ = true;
+        have_last_elevator_entry_cmd_ = false;
+        last_elevator_entry_cmd_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+        publish_elevator_entry_transition_stop();
+        RCLCPP_WARN(
+          get_logger(),
+          "elevator entry collision-monitor bypass enabled after runtime contract became valid");
+        return;
+      }
+      elevator_entry_collision_bypass_active_ = true;
+      const auto snapshot = current_snapshot(CommandSource::NORMAL);
+      if (
+        zero_cmd_priority_active() ||
+        !snapshot.motion_allowed ||
+        !elevator_entry_command_fresh())
+      {
+        publish_command(geometry_msgs::msg::Twist{}, snapshot);
+      } else {
+        publish_command(
+          prepare_checked_command(
+            last_elevator_entry_cmd_, CommandSource::NORMAL),
+          snapshot);
+      }
+      return;
+    }
     const bool docking_context = fresh_docking_command_active();
     const bool api_context = !docking_context && fresh_api_command_active();
     if (docking_context && !docking_command_allowed_during_bms_contact(last_docking_cmd_)) {
@@ -936,7 +1236,7 @@ private:
         publish_command(
           prepare_checked_command(last_api_cmd_, CommandSource::API),
           snapshot);
-      } else if (actual_motion_mode_is_lateral()) {
+      } else if (actual_motion_mode_is_lateral() && !normal_command_fresh()) {
         RCLCPP_WARN_THROTTLE(
           get_logger(),
           *get_clock(),
@@ -954,10 +1254,15 @@ private:
 
   bool battery_indicates_charging_contact(const sensor_msgs::msg::BatteryState & msg) const
   {
-    if (msg.power_supply_status == sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_CHARGING ||
-      msg.power_supply_status == sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_FULL)
+    if (msg.power_supply_status == sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_CHARGING)
     {
       return true;
+    }
+    if (msg.power_supply_status == sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_FULL) {
+      // FULL is supporting evidence, not physical contact proof by itself.
+      const auto evidence = dock_contact_latch_evidence();
+      return fresh_docking_command_active() ||
+             docking_status_indicates_docked() || evidence.strong;
     }
     if (std::isfinite(msg.current) && static_cast<double>(msg.current) > charging_current_min_a_) {
       return true;
@@ -968,7 +1273,10 @@ private:
       return true;
     }
     const double soc = normalized_soc_percent(msg.percentage);
-    return charging_full_soc_voltage_contact_enable_ && msg.present && std::isfinite(soc) &&
+    const auto evidence = dock_contact_latch_evidence();
+    return charging_full_soc_voltage_contact_enable_ &&
+      (fresh_docking_command_active() || docking_status_indicates_docked() || evidence.strong) &&
+      msg.present && std::isfinite(soc) &&
       soc >= charging_full_soc_threshold_pct_ &&
       voltage_in_contact_range(msg.voltage, charging_contact_voltage_min_v_, charging_contact_voltage_max_v_);
   }
@@ -979,19 +1287,29 @@ private:
       enable_bms_contact_guard_ && fresh_battery_sample() && battery_contact_active_;
     battery_contact_active_ = battery_indicates_charging_contact(*msg);
     last_battery_time_ = now();
-    if (bms_docking_interlock_enabled_ && battery_contact_active_) {
+    const auto persistent_evidence = dock_contact_latch_evidence();
+    if (bms_docking_interlock_enabled_ &&
+      robot_safety::should_latch_bms_docking_interlock(
+        battery_contact_active_,
+        fresh_docking_command_active(),
+        docking_status_indicates_docked(),
+        persistent_evidence))
+    {
       bms_docking_contact_latched_ = true;
     }
     if (bms_docking_interlock_enabled_ && battery_contact_active_ && !contact_was_active) {
       publish_bms_docking_interlock_stop("bms_contact_rising_edge");
     }
+    try_release_bms_docking_interlock("battery_state");
   }
 
   bool bms_docking_interlock_active() const
   {
+    const bool live_contact =
+      enable_bms_contact_guard_ && fresh_battery_sample() && battery_contact_active_;
     return bms_docking_interlock_enabled_ &&
-           (bms_docking_contact_latched_ ||
-           (enable_bms_contact_guard_ && fresh_battery_sample() && battery_contact_active_));
+           robot_safety::bms_docking_interlock_is_active(
+      bms_docking_contact_latched_, live_contact, dock_contact_latch_evidence());
   }
 
   bool docking_command_allowed_during_bms_contact(
@@ -1057,26 +1375,38 @@ private:
     permit.steady_stamp_sec = steady_now_sec();
   }
 
+  void try_release_bms_docking_interlock(const char * trigger)
+  {
+    const bool fresh_no_contact = enable_bms_contact_guard_ &&
+      fresh_battery_sample() && !battery_contact_active_;
+    if (!bms_docking_interlock_enabled_ ||
+      !bms_docking_contact_latched_ ||
+      !bms_interlock_reverse_session_seen_ ||
+      docking_reverse_permit_.enabled ||
+      !fresh_no_contact)
+    {
+      return;
+    }
+
+    bms_docking_contact_latched_ = false;
+    bms_interlock_reverse_session_seen_ = false;
+    RCLCPP_INFO(
+      get_logger(),
+      "BMS_DOCKING_INTERLOCK released after explicit reverse session and "
+      "fresh no-contact feedback trigger=%s",
+      trigger);
+  }
+
   void on_docking_reverse_enable(const bool enabled)
   {
-    const bool was_enabled = docking_reverse_permit_.enabled;
     update_reverse_permit(docking_reverse_permit_, enabled);
     if (enabled) {
-      if (bms_docking_contact_latched_) {
+      if (bms_docking_interlock_active()) {
         bms_interlock_reverse_session_seen_ = true;
       }
       return;
     }
-
-    const bool fresh_no_contact = enable_bms_contact_guard_ &&
-      fresh_battery_sample() && !battery_contact_active_;
-    if (was_enabled && bms_interlock_reverse_session_seen_ && fresh_no_contact) {
-      bms_docking_contact_latched_ = false;
-      bms_interlock_reverse_session_seen_ = false;
-      RCLCPP_INFO(
-        get_logger(),
-        "BMS_DOCKING_INTERLOCK released after explicit reverse session and fresh no-contact feedback");
-    }
+    try_release_bms_docking_interlock("reverse_disabled");
   }
 
   bool reverse_permit_fresh(const ReversePermit & permit) const
@@ -1093,8 +1423,12 @@ private:
 
   bool reverse_allowed(const CommandSource source) const
   {
-    const auto interlock = motion_interlock_->snapshot(steady_now_sec());
-    if (interlock.execution_session_engaged) {
+    const double now_sec = steady_now_sec();
+    const auto interlock = motion_interlock_->snapshot(now_sec);
+    if (
+      execution_contract_required(interlock) &&
+      execution_mode_contract_valid(interlock, now_sec))
+    {
       return source == CommandSource::NORMAL &&
              reverse_permit_fresh(nav_terminal_reverse_permit_);
     }
@@ -1264,17 +1598,28 @@ private:
     const CommandSource source) const
   {
     auto sanitized = cmd;
+    const double now_sec = steady_now_sec();
+    const auto interlock = motion_interlock_->snapshot(now_sec);
+    const bool elevator_navigation_contract =
+      execution_contract_required(interlock) &&
+      execution_mode_contract_valid(interlock, now_sec);
+    const auto navigation_limits = robot_safety::select_navigation_speed_envelope(
+      elevator_navigation_contract,
+      normal_navigation_reverse_max_mps_,
+      normal_navigation_lateral_max_mps_,
+      elevator_navigation_reverse_max_mps_,
+      elevator_navigation_lateral_max_mps_);
     if (sanitized.linear.x < 0.0) {
       if (!reverse_allowed(source)) {
         return geometry_msgs::msg::Twist{};
       }
       if (source == CommandSource::NORMAL) {
-        if (normal_navigation_reverse_max_mps_ <= 0.0) {
+        if (navigation_limits.reverse_max_mps <= 0.0) {
           return geometry_msgs::msg::Twist{};
         }
         sanitized.linear.x = std::max(
           sanitized.linear.x,
-          -normal_navigation_reverse_max_mps_);
+          -navigation_limits.reverse_max_mps);
       }
     }
     const bool allow_lateral =
@@ -1295,11 +1640,11 @@ private:
         -api_lateral_max_mps_,
         api_lateral_max_mps_);
     }
-    if (source == CommandSource::NORMAL && normal_navigation_lateral_max_mps_ > 0.0) {
+    if (source == CommandSource::NORMAL && navigation_limits.lateral_max_mps > 0.0) {
       sanitized.linear.y = std::clamp(
         sanitized.linear.y,
-        -normal_navigation_lateral_max_mps_,
-        normal_navigation_lateral_max_mps_);
+        -navigation_limits.lateral_max_mps,
+        navigation_limits.lateral_max_mps);
     }
     return sanitized;
   }
@@ -1528,30 +1873,31 @@ private:
     return false;
   }
 
-  bool dock_contact_latch_is_docked() const
+  robot_safety::PersistentDockEvidence dock_contact_latch_evidence() const
   {
     if (docking_contact_latch_file_.empty()) {
-      return false;
+      return {};
     }
     if (last_latch_read_time_.nanoseconds() > 0 &&
       (now() - last_latch_read_time_).seconds() < 1.0)
     {
-      return cached_latch_docked_;
+      return cached_latch_evidence_;
     }
     last_latch_read_time_ = now();
     std::ifstream file(docking_contact_latch_file_);
     if (!file) {
-      cached_latch_docked_ = false;
-      return false;
+      cached_latch_evidence_ = {};
+      return cached_latch_evidence_;
     }
     std::ostringstream data;
     data << file.rdbuf();
-    const auto text = data.str();
-    cached_latch_docked_ = text.find("\"latched_docked\": true") != std::string::npos ||
-      text.find("\"latched_docked\":true") != std::string::npos ||
-      text.find("\"docked\": true") != std::string::npos ||
-      text.find("\"docked\":true") != std::string::npos;
-    return cached_latch_docked_;
+    cached_latch_evidence_ = robot_safety::parse_persistent_dock_evidence(data.str());
+    return cached_latch_evidence_;
+  }
+
+  bool dock_contact_latch_is_docked() const
+  {
+    return dock_contact_latch_evidence().latched_docked;
   }
 
   bool dock_contact_active() const
@@ -1565,15 +1911,14 @@ private:
     if (docking_status_indicates_docked()) {
       return true;
     }
-    if (!enable_docked_latch_file_guard_ || !dock_contact_latch_is_docked()) {
+    if (!enable_docked_latch_file_guard_) {
       return false;
     }
+    const auto evidence = dock_contact_latch_evidence();
     const bool bms_contradicts_latch =
       enable_bms_contact_guard_ && fresh_battery_sample() && !battery_contact_active_;
-    const bool status_allows_latch_clear =
-      !enable_docking_status_guard_ || !docking_status_indicates_docked();
-    const bool live_no_contact = bms_contradicts_latch && status_allows_latch_clear;
-    return !live_no_contact;
+    return robot_safety::dock_latch_blocks_normal_motion(
+      evidence, bms_contradicts_latch, docking_status_indicates_docked());
   }
 
   bool estop_active_{false};
@@ -1602,11 +1947,16 @@ private:
   std::string cmd_vel_in_topic_;
   std::string api_cmd_vel_in_topic_;
   std::string docking_cmd_vel_in_topic_;
+  std::string elevator_entry_cmd_vel_in_topic_{"/cmd_vel_nav"};
+  std::string elevator_entry_collision_bypass_permit_topic_{
+    "/ranger_mini3/elevator_entry_collision_bypass"};
   std::string cmd_vel_out_topic_;
   std::string cmd_vel_mirror_topic_;
   int cmd_vel_qos_depth_{1};
   double zero_cmd_priority_epsilon_{0.0001};
   double zero_cmd_priority_burst_sec_{0.25};
+  double elevator_entry_collision_bypass_permit_timeout_sec_{0.75};
+  double elevator_entry_cmd_timeout_sec_{0.25};
   bool spin_to_drive_settle_enabled_{true};
   std::string spin_to_drive_odom_topic_{"/wheel/odom"};
   std::string spin_to_drive_local_odom_topic_{"/local_state/odometry"};
@@ -1639,10 +1989,12 @@ private:
   std::string nav_terminal_lateral_enable_topic_{"/ranger_mini3/nav_terminal_lateral_enable"};
   double reverse_enable_timeout_sec_{0.75};
   double normal_navigation_reverse_max_mps_{0.08};
+  double elevator_navigation_reverse_max_mps_{0.40};
   double final_cmd_lateral_deadband_mps_{0.001};
   bool allow_api_lateral_cmd_{false};
   double api_lateral_max_mps_{0.10};
   double normal_navigation_lateral_max_mps_{0.05};
+  double elevator_navigation_lateral_max_mps_{0.40};
   std::string estop_topic_;
   std::string localization_ok_topic_;
   std::string battery_state_topic_;
@@ -1651,6 +2003,7 @@ private:
   std::string status_topic_;
   std::string motion_allowed_topic_;
   std::string motion_hold_service_name_;
+  std::string recovery_hold_release_service_name_;
   std::string execution_lease_service_name_;
   std::string motion_interlock_state_topic_;
   std::string execution_mode_state_topic_;
@@ -1660,6 +2013,7 @@ private:
   rclcpp::Time last_normal_cmd_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_api_cmd_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_docking_cmd_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_elevator_entry_cmd_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_battery_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_docking_status_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time latest_spin_to_drive_wz_time_{0, 0, RCL_ROS_TIME};
@@ -1669,6 +2023,12 @@ private:
   bool last_cmd_was_api_{false};
   bool have_last_api_cmd_{false};
   bool have_last_docking_cmd_{false};
+  bool have_last_elevator_entry_cmd_{false};
+  bool elevator_entry_collision_bypass_active_{false};
+  bool elevator_mode_contract_latched_{false};
+  bool elevator_transaction_permit_latched_{false};
+  std::string elevator_mode_contract_owner_;
+  std::string elevator_mode_contract_mission_id_;
   bool execution_mode_state_seen_{false};
   bool battery_contact_active_{false};
   bool bms_docking_contact_latched_{false};
@@ -1686,6 +2046,8 @@ private:
   ReversePermit teleop_reverse_permit_;
   ReversePermit nav_terminal_reverse_permit_;
   ReversePermit nav_terminal_lateral_permit_;
+  robot_safety::ElevatorEntryCollisionBypassPermit
+    elevator_entry_collision_bypass_permit_;
   rclcpp::Time zero_cmd_priority_until_time_{0, 0, RCL_ROS_TIME};
   double latest_spin_to_drive_wz_radps_{0.0};
   double latest_spin_to_drive_local_wz_radps_{0.0};
@@ -1695,7 +2057,7 @@ private:
   int spin_to_drive_stable_sample_count_{0};
   int spin_to_drive_local_stable_sample_count_{0};
   bool spin_to_drive_local_stable_anchor_valid_{false};
-  mutable bool cached_latch_docked_{false};
+  mutable robot_safety::PersistentDockEvidence cached_latch_evidence_;
   std::string latest_docking_status_;
   double execution_mode_state_last_seen_sec_{0.0};
   double execution_mode_lease_expires_at_sec_{0.0};
@@ -1704,6 +2066,7 @@ private:
   SafetySnapshot last_snapshot_;
   geometry_msgs::msg::Twist last_api_cmd_;
   geometry_msgs::msg::Twist last_docking_cmd_;
+  geometry_msgs::msg::Twist last_elevator_entry_cmd_;
   std::unique_ptr<robot_safety::MotionInterlockArbiter> motion_interlock_;
 
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;
@@ -1713,6 +2076,9 @@ private:
   rclcpp::Publisher<robot_interfaces::msg::MotionInterlockState>::SharedPtr
     motion_interlock_state_pub_;
   rclcpp::Service<robot_interfaces::srv::SetMotionHold>::SharedPtr motion_hold_service_;
+  rclcpp::Service<
+    robot_interfaces::srv::ReleaseMotionHoldIfExecutionIdle>::SharedPtr
+    recovery_hold_release_service_;
   rclcpp::Service<robot_interfaces::srv::SetExecutionLease>::SharedPtr
     execution_lease_service_;
   rclcpp::Subscription<robot_interfaces::msg::OperatingModeState>::SharedPtr
@@ -1720,6 +2086,8 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr api_cmd_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr docking_cmd_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr
+    elevator_entry_cmd_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr estop_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr localization_sub_;
   rclcpp::Subscription<sensor_msgs::msg::BatteryState>::SharedPtr battery_sub_;
@@ -1733,6 +2101,8 @@ private:
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr teleop_reverse_enable_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr nav_terminal_reverse_enable_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr nav_terminal_lateral_enable_sub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr
+    elevator_entry_collision_bypass_permit_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 

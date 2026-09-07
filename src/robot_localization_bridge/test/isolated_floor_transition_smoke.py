@@ -8,7 +8,6 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from robot_interfaces.msg import LocalizationHealth
 from robot_interfaces.srv import BeginFloorTransition, SetCorrectionPause
-from std_srvs.srv import Trigger
 
 
 class FloorTransitionSmoke(Node):
@@ -32,10 +31,6 @@ class FloorTransitionSmoke(Node):
             BeginFloorTransition,
             "/robot_localization_bridge/begin_floor_transition",
         )
-        self.force_client = self.create_client(
-            Trigger,
-            "/robot_localization_bridge/force_accept_next_localization",
-        )
 
     def _on_health(self, health: LocalizationHealth) -> None:
         self.health = health
@@ -58,7 +53,9 @@ class FloorTransitionSmoke(Node):
         raise AssertionError(f"timed out waiting for floor health: {self.health}")
 
 
-def transition_request(operation: int) -> BeginFloorTransition.Request:
+def transition_request(
+    operation: int, command_sequence: int
+) -> BeginFloorTransition.Request:
     request = BeginFloorTransition.Request()
     request.transaction_id = "floor-smoke-17"
     request.building_id = "B10"
@@ -70,7 +67,17 @@ def transition_request(operation: int) -> BeginFloorTransition.Request:
         "0123456789abcdef0123456789abcdef"
         "0123456789abcdef0123456789abcdef"
     )
+    request.source_building_id = "B10"
+    request.source_floor_id = "F1"
+    request.source_map_id = "map_f1"
+    request.source_asset_epoch = 22
+    request.source_asset_digest = (
+        "sha256:"
+        "abcdef0123456789abcdef0123456789"
+        "abcdef0123456789abcdef0123456789"
+    )
     request.operation = operation
+    request.command_sequence = command_sequence
     return request
 
 
@@ -80,7 +87,7 @@ def main() -> None:
     try:
         without_pause = node.call(
             node.transition_client,
-            transition_request(BeginFloorTransition.Request.OP_BEGIN),
+            transition_request(BeginFloorTransition.Request.OP_BEGIN, 1),
         )
         if without_pause.success or not without_pause.runtime_context_valid:
             raise AssertionError(f"BEGIN bypassed pause ownership: {without_pause}")
@@ -90,58 +97,46 @@ def main() -> None:
         acquire.transaction_id = "floor-smoke-17"
         acquire.reason = "floor_transition"
         acquire.operation = SetCorrectionPause.Request.OP_ACQUIRE
+        acquire.command_sequence = 1
         acquired = node.call(node.pause_client, acquire)
-        if not acquired.success or not acquired.state.paused:
+        if (
+            not acquired.success
+            or acquired.applied_sequence != acquire.command_sequence
+            or not acquired.state.paused
+        ):
             raise AssertionError(f"floor pause acquire failed: {acquired}")
 
         begun = node.call(
             node.transition_client,
-            transition_request(BeginFloorTransition.Request.OP_BEGIN),
+            transition_request(BeginFloorTransition.Request.OP_BEGIN, 2),
         )
-        if not begun.success or begun.runtime_context_valid or begun.safe_for_goal_start:
-            raise AssertionError(f"BEGIN did not invalidate runtime context: {begun}")
-        begin_health = node.wait_health(
-            lambda health: health.transition_active
-            and not health.runtime_context_valid
-            and health.map_id == "map_f2"
-        )
-        if begin_health.localizer_ready or begin_health.tf_unique:
-            raise AssertionError(f"health overstated unproven readiness: {begin_health}")
-
-        aborted = node.call(
-            node.transition_client,
-            transition_request(BeginFloorTransition.Request.OP_ABORT),
-        )
-        if not aborted.success or aborted.runtime_context_valid or aborted.safe_for_goal_start:
-            raise AssertionError(f"ABORT did not retain invalid context: {aborted}")
-        failed_health = node.wait_health(
-            lambda health: not health.transition_active
-            and not health.runtime_context_valid
-            and health.detail == "FAILED_LOCKED"
-        )
-
-        force = node.call(node.force_client, Trigger.Request())
-        if force.success:
-            raise AssertionError("FAILED_LOCKED bridge accepted force-localization arm")
+        if begun.success or not begun.runtime_context_valid:
+            raise AssertionError(
+                f"unseeded bridge accepted BEGIN or invalidated context: {begun}"
+            )
+        if "PREMUTATION_UNPROVEN" not in begun.message:
+            raise AssertionError(f"unexpected unseeded-source rejection: {begun}")
 
         release = SetCorrectionPause.Request()
         release.owner = acquire.owner
         release.transaction_id = acquire.transaction_id
         release.reason = acquire.reason
         release.operation = SetCorrectionPause.Request.OP_RELEASE
+        release.command_sequence = 2
         released = node.call(node.pause_client, release)
-        if not released.success or released.state.paused:
+        if (
+            not released.success
+            or released.applied_sequence != release.command_sequence
+            or released.state.paused
+        ):
             raise AssertionError(f"floor pause release failed: {released}")
 
         print(
             json.dumps(
                 {
                     "begin_without_pause_rejected": True,
-                    "begin_context_invalid": not begin_health.runtime_context_valid,
-                    "localizer_ready_overstated": begin_health.localizer_ready,
-                    "tf_unique_overstated": begin_health.tf_unique,
-                    "abort_detail": failed_health.detail,
-                    "force_arm_after_abort_rejected": True,
+                    "unseeded_source_begin_rejected": True,
+                    "runtime_context_remained_valid": begun.runtime_context_valid,
                     "final_pause_released": not released.state.paused,
                 },
                 sort_keys=True,

@@ -19,6 +19,7 @@
 #include "nav2_util/robot_utils.hpp"
 #include "pluginlib/class_list_macros.hpp"
 #include "robot_nav_config/terminal_rotation_braking.hpp"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "tf2/utils.h"
 
 namespace robot_nav_config

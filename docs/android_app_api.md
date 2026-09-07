@@ -8,6 +8,11 @@ The Android app should connect to the robot hotspot and talk to `robot_api_serve
 - Default API port: `8080`.
 - Use `X-Robot-Token` when `api_token` is configured.
 
+The server declares `host`, `port`, `api_token`, and
+`max_http_connections` through one HTTP-gateway configuration boundary. This
+internal ownership does not change the App endpoint, header, authentication,
+or overload behavior.
+
 ## Production Boundary
 
 `robot_api_server` is a gateway. It forwards requests to ROS 2 topics and services that already own robot behavior:
@@ -52,8 +57,12 @@ POST /api/v1/maps/poses/save_current
 POST /api/v1/maps/filters/keepout/save
 POST /api/v1/safety/stop
 POST /api/v1/safety/resume
+POST /api/v1/floor-switch/start
+GET  /api/v1/floor-switch/state
+POST /api/v1/floor-switch/cancel
 POST /api/v1/floors/switch
 POST /api/v1/localization/trigger
+POST /api/v1/navigation/start
 GET  /api/v1/navigation/state
 GET  /api/v1/navigation/pre_goal_check
 POST /api/v1/navigation/goal
@@ -74,33 +83,112 @@ Example floor switch body:
 {
   "building_id": "building_1",
   "floor_id": "floor_1",
+  "map_id": "map_20260728T104137Z_aa94536eb2",
   "resume_navigation": false
 }
 ```
 
-Reserved navigation start and 3D mapping endpoints return `501` until `robot_mode_manager` or `robot_mission_manager` exposes formal ROS-native services/actions. 2D mapping is wired to the repository-owned `slam_toolbox` runtime chain, not to the test Web dashboard. Navigation goals are wired to Nav2 `NavigateToPose`; the App should send saved `pose_id` targets instead of publishing velocity commands.
+The App supplies the map ID but never invents an asset epoch or digest. The
+gateway resolves the immutable manifest, sends the complete identity to
+`robot_floor_manager`, verifies the echoed proof, and then creates the fixed
+`current/` projection. A successful offline selection does not start the occupancy localization stack or Nav2. The App must next call
+`POST /api/v1/navigation/start` and poll navigation state before showing the
+map as current or sending a goal.
 
-`POST /api/v1/floors/switch` is not a live cross-floor API yet. A request with
-`"resume_navigation": true` always returns `409
-LIVE_FLOOR_SWITCH_DISABLED` before map lookup, file mutation, ROS service calls,
-or process launch.
+The 3D mapping start endpoint remains reserved and returns `501`. 2D mapping is wired to the repository-owned `slam_toolbox` runtime chain, not to the test Web dashboard. Navigation startup and goals are wired to the repository-owned runtime and Nav2 `NavigateToPose`; the App should send saved `pose_id` targets instead of publishing velocity commands.
 
-`"resume_navigation": false` is an offline selection operation only. It is
-accepted only after navigation, mapping, docking, API goal jobs, Nav2 goals,
-and the navigation runtime process have all stopped. The backend validates the
-selected bundle, clears the stale runtime-map context, and then projects that
-bundle into `maps_release/<building_id>/<floor_id>/current/` for a later
-controlled startup. It does not reload localization, start Nav2, or authorize
-motion; in particular, it does not start the occupancy localization stack.
-The App must not use this endpoint while the robot is riding or
-straddling an elevator doorway.
+`POST /api/v1/floors/switch` remains the legacy offline selector. A request
+with `"resume_navigation": true` is rejected before map lookup or mutation;
+the App must not use that flag as a live-switch shortcut.
+
+Manual live switching uses a separate strict transaction:
+
+```text
+POST /api/v1/floor-switch/start
+GET  /api/v1/floor-switch/state?transaction_id=<id>
+POST /api/v1/floor-switch/cancel
+```
+
+The start body contains only the exact `building_id/floor_id/map_id`. The
+server resolves and freezes the current immutable asset epoch/digest and calls
+only `/floor_manager/floor_switch`. Navigation/localization processes remain
+resident; an active Nav2 goal is not allowed, and the car must be stationary
+so the Action can prove Nav2-idle plus stable wheel/local odometry before any
+map mutation. The App polls the returned transaction ID to an explicit
+terminal state. It never calls offline `/floors/switch`, `/navigation/start`,
+or retries a timed-out start as part of this workflow.
+
+Success requires all of the following from the same transaction: `COMPLETE`,
+`success=true`, zero `failure_code`, `runtime_context_valid=true`,
+`recovery_required=false`, and exact equality between the requested target,
+the frozen target epoch/digest, and the active target epoch/digest. A cancel
+request is not completion; polling continues until `CANCELLED`, `FAILED`,
+`COMPLETE`, or fail-closed `UNKNOWN` is returned.
+
+Choosing a map in the App editor is App-local UI state. Read that map by
+`map_id` through the map, preview, semantic-layer, pose, keepout, and elevator
+configuration APIs. Do not call `/api/v1/floors/switch` merely because the
+operator opened or selected a map in the editor.
+
+`"resume_navigation": false` normally remains an offline runtime-asset
+selection operation. A different map is accepted only after navigation,
+mapping, docking, API goal jobs, Nav2 goals, and the navigation runtime process
+have all stopped. The backend validates the selected bundle, clears the stale
+runtime-map context, and then projects that bundle into
+`maps_release/<building_id>/<floor_id>/current/` for a later controlled
+startup. It does not reload localization, start Nav2, or authorize motion.
+
+Ordinary single-floor navigation therefore uses two explicit requests, never
+`resume_navigation=true`:
+
+```text
+POST /api/v1/floors/switch   {"building_id":"B1","floor_id":"F1","map_id":"<exact-map-id>","resume_navigation":false}
+POST /api/v1/navigation/start {"building_id":"B1","floor_id":"F1","map_id":"<exact-map-id>"}
+```
+
+`POST /api/v1/navigation/start` requires the requested bundle to be the
+floor's single active map, verifies its server-managed epoch/digest and the
+backend-owned `current/` projection, rejects mapping/docking/goal/transition
+conflicts, and starts or idempotently reuses only that exact runtime. HTTP
+`202` means startup was accepted, not ready. Poll
+`GET /api/v1/navigation/state` and enable navigation goals or display “当前”
+only when all of these are true:
+
+- `navigation_active == true`
+- `healthy == true`
+- `state` or `navigation_status` is `ready`/`running`
+- `safe_for_goal_start == true`
+- `runtime_map_context.confirmed == true`
+- `runtime_map_context.state == "ready"`
+- runtime `building_id/floor_id/map_id` exactly match the request
+
+There is one compatibility no-op: while navigation is running, an exact
+`building_id + floor_id + map_id` match with the confirmed, `ready` runtime map
+returns `200` without calling the floor service, clearing runtime context,
+writing `current/`, reloading localization, or changing any process:
+
+```json
+{
+  "ok": true,
+  "state": "runtime_map_already_selected",
+  "already_active": true,
+  "runtime_unchanged": true,
+  "selection_performed": false
+}
+```
+
+Any different or unconfirmed target still returns `409
+FLOOR_SELECTION_RUNTIME_BUSY` while a motion runtime is active. This no-op is
+not a floor switch and is not permission to switch maps in an elevator. The
+App must not use this endpoint while the robot is riding or straddling an
+elevator doorway.
 
 `current/` is a backend-owned selection mirror; the App must edit saved map
 records through map APIs and must not write files under `current/` directly.
-Saving a new 2D map does not select or run it. Until the strict FloorSwitch
-transaction is connected and validated, there is no App-supported live
-cross-floor switch workflow. The reserved transaction contract is that startup waits for the trigger wrapper to report a bridge-accepted `map -> odom`;
-this contract is documented for the future live path and is not enabled here.
+Saving a new 2D map does not select or run it. The strict live transaction
+startup waits for the trigger wrapper to report a bridge-accepted `map -> odom`,
+then requires fresh costmaps and final runtime-context commit before reporting
+`COMPLETE`.
 
 Manual relocalization uses:
 
@@ -182,9 +270,26 @@ The App should use these lightweight business fields instead of inferring state 
 - Idle: `mode == "IDLE"`.
 - Error: `mode == "ERROR" || healthy == false`.
 
-The backend intentionally keeps this status lightweight. It is driven by official API transitions such as `/mapping/2d/start`, `/mapping/2d/stop`, `/mapping/2d/save`, offline `/floors/switch?resume_navigation=false`, `/navigation/goal`, and `/navigation/cancel`. Deep ROS checks remain backend diagnostics and should not be duplicated in the App. The API has a fixed worker pool instead of one thread per request, so the App should poll with a modest interval, for example `500ms..1000ms` while a task is active and slower while idle. Treat HTTP `503 {"error":"server busy"}` as a transient backend overload and retry with backoff instead of launching more parallel requests.
+The backend intentionally keeps this status lightweight. It is driven by official API transitions such as `/mapping/2d/start`, `/mapping/2d/stop`, `/mapping/2d/save`, offline `/floors/switch?resume_navigation=false`, `/navigation/start`, `/navigation/goal`, and `/navigation/cancel`. Deep ROS checks remain backend diagnostics and should not be duplicated in the App. The API has a fixed worker pool instead of one thread per request, so the App should poll with a modest interval, for example `500ms..1000ms` while a task is active and slower while idle. Treat HTTP `503 {"error":"server busy"}` as a transient backend overload and retry with backoff instead of launching more parallel requests.
 
 `bms.soc` is the value the App should display as real battery percentage. The data path is Ranger CAN BMS frame decoded by `ranger_base_node` into `/battery_state`, then subscribed by `robot_api_server`; the App must not read CAN or ROS 2 DDS directly. Treat `soc_valid=false` as stale or unavailable power data. Use `bms.charging_contact`, `bms.charging_contact_reason`, and `bms.contact_snapshot` for dock-contact diagnostics; full batteries may report `current=0`, so App logic must not use current alone to decide whether undocking is allowed.
+
+## Safety Stop And Resume
+
+`POST /api/v1/safety/stop` publishes `true` to `/safety/estop` and returns
+`202 {"ok":true,"estop":true}`. It remains available while other
+state-changing requests are blocked so an operator can converge to a stopped
+state. `POST /api/v1/safety/resume` publishes `false` only after the existing
+floor-runtime and elevator-transaction admission checks succeed, then returns
+`202 {"ok":true,"estop":false}`.
+
+The API's `/safety/status` and `/safety/motion_allowed` subscriptions are
+process-resident reliable transient-local inputs. They are not page resources.
+An unavailable motion sample is reported with `motion_allowed_valid=false` and
+does not create a new gateway-side interlock; final arbitration remains in
+`robot_safety`. A false sample with `status=COMMAND_STALE` remains a
+first-command warmup case, while another explicit false state is treated as a
+hard block by the existing API motion checks.
 
 ## Page-Scoped Subscriptions
 
@@ -227,8 +332,18 @@ Resource mapping:
 - Home / robot detail: `status` may still be acquired for compatibility, but safety state is now a backend-resident cache. Releasing the page lease must not be treated as clearing `/safety/status` or `/safety/motion_allowed`.
 - Mapping page: acquire `live_map`, `tf`, and `teleop`, then open `WS /ws/v1/teleop`. The API keeps an internal `/map` cache during active 2D mapping for status and save, but the page should still acquire `live_map` before polling the PNG endpoint.
 - Map editing page: usually does not acquire ROS resources; read saved map assets and semantic layers only.
+- Live field-marking mode: keep the editor selection local, poll
+  `GET /api/v1/robot/pose`, and enable capture only when the returned
+  `building_id/floor_id/map_id` exactly matches the editor map. Navigation and
+  localization may remain resident; wait for the current goal to end and the
+  robot to settle before recording a point.
 
 If the App crashes or network drops, the server expires the lease after `ttl_ms`. WebSocket disconnect immediately releases the internal `teleop` lease and publishes one zero velocity command.
+
+The subscription application module owns the scan topic/freshness and lease
+TTL configuration as one boundary. Existing TTL normalization remains: the
+default is at least 1000 ms and the maximum is never below the normalized
+default. This extraction does not add a lease, resource, or App-side gate.
 
 ## 2D Mapping Start / Stop
 
@@ -338,7 +453,7 @@ Successful response includes:
 }
 ```
 
-The Nav2 `PGM` and Isaac localizer `PNG` are generated from the same cached occupancy grid. The endpoint also creates neutral filter masks, `asset_report.json`, `poses.yaml`, and an atomic `njrh.map_manifest.v2` manifest. The server calculates the canonical `sha256:<64 lowercase hex>` digest and binds it to a persistent, globally monotonic positive `asset_epoch`; the App must treat both fields as opaque, server-managed identity evidence. It must never calculate, increment, reuse, or substitute either value. Runtime consumers do not use the business filename directly; offline selection copies fixed role files into `maps_release/<building_id>/<floor_id>/current/nav/nav_map.yaml` and `current/localizer/localizer_map.png`. The save response includes `requires_manual_navigation_selection:true`; after all motion runtimes are stopped, call `/api/v1/floors/switch` with the returned `map_id` and `resume_navigation:false` to select it. This does not start navigation; startup remains a separate controlled operation.
+The Nav2 `PGM` and Isaac localizer `PNG` are generated from the same cached occupancy grid. The endpoint also creates neutral filter masks, `asset_report.json`, `poses.yaml`, and an atomic `njrh.map_manifest.v2` manifest. The server calculates the canonical `sha256:<64 lowercase hex>` digest and binds it to a persistent, globally monotonic positive `asset_epoch`; the App must treat both fields as opaque, server-managed identity evidence. It must never calculate, increment, reuse, or substitute either value. Runtime consumers do not use the business filename directly; offline selection copies fixed role files into `maps_release/<building_id>/<floor_id>/current/nav/nav_map.yaml` and `current/localizer/localizer_map.png`. The save response includes `requires_manual_navigation_selection:true`; after all motion runtimes are stopped, call `/api/v1/floors/switch` with the returned `map_id` and `resume_navigation:false` to select it. This does not start navigation; if the operator requested navigation, follow it with `/api/v1/navigation/start` for the same exact identity and wait for the readiness proof above.
 
 List maps:
 
@@ -388,10 +503,31 @@ The App should implement elevator setup as a commissioning workflow, not by
 editing floor `poses.yaml`. For every elevator and served floor, collect:
 
 - exact `building_id`, `floor_id`, and `map_id`;
-- `hall_call`, `hall_wait`, `doorway`, `cabin`, and `exit` in map-frame metres
-  plus yaw;
-- threshold `left`, `right`, and `cabin_reference`;
-- optional advanced clearances, defaulting to `0.05 m`.
+- `hall_call`, `landing`, and `cabin` in map-frame metres plus yaw.
+
+`landing` is the one shared physical point outside the elevator. It replaces
+the old hall-wait, doorway, and exit points. The operator does not draw a
+threshold, mark jambs, or enter clearance values. Entry and exit direction are
+runtime context, not extra commissioning points.
+
+For live commissioning of each `hall_call`, `landing`, and `cabin` role:
+
+1. Select the floor/map in the editor without calling `/floors/switch`.
+2. Move the robot to the role position, end the active goal, and let the robot
+   settle.
+3. Call `GET /api/v1/robot/pose`.
+4. Require the returned `building_id/floor_id/map_id` to exactly match the
+   floor binding being edited.
+5. Copy the returned `x/y/yaw` into the role in the in-memory elevator
+   configuration, then `PUT` the complete draft with the latest
+   `expected_draft_revision`.
+
+Repeat this only while the robot is physically localized on the corresponding
+runtime map. Do not paste the current robot pose into a different or offline
+map. Elevator roles must not be written through
+`/api/v1/maps/poses/save_current`; that endpoint rejects the reserved elevator
+namespace. Publishing the elevator draft generates the private
+`elevator_internal_poses.yaml`.
 
 Save the whole building draft:
 
@@ -404,7 +540,7 @@ Content-Type: application/json
 {
   "actor_id": "commissioning_app",
   "configuration": {
-    "schema_version": 1,
+    "schema_version": 2,
     "building_id": "B3",
     "elevators": [{
       "elevator_id": "elevator_1",
@@ -414,17 +550,8 @@ Content-Type: application/json
         "map_id": "map_f3",
         "poses": {
           "hall_call": {"x": -1.0, "y": 0.0, "yaw": 0.0},
-          "hall_wait": {"x": -0.8, "y": 0.0, "yaw": 0.0},
-          "doorway": {"x": 0.0, "y": 0.0, "yaw": 0.0},
-          "cabin": {"x": 0.8, "y": 0.0, "yaw": 3.14159},
-          "exit": {"x": -0.6, "y": 0.0, "yaw": 0.0}
-        },
-        "threshold": {
-          "left": [0.0, -0.6],
-          "right": [0.0, 0.6],
-          "cabin_reference": [1.0, 0.0],
-          "clearance_m": 0.05,
-          "jamb_clearance_m": 0.05
+          "landing": {"x": -0.4, "y": 0.0, "yaw": 0.0},
+          "cabin": {"x": 0.8, "y": 0.0, "yaw": 3.14159}
         }
       }]
     }]
@@ -453,7 +580,7 @@ Publish only after `valid_for_publish=true`:
 POST /api/v1/elevator-config/publish
 {
   "building_id": "B3",
-  "expected_draft_revision": "draft-v1-...",
+  "expected_draft_revision": "draft-v2-...",
   "expected_release_id": "elevator-config-000001-...",
   "actor_id": "commissioning_app"
 }
@@ -461,10 +588,18 @@ POST /api/v1/elevator-config/publish
 
 Omit `expected_release_id` only for the first publication. Publishing always
 revalidates exact map ownership, required assets, map bounds, the indivisible
-map asset epoch/digest pair, five roles, threshold geometry, and the generated
-runtime topology.
+map asset epoch/digest pair, all three roles, and the generated runtime
+topology.
 The successful response includes a new immutable `release_id`,
 `asset_published:true`, and `runtime_applied:false`.
+
+Schema-v1 drafts are shown as an in-memory migration preview. The server chooses
+`landing` from the first present legacy field in this order:
+`hall_wait`, `doorway`, `exit`; a malformed higher-priority field is not hidden
+by a lower-priority fallback. GET never rewrites the stored draft. The next
+explicit PUT persists a `draft-v2-*` revision. Immutable schema-v1 releases
+remain readable for audit but are `legacy_read_only` and cannot be rolled back
+into the executable configuration.
 
 Saving a valid draft stamps the resolved positive `map_asset_epoch` and
 canonical `map_asset_digest` into every floor binding. The pair belongs to the
@@ -764,13 +899,34 @@ The backend reads TF and requires a fresh `map -> base_link` pose. It does not u
 }
 ```
 
-If this returns `503`, the App should tell the operator to start mapping, navigation, or localization before saving a live point. The error body is:
+If this returns `503`, the App should wait for the target map's navigation and
+localization runtime to reach confirmed ready state before saving a live point.
+Starting mapping does not satisfy the live-point identity contract. The error
+body is:
 
 ```json
 {"ok":false,"error":"no fresh map-frame robot pose","frame_id":"map","child_frame_id":"base_link","age_sec":null}
 ```
 
+When the pose is withheld because a floor transaction has not committed, the
+response additionally contains a machine-readable code and the actual runtime
+state, for example:
+
+```json
+{"ok":false,"code":"FLOOR_CONTEXT_NOT_READY","error":"no fresh map-frame robot pose","runtime_state":"floor_switch_failed_locked","detail":"runtime map context is not ready: ...","frame_id":"map","child_frame_id":"base_link","age_sec":null}
+```
+
+The App should display the floor transaction state/detail instead of describing
+this case as a TF sampling timeout.
+
 `map_id`, `floor_id`, and `building_id` are returned only from the robot's confirmed runtime map context. During navigation startup or floor switching, the backend may already have a fresh TF pose but still return `503` if the requested map has not been confirmed by localization and Nav2 readiness. The App must treat that as a real backend state mismatch, not silently reuse an older map context.
+
+Navigation and localization may remain running while the operator marks or
+updates points on that same confirmed runtime map. The App must compare all
+three identity fields with its editor selection before enabling capture. A
+different/offline map can still be edited with explicit static coordinates,
+but it cannot receive the current robot pose. Selecting an editor map never
+requires `/api/v1/floors/switch`.
 
 Save the robot's current position as a point:
 
@@ -789,7 +945,14 @@ Content-Type: application/json
 }
 ```
 
-The App should use this endpoint for "mark point at current robot position". Do not convert PNG pixels to map coordinates for this workflow. The server fills `x`, `y`, and `yaw` from the same live `map -> base_link` pose returned by `/api/v1/robot/pose`; if `/robot/pose` would return `503`, `save_current` also returns `503` and does not save. Request-body `yaw` or `theta` is ignored so saved orientation always equals the live robot heading. `type: "dock"` means the final charging-contact `base_link` pose, not the pre-dock point. The server writes `maps/<map_id>/poses.yaml` and synchronizes `current/poses.yaml` if that map is active. `pose_id` is optional; when omitted, the server generates a stable ID and returns it.
+The App should use this endpoint for "mark point at current robot position". Do not convert PNG pixels to map coordinates for this workflow. The server fills `x`, `y`, and `yaw` from the same live `map -> base_link` pose returned by `/api/v1/robot/pose`; if `/api/v1/robot/pose` would return `503`, `/api/v1/maps/poses/save_current` also returns `503` and does not save. Request-body `yaw` or `theta` is ignored so saved orientation always equals the live robot heading. `type: "dock"` means the final charging-contact `base_link` pose, not the pre-dock point. The server writes `maps/<map_id>/poses.yaml` and synchronizes `current/poses.yaml` if that map is active. `pose_id` is optional; when omitted, the server generates a stable ID and returns it.
+
+This endpoint is for ordinary semantic points only. For the five elevator
+roles, first `GET /api/v1/elevator-config` and retain the complete editable
+configuration plus its latest draft revision. Then use
+`GET /api/v1/robot/pose`, update only the selected role's `x/y/yaw`, and send
+the complete configuration with the latest `expected_draft_revision` through
+`PUT /api/v1/elevator-config/draft`, as described above.
 
 Check whether a normal point navigation request would need auto-undock:
 
@@ -818,7 +981,7 @@ Successful response returns `202 Accepted` with `navigation_goal_id`. The server
 
 During normal point navigation, `robot_api_server` also publishes a distance-based Nav2 `/speed_limit` derived from the current map-frame distance to the target. This keeps the 1.2 m/s cruise speed at long range but steps down near the goal to match the measured Ranger Mini 3 stop distance, then restores the cruise limit when the Nav2 task exits. It must not publish `0.0` as a clear signal because controller-server treats that as a stop limit. The App should not publish `/speed_limit` or velocity commands.
 
-The App must not infer docked state solely from current map position. Use `bms.charging_contact`, `docking.inferred_docked`, and `pre_navigation_dock_check.dock_contact_snapshot`. While docked or charging, normal navigation auto-undocks first; if that fails, no Nav2 goal is sent. Normal command velocity is also blocked by `robot_safety`, and only the controlled docking/undock path may move the chassis. Undock first-motion delay is handled in `robot_docking_manager`: the retained calibrated reverse speed is `undock.speed_mps=0.06`, `motion_start_timeout_s` waits for the first odometry displacement, and `no_progress_timeout_s` applies only after movement has started. The App should surface the backend failure string, such as `undock_failed_motion_start_timeout` or `undock_failed_no_progress`, rather than publishing reverse velocity or enabling ordinary navigation reverse.
+The App must not infer docked state solely from current map position. Use `bms.charging_contact`, `docking.inferred_docked`, and `pre_navigation_dock_check.dock_contact_snapshot`. While docked or charging, normal navigation auto-undocks first; if that fails, no Nav2 goal is sent. Normal command velocity is also blocked by `robot_safety`, and only the controlled docking/undock path may move the chassis. Undock first-motion delay is handled in `robot_docking_manager`: the configured reverse speed is `undock.speed_mps=0.50`, independently capped by `undock.max_speed_mps=0.50`; `motion_start_timeout_s` waits for the first odometry displacement, and `no_progress_timeout_s` applies only after movement has started. The App should surface the backend failure string, such as `undock_failed_motion_start_timeout` or `undock_failed_no_progress`, rather than publishing reverse velocity or enabling ordinary navigation reverse.
 
 Maintenance recovery for a robot physically on the charger with missing BMS/contact evidence is handled through protected backend endpoints, not ordinary user UI:
 
@@ -997,11 +1160,19 @@ The App must acquire `live_map` before polling this endpoint:
 Saved map preview is explicit:
 
 ```text
-GET http://<robot-ip>:8080/api/v1/mapping/2d/map?source=saved
-GET http://<robot-ip>:8080/api/v1/mapping/2d/map?name=test-16
+GET http://<robot-ip>:8080/api/v1/mapping/2d/map?source=saved&map_id=map_...&building_id=B11&floor_id=F1
 ```
 
-Saved mode only serves existing PNG map assets, for example `<name>.png`; it does not convert `PGM` to `PNG` during the request.
+The App must use this exact form for a selected catalog map. The backend
+resolves the immutable manifest and returns only
+`maps_release/<building>/<floor>/maps/<map_id>/localizer/<safe_map_name>.png`.
+It returns JSON `404` if the map ID or that exact PNG is missing and JSON `400`
+if the ID belongs to another building or floor. It never substitutes the
+newest runtime PNG or a `current/` projection for an exact request.
+
+`?name=test-16` and selector-free `?source=saved` are legacy commissioning
+preview forms and must not be used to render an App-selected catalog map.
+Saved mode only serves an existing PNG asset; it does not convert `PGM` to `PNG` during the request.
 
 ## Mapping Teleop WebSocket
 
@@ -1037,6 +1208,11 @@ Server-side safety contract:
 - Teleop stops automatically if the robot reports charging/full or charge current on `/battery_state`.
 - WebSocket disconnect or receive timeout publishes a zero command; `robot_safety` watchdog remains the final stop layer.
 
+The server-side Teleop feature owns all `teleop_*` parameters as one
+configuration boundary. Subscription lease TTL remains application-owned and
+is projected into Teleop after normalization; this internal ownership change
+does not alter the App protocol, defaults, admission rules, or velocity chain.
+
 The server also pushes `mapping_state` frames after connection and command acknowledgements:
 
 ```json
@@ -1065,3 +1241,41 @@ Then test from the phone or development machine:
 ```bash
 curl -H 'X-Robot-Token: change-me' http://192.168.31.23:8080/api/v1/status
 ```
+
+### Elevator test arm automation (2026-08-25)
+
+The existing elevator-test start form remains authoritative for destination
+selection: the operator selects the building/elevator plus exact source and
+target floor/map/release identities. The App must not call port 8083 directly.
+It renders the server transaction and only asks for a confirmation when
+`awaiting_confirmation=true`.
+
+With production arm automation enabled, a successful cabin floor press does
+not produce a `TARGET_BUTTON_PRESSED` prompt. Door-open, target-floor-arrived,
+and target-door-open prompts remain. Because the deployed hall-call endpoint
+currently reports `capability_unavailable`, the App will still receive
+`CALL_BUTTON_PRESSED` after the server completes the arm `release` task. During
+feature validation the server does not add health/status/pose safety gates.
+
+### Elevator restart-lock recovery
+
+The App treats the elevator execution state as the only recovery authority.
+`GET /api/v1/elevator-test/state` supplies `physical_zone`,
+`interrupted_state`, `interrupted_expected_confirmation`, and
+`allowed_recovery_actions`. A restart `LOCKED` card must therefore keep the
+real interrupted timeline step instead of resetting to step 1.
+
+When the server advertises `CONFIRM_SOURCE_OUTSIDE_AND_RELEASE`, the App shows
+one field-recovery dialog and requires all of the following before submitting:
+
+- the complete robot is outside the source-floor elevator doorway;
+- the door zone and surrounding area are clear;
+- the robot and wheels are fully stationary.
+
+The request carries `action`, `physical_zone`, `stationary_confirmed`, and
+`door_zone_clear_confirmed` in addition to the current transaction/state/
+sequence/operator and source-floor confirmation. Submission does not mean
+success: the App polls until the vehicle returns an explicit terminal result.
+A `409` refreshes state and never replays the stale sequence. If the server
+later advertises `RETRY_SAFETY_VERIFICATION`, the App retries only the vehicle
+safety proof and does not fabricate a second on-site observation.

@@ -26,6 +26,11 @@ floor, publish TF, or grant a motion permission.
   timestamped door and observed-floor evidence.
 - `msg/ArmState`: future arm availability, stowed, moving, pressing, and fault
   state.
+- `srv/SetElevatorNavigationSession`: private API-runtime-to-Nav2-controller
+  action-attempt boundary. `BEGIN` binds one immutable
+  `transaction_id:effect_sequence` and requests a full controller-state reset;
+  a duplicate `BEGIN` is idempotent. `END` clears only the matching attempt, so
+  a delayed old response cannot erase a newer session.
 
 `robot_elevator_manager` and `robot_mission_manager` currently provide pure C++
 state-machine cores, and their non-moving integration test composes the related
@@ -43,10 +48,21 @@ server, Nav2 adapter, arm adapter, or vision adapter yet.
   fields so a blocked request is never mislabeled as active asset evidence.
 - `srv/BeginFloorTransition`: intended localization-side begin/commit/abort
   transaction boundary.
-- `srv/SwitchFloor`: legacy selection/live-switch service retained for the
-  existing floor-manager node.
-- `srv/ApplyFloorAssets` and `srv/TriggerLocalization`: lower-level legacy
-  localizer wrapper calls.
+- `srv/SwitchFloor`: offline selection preflight retained for the existing
+  floor-manager node. A request freezes
+  `building_id/floor_id/map_id/expected_asset_epoch/expected_asset_digest`;
+  success echoes the exact verified identity and dynamic source-bundle paths.
+  `resume_navigation=true` is disabled.
+- `srv/ApplyFloorAssets`: transaction-correlated Isaac component replacement.
+  The request freezes `building/floor/map/asset_epoch/asset_digest` plus the
+  three canonical asset paths. The synchronous response echoes the same exact
+  identity and reports idempotence, real reload, rollback outcome, and the
+  resulting `localizer_generation`; a topic alone is not proof that the
+  calling transaction succeeded.
+- `msg/LocalizerAssetState`: transient-local authoritative requested/active
+  asset state for `/global_localization/asset_state`, including exact identity,
+  canonical paths, generation, readiness, and rollback/error state.
+- `srv/TriggerLocalization`: explicit Isaac localization trigger wrapper.
 
 `robot_floor_manager` now contains a pure C++ transition core for this ordered
 barrier, including correction-pause handoff, source-context invalidation,
@@ -58,6 +74,10 @@ success barrier.
 ### Safety interlock
 
 - `srv/SetMotionHold`: owner- and transaction-scoped persistent stop hold.
+- `srv/ReleaseMotionHoldIfExecutionIdle`: recovery-only compare-and-release
+  operation. It releases the exact owner/transaction hold only when the
+  requested interlock generation still matches and both the execution session
+  and lease remain absent.
 - `srv/SetExecutionLease`: bounded steady-clock execution heartbeat and explicit
   recovery/release contract.
 - `msg/MotionInterlockState`: authoritative hold keys, execution owner/session,
@@ -72,7 +92,13 @@ production safety process, process-loss testing, and physical stop validation.
 ### Localization correction ownership
 
 - `srv/SetCorrectionPause`: composable owner- and transaction-scoped correction
-  pause acquire/release contract.
+  pause acquire/release contract. Commands are sequence-fenced; an exact
+  release records the applied sequence even when the key is already absent, so
+  a delayed lower-sequence acquire cannot recreate a released pause.
+- `srv/BeginFloorTransition`: sequenced BEGIN/COMMIT/locking ABORT contract plus
+  `OP_ABORT_PREMUTATION`. The latter carries the exact verified source identity
+  and fences a delayed lower-sequence BEGIN before a clean pre-mutation failure
+  may be reported.
 - `msg/CorrectionPauseState`: authoritative effective pause, generation, and
   active owner keys.
 - `msg/LocalizationHealth`: floor/map/asset epoch, explicit-relocalization

@@ -16,6 +16,8 @@ chassis motion modes.
 exact lease may renew, change mode, or release. Other leases are rejected.
 Only the configured recovery owner may preempt an active lease by requesting
 `RECOVERY`. Released, expired, or preempted lease IDs cannot be reused.
+An exact release may retire a lease ID before its delayed SET is observed; the
+later SET is then stale and cannot re-enter a non-`NORMAL` mode after cleanup.
 
 Supported operating modes:
 

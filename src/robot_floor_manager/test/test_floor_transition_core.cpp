@@ -42,6 +42,7 @@ FloorTransitionEvent success(
   evidence.caller_pause_released = true;
   evidence.runtime_context_invalid = true;
   evidence.bridge_ready = true;
+  evidence.amcl_ready = true;
   evidence.global_costmap_fresh = true;
   evidence.local_costmap_fresh = true;
   evidence.active_building_id = target.building_id;
@@ -58,6 +59,9 @@ FloorTransitionEvent success(
   if (output.effect.kind == FloorTransitionEffectKind::kCommitRuntimeContext) {
     evidence.runtime_context_valid = true;
     evidence.safe_for_goal_start = true;
+  }
+  if (output.effect.kind == FloorTransitionEffectKind::kHoldAndLock) {
+    evidence.runtime_context_invalid = output.recovery_required;
   }
   return event;
 }
@@ -105,6 +109,32 @@ TEST(FloorTransitionCore, RunsOrderedAtomicBarrierAndCommitsOnlyAtEnd)
   EXPECT_EQ(core.state(), FloorTransitionState::kComplete);
   EXPECT_TRUE(core.runtime_context_valid());
   EXPECT_FALSE(core.recovery_required());
+}
+
+TEST(FloorTransitionCore, RefusesCommitWhenTargetAmclIsNotReady)
+{
+  FloorTransitionCore core;
+  const auto target = request();
+  auto output = core.start(target);
+  ASSERT_TRUE(output.accepted);
+
+  while (output.effect.kind != FloorTransitionEffectKind::kVerifyBridgeReady) {
+    ASSERT_NE(output.effect.kind, FloorTransitionEffectKind::kNone);
+    output = core.dispatch(success(output, target));
+    ASSERT_TRUE(output.accepted);
+  }
+
+  auto event = success(output, target);
+  event.evidence.amcl_ready = false;
+  output = core.dispatch(event);
+
+  EXPECT_EQ(output.state, FloorTransitionState::kFailureCleanup);
+  EXPECT_TRUE(output.recovery_required);
+  EXPECT_EQ(output.effect.kind, FloorTransitionEffectKind::kHoldAndLock);
+
+  output = core.dispatch(success(output, target));
+  EXPECT_EQ(output.state, FloorTransitionState::kFailedLocked);
+  EXPECT_TRUE(output.recovery_required);
 }
 
 TEST(FloorTransitionCore, RejectsZeroEpochAndNonCanonicalDigestBeforeStarting)
@@ -166,6 +196,34 @@ TEST(FloorTransitionCore, FailureAfterInvalidationLocksInvalidContext)
   EXPECT_EQ(output.effect.kind, FloorTransitionEffectKind::kHoldAndLock);
   EXPECT_TRUE(output.recovery_required);
   EXPECT_FALSE(output.runtime_context_valid);
+}
+
+TEST(FloorTransitionCore, ProvenPostBeginCleanupRestoresSourceWithoutLock)
+{
+  FloorTransitionCore core;
+  const auto target = request();
+  auto output = core.start(target);
+  output = core.dispatch(success(output, target));
+  output = core.dispatch(success(output, target));
+  output = core.dispatch(success(output, target));
+  ASSERT_TRUE(output.recovery_required);
+
+  FloorTransitionEvent failed;
+  failed.kind = FloorTransitionEventKind::kEffectFailed;
+  failed.transaction_id = output.effect.transaction_id;
+  failed.effect_sequence = output.effect.sequence;
+  failed.detail = "target asset load failed";
+  output = core.dispatch(failed);
+  ASSERT_EQ(output.effect.kind, FloorTransitionEffectKind::kHoldAndLock);
+
+  auto cleanup = success(output, target);
+  cleanup.evidence.runtime_context_invalid = false;
+  cleanup.evidence.motion_hold_active = false;
+  output = core.dispatch(cleanup);
+
+  EXPECT_EQ(output.state, FloorTransitionState::kFailed);
+  EXPECT_TRUE(output.runtime_context_valid);
+  EXPECT_FALSE(output.recovery_required);
 }
 
 TEST(FloorTransitionCore, SameTransactionStartIsIdempotentAndForeignEventIgnored)
@@ -257,8 +315,61 @@ TEST(FloorTransitionCore, FailedCleanupRetainsStableCleanupIdAndRetries)
   EXPECT_EQ(core.state(), FloorTransitionState::kFailureCleanup);
 
   output = core.dispatch(success(output, request()));
-  EXPECT_EQ(core.state(), FloorTransitionState::kFailedLocked);
+  EXPECT_EQ(core.state(), FloorTransitionState::kFailed);
   EXPECT_EQ(output.effect.kind, FloorTransitionEffectKind::kNone);
+  EXPECT_TRUE(output.runtime_context_valid);
+  EXPECT_FALSE(output.recovery_required);
+}
+
+TEST(FloorTransitionCore, UnprovenPreMutationCleanupBecomesRecoveryLocked)
+{
+  FloorTransitionCore core;
+  auto output = core.start(request());
+  FloorTransitionEvent failure;
+  failure.kind = FloorTransitionEventKind::kEffectFailed;
+  failure.transaction_id = output.effect.transaction_id;
+  failure.effect_sequence = output.effect.sequence;
+  failure.detail = "motion hold acquire response timed out";
+  output = core.dispatch(failure);
+  ASSERT_EQ(output.effect.kind, FloorTransitionEffectKind::kHoldAndLock);
+  ASSERT_FALSE(output.recovery_required);
+
+  auto cleanup = success(output, request());
+  cleanup.evidence.runtime_context_invalid = true;
+  cleanup.evidence.motion_hold_active = true;
+  output = core.dispatch(cleanup);
+
+  EXPECT_EQ(core.state(), FloorTransitionState::kFailedLocked);
+  EXPECT_FALSE(output.runtime_context_valid);
+  EXPECT_TRUE(output.recovery_required);
+}
+
+TEST(FloorTransitionCore, RetriedCleanupCanProveUnknownBeginRestoredBeforeMutation)
+{
+  FloorTransitionCore core;
+  auto output = core.start(request());
+  FloorTransitionEvent failure;
+  failure.kind = FloorTransitionEventKind::kEffectFailed;
+  failure.transaction_id = output.effect.transaction_id;
+  failure.effect_sequence = output.effect.sequence;
+  failure.detail = "bridge BEGIN response timed out";
+  output = core.dispatch(failure);
+  ASSERT_EQ(output.effect.kind, FloorTransitionEffectKind::kHoldAndLock);
+
+  auto cleanup_failure = failure;
+  cleanup_failure.effect_sequence = output.effect.sequence;
+  cleanup_failure.evidence.runtime_context_invalid = true;
+  output = core.dispatch(cleanup_failure);
+  ASSERT_TRUE(output.recovery_required);
+  ASSERT_FALSE(output.runtime_context_valid);
+
+  auto cleanup_success = success(output, request());
+  cleanup_success.evidence.runtime_context_invalid = false;
+  output = core.dispatch(cleanup_success);
+
+  EXPECT_EQ(core.state(), FloorTransitionState::kFailed);
+  EXPECT_TRUE(output.runtime_context_valid);
+  EXPECT_FALSE(output.recovery_required);
 }
 
 }  // namespace

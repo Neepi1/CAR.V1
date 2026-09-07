@@ -7,4 +7,12 @@
       SmacPlannerLattice with a footprint-checked straight-corridor policy for Ranger Mini3.
     </description>
   </class>
+  <class
+    name="robot_nav_config::ElevatorScopedPlanner"
+    type="robot_nav_config::ElevatorScopedPlanner"
+    base_class_type="nav2_core::GlobalPlanner">
+    <description>
+      Elevator-transaction-only bounded forward, reverse, and lateral search with full footprint checks.
+    </description>
+  </class>
 </library>

@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <optional>
 #include <string>
+#include <vector>
 
 #include "robot_elevator_manager/elevator_fsm.hpp"
 #include "robot_floor_manager/floor_transition_core.hpp"
@@ -18,6 +20,7 @@ using robot_elevator_manager::ElevatorEvent;
 using robot_elevator_manager::ElevatorEventKind;
 using robot_elevator_manager::ElevatorFsm;
 using robot_elevator_manager::ElevatorFsmOutput;
+using robot_elevator_manager::ElevatorNavigationIntent;
 using robot_elevator_manager::ElevatorRoute;
 using robot_elevator_manager::FloorElevatorTopology;
 using robot_elevator_manager::PoseRole;
@@ -37,8 +40,6 @@ using robot_mission_manager::MissionRequest;
 using robot_mode_manager::ModeCommand;
 using robot_mode_manager::ModeLeaseArbiter;
 using robot_mode_manager::ModeOperation;
-using robot_safety::ExecutionCommand;
-using robot_safety::ExecutionOperation;
 using robot_safety::HoldCommand;
 using robot_safety::HoldOperation;
 using robot_safety::MotionInterlockArbiter;
@@ -53,12 +54,10 @@ FloorElevatorTopology floor(
     map_id,
     {
       {PoseRole::kHallCall, prefix + "_hall_call"},
-      {PoseRole::kHallWait, prefix + "_hall_wait"},
-      {PoseRole::kDoorway, prefix + "_doorway"},
+      {PoseRole::kLanding, prefix + "_landing"},
       {PoseRole::kCabin, prefix + "_cabin"},
-      {PoseRole::kExit, prefix + "_exit"},
     },
-    {{0.0, -0.6}, {0.0, 0.6}, {1.0, 0.0}, 0.05, 0.05},
+    std::nullopt,
   };
 }
 
@@ -92,6 +91,7 @@ FloorTransitionEvent floor_success(
   evidence.caller_pause_released = caller_pause_released;
   evidence.runtime_context_invalid = true;
   evidence.bridge_ready = true;
+  evidence.amcl_ready = true;
   evidence.global_costmap_fresh = true;
   evidence.local_costmap_fresh = true;
   evidence.active_building_id = target.building_id;
@@ -119,7 +119,7 @@ bool owns_pause(
     key) != snapshot.lease_keys.end();
 }
 
-TEST(P6NonmovingScenario, CrossFloorFlowLeavesNoGoalHoldLeaseOrPause)
+TEST(P6NonmovingScenario, CrossFloorFlowLeavesNoGoalHoldModeOrPause)
 {
   MissionFsm mission("boot-integration");
   MissionRequest mission_request;
@@ -147,6 +147,7 @@ TEST(P6NonmovingScenario, CrossFloorFlowLeavesNoGoalHoldLeaseOrPause)
     "building_1",
     floor("F1", "map_f1", "f1"),
     floor("F2", "map_f2", "f2"),
+    2U,
   };
   ElevatorFsm elevator(robot_elevator_manager::ElevatorFsmOptions{true});
   auto elevator_output = elevator.start(elevator_transaction, route);
@@ -158,7 +159,6 @@ TEST(P6NonmovingScenario, CrossFloorFlowLeavesNoGoalHoldLeaseOrPause)
   FloorTransitionCore floor_switch;
   const std::string owner = "robot_elevator_manager";
   const std::string mode_lease_id = "mode-lease-integration";
-  const std::string execution_lease_id = "execution-lease-integration";
   const std::string hold_id = elevator_transaction + "-hold";
   const std::string floor_transaction = elevator_transaction + "-floor";
   const FloorTransitionRequest floor_request{
@@ -175,6 +175,8 @@ TEST(P6NonmovingScenario, CrossFloorFlowLeavesNoGoalHoldLeaseOrPause)
   bool floor_begin_ready = false;
   bool hold_active = false;
   bool active_nav_goal = false;
+  std::vector<std::string> elevator_navigation_targets;
+  std::vector<ElevatorNavigationIntent> elevator_navigation_intents;
   double now_sec = 10.0;
 
   std::size_t elevator_steps = 0U;
@@ -188,6 +190,9 @@ TEST(P6NonmovingScenario, CrossFloorFlowLeavesNoGoalHoldLeaseOrPause)
     const auto effect = elevator_output.effect.kind;
 
     if (effect == ElevatorEffectKind::kNavigateToPose) {
+      elevator_navigation_targets.push_back(elevator_output.effect.pose_id);
+      elevator_navigation_intents.push_back(
+        elevator_output.effect.navigation_intent);
       EXPECT_FALSE(active_nav_goal);
       active_nav_goal = true;
       EXPECT_FALSE(hold_active);
@@ -212,24 +217,6 @@ TEST(P6NonmovingScenario, CrossFloorFlowLeavesNoGoalHoldLeaseOrPause)
         now_sec);
       ASSERT_TRUE(decision.accepted);
       hold_active = false;
-    } else if (effect == ElevatorEffectKind::kAcquireExecutionLease) {
-      ExecutionCommand command;
-      command.owner = owner;
-      command.mission_id = mission_request.mission_id;
-      command.transaction_id = elevator_transaction;
-      command.lease_id = execution_lease_id;
-      command.lease_duration_sec = 5.0;
-      const auto decision = safety.apply_execution(command, now_sec);
-      ASSERT_TRUE(decision.accepted);
-    } else if (effect == ElevatorEffectKind::kReleaseExecutionLease) {
-      ExecutionCommand command;
-      command.operation = ExecutionOperation::kRelease;
-      command.owner = owner;
-      command.mission_id = mission_request.mission_id;
-      command.transaction_id = elevator_transaction;
-      command.lease_id = execution_lease_id;
-      const auto decision = safety.apply_execution(command, now_sec);
-      ASSERT_TRUE(decision.accepted);
     } else if (effect == ElevatorEffectKind::kSetOperatingMode) {
       ModeCommand command;
       command.mode = elevator_output.effect.mode;
@@ -254,10 +241,12 @@ TEST(P6NonmovingScenario, CrossFloorFlowLeavesNoGoalHoldLeaseOrPause)
           owner,
           elevator_transaction,
           "elevator_ride",
+          1U,
         });
       ASSERT_TRUE(decision.accepted);
       EXPECT_TRUE(decision.state.paused);
     } else if (effect == ElevatorEffectKind::kBeginFloorTransition) {
+      EXPECT_EQ(elevator_output.effect.pose_id, "f2_cabin");
       floor_output = floor_switch.start(floor_request);
       ASSERT_EQ(
         floor_output.effect.kind,
@@ -274,6 +263,7 @@ TEST(P6NonmovingScenario, CrossFloorFlowLeavesNoGoalHoldLeaseOrPause)
           "robot_floor_manager",
           floor_transaction,
           "floor_transition",
+          1U,
         });
       ASSERT_TRUE(pause_decision.accepted);
       floor_output = floor_switch.dispatch(
@@ -297,10 +287,12 @@ TEST(P6NonmovingScenario, CrossFloorFlowLeavesNoGoalHoldLeaseOrPause)
           owner,
           elevator_transaction,
           "",
+          2U,
         });
       ASSERT_TRUE(decision.accepted);
       EXPECT_TRUE(decision.state.paused);
     } else if (effect == ElevatorEffectKind::kSwitchFloor) {
+      EXPECT_EQ(elevator_output.effect.pose_id, "f2_cabin");
       ASSERT_TRUE(floor_started);
       const auto handoff_state = pauses.snapshot();
       floor_output = floor_switch.dispatch(
@@ -327,6 +319,7 @@ TEST(P6NonmovingScenario, CrossFloorFlowLeavesNoGoalHoldLeaseOrPause)
               "robot_floor_manager",
               floor_transaction,
               "",
+              2U,
             });
           ASSERT_TRUE(pause_decision.accepted);
         }
@@ -352,27 +345,10 @@ TEST(P6NonmovingScenario, CrossFloorFlowLeavesNoGoalHoldLeaseOrPause)
       EXPECT_FALSE(floor_switch.recovery_required());
       EXPECT_FALSE(pauses.snapshot().paused);
     } else if (effect == ElevatorEffectKind::kVerifyFloorReady) {
+      EXPECT_EQ(elevator_output.effect.pose_id, "f2_cabin");
       ASSERT_EQ(
         floor_switch.state(),
         robot_floor_manager::FloorTransitionState::kComplete);
-    } else if (effect == ElevatorEffectKind::kVerifyFootprintInside) {
-      elevator_output = elevator.dispatch(
-        ElevatorEvent{
-          ElevatorEventKind::kFootprintInside,
-          "",
-          elevator_output.effect.sequence,
-          elevator_transaction,
-        });
-      continue;
-    } else if (effect == ElevatorEffectKind::kVerifyFootprintOutside) {
-      elevator_output = elevator.dispatch(
-        ElevatorEvent{
-          ElevatorEventKind::kFootprintOutside,
-          "",
-          elevator_output.effect.sequence,
-          elevator_transaction,
-        });
-      continue;
     }
 
     elevator_output = elevator.dispatch(elevator_success(elevator_output));
@@ -380,6 +356,22 @@ TEST(P6NonmovingScenario, CrossFloorFlowLeavesNoGoalHoldLeaseOrPause)
   }
 
   ASSERT_EQ(elevator_output.effect.kind, ElevatorEffectKind::kComplete);
+  EXPECT_EQ(
+    elevator_navigation_targets,
+    (std::vector<std::string>{
+      "f1_hall_call",
+      "f1_landing",
+      "f1_cabin",
+      "f2_landing",
+    }));
+  EXPECT_EQ(
+    elevator_navigation_intents,
+    (std::vector<ElevatorNavigationIntent>{
+      ElevatorNavigationIntent::kHallCall,
+      ElevatorNavigationIntent::kSourceLanding,
+      ElevatorNavigationIntent::kEnterCabin,
+      ElevatorNavigationIntent::kTargetLanding,
+    }));
   EXPECT_FALSE(active_nav_goal);
   const auto safety_state = safety.snapshot(now_sec);
   const auto mode_state = modes.snapshot(now_sec);

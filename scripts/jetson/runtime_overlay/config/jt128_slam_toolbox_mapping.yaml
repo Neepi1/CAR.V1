@@ -5,7 +5,9 @@ slam_toolbox:
     ceres_preconditioner: SCHUR_JACOBI
     ceres_trust_strategy: LEVENBERG_MARQUARDT
     ceres_dogleg_type: TRADITIONAL_DOGLEG
-    ceres_loss_function: None
+    # Phase LC1: limit the influence of an accepted but inconsistent loop edge
+    # without changing scan matching, TF, or the FAST-LIO2 odometry source.
+    ceres_loss_function: HuberLoss
 
     mode: mapping
     map_frame: map
@@ -24,26 +26,33 @@ slam_toolbox:
     minimum_time_interval: 0.05
     transform_timeout: 0.50
     tf_buffer_duration: 30.0
-    # This is the tf2 MessageFilter queue in front of slam_toolbox scan
-    # processing. The default async queue is effectively too small for the
-    # JT128 -> FAST-LIO -> flatscan chain when TF/scan timestamps jitter.
-    scan_queue_size: 30
+    # async_slam_toolbox_node must not retain a stale scan backlog. The
+    # launcher proves original-stamp scan/TF transformability before startup.
+    scan_queue_size: 1
     stack_size_to_use: 40000000
 
+    # Phase SM1 keeps local 2D refinement enabled, but avoids filling the scan
+    # chain with near-duplicate nodes during translation and in-place turns.
     use_scan_matching: true
     use_scan_barycenter: false
-    minimum_travel_distance: 0.04
-    minimum_travel_heading: 0.02
-    scan_buffer_size: 30
-    scan_buffer_maximum_scan_distance: 25.0
+    minimum_travel_distance: 0.10
+    minimum_travel_heading: 0.035
+    scan_buffer_size: 100
+    scan_buffer_maximum_scan_distance: 10.0
     link_match_minimum_response_fine: 0.1
     link_scan_maximum_distance: 2.0
     loop_search_maximum_distance: 3.0
+    # Keep conservative loop closing enabled so accumulated planar yaw drift
+    # can be corrected when the route revisits commissioned geometry.
     do_loop_closing: true
-    loop_match_minimum_chain_size: 10
-    loop_match_maximum_variance_coarse: 2.5
-    loop_match_minimum_response_coarse: 0.40
-    loop_match_minimum_response_fine: 0.50
+    # Require a longer, more consistent scan chain and stronger coarse/fine
+    # responses before adding a loop constraint. Search geometry stays frozen
+    # for the first field A/B so valid-loop reach is not reduced at the same
+    # time as the acceptance gate is tightened.
+    loop_match_minimum_chain_size: 15
+    loop_match_maximum_variance_coarse: 2.0
+    loop_match_minimum_response_coarse: 0.45
+    loop_match_minimum_response_fine: 0.55
 
     correlation_search_space_dimension: 0.5
     correlation_search_space_resolution: 0.01

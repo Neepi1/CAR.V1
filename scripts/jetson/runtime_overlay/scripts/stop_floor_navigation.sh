@@ -59,6 +59,8 @@ lifecycle_shutdown_nav2() {
   done
 }
 
+# This is a navigation-mode cleanup boundary. Common resident floor, safety,
+# API, chassis, and sensor services must remain available for the next action.
 patterns=(
   "run_navigation_runtime_services.sh"
   "run_floor_navigation.sh"
@@ -68,7 +70,6 @@ patterns=(
   "run_local_perception.sh"
   "run_occupancy_grid_localization.sh"
   "run_localization_bridge.sh"
-  "run_floor_manager.sh"
   "standard_navigation.launch.py"
   "local_costmap_debug.launch.py"
   "occupancy_localization_stack.launch.py"
@@ -98,6 +99,7 @@ patterns=(
   "pointcloud_to_laserscan_node"
   "pointcloud_to_laserscan"
   "scan_republisher_node"
+  "mapping_scan_tf_gate_node"
   "nav_cloud_preprocessor"
   "run_global_localization.sh"
   "robot_global_localization/global_localization_node"
@@ -111,8 +113,6 @@ patterns=(
   "map_to_odom_tf_bridge"
   "robot_local_perception/local_perception_node"
   "local_perception_node --ros-args"
-  "robot_floor_manager/floor_manager_node"
-  "floor_manager_node --ros-args"
 )
 
 matching_navigation_processes() {
@@ -208,4 +208,4 @@ if [[ -n "${lingering}" ]]; then
   exit 1
 fi
 
-echo "[runtime-overlay] floor navigation stack stopped; common driver/chassis/safety services kept alive" >&2
+echo "[runtime-overlay] floor navigation stack stopped; common driver/chassis/safety/floor-manager/API services kept alive" >&2

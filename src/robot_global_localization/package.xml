@@ -6,12 +6,18 @@
   <maintainer email="codex@example.com">Codex</maintainer>
   <license>Apache-2.0</license>
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>composition_interfaces</depend>
   <depend>geometry_msgs</depend>
   <depend>isaac_ros_pointcloud_interfaces</depend>
   <depend>rclcpp</depend>
+  <depend>rcl_interfaces</depend>
   <depend>robot_interfaces</depend>
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
   <depend>tf2_ros</depend>
-  <export/>
+  <depend>yaml-cpp</depend>
+  <test_depend>ament_cmake_gtest</test_depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
 </package>

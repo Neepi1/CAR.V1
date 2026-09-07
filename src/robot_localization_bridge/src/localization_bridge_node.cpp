@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -9,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -19,11 +21,14 @@
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/executors/multi_threaded_executor.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "rmw/types.h"
 #include "robot_interfaces/msg/correction_pause_state.hpp"
 #include "robot_interfaces/msg/localization_health.hpp"
+#include "robot_interfaces/msg/localizer_asset_state.hpp"
 #include "robot_interfaces/srv/begin_floor_transition.hpp"
 #include "robot_interfaces/srv/set_correction_pause.hpp"
 #include "robot_localization_bridge/correction_pause_arbiter.hpp"
+#include "robot_localization_bridge/explicit_localization_result_policy.hpp"
 #include "robot_localization_bridge/floor_transition_context.hpp"
 #include "robot_localization_bridge/post_isaac_refine_gate.hpp"
 #include "robot_localization_bridge/se2_correction.hpp"
@@ -32,9 +37,11 @@
 #include "std_srvs/srv/empty.hpp"
 #include "std_srvs/srv/set_bool.hpp"
 #include "std_srvs/srv/trigger.hpp"
+#include "tf2/time.h"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_broadcaster.h"
 #include "tf2_ros/transform_listener.h"
+#include "tf2_msgs/msg/tf_message.hpp"
 
 namespace
 {
@@ -62,6 +69,43 @@ double stamp_to_sec(const builtin_interfaces::msg::Time & stamp)
 double normalize_yaw(const double yaw)
 {
   return robot_localization_bridge::se2::normalize_yaw(yaw);
+}
+
+std::string normalized_frame(std::string frame)
+{
+  while (!frame.empty() && frame.front() == '/') {
+    frame.erase(frame.begin());
+  }
+  return frame;
+}
+
+std::string publisher_gid_key(const rclcpp::MessageInfo & message_info)
+{
+  const auto & gid =
+    message_info.get_rmw_message_info().publisher_gid;
+  std::ostringstream output;
+  output << std::hex << std::setfill('0');
+  for (std::size_t index = 0U; index < RMW_GID_STORAGE_SIZE; ++index) {
+    output << std::setw(2) << static_cast<unsigned int>(gid.data[index]);
+  }
+  return output.str();
+}
+
+double declare_odom_tf_history_duration_sec(rclcpp::Node & node)
+{
+  const double duration_sec =
+    node.declare_parameter<double>("odom_tf_history_duration_sec", 30.0);
+  if (!std::isfinite(duration_sec) || duration_sec < 20.0) {
+    throw std::invalid_argument(
+            "odom_tf_history_duration_sec must be finite and at least 20 seconds");
+  }
+  return duration_sec;
+}
+
+double monotonic_now_sec()
+{
+  return std::chrono::duration<double>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 std::string json_escape(const std::string & input)
@@ -384,7 +428,8 @@ class LocalizationBridgeNode : public rclcpp::Node
 public:
   LocalizationBridgeNode()
   : Node("robot_localization_bridge"),
-    tf_buffer_(get_clock()),
+    odom_tf_history_duration_sec_(declare_odom_tf_history_duration_sec(*this)),
+    tf_buffer_(get_clock(), tf2::durationFromSec(odom_tf_history_duration_sec_)),
     tf_listener_(tf_buffer_),
     tf_broadcaster_(std::make_unique<tf2_ros::TransformBroadcaster>(*this))
   {
@@ -392,6 +437,12 @@ public:
     map_frame_ = declare_parameter<std::string>("map_frame", "map");
     odom_frame_ = declare_parameter<std::string>("odom_frame", "odom");
     base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
+    localizer_asset_state_topic_ = declare_parameter<std::string>(
+      "localizer_asset_state_topic", "/global_localization/asset_state");
+    tf_authority_topic_ =
+      declare_parameter<std::string>("tf_authority_topic", "/tf");
+    tf_authority_max_age_sec_ = declare_parameter<double>(
+      "tf_authority_max_age_sec", 0.75);
     jump_threshold_m_ = declare_parameter<double>("jump_threshold_m", 1.0);
     forced_jump_threshold_m_ = declare_parameter<double>("forced_jump_threshold_m", 20.0);
     timeout_sec_ = declare_parameter<double>("timeout_sec", 1.0);
@@ -477,9 +528,9 @@ public:
     amcl_post_isaac_refine_window_sec_ = declare_parameter<double>(
       "amcl_post_isaac_refine_window_sec", 10.0);
     amcl_post_isaac_refine_max_translation_m_ = declare_parameter<double>(
-      "amcl_post_isaac_refine_max_translation_m", 0.12);
+      "amcl_post_isaac_refine_max_translation_m", 10.0);
     amcl_post_isaac_refine_max_yaw_rad_ = declare_parameter<double>(
-      "amcl_post_isaac_refine_max_yaw_rad", 0.10);
+      "amcl_post_isaac_refine_max_yaw_rad", 0.872664626);
     amcl_post_isaac_refine_consistency_count_ = declare_parameter<int>(
       "amcl_post_isaac_refine_consistency_count", 2);
     amcl_post_isaac_refine_agreement_translation_m_ = declare_parameter<double>(
@@ -519,7 +570,7 @@ public:
       "amcl_scan_admission_enabled", false);
     amcl_scan_admission_status_topic_ = declare_parameter<std::string>(
       "amcl_scan_admission_status_topic", "/amcl_scan_admission/status");
-    status_publish_period_sec_ = declare_parameter<double>("status_publish_period_sec", 1.0);
+    status_publish_period_sec_ = declare_parameter<double>("status_publish_period_sec", 0.25);
     map_odom_publish_gap_warn_ms_ =
       declare_parameter<double>("map_odom_publish_gap_warn_ms", 100.0);
     map_odom_publish_gap_fail_ms_ =
@@ -639,6 +690,8 @@ public:
     amcl_initial_pose_repeat_period_ms_ =
       std::clamp(amcl_initial_pose_repeat_period_ms_, 0, 1000);
     status_publish_period_sec_ = std::max(0.2, status_publish_period_sec_);
+    tf_authority_max_age_sec_ =
+      std::max(0.2, tf_authority_max_age_sec_);
     amcl_runtime_status_ttl_sec_ = std::max(0.0, amcl_runtime_status_ttl_sec_);
     map_odom_publish_gap_warn_ms_ = std::max(1.0, map_odom_publish_gap_warn_ms_);
     map_odom_publish_gap_fail_ms_ =
@@ -691,6 +744,23 @@ public:
       local_odom_topic_,
       rclcpp::QoS(20),
       std::bind(&LocalizationBridgeNode::on_odom, this, std::placeholders::_1));
+    localizer_asset_state_sub_ =
+      create_subscription<robot_interfaces::msg::LocalizerAssetState>(
+      localizer_asset_state_topic_,
+      rclcpp::QoS(1).reliable().transient_local(),
+      std::bind(
+        &LocalizationBridgeNode::on_localizer_asset_state,
+        this,
+        std::placeholders::_1));
+    tf_authority_sub_ = create_subscription<tf2_msgs::msg::TFMessage>(
+      tf_authority_topic_,
+      rclcpp::QoS(100),
+      [this](
+        const tf2_msgs::msg::TFMessage::SharedPtr message,
+        const rclcpp::MessageInfo & message_info)
+      {
+        on_tf_authority(message, message_info);
+      });
     health_pub_ = create_publisher<std_msgs::msg::Bool>(health_topic_, rclcpp::QoS(10));
     status_pub_ = create_publisher<std_msgs::msg::String>(status_topic_, rclcpp::QoS(10));
     amcl_initial_pose_pub_ = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
@@ -770,12 +840,102 @@ public:
   }
 
 private:
+  void on_localizer_asset_state(
+    const robot_interfaces::msg::LocalizerAssetState::SharedPtr message)
+  {
+    std::lock_guard<std::mutex> lock(localizer_asset_state_mutex_);
+    localizer_asset_state_ = *message;
+    have_localizer_asset_state_ = true;
+  }
+
+  void on_tf_authority(
+    const tf2_msgs::msg::TFMessage::SharedPtr message,
+    const rclcpp::MessageInfo & message_info)
+  {
+    const auto publisher = publisher_gid_key(message_info);
+    const auto received_at = monotonic_now_sec();
+    std::lock_guard<std::mutex> lock(tf_authority_mutex_);
+    for (const auto & transform : message->transforms) {
+      const auto parent = normalized_frame(transform.header.frame_id);
+      const auto child = normalized_frame(transform.child_frame_id);
+      if (
+        parent == normalized_frame(map_frame_) &&
+        child == normalized_frame(odom_frame_))
+      {
+        map_odom_authorities_[publisher] = received_at;
+      } else if (
+        parent == normalized_frame(odom_frame_) &&
+        child == normalized_frame(base_frame_))
+      {
+        odom_base_authorities_[publisher] = received_at;
+      }
+    }
+  }
+
+  bool canonical_tf_authorities_unique()
+  {
+    const auto now_sec = monotonic_now_sec();
+    std::lock_guard<std::mutex> lock(tf_authority_mutex_);
+    const auto prune =
+      [this, now_sec](auto & authorities) {
+        for (auto iterator = authorities.begin();
+          iterator != authorities.end();)
+        {
+          const auto age = now_sec - iterator->second;
+          if (
+            !std::isfinite(age) || age < 0.0 ||
+            age > tf_authority_max_age_sec_)
+          {
+            iterator = authorities.erase(iterator);
+          } else {
+            ++iterator;
+          }
+        }
+      };
+    prune(map_odom_authorities_);
+    prune(odom_base_authorities_);
+    return
+      map_odom_authorities_.size() == 1U &&
+      odom_base_authorities_.size() == 1U;
+  }
+
   void on_pose(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
   {
     const double received_sec = now().seconds();
+    const double pose_stamp_sec = stamp_to_sec(msg->header.stamp);
+    const bool explicit_arm_active =
+      force_accept_next_pose_ && force_accept_next_pose_explicit_trigger_;
+    const auto admission =
+      robot_localization_bridge::explicit_localization::classify_isaac_result(
+      explicit_arm_active,
+      force_accept_armed_sec_,
+      pose_stamp_sec,
+      force_accept_min_pose_stamp_slack_sec_);
+    if (
+      admission ==
+      robot_localization_bridge::explicit_localization::IsaacResultAdmission::kIgnoreUnarmed)
+    {
+      last_result_header_stamp_sec_ = pose_stamp_sec;
+      last_result_receive_time_sec_ = received_sec;
+      last_result_age_ms_ = (received_sec - pose_stamp_sec) * 1000.0;
+      last_unarmed_isaac_result_ignored_reason_ =
+        "isaac localization_result arrived without an explicit force-accept arm";
+      ++unarmed_isaac_result_ignored_count_;
+      RCLCPP_WARN(
+        get_logger(),
+        "ignoring unarmed Isaac localization_result; canonical map->odom is unchanged: "
+        "pose_stamp=%.3f receive_age_ms=%.3f",
+        pose_stamp_sec,
+        last_result_age_ms_);
+      return;
+    }
     std::string ignored_reason;
-    if (should_ignore_force_accept_pretrigger_result(*msg, received_sec, ignored_reason)) {
-      last_result_header_stamp_sec_ = stamp_to_sec(msg->header.stamp);
+    if (
+      admission ==
+      robot_localization_bridge::explicit_localization::IsaacResultAdmission::kIgnoreBeforeArm &&
+      should_ignore_force_accept_pretrigger_result(*msg, received_sec, ignored_reason))
+    {
+      last_result_header_stamp_sec_ = pose_stamp_sec;
       last_result_receive_time_sec_ = received_sec;
       last_result_age_ms_ = (received_sec - last_result_header_stamp_sec_) * 1000.0;
       last_force_accept_ignored_reason_ = ignored_reason;
@@ -800,13 +960,19 @@ private:
     const double received_sec,
     std::string & reason) const
   {
-    if (!force_accept_next_pose_ || !force_accept_next_pose_explicit_trigger_) {
-      return false;
-    }
-    if (force_accept_armed_sec_ <= 0.0) {
-      return false;
-    }
     const double pose_stamp_sec = stamp_to_sec(pose.header.stamp);
+    const auto admission =
+      robot_localization_bridge::explicit_localization::classify_isaac_result(
+      force_accept_next_pose_ && force_accept_next_pose_explicit_trigger_,
+      force_accept_armed_sec_,
+      pose_stamp_sec,
+      force_accept_min_pose_stamp_slack_sec_);
+    if (
+      admission !=
+      robot_localization_bridge::explicit_localization::IsaacResultAdmission::kIgnoreBeforeArm)
+    {
+      return false;
+    }
     const double min_pose_stamp_sec =
       force_accept_armed_sec_ - force_accept_min_pose_stamp_slack_sec_;
     if (pose_stamp_sec >= min_pose_stamp_sec) {
@@ -977,6 +1143,37 @@ private:
       explicit_trigger, corrections_paused);
   }
 
+  robot_localization_bridge::explicit_localization::ForcedTranslationLimitContext
+  forced_translation_limit_context(const bool explicit_trigger) const
+  {
+    robot_localization_bridge::explicit_localization::ForcedTranslationLimitContext context;
+    context.explicit_trigger = explicit_trigger;
+    const auto floor = floor_transition_snapshot();
+    context.floor_transition_active = floor.transition_active;
+    context.runtime_context_valid = floor.runtime_context_valid;
+    context.floor_transition_failed_locked = floor.failed_locked;
+    if (
+      !explicit_trigger || !floor.transition_active || floor.runtime_context_valid ||
+      floor.failed_locked || floor.pending.transaction_id.empty())
+    {
+      return context;
+    }
+
+    robot_interfaces::msg::LocalizerAssetState localizer_asset;
+    {
+      std::lock_guard<std::mutex> lock(localizer_asset_state_mutex_);
+      if (!have_localizer_asset_state_) {
+        return context;
+      }
+      localizer_asset = localizer_asset_state_;
+    }
+    const auto & target = floor.pending;
+    context.exact_pending_target_localizer =
+      robot_localization_bridge::explicit_localization::proves_exact_pending_floor_target(
+      target, localizer_asset);
+    return context;
+  }
+
   bool floor_pause_is_owned(
     const robot_localization_bridge::CorrectionPauseSnapshot & pause,
     const std::string & transaction_id) const
@@ -998,12 +1195,88 @@ private:
            !floor.failed_locked;
   }
 
+  void maybe_seed_active_floor_source()
+  {
+    const auto current = floor_transition_snapshot();
+    if (
+      current.transition_active || current.failed_locked ||
+      !current.active.map_id.empty())
+    {
+      return;
+    }
+
+    robot_interfaces::msg::LocalizerAssetState localizer_asset;
+    {
+      std::lock_guard<std::mutex> lock(localizer_asset_state_mutex_);
+      if (!have_localizer_asset_state_) {
+        return;
+      }
+      localizer_asset = localizer_asset_state_;
+    }
+    MapOdomState map_state;
+    {
+      std::lock_guard<std::mutex> lock(map_odom_state_mutex_);
+      map_state = map_odom_state_;
+    }
+    std::uint64_t last_published_sequence = 0U;
+    {
+      std::lock_guard<std::mutex> lock(map_odom_publish_stats_mutex_);
+      last_published_sequence = map_odom_last_published_sequence_;
+    }
+    if (
+      !localizer_asset.success ||
+      localizer_asset.applying ||
+      !localizer_asset.active_identity_valid ||
+      localizer_asset.active_building_id.empty() ||
+      localizer_asset.active_floor_id.empty() ||
+      localizer_asset.active_map_id.empty() ||
+      localizer_asset.active_asset_epoch == 0U ||
+      localizer_asset.active_asset_digest.empty() ||
+      localizer_asset.localizer_generation == 0U ||
+      !localizer_asset.localizer_ready ||
+      !has_map_to_odom_ ||
+      !map_state.valid ||
+      map_state.correction_active ||
+      map_state.target_sequence == 0U ||
+      map_state.current_sequence != map_state.target_sequence ||
+      last_published_sequence < map_state.target_sequence ||
+      !map_state.safe_for_goal_start ||
+      !canonical_tf_authorities_unique())
+    {
+      return;
+    }
+
+    robot_localization_bridge::FloorTransitionIdentity identity;
+    identity.transaction_id =
+      "runtime-source-" +
+      std::to_string(localizer_asset.active_asset_epoch);
+    identity.building_id = localizer_asset.active_building_id;
+    identity.floor_id = localizer_asset.active_floor_id;
+    identity.map_id = localizer_asset.active_map_id;
+    identity.asset_epoch = localizer_asset.active_asset_epoch;
+    identity.asset_digest = localizer_asset.active_asset_digest;
+    robot_localization_bridge::FloorTransitionContextDecision decision;
+    {
+      std::lock_guard<std::mutex> lock(floor_transition_context_mutex_);
+      decision = floor_transition_context_.seed_active_source(identity);
+    }
+    if (decision.accepted && !decision.idempotent) {
+      RCLCPP_INFO(
+        get_logger(),
+        "seeded verified active floor source building=%s floor=%s map=%s epoch=%llu",
+        identity.building_id.c_str(), identity.floor_id.c_str(),
+        identity.map_id.c_str(),
+        static_cast<unsigned long long>(identity.asset_epoch));
+    }
+  }
+
   void publish_floor_health(
     const bool amcl_ready,
     const bool map_odom_state_valid,
     const bool map_odom_correction_active,
     const bool map_odom_safe_for_goal_start)
   {
+    maybe_seed_active_floor_source();
     const auto floor = floor_transition_snapshot();
     const auto & identity =
       (floor.transition_active || floor.failed_locked) &&
@@ -1012,6 +1285,57 @@ private:
     const bool effective_safe =
       effective_safe_for_goal_start(map_odom_safe_for_goal_start, floor);
 
+    robot_interfaces::msg::LocalizerAssetState localizer_asset;
+    bool have_localizer_asset = false;
+    {
+      std::lock_guard<std::mutex> lock(localizer_asset_state_mutex_);
+      have_localizer_asset = have_localizer_asset_state_;
+      if (have_localizer_asset) {
+        localizer_asset = localizer_asset_state_;
+      }
+    }
+    const bool exact_localizer_identity =
+      have_localizer_asset &&
+      localizer_asset.success &&
+      !localizer_asset.applying &&
+      localizer_asset.active_identity_valid &&
+      localizer_asset.active_building_id == identity.building_id &&
+      localizer_asset.active_floor_id == identity.floor_id &&
+      localizer_asset.active_map_id == identity.map_id &&
+      localizer_asset.active_asset_epoch == identity.asset_epoch &&
+      localizer_asset.active_asset_digest == identity.asset_digest &&
+      localizer_asset.localizer_generation > 0U &&
+      localizer_asset.localizer_ready;
+
+    MapOdomState map_state;
+    {
+      std::lock_guard<std::mutex> lock(map_odom_state_mutex_);
+      map_state = map_odom_state_;
+    }
+    std::uint64_t last_published_sequence = 0U;
+    {
+      std::lock_guard<std::mutex> lock(map_odom_publish_stats_mutex_);
+      last_published_sequence = map_odom_last_published_sequence_;
+    }
+    const bool explicit_target_accepted =
+      !floor.transition_active ||
+      last_explicit_relocalization_sequence_ >
+      floor.begin_explicit_relocalization_sequence;
+    // bridge_ready deliberately describes pending target map->odom evidence,
+    // not API goal-start authorization. During a floor transaction the
+    // runtime context must remain invalid until COMMIT, while the settled
+    // target transform still needs typed proof so COMMIT can be authorized.
+    const bool pending_or_active_bridge_ready =
+      has_map_to_odom_ &&
+      map_odom_state_valid &&
+      map_state.valid &&
+      !map_odom_correction_active &&
+      !map_state.correction_active &&
+      map_state.target_sequence > 0U &&
+      map_state.current_sequence == map_state.target_sequence &&
+      last_published_sequence >= map_state.target_sequence &&
+      explicit_target_accepted;
+
     robot_interfaces::msg::LocalizationHealth health;
     health.stamp = now();
     health.building_id = identity.building_id;
@@ -1019,20 +1343,21 @@ private:
     health.map_id = identity.map_id;
     health.asset_epoch = identity.asset_epoch;
     health.asset_digest = identity.asset_digest;
-    health.localizer_ready = false;
-    health.localizer_generation = 0U;
-    health.bridge_ready =
-      has_map_to_odom_ &&
-      map_odom_state_valid &&
-      !map_odom_correction_active &&
-      effective_safe;
-    health.tf_unique = false;
+    health.localizer_ready = exact_localizer_identity;
+    health.localizer_generation = exact_localizer_identity ?
+      localizer_asset.localizer_generation : 0U;
+    health.bridge_ready = pending_or_active_bridge_ready;
+    health.tf_unique = canonical_tf_authorities_unique();
     health.explicit_relocalization_sequence =
       last_explicit_relocalization_sequence_;
     health.amcl_ready = amcl_ready;
     health.transition_active = floor.transition_active;
     health.runtime_context_valid = floor.runtime_context_valid;
-    health.detail = floor.detail;
+    health.detail =
+      floor.detail +
+      ";safe_for_goal_start=" + (effective_safe ? "true" : "false") +
+      ";exact_localizer=" + (exact_localizer_identity ? "true" : "false") +
+      ";canonical_tf_unique=" + (health.tf_unique ? "true" : "false");
     floor_health_pub_->publish(health);
   }
 
@@ -1065,6 +1390,13 @@ private:
     identity.map_id = request->map_id;
     identity.asset_epoch = request->asset_epoch;
     identity.asset_digest = request->asset_digest;
+    robot_localization_bridge::FloorTransitionIdentity source_identity;
+    source_identity.transaction_id = request->transaction_id;
+    source_identity.building_id = request->source_building_id;
+    source_identity.floor_id = request->source_floor_id;
+    source_identity.map_id = request->source_map_id;
+    source_identity.asset_epoch = request->source_asset_epoch;
+    source_identity.asset_digest = request->source_asset_digest;
 
     const auto pause = correction_pause_snapshot();
     robot_localization_bridge::FloorTransitionContextDecision decision;
@@ -1086,8 +1418,10 @@ private:
         std::lock_guard<std::mutex> lock(floor_transition_context_mutex_);
         decision = floor_transition_context_.begin(
           identity,
+          source_identity,
           floor_pause_is_owned(pause, identity.transaction_id),
-          last_explicit_relocalization_sequence_);
+          last_explicit_relocalization_sequence_,
+          request->command_sequence);
       }
       if (decision.accepted && !decision.idempotent) {
         force_accept_next_pose_ = false;
@@ -1118,14 +1452,68 @@ private:
       evidence.last_published_sequence = last_published_sequence;
       {
         std::lock_guard<std::mutex> lock(floor_transition_context_mutex_);
-        decision = floor_transition_context_.commit(identity, evidence);
+        decision = floor_transition_context_.commit(
+          identity, evidence, request->command_sequence);
       }
     } else if (
       request->operation == robot_interfaces::srv::BeginFloorTransition::Request::OP_ABORT)
     {
       {
         std::lock_guard<std::mutex> lock(floor_transition_context_mutex_);
-        decision = floor_transition_context_.abort(identity);
+        decision = floor_transition_context_.abort(
+          identity, request->command_sequence);
+      }
+      if (decision.accepted) {
+        force_accept_next_pose_ = false;
+        force_accept_next_pose_explicit_trigger_ = false;
+        force_accept_armed_sec_ = 0.0;
+      }
+    } else if (
+      request->operation ==
+      robot_interfaces::srv::BeginFloorTransition::Request::OP_ABORT_PREMUTATION)
+    {
+      const auto before = floor_transition_snapshot();
+      robot_interfaces::msg::LocalizerAssetState localizer_asset;
+      bool have_localizer_asset = false;
+      {
+        std::lock_guard<std::mutex> lock(localizer_asset_state_mutex_);
+        have_localizer_asset = have_localizer_asset_state_;
+        if (have_localizer_asset) {
+          localizer_asset = localizer_asset_state_;
+        }
+      }
+      MapOdomState map_state;
+      {
+        std::lock_guard<std::mutex> lock(map_odom_state_mutex_);
+        map_state = map_odom_state_;
+      }
+      const bool exact_source_localizer =
+        have_localizer_asset &&
+        localizer_asset.success &&
+        !localizer_asset.applying &&
+        localizer_asset.active_identity_valid &&
+        localizer_asset.active_building_id == source_identity.building_id &&
+        localizer_asset.active_floor_id == source_identity.floor_id &&
+        localizer_asset.active_map_id == source_identity.map_id &&
+        localizer_asset.active_asset_epoch == source_identity.asset_epoch &&
+        localizer_asset.active_asset_digest == source_identity.asset_digest &&
+        localizer_asset.localizer_generation > 0U &&
+        localizer_asset.localizer_ready;
+      robot_localization_bridge::FloorTransitionPreMutationAbortEvidence evidence;
+      evidence.source = source_identity;
+      evidence.source_assets_unchanged =
+        floor_pause_is_owned(pause, identity.transaction_id) &&
+        exact_source_localizer &&
+        has_map_to_odom_ &&
+        map_state.valid &&
+        !map_state.correction_active &&
+        (!before.transition_active ||
+        last_explicit_relocalization_sequence_ ==
+        before.begin_explicit_relocalization_sequence);
+      {
+        std::lock_guard<std::mutex> lock(floor_transition_context_mutex_);
+        decision = floor_transition_context_.abort_pre_mutation(
+          identity, evidence, request->command_sequence);
       }
       if (decision.accepted) {
         force_accept_next_pose_ = false;
@@ -1151,9 +1539,11 @@ private:
       decision.state.runtime_context_valid ?
       decision.state.active : decision.state.pending;
     response->success = decision.accepted;
+    response->result_code = static_cast<std::uint8_t>(decision.code);
     response->message =
       std::string(robot_localization_bridge::to_string(decision.code)) +
       ": " + decision.message;
+    response->applied_sequence = decision.applied_sequence;
     response->runtime_context_valid = decision.state.runtime_context_valid;
     response->safe_for_goal_start = effective_safe;
     response->accepted_asset_epoch = accepted_identity.asset_epoch;
@@ -1222,6 +1612,8 @@ private:
     command.owner = kLegacyOwner;
     command.transaction_id = kLegacyTransaction;
     command.reason = "docking_fine";
+    command.command_sequence =
+      legacy_correction_pause_command_sequence_.fetch_add(1U) + 1U;
     const auto decision = apply_correction_pause_command(command);
     apply_correction_pause_snapshot(decision.state);
     response->success = decision.accepted;
@@ -1276,6 +1668,7 @@ private:
         robot_localization_bridge::PauseDecisionCode::kInvalidRequest);
       response->message =
         "legacy_set_bool owner/transaction identifiers are reserved";
+      response->applied_sequence = 0U;
       response->state = make_correction_pause_state(state);
       publish_correction_pause_state(state);
       return;
@@ -1286,11 +1679,13 @@ private:
     command.owner = request->owner;
     command.transaction_id = request->transaction_id;
     command.reason = request->reason;
+    command.command_sequence = request->command_sequence;
     const auto decision = apply_correction_pause_command(command);
     apply_correction_pause_snapshot(decision.state);
     response->success = decision.accepted;
     response->result_code = static_cast<std::uint8_t>(decision.code);
     response->message = decision.message;
+    response->applied_sequence = decision.applied_sequence;
     response->state = make_correction_pause_state(decision.state);
     RCLCPP_WARN(
       get_logger(),
@@ -1498,7 +1893,10 @@ private:
       candidate.reject_reason = source_label + "_pose_from_future_ms=" + std::to_string(-result_age_ms);
       return candidate;
     }
-    if (result_age_ms > candidate.gate_result_age_limit_ms) {
+    if (
+      result_age_ms > candidate.gate_result_age_limit_ms &&
+      robot_localization_bridge::explicit_localization::enforce_wall_age_limit(candidate.explicit_trigger))
+    {
       candidate.reject_reason =
         source_label + "_pose_stale_ms=" + std::to_string(result_age_ms) +
         " gate_mode=" + candidate.gate_mode +
@@ -1860,9 +2258,9 @@ private:
 
     if (!has_map_to_odom_) {
       if (force_accept_next_pose_) {
+        apply_candidate(candidate, source, "EXPLICIT_TRIGGERED_RELOCALIZATION");
         force_accept_next_pose_ = false;
         force_accept_next_pose_explicit_trigger_ = false;
-        apply_candidate(candidate, source, "EXPLICIT_TRIGGERED_RELOCALIZATION");
       } else {
         apply_candidate(candidate, source, "initial_lock");
       }
@@ -1873,22 +2271,51 @@ private:
       const double forced_limit = std::min(
         forced_jump_threshold_m_,
         triggered_hard_reject_translation_m_);
-      if (candidate.correction_translation_m > forced_limit) {
+      const auto forced_context =
+        forced_translation_limit_context(candidate.explicit_trigger);
+      const bool forced_translation_accepted =
+        robot_localization_bridge::explicit_localization::forced_translation_within_limit(
+        candidate.correction_translation_m, forced_limit, forced_context);
+      const bool exact_floor_transition_limit_bypass =
+        forced_translation_accepted &&
+        candidate.correction_translation_m > forced_limit;
+      last_forced_translation_limit_bypassed_ =
+        exact_floor_transition_limit_bypass;
+      if (!forced_translation_accepted) {
         ++large_correction_rejected_count_;
         reject_candidate("bridge forced map->odom jump rejected", source);
         force_accept_next_pose_ = false;
         force_accept_next_pose_explicit_trigger_ = false;
         return false;
       }
-      if (!triggered_allow_large_correction_ && candidate.correction_translation_m > jump_threshold_m_) {
+      if (
+        !triggered_allow_large_correction_ &&
+        candidate.correction_translation_m > jump_threshold_m_ &&
+        !exact_floor_transition_limit_bypass)
+      {
         reject_candidate("triggered_large_correction_disabled", source);
         force_accept_next_pose_ = false;
         force_accept_next_pose_explicit_trigger_ = false;
         return false;
       }
+      if (exact_floor_transition_limit_bypass) {
+        ++floor_transition_translation_limit_bypass_count_;
+        last_forced_translation_limit_bypassed_ = true;
+        const auto floor = floor_transition_snapshot();
+        RCLCPP_WARN(
+          get_logger(),
+          "accepting exact cross-map FloorSwitch localization beyond same-map limit: "
+          "transaction=%s building=%s floor=%s map=%s correction=%.3f limit=%.3f",
+          floor.pending.transaction_id.c_str(),
+          floor.pending.building_id.c_str(),
+          floor.pending.floor_id.c_str(),
+          floor.pending.map_id.c_str(),
+          candidate.correction_translation_m,
+          forced_limit);
+      }
+      apply_candidate(candidate, source, "EXPLICIT_TRIGGERED_RELOCALIZATION");
       force_accept_next_pose_ = false;
       force_accept_next_pose_explicit_trigger_ = false;
-      apply_candidate(candidate, source, "EXPLICIT_TRIGGERED_RELOCALIZATION");
       return true;
     }
 
@@ -2969,12 +3396,21 @@ private:
         << force_accept_ignored_pretrigger_result_count_
         << ",\"last_force_accept_ignored_reason\":\""
         << json_escape(last_force_accept_ignored_reason_) << "\""
+        << ",\"isaac_result_requires_explicit_arm\":true"
+        << ",\"explicit_isaac_arm_active\":"
+        << ((force_accept_next_pose_ && force_accept_next_pose_explicit_trigger_) ? "true" : "false")
+        << ",\"unarmed_isaac_result_ignored_count\":"
+        << unarmed_isaac_result_ignored_count_
+        << ",\"last_unarmed_isaac_result_ignored_reason\":\""
+        << json_escape(last_unarmed_isaac_result_ignored_reason_) << "\""
+        << ",\"explicit_result_wall_age_gate_enforced\":false"
         << ",\"last_result_header_stamp\":" << last_result_header_stamp_sec_
         << ",\"last_result_receive_time\":" << last_result_receive_time_sec_
         << ",\"last_result_age_ms\":" << last_result_age_ms_
         << ",\"gate_result_age_limit_ms\":" << last_gate_result_age_limit_ms_
         << ",\"last_result_used_original_stamp\":true"
         << ",\"has_odom\":" << (has_odom_ ? "true" : "false")
+        << ",\"odom_tf_history_duration_sec\":" << odom_tf_history_duration_sec_
         << ",\"last_tf_lookup_stamp\":" << last_tf_lookup_stamp_sec_
         << ",\"last_odom_tf_history_lookup_ok\":" << (last_odom_tf_history_lookup_ok_ ? "true" : "false")
         << ",\"latest_odom_tf_fresh\":" << (latest_odom_tf_fresh_ ? "true" : "false")
@@ -3250,6 +3686,10 @@ private:
         << ",\"large_correction_requires_recovery\":"
         << (map_odom_large_correction_requires_recovery_ ? "true" : "false")
         << ",\"large_correction_rejected_count\":" << large_correction_rejected_count_
+        << ",\"floor_transition_translation_limit_bypass_count\":"
+        << floor_transition_translation_limit_bypass_count_
+        << ",\"last_forced_translation_limit_bypassed\":"
+        << (last_forced_translation_limit_bypassed_ ? "true" : "false")
         << ",\"online_correction_smoothed_count\":" << online_correction_smoothed_count_
         << ",\"online_correction_snap_count\":" << online_correction_snap_count_
         << ",\"map_odom_publish_missed_count\":" << map_odom_publish_missed_count
@@ -3322,8 +3762,8 @@ private:
   double amcl_max_yaw_covariance_{0.5};
   double amcl_accept_after_isaac_delay_sec_{2.0};
   double amcl_post_isaac_refine_window_sec_{10.0};
-  double amcl_post_isaac_refine_max_translation_m_{0.12};
-  double amcl_post_isaac_refine_max_yaw_rad_{0.10};
+  double amcl_post_isaac_refine_max_translation_m_{10.0};
+  double amcl_post_isaac_refine_max_yaw_rad_{0.872664626};
   double amcl_post_isaac_refine_agreement_translation_m_{0.08};
   double amcl_post_isaac_refine_agreement_yaw_rad_{0.08};
   double amcl_post_isaac_refine_min_delay_sec_{0.25};
@@ -3388,6 +3828,7 @@ private:
   std::uint64_t accepted_result_count_{0U};
   std::uint64_t rejected_result_count_{0U};
   std::uint64_t force_accept_ignored_pretrigger_result_count_{0U};
+  std::uint64_t unarmed_isaac_result_ignored_count_{0U};
   std::uint64_t triggered_result_count_{0U};
   std::uint64_t last_explicit_relocalization_sequence_{0U};
   std::uint64_t last_explicit_map_odom_target_sequence_{0U};
@@ -3427,6 +3868,7 @@ private:
   std::uint64_t map_odom_last_accepted_sequence_snapshot_{0U};
   std::uint64_t map_odom_last_published_sequence_snapshot_{0U};
   std::uint64_t large_correction_rejected_count_{0U};
+  std::uint64_t floor_transition_translation_limit_bypass_count_{0U};
   std::uint64_t online_correction_smoothed_count_{0U};
   std::uint64_t online_correction_snap_count_{0U};
   double map_odom_last_publish_wall_sec_{0.0};
@@ -3464,6 +3906,9 @@ private:
   std::string map_frame_;
   std::string odom_frame_;
   std::string base_frame_;
+  std::string localizer_asset_state_topic_;
+  std::string tf_authority_topic_;
+  double tf_authority_max_age_sec_{0.75};
   std::string localization_topic_;
   std::string local_odom_topic_;
   std::string health_topic_;
@@ -3497,6 +3942,7 @@ private:
   std::string last_amcl_scan_admission_status_;
   std::string correction_pause_reason_{"none"};
   std::string last_force_accept_ignored_reason_{"none"};
+  std::string last_unarmed_isaac_result_ignored_reason_{"none"};
 
   bool has_pose_{false};
   bool has_odom_{false};
@@ -3511,6 +3957,7 @@ private:
   bool correction_paused_{false};
   bool live_floor_transition_service_enabled_{false};
   bool triggered_allow_large_correction_{true};
+  bool last_forced_translation_limit_bypassed_{false};
   bool map_odom_smoothing_enabled_{true};
   bool map_odom_large_correction_requires_recovery_{true};
   bool last_odom_tf_history_lookup_ok_{false};
@@ -3526,18 +3973,29 @@ private:
   MapToOdom last_post_isaac_refine_candidate_;
   MapOdomState map_odom_state_;
   robot_localization_bridge::CorrectionPauseArbiter correction_pause_arbiter_;
+  std::atomic<std::uint64_t> legacy_correction_pause_command_sequence_{0U};
   robot_localization_bridge::FloorTransitionContext floor_transition_context_;
   mutable std::mutex correction_pause_mutex_;
   mutable std::mutex floor_transition_context_mutex_;
   mutable std::mutex map_odom_state_mutex_;
   mutable std::mutex map_odom_publish_stats_mutex_;
+  mutable std::mutex localizer_asset_state_mutex_;
+  bool have_localizer_asset_state_{false};
+  robot_interfaces::msg::LocalizerAssetState localizer_asset_state_;
+  mutable std::mutex tf_authority_mutex_;
+  std::unordered_map<std::string, double> map_odom_authorities_;
+  std::unordered_map<std::string, double> odom_base_authorities_;
 
+  double odom_tf_history_duration_sec_{30.0};
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr amcl_pose_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr amcl_scan_admission_status_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp::Subscription<robot_interfaces::msg::LocalizerAssetState>::SharedPtr
+    localizer_asset_state_sub_;
+  rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr tf_authority_sub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr health_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
   rclcpp::Publisher<robot_interfaces::msg::CorrectionPauseState>::SharedPtr

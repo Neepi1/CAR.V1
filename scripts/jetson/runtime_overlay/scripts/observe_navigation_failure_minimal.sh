@@ -16,6 +16,8 @@ INCLUDE_ROSOUT=true
 INCLUDE_CMD_VEL=true
 INCLUDE_PERCEPTION_STATUS=false
 INCLUDE_CONTROLLER_DETAIL=true
+STORE_COSTMAP_SNAPSHOTS=false
+COSTMAP_SNAPSHOT_PERIOD_SEC=0.5
 ACKERMANN_MIN_TURNING_RADIUS_M="${ACKERMANN_MIN_TURNING_RADIUS_M:-0.81}"
 PREFIX="[nav-failure-minimal]"
 
@@ -43,6 +45,9 @@ Options:
   --no-cmd-vel                  Do not subscribe to command-chain Twist topics.
   --include-perception-status   Also record lightweight status strings from perception/lidar status topics.
   --no-controller-detail        Do not subscribe to /speed_limit, Nav2 Path topics, or /local_costmap/costmap.
+  --store-costmap-snapshots     Store an exact, sampled local-costmap timeline for later rendering.
+  --costmap-snapshot-period-sec N
+                                Full-grid snapshot period. Default: 0.5 s (2 Hz).
   --ackermann-min-radius M      Radius used only for cmd-shape diagnostics. Default: 0.81.
   -h, --help                    Show this help.
 EOF
@@ -90,6 +95,14 @@ while [[ $# -gt 0 ]]; do
       INCLUDE_CONTROLLER_DETAIL=false
       shift
       ;;
+    --store-costmap-snapshots)
+      STORE_COSTMAP_SNAPSHOTS=true
+      shift
+      ;;
+    --costmap-snapshot-period-sec)
+      COSTMAP_SNAPSHOT_PERIOD_SEC="${2:-}"
+      shift 2
+      ;;
     --ackermann-min-radius)
       ACKERMANN_MIN_TURNING_RADIUS_M="${2:-}"
       shift 2
@@ -121,6 +134,16 @@ if ! [[ "${ACKERMANN_MIN_TURNING_RADIUS_M}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   exit 2
 fi
 
+if ! [[ "${COSTMAP_SNAPSHOT_PERIOD_SEC}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "${PREFIX} FAIL --costmap-snapshot-period-sec must be numeric" >&2
+  exit 2
+fi
+
+if [[ "${STORE_COSTMAP_SNAPSHOTS}" == "true" && "${INCLUDE_CONTROLLER_DETAIL}" != "true" ]]; then
+  echo "${PREFIX} FAIL --store-costmap-snapshots cannot be combined with --no-controller-detail" >&2
+  exit 2
+fi
+
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 LABEL="$(sanitize_label "${LABEL}")"
 if [[ -z "${OUTPUT_DIR}" ]]; then
@@ -128,9 +151,24 @@ if [[ -z "${OUTPUT_DIR}" ]]; then
 fi
 mkdir -p "${OUTPUT_DIR}"
 
+# The runtime API normally keeps its token only in the server process environment.
+# Reuse it for read-only status polling when this observer is run as container root.
+if [[ -z "${ROBOT_API_TOKEN:-}" ]] && command -v pgrep >/dev/null 2>&1; then
+  API_SERVER_PID="$(pgrep -fn '[r]obot_api_server_node' 2>/dev/null || true)"
+  if [[ -n "${API_SERVER_PID}" && -r "/proc/${API_SERVER_PID}/environ" ]]; then
+    ROBOT_API_TOKEN="$(
+      tr '\0' '\n' < "/proc/${API_SERVER_PID}/environ" \
+        | sed -n 's/^ROBOT_API_TOKEN=//p' \
+        | head -n 1
+    )"
+    export ROBOT_API_TOKEN
+  fi
+fi
+
 echo "${PREFIX} report_dir=${OUTPUT_DIR}"
 echo "${PREFIX} duration_sec=${DURATION_SEC} sample_period_sec=${SAMPLE_PERIOD_SEC}"
 echo "${PREFIX} controller_detail=${INCLUDE_CONTROLLER_DETAIL} ackermann_min_radius_m=${ACKERMANN_MIN_TURNING_RADIUS_M}"
+echo "${PREFIX} store_costmap_snapshots=${STORE_COSTMAP_SNAPSHOTS} costmap_snapshot_period_sec=${COSTMAP_SNAPSHOT_PERIOD_SEC}"
 echo "${PREFIX} read-only: no goals, no params, no services, no /tf, no PointCloud2, no LaserScan"
 echo "${PREFIX} start the App navigation goal now if you have not already"
 
@@ -143,9 +181,13 @@ python3 - \
   "${INCLUDE_CMD_VEL}" \
   "${INCLUDE_PERCEPTION_STATUS}" \
   "${INCLUDE_CONTROLLER_DETAIL}" \
-  "${ACKERMANN_MIN_TURNING_RADIUS_M}" <<'PY'
+  "${ACKERMANN_MIN_TURNING_RADIUS_M}" \
+  "${STORE_COSTMAP_SNAPSHOTS}" \
+  "${COSTMAP_SNAPSHOT_PERIOD_SEC}" <<'PY'
+import gzip
 import json
 import math
+import os
 import re
 import sys
 import time
@@ -158,7 +200,7 @@ from action_msgs.msg import GoalStatusArray
 from geometry_msgs.msg import Twist
 from rcl_interfaces.msg import Log
 from nav2_msgs.msg import SpeedLimit
-from nav_msgs.msg import OccupancyGrid, Path as NavPath
+from nav_msgs.msg import OccupancyGrid, Odometry, Path as NavPath
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
@@ -173,6 +215,9 @@ include_cmd_vel = sys.argv[6].lower() == "true"
 include_perception_status = sys.argv[7].lower() == "true"
 include_controller_detail = sys.argv[8].lower() == "true"
 ackermann_min_turning_radius_m = float(sys.argv[9])
+store_costmap_snapshots = sys.argv[10].lower() == "true"
+costmap_snapshot_period_sec = max(0.2, float(sys.argv[11]))
+api_token = os.environ.get("ROBOT_API_TOKEN", "").strip()
 
 output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -222,7 +267,22 @@ BRIDGE_KEYS = (
 
 
 def now_iso():
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    wall = time.time()
+    whole = int(wall)
+    millis = int((wall - whole) * 1000.0)
+    return f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(whole))}.{millis:03d}Z"
+
+
+def quaternion_yaw(orientation):
+    siny_cosp = 2.0 * (
+        float(orientation.w) * float(orientation.z)
+        + float(orientation.x) * float(orientation.y)
+    )
+    cosy_cosp = 1.0 - 2.0 * (
+        float(orientation.y) * float(orientation.y)
+        + float(orientation.z) * float(orientation.z)
+    )
+    return math.atan2(siny_cosp, cosy_cosp)
 
 
 def short_uuid(uuid_msg):
@@ -370,6 +430,13 @@ class MinimalNavigationObserver(Node):
         self.events_file = self.events_path.open("a", encoding="utf-8")
         self.cmd_frames_file = self.cmd_frames_path.open("a", encoding="utf-8")
         self.rosout_file = self.rosout_path.open("a", encoding="utf-8")
+        self.costmap_snapshot_dir = output_dir / "costmap_snapshots"
+        self.costmap_index_file = None
+        if store_costmap_snapshots:
+            self.costmap_snapshot_dir.mkdir(parents=True, exist_ok=True)
+            self.costmap_index_file = (
+                self.costmap_snapshot_dir / "index.jsonl"
+            ).open("a", encoding="utf-8")
 
         self.action_status = {}
         self.action_status_keys = {}
@@ -391,6 +458,10 @@ class MinimalNavigationObserver(Node):
             "zero_or_near_zero_count": 0,
         }
         self.path_stats = {}
+        self.latest_path_geometry = {}
+        self.latest_odometry = None
+        self.last_costmap_snapshot_monotonic = None
+        self.costmap_snapshot_count = 0
         self.local_costmap_stats = {
             "count": 0,
             "last_msg_at": None,
@@ -501,6 +572,13 @@ class MinimalNavigationObserver(Node):
                 self.on_local_costmap,
                 QoSProfile(depth=2),
             )
+            if store_costmap_snapshots:
+                self.create_subscription(
+                    Odometry,
+                    "/local_state/odometry",
+                    self.on_odometry,
+                    small_qos,
+                )
 
         if include_rosout:
             self.create_subscription(Log, "/rosout", self.on_rosout, rosout_qos)
@@ -515,7 +593,10 @@ class MinimalNavigationObserver(Node):
             self.events_file,
             self.cmd_frames_file,
             self.rosout_file,
+            self.costmap_index_file,
         ):
+            if handle is None:
+                continue
             try:
                 handle.flush()
                 handle.close()
@@ -640,8 +721,144 @@ class MinimalNavigationObserver(Node):
             "last_pose": pose_summary(msg.poses[-1]) if count else None,
         }
         stats["latest"] = latest
+        if store_costmap_snapshots:
+            self.latest_path_geometry[topic] = {
+                "frame_id": msg.header.frame_id,
+                "stamp_sec": int(msg.header.stamp.sec),
+                "stamp_nanosec": int(msg.header.stamp.nanosec),
+                "poses_xy": [
+                    [float(item.pose.position.x), float(item.pose.position.y)]
+                    for item in msg.poses
+                ],
+            }
         if count == 0:
             self.emit_event("path_empty", {"topic": topic})
+
+    def on_odometry(self, msg):
+        pose = msg.pose.pose
+        twist = msg.twist.twist
+        self.latest_odometry = {
+            "captured_at": now_iso(),
+            "stamp_sec": int(msg.header.stamp.sec),
+            "stamp_nanosec": int(msg.header.stamp.nanosec),
+            "frame_id": msg.header.frame_id,
+            "child_frame_id": msg.child_frame_id,
+            "x": float(pose.position.x),
+            "y": float(pose.position.y),
+            "yaw_rad": quaternion_yaw(pose.orientation),
+            "linear_x": float(twist.linear.x),
+            "linear_y": float(twist.linear.y),
+            "angular_z": float(twist.angular.z),
+        }
+
+    @staticmethod
+    def costmap_preview_pixel(value):
+        value = int(value)
+        if value < 0:
+            return 205
+        if value >= 99:
+            return 0
+        return max(1, min(254, 254 - int(round(254.0 * value / 100.0))))
+
+    def store_costmap_snapshot(self, msg, latest_stats):
+        snapshot_index = self.costmap_snapshot_count
+        self.costmap_snapshot_count += 1
+        sec = int(msg.header.stamp.sec)
+        nanosec = int(msg.header.stamp.nanosec)
+        stem = f"costmap_{sec}_{nanosec:09d}_{snapshot_index:05d}"
+        raw_name = f"{stem}.int8.bin.gz"
+        pgm_name = f"{stem}.pgm"
+        metadata_name = f"{stem}.json"
+        raw_path = self.costmap_snapshot_dir / raw_name
+        pgm_path = self.costmap_snapshot_dir / pgm_name
+        metadata_path = self.costmap_snapshot_dir / metadata_name
+
+        raw_bytes = bytes((int(value) & 0xFF) for value in msg.data)
+        with gzip.open(raw_path, "wb", compresslevel=3) as handle:
+            handle.write(raw_bytes)
+
+        width = int(msg.info.width)
+        height = int(msg.info.height)
+        pixels = bytearray()
+        for y in range(height - 1, -1, -1):
+            row_start = y * width
+            pixels.extend(
+                self.costmap_preview_pixel(msg.data[row_start + x])
+                for x in range(width)
+            )
+        with pgm_path.open("wb") as handle:
+            handle.write(f"P5\n{width} {height}\n255\n".encode("ascii"))
+            handle.write(pixels)
+
+        metadata = {
+            "captured_at": now_iso(),
+            "captured_epoch_sec": time.time(),
+            "snapshot_index": snapshot_index,
+            "message": {
+                "stamp_sec": sec,
+                "stamp_nanosec": nanosec,
+                "frame_id": msg.header.frame_id,
+                "width": width,
+                "height": height,
+                "resolution": float(msg.info.resolution),
+                "origin": {
+                    "x": float(msg.info.origin.position.x),
+                    "y": float(msg.info.origin.position.y),
+                    "z": float(msg.info.origin.position.z),
+                    "qx": float(msg.info.origin.orientation.x),
+                    "qy": float(msg.info.origin.orientation.y),
+                    "qz": float(msg.info.origin.orientation.z),
+                    "qw": float(msg.info.origin.orientation.w),
+                },
+            },
+            "raw_grid": {
+                "file": raw_name,
+                "encoding": "int8_twos_complement_row_major",
+                "cell_count": len(msg.data),
+            },
+            "preview": {
+                "file": pgm_name,
+                "row_order": "top_row_is_positive_y",
+                "unknown_gray": 205,
+                "free_gray": 254,
+                "lethal_gray": 0,
+            },
+            "statistics": latest_stats,
+            "odometry": self.latest_odometry,
+            "paths": self.latest_path_geometry,
+            "action_status": self.action_status,
+            "api_goal": (
+                (self.latest_api_navigation or {}).get("navigation_goal")
+                if isinstance(self.latest_api_navigation, dict)
+                else None
+            ),
+            "latest_commands": {
+                topic: {
+                    "last_msg_at": stats.get("last_msg_at"),
+                    "last": stats.get("last"),
+                }
+                for topic, stats in self.twist_stats.items()
+            },
+        }
+        metadata_path.write_text(
+            json.dumps(metadata, ensure_ascii=True, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        index_row = {
+            "captured_at": metadata["captured_at"],
+            "captured_epoch_sec": metadata["captured_epoch_sec"],
+            "snapshot_index": snapshot_index,
+            "stamp_sec": sec,
+            "stamp_nanosec": nanosec,
+            "frame_id": msg.header.frame_id,
+            "raw_file": raw_name,
+            "preview_file": pgm_name,
+            "metadata_file": metadata_name,
+        }
+        self.costmap_index_file.write(
+            json.dumps(index_row, ensure_ascii=True, sort_keys=True) + "\n"
+        )
+        self.costmap_index_file.flush()
 
     def summarize_costmap_window(self, data, width, height, cx, cy, radius_cells):
         counts = {
@@ -741,6 +958,21 @@ class MinimalNavigationObserver(Node):
         if near_0_5["lethal"] > 0:
             stats["near_robot_lethal_count"] += 1
             self.emit_event("local_costmap_center_lethal", latest)
+        if store_costmap_snapshots:
+            now_monotonic = time.monotonic()
+            if (
+                self.last_costmap_snapshot_monotonic is None
+                or now_monotonic - self.last_costmap_snapshot_monotonic
+                >= costmap_snapshot_period_sec
+            ):
+                self.last_costmap_snapshot_monotonic = now_monotonic
+                try:
+                    self.store_costmap_snapshot(msg, latest)
+                except Exception as exc:
+                    self.emit_event(
+                        "costmap_snapshot_write_failed",
+                        {"error": f"{type(exc).__name__}: {exc}"},
+                    )
 
     def on_rosout(self, msg):
         text = msg.msg or ""
@@ -758,7 +990,10 @@ class MinimalNavigationObserver(Node):
     def fetch_json(self, path):
         url = f"{api_url}{path}"
         try:
-            with urllib.request.urlopen(url, timeout=0.45) as response:
+            request = urllib.request.Request(url)
+            if api_token:
+                request.add_header("X-Robot-Token", api_token)
+            with urllib.request.urlopen(request, timeout=0.45) as response:
                 body = response.read(1024 * 1024).decode("utf-8", errors="replace")
             return json.loads(body), None
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
@@ -888,9 +1123,16 @@ class MinimalNavigationObserver(Node):
                 "subscribes_tf": False,
                 "subscribes_pointcloud": False,
                 "subscribes_laserscan": False,
-                "subscribes_local_costmap_summary_only": include_controller_detail,
-                "stores_full_costmap": False,
+                "subscribes_local_costmap_summary_only": (
+                    include_controller_detail and not store_costmap_snapshots
+                ),
+                "stores_full_costmap": store_costmap_snapshots,
+                "costmap_snapshot_period_sec": (
+                    costmap_snapshot_period_sec if store_costmap_snapshots else None
+                ),
             },
+            "api_auth_token_present": bool(api_token),
+            "costmap_snapshot_count": self.costmap_snapshot_count,
             "classification": classification,
             "latest_api_goal": goal,
             "latest_api_status": self.latest_api_status,
@@ -924,7 +1166,10 @@ class MinimalNavigationObserver(Node):
             "",
             f"- report_dir: `{summary['report_dir']}`",
             f"- duration_sec: `{summary['duration_sec']}`",
-            "- impact: one temporary rclpy participant; no publish/action/service/param; no `/tf`, PointCloud2, or LaserScan subscriptions; local costmap is summarized only, not stored",
+            "- impact: one temporary rclpy participant; no publish/action/service/param; no `/tf`, PointCloud2, or LaserScan subscriptions",
+            f"- full_costmap_snapshots: `{summary['impact_contract']['stores_full_costmap']}` "
+            f"count=`{summary.get('costmap_snapshot_count')}` "
+            f"period_sec=`{summary['impact_contract'].get('costmap_snapshot_period_sec')}`",
             f"- classification: `{', '.join(summary['classification']) if summary['classification'] else 'no_failure_classification_yet'}`",
             "",
             "## Final API Goal",
@@ -1035,6 +1280,9 @@ class MinimalNavigationObserver(Node):
                 "- `api_poll.jsonl`: `/api/v1/status` and `/api/v1/navigation/state` poll",
                 "- `events.jsonl`: action/status changes and first nonzero command events",
                 "- `rosout_filtered.log`: filtered Nav2/controller/localization/safety log lines",
+                "- `costmap_snapshots/index.jsonl`: sampled full-grid timeline when `--store-costmap-snapshots` is enabled",
+                "- `costmap_snapshots/*.int8.bin.gz`: exact signed int8 row-major OccupancyGrid payloads",
+                "- `costmap_snapshots/*.pgm` and `*.json`: visual previews and frame/origin/odom/path metadata",
             ]
         )
         return "\n".join(lines) + "\n"
@@ -1045,6 +1293,8 @@ node = MinimalNavigationObserver()
 try:
     while rclpy.ok() and time.time() < node.deadline_wall:
         rclpy.spin_once(node, timeout_sec=0.1)
+except KeyboardInterrupt:
+    pass
 finally:
     try:
         node.on_sample_timer()
@@ -1052,7 +1302,15 @@ finally:
     finally:
         node.close_files()
         node.destroy_node()
-        rclpy.shutdown()
+        # SIGINT is handled by rclpy first and may already have shut down the
+        # default context.  Keep Ctrl+C finalization idempotent so a completed
+        # report is not followed by a misleading observer failure.
+        if rclpy.ok():
+            try:
+                rclpy.shutdown()
+            except Exception as exc:
+                if "rcl_shutdown already called" not in str(exc):
+                    raise
 PY
 
 status=$?

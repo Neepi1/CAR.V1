@@ -1,9 +1,18 @@
 string building_id
 string floor_id
+string map_id
+uint64 expected_asset_epoch
+string expected_asset_digest
 bool resume_navigation
 ---
 bool success
+string code
 string message
+string selected_building_id
+string selected_floor_id
+string selected_map_id
+uint64 asset_epoch
+string asset_digest
 string nav_map_yaml
 string localizer_map_png
 string localizer_params_yaml

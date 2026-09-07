@@ -3,6 +3,32 @@
 日期：2026-07-23
 状态：接口、事务围栏与负向互锁收口阶段；**未授权真实电梯运动或真实切层**
 
+> 2026-08-25 更新：本文标题保留历史阶段名。生产
+> `robot_api_server` 已接入 `127.0.0.1:8083` 机械臂黑盒，自动执行厅外呼梯
+> 按键效果和轿厢选层按键效果；门开、到层、目标层门开仍为人工观察。当前黑盒
+> 的物理呼梯端点返回 `501 capability_unavailable`，因此厅外呼梯会在
+> `release` 任务完成后降级到人工 `CALL_BUTTON_PRESSED`，不会伪造成功。当前为
+> 功能验证模式，不使用 health/status/避让状态作为流程门控。下文关于“后接”
+> 的描述是 7 月设计基线，最新运行契约以本更新和
+> `elevator_test_http_fail_closed_deployment.md` 为准。
+
+## 2026-08-05 当前方案：四点倒车入梯
+
+当前新增 schema v3，作为后续现场标定和乘梯联调的目标契约。每层需要四个
+内部点：`hall_call`（呼梯作业位）、`landing`（倒车入梯接驳位）、
+`cabin`（轿厢中心位）、`cabin_panel`（轿厢面板作业位），并显式选择
+`hall_call_panel_side` 与 `cabin_panel_side` 的 `LEFT/RIGHT`。左右均以机器人
+在相应标定点的车头方向为基准，系统不从地图坐标猜测。
+
+流程固定为：呼梯完成后转到与 `landing` 相同的朝向（约 180°），先纵向
+对线再横移到接驳位；确认开门后保持该朝向直线倒车到 `cabin`；随后按轿厢
+面板侧横移到 `cabin_panel`。切层以目标层 `cabin_panel` 为定位锚点，之后
+先横移回 `cabin`，再前进到目标层 `landing`。schema v2 三点发布版继续兼容，
+但不会被静默补造第四点或左右属性。
+
+后尾激光雷达尚未安装，因此当前实现只建立软件契约和受控动作链；在后向
+盲区完成覆盖和实车验收前，不得据此宣称可无人值守倒车入梯。
+
 ## 0. 本轮新增：不可变 release 运行预检
 
 `robot_elevator_manager::load_elevator_release()` 现在是电梯执行链的配置
@@ -15,12 +41,13 @@
    `elevator_internal_poses.yaml`、`validation.json`、`manifest.json` 和
    `current.json`；
 3. 联合校验 release/generation/lineage、发布标志、legacy configuration
-   digest、canonical `sha256:<64 lowercase hex>` 地图绑定、拓扑、门槛和
-   五类内部点；
+   digest、canonical `sha256:<64 lowercase hex>` 地图绑定以及对应 schema
+   的拓扑和内部点；schema v1 五点/门槛只做历史完整性校验，不能执行；
 4. 首选电梯为空时，按 `elevator_id` 稳定选择能精确服务 source/target
    floor+map 的电梯；
-5. 返回按值冻结的 release、选中电梯、source/target 地图摘要、门槛和五类
-   pose。任务期间 `current` 再切换也不会改变已返回对象。
+5. 对 schema v2/v3 返回按值冻结的 release、选中电梯、source/target 地图
+   摘要和相应角色/面板侧。任务期间 `current`
+   再切换也不会改变已返回对象。
 
 Jetson/Linux 实现固定 release 目录 FD，并使用
 `openat(O_NOFOLLOW)`、`fstat`、2 MiB 单文件上限和单硬链接约束读取文件。
@@ -46,9 +73,9 @@ Jetson/Linux 实现固定 release 目录 FD，并使用
 本阶段先完成与机械臂、视觉算法无关的部分：
 
 - 电梯和跨层任务的确定性状态机；
-- 楼层、电梯、门槛和内部 waypoint 的数据契约；
+- 楼层、电梯和三个内部 waypoint 的数据契约；
 - owner-scoped 模式、运动 hold、执行 TTL 和定位修正暂停；
-- 完整 footprint 进舱/出舱判定；
+- `landing -> cabin` 和 `cabin -> landing` 的串行导航与停车确认边界；
 - 串行 Nav2 effect 和失败锁定；
 - floor switch 的目标成功屏障；
 - 可重复的纯单元测试和隔离 mock 测试边界。
@@ -69,13 +96,13 @@ Jetson/Linux 实现固定 release 目录 FD，并使用
 | 组件 | 当前已有 | 当前没有 |
 |---|---|---|
 | `robot_interfaces` | Elevator/Mission/FloorSwitch/PressButton actions；门、机械臂、floor、safety、mode、correction-pause 消息与服务 | 接口文件本身不提供运行节点或安全保证 |
-| `robot_elevator_manager` | 纯 C++ topology 与 YAML catalog loader、完整 footprint 门槛分类、事件驱动 FSM 和 GTest；核心已编排 `BEGIN_FLOOR_TRANSITION -> resume -> switch`，安全清理 effect 可确认和重试 | ROS 节点、action server、Nav2/floor/safety/mode adapter、真实 mock node |
+| `robot_elevator_manager` | 纯 C++ schema-v1/v2 topology 与 YAML catalog loader、schema-v2 三点事件驱动 FSM 和 GTest；核心已编排 `BEGIN_FLOOR_TRANSITION -> resume -> switch`，安全清理 effect 可确认和重试；旧门槛分类只保留给 v1 历史资产校验 | ROS 节点、action server、Nav2/floor/safety/mode adapter、真实 mock node |
 | `robot_mission_manager` | 同层/跨层纯 C++ 串行 effect FSM 和 GTest；跨层 completion 校验 floor/map、asset epoch/digest、显式重定位、`TARGET_HALL`、上下文及残留 goal/hold/lease/pause；清理 ID 跨重试稳定 | ROS action server、Nav2/elevator adapter、任务恢复节点 |
 | `robot_mode_manager` | owner/mission/lease 仲裁核心、服务节点、状态 heartbeat 和单元测试 | 生产 bringup 与所有 profile 消费者的实车验证 |
-| `robot_safety` | owner-scoped motion hold、执行 TTL/failure lock、mode owner/mission/lease 交叉校验、电梯期仅允许 Nav2 正常源、状态主题、最终 Twist gate、单元测试和手动隔离脚本 | 精确 Nav2 goal 身份绑定、进程丢失和真实停车距离验收 |
+| `robot_safety` | owner-scoped motion hold、历史/通用 execution TTL arbiter、乘梯 transaction-owned mode owner/mission/lease 校验、电梯期仅允许 Nav2 正常源、状态主题、最终 Twist gate、单元测试和手动隔离脚本 | 精确 Nav2 goal 身份绑定、进程丢失和真实停车距离验收 |
 | `robot_localization_bridge` | owner-scoped correction pause 与 legacy Bool 组合；`BeginFloorTransition` BEGIN/COMMIT/ABORT 围栏；typed `/localization/floor_health`；单元测试和隔离 ROS smoke | localizer generation、TF 唯一性和目标 asset epoch 的外部权威证明；实车切层验收 |
 | `robot_floor_manager` | 旧服务仅允许 `resume_navigation=false` 选择；`resume_navigation=true` 零副作用拒绝；新增 preflight-only `FloorSwitch.action`、typed status、纯 C++ pause 交接/source invalidation/epoch/digest/readiness/失败锁定核心 | Action 到 bridge、真实 map/filter/localizer/costmap adapter 的 live 串接和目标 readiness 观测 |
-| `robot_api_server` | 永久订阅 typed floor/health；事务活动、runtime invalid 或 `FAILED_LOCKED` 时阻止新导航、建图、地图/点位/禁行线/电梯配置写入、重定位、停靠、脱桩和 safety resume；stop/cancel 仍允许；旧 HTTP live-switch 旁路已关闭；已实现电梯配置草稿、校验、不可变发布、回滚和内部点隔离 | 跨节点 execution lease；完成切层后对请求解析代际的强一致 token；配置发布后的 live 应用 adapter |
+| `robot_api_server` | 永久订阅 typed floor/health；事务活动、runtime invalid 或 `FAILED_LOCKED` 时阻止新导航、建图、地图/点位/禁行线/电梯配置写入、重定位、停靠、脱桩和 safety resume；stop/cancel 仍允许；乘梯流程使用精确 mode contract 且不创建 execution lease；已实现电梯配置草稿、校验、不可变发布、回滚和内部点隔离 | 完成切层后对请求解析代际的强一致 token；配置发布后的 live 应用 adapter |
 | 机械臂/视觉 | 预留接口 | action server、observation publisher、标定和现场证据 |
 
 特别注意：
@@ -110,14 +137,14 @@ robot_mission_manager
         |
         v
 robot_elevator_manager
-  topology + threshold + elevator FSM
+  schema-v2 three-point topology + elevator FSM
         |
         +--> Nav2 adapter ------------------------------+
         +--> robot_mode_manager                         |
         +--> robot_floor_manager                        |
         +--> robot_localization_bridge pause ownership  |
         +--> future arm / vision adapters               |
-        +--> robot_safety hold / execution lease -------+
+        +--> robot_safety hold / exact mode contract ---+
                                                         |
 Nav2 -> velocity_smoother -> collision_monitor -> robot_safety
      -> /cmd_vel -> ranger_base
@@ -125,7 +152,7 @@ Nav2 -> velocity_smoother -> collision_monitor -> robot_safety
 
 职责约束：
 
-- mission manager 不识别门、不按按钮、不检查门槛、不切图；
+- mission manager 不识别门、不按按钮、不切图；
 - elevator manager 不发布 Twist、不发布 TF、不修改导航参数；
 - floor manager 只拥有楼层资产事务，不决定何时进出电梯；
 - mode manager 只拥有运行模式控制面，模式不是运动许可；
@@ -183,17 +210,14 @@ recovery 流程完成。
 ```text
 导航到 hall_call
 -> 获取厅外 motion hold
--> 获取 execution lease/session
 -> MOCK 呼梯
 -> 设置 ELEVATOR_WAIT
 -> 释放厅外 hold
--> 导航到 hall_wait
+-> 导航到源层 landing
 -> MOCK 等待源层开门
 -> 设置 DOORWAY
--> 导航到源层 doorway
 -> 导航到源层 cabin
--> 验证完整 footprint 已在舱内
--> 获取舱内 hold
+-> 确认 cabin 目标成功且车体停稳，获取舱内 hold
 -> MOCK 按目标楼层
 -> 获取 owner-scoped correction pause
 -> 设置 ELEVATOR_RIDE
@@ -205,21 +229,27 @@ recovery 流程完成。
 -> 验证目标楼层 readiness
 -> 设置 DOORWAY
 -> 释放舱内 hold
--> 导航到目标层 doorway
--> 导航到目标层 exit
--> 验证完整 footprint 已在厅外
--> 获取出口 hold
+-> 从 cabin 导航到目标层 landing
+-> 确认 landing 目标成功且车体停稳，获取厅外 hold
 -> 精确释放 mode lease
--> 精确释放 execution session
 -> 释放出口 hold
 -> COMPLETE
 ```
 
-任何 active effect 失败、取消、乱序、序号不匹配或门槛判定失败都会进入
-`FAILURE_CLEANUP` 并产生 `HOLD_AND_CANCEL`。所有非 `NONE` 安全 effect 都带
-`accepted=true`；非法启动请求在任何运动前直接拒绝且不产生 effect。清理失败
-会以新序号重发，只有确认 hold、唯一 Nav2 goal 已取消且停稳后才进入永久
-`LOCKED`。这仍只是未来 ROS adapter 的指令，不代表 live 适配已经完成。
+任何 active effect 失败、取消、乱序或序号不匹配都会进入
+`FAILURE_CLEANUP` 并产生 `HOLD_AND_CANCEL`。所有非 `NONE` effect 都带
+`accepted=true`；非法启动请求在任何运动前直接拒绝且不产生 effect。普通阶段
+故障不再按“车可能位于轿厢任意位置”永久锁定：`SWITCH_FLOOR` 成功前使用日志中
+精确的源层运行身份清理，成功后使用精确的目标层运行身份清理。资源回收和本事务
+hold 释放完成后终态为 `FAILED/CANCELLED`，允许操作员重新开始测试。只有日志
+损坏、schema 不支持或运行资源确实无法核实时才保留维护锁；底层碰撞、急停和
+`robot_safety` 速度仲裁不因此绕过。
+
+若完整运行链冷启动时 Nav2/定位端点尚未就绪，旧版共享 40 次窗口可能留下
+`ELEVATOR_EXECUTION_RESTART_RECOVERY_UNPROVEN`。下一次完整运行链冷启动只会将
+schema v3、普通阶段、精确匹配 source/target floor-map 与 cleanup disposition 的
+该终态收口为 `FAILED`；不会继续乘梯任务，也不会虚构运动或停车证明。prepare、
+`RETAIN_LOCK`、身份错配、日志损坏及存储/审计故障不走此路径。
 
 当前核心已经编排
 `BEGIN_FLOOR_TRANSITION -> RESUME_LOCALIZATION_CORRECTIONS -> SWITCH_FLOOR`。
@@ -252,15 +282,18 @@ transaction adapter 已存在，floor manager Action 仍是 preflight-only；真
 1. 电梯事务任意时刻最多一个活动 Nav2 goal handle。
 2. 不使用一次灌入多个点的 `NavigateThroughPoses` 代替阶段许可。
 3. 前一个 action 必须明确终态，且阶段后置条件成立，才能发送下一目标。
-4. goal 接受前保持 hold；action 已接受且门、机械臂、模式、执行租约均有效后
-   才可释放 hold。
-5. goal 结束后先重新获取 hold，再检查停稳、footprint 和楼层状态。
+4. goal 接受前保持 hold。首段 `hall_call` 在 action 接受后，只能在 fresh
+   interlock 证明 hold 已释放、无 motion/effective blocker、且没有遗留 execution
+   session/lease 时进入普通 Nav2 首指令暖机；此时 `COMMAND_STALE` 是预期状态。
+   其余电梯段必须在门、机械臂及 transaction-owned 精确 operating mode
+   均有效后才可释放 hold；乘梯流程不创建 execution lease。
+5. goal 结束后先重新获取 hold，再检查实际停稳和楼层状态。
 6. cancel 未确认或停稳未确认时不得发送新 goal。
 7. mission 活动时，普通 App 导航入口必须拒绝外部目标，避免 Nav2 preempt。
 8. 电梯内部 waypoint 不经过 API 的 post-Nav2 速度修正或 API fallback。
 9. manager 不发布 `/cmd_vel_api`、`/cmd_vel_collision_checked` 或 `/cmd_vel`。
 
-## 6. 电梯拓扑与完整 footprint
+## 6. 电梯拓扑与四点倒车模型
 
 每栋楼建议提供：
 
@@ -268,13 +301,27 @@ transaction adapter 已存在，floor manager Action 仍是 preflight-only；真
 maps_release/<building_id>/elevators.yaml
 ```
 
-当前纯 topology 核心要求每个服务楼层恰好一个以下角色：
+schema v3 要求每个服务楼层恰好一个以下角色：
 
 - `hall_call`
-- `hall_wait`
-- `doorway`
+- `landing`
 - `cabin`
-- `exit`
+- `cabin_panel`
+
+并要求：
+
+- `hall_call_panel_side: LEFT|RIGHT`
+- `cabin_panel_side: LEFT|RIGHT`
+
+`landing` 是厅外倒车接驳点，车头朝厅外、车尾朝轿厢；`cabin` 必须位于
+该朝向的正后方。`cabin_panel_side` 由操作员按标定车头方向明确选择，是面板
+左右语义的权威来源；发布校验不再根据 `cabin -> cabin_panel` 的地图 XY
+反推左右，也不要求两个实测点形成纯横移向量。`hall_call -> landing` 固定执行
+转向、纵向对线、横移。此后的所有轿厢内部及进出段——`landing -> cabin`、
+`cabin -> cabin_panel`、目标层 `cabin_panel -> cabin`、`cabin -> landing`——
+统一使用无代价地图碰撞检查的直达 Nav2 链，并按实时目标残差闭合 yaw、横向和
+前后误差。厅外呼梯和接驳段仍保留正常碰撞检查。schema v3 不包含门槛线、门框点、
+`clearance_m` 或 `jamb_clearance_m`。schema v2 的三点模型仅保留给已有发布版。
 
 配置管理模块自动为角色生成全楼唯一的内部 pose ID。坐标不写入本层普通
 `poses.yaml`，而是写入发布版本专用的
@@ -308,7 +355,7 @@ maps_release/<building_id>/elevator_internal_poses.yaml
 发布按整栋楼生成不可变 release，并用 `expected_draft_revision` /
 `expected_release_id` 防止多个标定端互相覆盖。回滚会从历史内容生成新
 release，不覆盖旧版本。发布前重新验证精确 `building/floor/map_id`、地图
-资产摘要、地图边界、五角色、门槛几何以及 topology YAML 回读。有效草稿会
+资产摘要、地图边界、四角色、两项面板侧、倒车几何、面板点 yaw 以及 topology YAML 回读。有效草稿会
 固化每个绑定地图的 `map_asset_digest`；复核后若地图发生变化，发布必须以
 `MAP_ASSET_DIGEST_CHANGED` 拒绝，不能静默绑定新资产。重新绑定必须是显式
 操作：App 删除旧的服务端管理 digest 后重新保存，由服务端写入当前 digest
@@ -327,28 +374,21 @@ HTTP `409 ELEVATOR_CONFIG_MAP_IN_USE` 拒绝删除，先发布解除引用的新
 Nav2、发送目标、解除 hold 或发布速度；因此不能把配置发布成功当作真实
 电梯链已启用。
 
-每层门槛需要：
+旧 schema v1 的五角色和门槛几何仍可被 loader 校验，以证明历史 release
+没有被篡改，但 loader 返回 `LEGACY_READ_ONLY`，FSM 也拒绝 schema v1 route。
+旧 schema v2 可继续读取、回滚和执行；新的 App 编辑流程写 schema v3。
 
-- `left`、`right`：本层 map frame 中的门槛端点；
-- `cabin_reference`：确定哪一侧是舱内；
-- `clearance_m`：车体完全越过门槛的法向安全距离；
-- `jamb_clearance_m`：车体相对左右门框的安全距离。
-
-门槛判定使用已变换到当前 map frame 的完整机器人 footprint。设指向舱内的
-单位法向量为 `n`、门槛上一点为 `p`，每个顶点为 `v_i`：
-
-```text
-d_i = n · (v_i - p)
-```
-
-- 所有顶点超过舱内 clearance，且全部位于门框净宽内，才是 `INSIDE`；
-- 所有顶点超过厅外 clearance，且全部位于门框净宽内，才是 `OUTSIDE`；
-- 跨线、接触 clearance band、门框越界、几何无效或 footprint 无效均为
-  `STRADDLING`/invalid，并 fail closed。
-
-不得只用 `base_link`、目标点到达、Nav2 result code 或车体中心越线代替完整
-footprint 判定。有效 footprint 必须与 Nav2 共源并包含 padding，不能在电梯
-包中维护另一套车体尺寸。
+四点模型不把“到点”单独当成门已打开或通道安全的证明。首段 `hall_call`
+按普通厅外接近契约放行；它仍要求无急停、
+定位有效、非在桩、无 hold、无既有 execution session，并持续经过实时激光、
+Nav2 costmap、collision monitor 和 `robot_safety`。该目标成功后，从呼梯点到
+源层 landing/进梯接驳位的 schema-v2 `SOURCE_LANDING_FACE_CABIN` 与 schema-v3
+`REVERSE_ENTRY_STAGING` 改为复用后续轿厢段的无障碍检测契约：规划器不读取
+costmap 障碍，控制器不做 clearance/障碍重规划，精确 transaction permit 让
+`/cmd_vel_nav` 绕过 collision monitor；schema-v3 原有 yaw -> 横移 -> 纵移顺序
+不变。其余 Nav2 goal 仍必须确认门/楼层观测、机械臂收回与 transaction-owned
+精确 operating mode。
+Nav2 goal 成功后还要确认实际轮速为零，才能推进状态。
 
 ## 7. 安全不变量
 
@@ -358,26 +398,26 @@ footprint 判定。有效 footprint 必须与 Nav2 共源并包含 padding，不
 - 只有精确 owner/transaction 能释放；
 - hold 无 TTL，失败返回或 FSM 析构不能释放；
 - 任一错误先 hold，再 cancel，再等待实际停稳；
-- footprint 为 `STRADDLING` 时不自动前进、后退或重试。
+- 启用障碍检查的阶段若门状态、障碍感知、Nav2 或实际停车证据不满足，不自动
+  推进下一阶段；明确采用无障碍检测契约的接驳/轿厢段仍要求 Nav2 终态与实际停车。
 
-### 7.2 Execution lease
+### 7.2 Execution lease 兼容边界
 
-- 进入电梯专用运动前建立 execution session；
-- adapter 以 steady-clock TTL 持续续租；
-- manager 崩溃或 heartbeat 过期后，session 保持 engaged、lease 失效，
-  `robot_safety` 进入 `EXECUTION_LEASE_MISSING` 并持续输出零；
-- 普通 owner 不能接管 failure-locked session；
-- 只有配置的 recovery owner 可建立恢复租约；
-- 恢复后仍需显式关闭 session，旧 lease ID 不得复用。
-- session 期间只允许正常 Nav2/collision-monitor 源，API 与 docking 速度被拒绝；
-- mode heartbeat 必须与 execution owner/mission 一致；safety 同时约束 heartbeat
-  age 与消息携带的 lease remaining，任一先到期即零速。
+- 新乘梯事务不建立、续期或释放 execution session；FSM 中对应 effect 仅为历史
+  日志分类保留；
+- `/safety/set_execution_lease` 和 failure-locked arbiter 仍为其他调用方及历史
+  残留资源恢复保留，本次修改不删除其实现；
+- 新乘梯开始前若发现遗留/外部 execution session，仍拒绝进入，避免旧状态与新
+  transaction 并存；
+- 精确 post-call transaction permit 可选择 `/cmd_vel_nav` 绕过 collision monitor，
+  API 与 docking 速度仍被拒绝。
 
 ### 7.3 Operating mode
 
 - `ELEVATOR_WAIT`、`DOORWAY`、`ELEVATOR_RIDE` 使用精确 owner/mission/lease；
 - mode lease 需要 heartbeat，但 lease 过期回到 `NORMAL` 不等于允许运动；
-- 专用模式失效时仍由 safety hold/execution failure lock 保持零速；
+- `robot_safety` 将本次乘梯 mode contract 锁存到显式 release；专用模式失效时保持
+  零速，停车切图期间的续期失败不能取消已提交的 `FloorSwitch`；
 - 不全局开放横移或倒车，不修改普通导航参数。
 
 ### 7.4 Localization correction pause
@@ -394,6 +434,19 @@ footprint 判定。有效 footprint 必须与 Nav2 共源并包含 padding，不
 - 如果其他 owner 仍持有 pause，FloorSwitch 必须失败锁定，不能全局清除。
 
 ### 7.5 Floor switch failure
+
+恢复依赖按持久化阶段收口：事务日志必须先写入
+`RUNTIME_EFFECT_INTENT=BEGIN_FLOOR_TRANSITION`，车端才可能提交
+`FloorSwitch.action`。因此该意图之前的失败（例如前往呼梯位）只清理 Nav2、
+事务资源和停车证据，不依赖尚未参与事务的 floor Action；出现该意图之后，
+FloorSwitch endpoint、cancel response 与终态证明仍全部必需。阶段未知或旧日志
+无法证明处于切层前时继续按已提交处理，不放宽安全边界。
+
+完整运行链重启可能把一个已证明处于切层前的失败恢复到同一冻结电梯配置的另一
+端点。此时清理允许使用当前已确认的源端或目标端，但必须同时精确匹配
+building/floor/map/asset epoch/digest，并证明 localizer、bridge、唯一 TF、运行资源
+空闲和双里程计停车。无关楼层仍拒绝；一旦日志表明可能提交过 FloorSwitch，仍只
+接受原记录的外部楼层及 FloorSwitch 终态证明。
 
 机器人物理上已乘梯到目标楼层后，不得在切层失败时自动恢复源楼层地图并宣称
 运行上下文有效。
@@ -442,8 +495,9 @@ Action 也只做 preflight，均不满足该成功契约，因此不能用于真
 - 同时最多一个 active effect；
 - 当前 transaction 的错误、取消和 effect-sequence 乱序进入 failure cleanup；
   外部 transaction 或迟到的旧回执只被忽略，不能推进新状态；
-- topology 标识符、角色完整性和门槛几何校验；
-- 完整 footprint 的 inside/outside/straddling 判定；
+- schema-v1/v2 topology 标识符和角色完整性校验；
+- v1 历史门槛完整性校验以及 v1 runtime fail-closed；
+- v2 `hall_call -> landing -> cabin -> target landing` 串行 effect；
 - mode、motion interlock 和 correction-pause 的纯仲裁逻辑；
 - legacy pause 与 owner-scoped pause 的组合规则；
 - floor transaction 的 pause 交接、source invalidation、target readiness 和
@@ -469,9 +523,8 @@ Action 也只做 preflight，均不满足该成功契约，因此不能用于真
 
 ### 10.1 每部电梯、每个楼层
 
-- 五个内部 pose 的实测坐标和 yaw；
+- `hall_call`、`landing`、`cabin` 三个内部 pose 的实测坐标和 yaw；
 - source/target `map_id`、asset digest 和版本关系；
-- 左右门槛端点、舱内参考点、法向 clearance 和门框 clearance；
 - 电梯门净宽、轿厢净尺寸、门槛高度和 Ranger 完整 footprint 余量；
 - 静态地图中可规划的门口/舱内区域；
 - keepout、speed 和 binary filter 资产；
@@ -498,7 +551,7 @@ Action 也只做 preflight，均不满足该成功契约，因此不能用于真
 4. 将纯核心已有的 safety effect ack、稳定 cleanup ID 与失败重试语义映射到
    ROS adapter，并用隔离 launch test 验证。
 5. 实现 fake Nav2、fake FloorSwitch、fake safety/mode/pause 的隔离 launch
-   test，并把跨节点 execution lease 覆盖到 API 最终提交窗口。
+   test，并覆盖精确 transaction-owned mode contract 与切图期间不取消契约。
 6. 将 manager 加入 bringup，但保持真实电梯 motion disabled。
 7. 接入 `PressButton.action`、`ElevatorObservation`、`ArmState`。
 8. 增加 observation freshness、confidence、稳定时长、arm-stowed 和连续门状态
@@ -526,7 +579,7 @@ Action 也只做 preflight，均不满足该成功契约，因此不能用于真
 - 人为制造门关闭、视觉过期、低 confidence、arm fault、Nav2 abort、
   manager crash、lease expiry 和 floor-switch failure；
 - 每种故障都必须在最终 `/cmd_vel` 观察到零，并保持 failure lock；
-- Nav2 success 但 footprint 仍 `STRADDLING` 时不得推进；
+- Nav2 success 但实际轮速未停稳、门状态失效或安全层阻塞时不得推进；
 - 目标层切图必须满足完整 readiness 后才能释放舱内 hold；
 - Mission 成功回执同时证明目标 floor/map、`TARGET_HALL`、有效 runtime context、
   已提交 target asset epoch，以及无残留 hold/lease/pause；

@@ -6,8 +6,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-$(cd "${SCRIPT_DIR}/../../../.." && pwd)}"
 
 API_CPP="${WORKSPACE_ROOT}/src/robot_api_server/src/robot_api_server_node.cpp"
-DOCKING_JOB_HPP="${WORKSPACE_ROOT}/src/robot_api_server/include/robot_api_server/docking_job_model.hpp"
-DOCKING_JOB_CPP="${WORKSPACE_ROOT}/src/robot_api_server/src/docking_job_model.cpp"
+DOCKING_JOB_HPP="${WORKSPACE_ROOT}/src/robot_api_server/include/robot_api_server/features/docking/lifecycle/docking_job_model.hpp"
+DOCKING_JOB_CPP="${WORKSPACE_ROOT}/src/robot_api_server/src/features/docking/lifecycle/docking_job_model.cpp"
 ROBOT_API_CONFIG="${WORKSPACE_ROOT}/scripts/jetson/runtime_overlay/config/robot_api_server.yaml"
 
 PASS_COUNT=0

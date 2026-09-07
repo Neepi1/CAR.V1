@@ -87,6 +87,22 @@ debug/compat outputs only in this profile, not production-required DDS hops.
 Profile restart stops legacy production obstacle and scan-chain owners unless an
 explicit fallback environment variable is set for diagnosis.
 
+The `/flatscan` helper is owned by the long-lived pointcloud supervisor. Cold
+startup waits for the first stream, applies a short warmup, and retries the
+bounded rate sample. A transient sample below the diagnostic threshold is not
+a reason to stop a publishing helper: after all startup samples remain
+inconclusive the status becomes `startup_degraded`, while the helper and parent
+supervisor stay alive and continue graph/process recovery. This prevents an
+unguarded readiness return under shell `set -e` from leaving `/scan` alive but
+removing `/flatscan` before Isaac localization starts.
+
+For the default `separate_process` ingress, the upstream Hesai driver and
+`pointcloud_accel_axis_node` both use the same resident `UDPv4 + SHM` Fast DDS
+profile. `/jt128/vendor/points_raw` is a full-density PointCloud2 stream; using
+the generic UDP-only wrapper for just the publisher can fragment/drop this hop
+and leave `/scan` and `/flatscan` stale even while both processes remain alive.
+Remote compatibility still uses the UDP transport in the same profile.
+
 Phase Z1 keeps this ROS graph unchanged but removes the worker-side full-cloud
 reparse path. The accel node now stores the latest normalized points internally
 as `LatestNormalizedBuffer` / `NormalizedPointView`; local and scan workers read

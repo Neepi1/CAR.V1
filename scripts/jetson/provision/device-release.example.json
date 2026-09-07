@@ -1,0 +1,111 @@
+{
+  "schema": "njrh.device_release.v1",
+  "release_id": "car-v1-2026.07.25-candidate",
+  "release_state": "template",
+  "desired_state": "ready_locked",
+  "source": {
+    "repository": "https://github.com/Neepi1/CAR.V1.git",
+    "commit": "b0ef442a54ad2af3d0e7a6a307630b6fe9b2351b",
+    "require_clean_tracked_tree": true,
+    "require_clean_tree": true
+  },
+  "platform": {
+    "architecture": "aarch64",
+    "l4t_release": "36",
+    "l4t_revision": "4.3",
+    "jetson_model": "NVIDIA Jetson Orin NX Engineering Reference Developer Kit Super",
+    "jetpack_version": "6.2.1+b38",
+    "l4t_core_version": "36.4.3-20250107174145",
+    "tnspec": "3767-303-0000-D.1-1-1-jetson-orin-nano-devkit-super-",
+    "compatible_spec": "3767-000-0000--1--jetson-orin-nano-devkit-super-",
+    "minimum_online_cpus": 8,
+    "minimum_memory_bytes": 15000000000,
+    "minimum_workspace_free_bytes": 60000000000,
+    "minimum_docker_free_bytes": 30000000000,
+    "minimum_state_free_bytes": 5000000000,
+    "minimum_free_inodes": 500000
+  },
+  "workspace": {
+    "host_path": "/home/nvidia/workspaces/njrh-v3/workspace1",
+    "container_path": "/workspaces/njrh-v3/workspace1",
+    "upstream_host_path": "/home/nvidia/workspaces/isaac_ros-dev",
+    "upstream_container_path": "/workspaces/isaac_ros-dev"
+  },
+  "artifacts": {
+    "runtime_image": {
+      "kind": "oci",
+      "uri": "oci://ghcr.io/neepi1/car-v1/njrh-car@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "reference": "ghcr.io/neepi1/car-v1/njrh-car:2026.07.25",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "image_id": "sha256:2345545cf8b909d7b8fd0858af183fa0e801e59633b55f11c228b69b14253a3a"
+    },
+    "upstream_runtime": {
+      "kind": "payload",
+      "uri": "https://github.com/Neepi1/CAR.V1/releases/download/UNPUBLISHED/njrh-upstream-runtime.tar.gz",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "destination": "/home/nvidia/workspaces/isaac_ros-dev",
+      "required": true
+    },
+    "runtime_overlays": {
+      "kind": "payload",
+      "uri": "https://github.com/Neepi1/CAR.V1/releases/download/UNPUBLISHED/njrh-runtime-overlays.tar.gz",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "destination": "/home/nvidia/workspaces/njrh-v3/workspace1/.runtime",
+      "required": true
+    },
+    "site_assets": {
+      "kind": "payload",
+      "uri": "",
+      "sha256": "",
+      "destination": "/home/nvidia/workspaces/njrh-v3/workspace1/maps_release",
+      "required": false
+    }
+  },
+  "hardware": {
+    "can": {
+      "interface": "can0",
+      "bitrate": 500000,
+      "require_up_during_preflight": true
+    },
+    "jt128": {
+      "interface": "eth1",
+      "host_cidr": "192.168.1.100/24",
+      "device_ip": "192.168.1.201",
+      "lidar_port": 2368,
+      "imu_port": 10110,
+      "require_dedicated_interface": true
+    },
+    "orbbec": {
+      "usb_id": "2bc5:0807",
+      "serial": "AUTO_ENROLL",
+      "required": true,
+      "minimum_usb_speed_mbps": 5000
+    },
+    "required_cpu_ids": [0, 1, 2, 3, 4, 5, 6, 7]
+  },
+  "build": {
+    "package_manifest": "scripts/jetson/provision/runtime-packages.txt",
+    "pytest_failure_allowlist": "scripts/jetson/provision/historical-test-failures.json",
+    "build_testing": true
+  },
+  "trust": {
+    "signature_algorithm": "ed25519",
+    "release_lock": "release-lock.json",
+    "release_lock_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "signature_file": "device-release.json.sig",
+    "trusted_public_key": "/etc/njrh/trust/release-ed25519-public.pem",
+    "trusted_public_key_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "installation": {
+    "container_name": "NJRH-car",
+    "runtime_user": "root",
+    "runtime_env_file": "/etc/njrh/runtime.env",
+    "secrets_env_file": "/etc/njrh/secrets.env",
+    "require_api_secret": true,
+    "provision_state_root": "/var/lib/njrh/provision",
+    "motion_lock": "/var/lib/njrh/provision/motion.lock",
+    "report_root": "/tmp/njrh_reports",
+    "hardware_acceptance_file": "/etc/njrh/hardware_acceptance.json",
+    "device_identity_file": "/etc/njrh/device-identity.json"
+  }
+}

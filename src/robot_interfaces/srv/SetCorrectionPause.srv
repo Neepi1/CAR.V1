@@ -5,13 +5,16 @@ string owner
 string transaction_id
 string reason
 uint8 operation
+uint64 command_sequence
 ---
 uint8 RESULT_OK=0
 uint8 RESULT_INVALID_REQUEST=1
 uint8 RESULT_CONFLICT=2
 uint8 RESULT_NOT_OWNER=3
+uint8 RESULT_STALE_COMMAND=4
 
 bool success
 uint8 result_code
 string message
+uint64 applied_sequence
 robot_interfaces/CorrectionPauseState state

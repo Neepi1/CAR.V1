@@ -1,9 +1,9 @@
 #pragma once
 
-#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "robot_elevator_manager/elevator_topology.hpp"
 
@@ -21,6 +21,7 @@ enum class ElevatorReleaseLoadError
   kInvalidConfiguration,
   kInvalidTopology,
   kInvalidInternalPoses,
+  kLegacyReadOnly,
   kNoRoute,
 };
 
@@ -51,8 +52,9 @@ struct ElevatorRuntimeFloor
   std::string map_id;
   std::uint64_t map_asset_epoch{0U};
   std::string map_asset_digest;
-  DoorThreshold threshold;
-  std::array<ElevatorRuntimePose, 5> poses;
+  std::vector<ElevatorRuntimePose> poses;
+  PanelSide hall_call_panel_side{PanelSide::kUnknown};
+  PanelSide cabin_panel_side{PanelSide::kUnknown};
 };
 
 struct FrozenElevatorRelease
@@ -64,6 +66,7 @@ struct FrozenElevatorRelease
   std::string elevator_id;
   ElevatorRuntimeFloor source;
   ElevatorRuntimeFloor target;
+  std::uint32_t schema_version{2U};
 };
 
 struct ElevatorReleaseLoadResult

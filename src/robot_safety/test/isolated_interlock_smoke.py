@@ -152,6 +152,7 @@ def main() -> None:
         acquire.transaction_id = "tx-isolated"
         acquire.reason = "isolated_gate_test"
         acquire.operation = SetMotionHold.Request.OP_ACQUIRE
+        acquire.command_sequence = 1
         acquired = node.call(node.hold_client, acquire)
         if not acquired.success or not acquired.state.motion_blocked:
             raise AssertionError(f"hold acquisition failed: {acquired}")
@@ -167,6 +168,7 @@ def main() -> None:
         release.transaction_id = acquire.transaction_id
         release.reason = acquire.reason
         release.operation = SetMotionHold.Request.OP_RELEASE
+        release.command_sequence = 2
         released = node.call(node.hold_client, release)
         if not released.success or released.state.motion_blocked:
             raise AssertionError(f"hold release failed: {released}")

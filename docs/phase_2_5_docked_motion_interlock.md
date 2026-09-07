@@ -45,6 +45,14 @@ reports `DOCKED_CONTACT_BLOCK`. The docking input `/cmd_vel_docking` is still
 allowed when `allow_docking_cmd_when_docked=true`, so the controlled undock
 path remains usable.
 
+The final BMS docking interlock releases only after one explicit reverse
+session has been observed, the reverse permit is disabled, and fresh BMS
+feedback says no contact. Reverse-permit disable and BMS no-contact are
+independent asynchronous observations, so `robot_safety` evaluates this same
+predicate from both callbacks. Either arrival order converges; contact still
+present, a still-enabled permit, or a missing reverse session continues to
+hold zero.
+
 The verification script is read-only by default:
 
 ```bash

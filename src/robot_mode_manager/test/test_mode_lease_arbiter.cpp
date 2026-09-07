@@ -157,6 +157,29 @@ TEST(ModeLeaseArbiter, ExpiryTransitionsOnceAndRetiresLease)
   EXPECT_EQ(stale.state.generation, 2U);
 }
 
+TEST(ModeLeaseArbiter, ReleaseBeforeDelayedSetFencesUniqueLease)
+{
+  ModeLeaseArbiter arbiter;
+  auto release = make_command(
+    "ELEVATOR_WAIT", "robot_elevator_manager", "mission-late",
+    "lease-late");
+  release.operation = ModeOperation::kRelease;
+
+  const auto fenced = arbiter.apply(release, 10.0);
+  ASSERT_TRUE(fenced.accepted);
+  EXPECT_FALSE(fenced.state.lease_active);
+  EXPECT_EQ(fenced.state.mode, OperatingMode::kNormal);
+
+  const auto delayed = arbiter.apply(
+    make_command(
+      "ELEVATOR_WAIT", "robot_elevator_manager", "mission-late",
+      "lease-late"),
+    10.1);
+  EXPECT_FALSE(delayed.accepted);
+  EXPECT_EQ(delayed.code, ModeDecisionCode::kStaleLease);
+  EXPECT_EQ(delayed.state.mode, OperatingMode::kNormal);
+}
+
 TEST(ModeLeaseArbiter, ConfiguredRecoveryOwnerCanPreempt)
 {
   ModeLeaseArbiter arbiter;

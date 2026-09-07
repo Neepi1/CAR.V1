@@ -53,14 +53,6 @@ fi
 source "${PROJECT_ROOT}/install/setup.bash"
 set -u
 
-if [[ -n "${ROBOT_API_TOKEN:-}" ]]; then
-  njrh_exec_affined robot_api_server ros2 run robot_api_server robot_api_server_node --ros-args \
-    --params-file "${CONFIG_FILE}" \
-    -p port:="${PORT}" \
-    -p api_token:="${ROBOT_API_TOKEN}" \
-    "${docking_backend_args[@]}"
-fi
-
 njrh_exec_affined robot_api_server ros2 run robot_api_server robot_api_server_node --ros-args \
   --params-file "${CONFIG_FILE}" \
   -p port:="${PORT}" \

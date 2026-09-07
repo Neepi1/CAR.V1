@@ -1,0 +1,24 @@
+string owner
+string transaction_id
+string reason
+# Must be strictly newer than the last accepted command for the exact
+# (owner, transaction_id) hold key.
+uint64 command_sequence
+# Generation from the final fresh MotionInterlockState that proved both the
+# execution session and execution lease absent.
+uint64 expected_generation
+---
+uint8 RESULT_OK=0
+uint8 RESULT_INVALID_REQUEST=1
+uint8 RESULT_CONFLICT=2
+uint8 RESULT_NOT_OWNER=3
+uint8 RESULT_STALE_LEASE=4
+uint8 RESULT_STALE_COMMAND=5
+uint8 RESULT_GENERATION_MISMATCH=6
+uint8 RESULT_EXECUTION_ACTIVE=7
+
+bool success
+uint8 result_code
+string message
+uint64 applied_sequence
+robot_interfaces/MotionInterlockState state

@@ -7,4 +7,28 @@
       Humble-compatible RotationShim wrapper that arms startup alignment once per navigation goal.
     </description>
   </class>
+  <class
+    name="robot_nav_config::ElevatorScopedController"
+    type="robot_nav_config::ElevatorScopedController"
+    base_class_type="nav2_core::Controller">
+    <description>
+      Elevator-transaction-only segmented yaw, lateral, forward, and reverse controller with local footprint replanning.
+    </description>
+  </class>
+  <class
+    name="robot_nav_config::ElevatorAwareProgressChecker"
+    type="robot_nav_config::ElevatorAwareProgressChecker"
+    base_class_type="nav2_core::ProgressChecker">
+    <description>
+      Pose progress checker that preserves ordinary navigation limits and selects finer limits only while an elevator-scoped controller heartbeat is fresh.
+    </description>
+  </class>
+  <class
+    name="robot_nav_config::DockStagingGoalChecker"
+    type="robot_nav_config::DockStagingGoalChecker"
+    base_class_type="nav2_core::GoalChecker">
+    <description>
+      Return-to-dock-only capture-envelope checker that ends coarse Nav2 control before the docking manager owns near-field alignment.
+    </description>
+  </class>
 </library>

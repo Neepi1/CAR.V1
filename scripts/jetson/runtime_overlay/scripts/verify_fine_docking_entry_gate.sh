@@ -42,8 +42,8 @@ mkdir -p "${OUTPUT_DIR}"
 
 API_CPP="${WORKSPACE_ROOT}/src/robot_api_server/src/robot_api_server_node.cpp"
 API_CFG="${WORKSPACE_ROOT}/scripts/jetson/runtime_overlay/config/robot_api_server.yaml"
-JOB_HPP="${WORKSPACE_ROOT}/src/robot_api_server/include/robot_api_server/docking_job_model.hpp"
-JOB_CPP="${WORKSPACE_ROOT}/src/robot_api_server/src/docking_job_model.cpp"
+JOB_HPP="${WORKSPACE_ROOT}/src/robot_api_server/include/robot_api_server/features/docking/lifecycle/docking_job_model.hpp"
+JOB_CPP="${WORKSPACE_ROOT}/src/robot_api_server/src/features/docking/lifecycle/docking_job_model.cpp"
 
 pass=0
 fail=0

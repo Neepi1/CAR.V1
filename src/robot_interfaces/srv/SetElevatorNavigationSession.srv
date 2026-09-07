@@ -1,0 +1,11 @@
+uint8 OP_BEGIN=1
+uint8 OP_END=2
+
+uint8 operation
+string session_id
+string terminal_reason
+---
+bool accepted
+bool reset_performed
+string active_session_id
+string detail

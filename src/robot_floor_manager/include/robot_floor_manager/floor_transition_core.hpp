@@ -27,6 +27,7 @@ enum class FloorTransitionState
   kCompleting,
   kComplete,
   kFailureCleanup,
+  kFailed,
   kFailedLocked,
 };
 
@@ -79,6 +80,7 @@ struct FloorTransitionEvidence
   bool runtime_context_invalid{false};
   bool runtime_context_valid{false};
   bool bridge_ready{false};
+  bool amcl_ready{false};
   bool global_costmap_fresh{false};
   bool local_costmap_fresh{false};
   bool safe_for_goal_start{false};

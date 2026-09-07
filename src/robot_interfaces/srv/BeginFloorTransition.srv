@@ -1,6 +1,7 @@
 uint8 OP_BEGIN=0
 uint8 OP_COMMIT=1
 uint8 OP_ABORT=2
+uint8 OP_ABORT_PREMUTATION=3
 
 string transaction_id
 string building_id
@@ -8,10 +9,29 @@ string floor_id
 string map_id
 uint64 asset_epoch
 string asset_digest
+string source_building_id
+string source_floor_id
+string source_map_id
+uint64 source_asset_epoch
+string source_asset_digest
 uint8 operation
+uint64 command_sequence
 ---
+uint8 RESULT_OK=0
+uint8 RESULT_INVALID_REQUEST=1
+uint8 RESULT_PAUSE_UNPROVEN=2
+uint8 RESULT_CONFLICT=3
+uint8 RESULT_IDENTITY_MISMATCH=4
+uint8 RESULT_EXPLICIT_RELOCALIZATION_UNPROVEN=5
+uint8 RESULT_MAP_ODOM_UNSETTLED=6
+uint8 RESULT_FAILED_LOCKED=7
+uint8 RESULT_STALE_COMMAND=8
+uint8 RESULT_PREMUTATION_UNPROVEN=9
+
 bool success
+uint8 result_code
 string message
+uint64 applied_sequence
 bool runtime_context_valid
 bool safe_for_goal_start
 uint64 accepted_asset_epoch

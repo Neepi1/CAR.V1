@@ -31,6 +31,9 @@ helper_process_pattern() {
     robot_safety*)
       printf '%s\n' "robot_safety/robot_safety_node|/install/robot_safety/lib/robot_safety/robot_safety_node"
       ;;
+    mode_manager*)
+      printf '%s\n' "robot_mode_manager/mode_manager_node|/install/robot_mode_manager/lib/robot_mode_manager/mode_manager_node"
+      ;;
     floor_manager*)
       printf '%s\n' "robot_floor_manager/floor_manager_node|/install/robot_floor_manager/lib/robot_floor_manager/floor_manager_node"
       ;;
@@ -65,6 +68,10 @@ cleanup_stale_overlay_helper() {
     robot_safety*)
       [[ -n "${helper_pattern}" ]] && kill_overlay_pattern "${helper_pattern}"
       kill_overlay_pattern "${NJRH_OVERLAY_ROOT}/scripts/run_robot_safety.sh"
+      ;;
+    mode_manager*)
+      [[ -n "${helper_pattern}" ]] && kill_overlay_pattern "${helper_pattern}"
+      kill_overlay_pattern "${NJRH_OVERLAY_ROOT}/scripts/run_mode_manager.sh"
       ;;
     floor_manager*)
       [[ -n "${helper_pattern}" ]] && kill_overlay_pattern "${helper_pattern}"
@@ -163,6 +170,9 @@ stop_existing_overlay_nav_helpers() {
   kill_overlay_pattern "${NJRH_OVERLAY_ROOT}/scripts/run_robot_safety.sh"
   kill_overlay_pattern "/install/robot_safety/lib/robot_safety/robot_safety_node"
   kill_overlay_pattern "robot_safety/robot_safety_node"
+  kill_overlay_pattern "${NJRH_OVERLAY_ROOT}/scripts/run_mode_manager.sh"
+  kill_overlay_pattern "/install/robot_mode_manager/lib/robot_mode_manager/mode_manager_node"
+  kill_overlay_pattern "robot_mode_manager/mode_manager_node"
   kill_overlay_pattern "${NJRH_OVERLAY_ROOT}/scripts/run_floor_manager.sh"
   kill_overlay_pattern "/install/robot_floor_manager/lib/robot_floor_manager/floor_manager_node"
   kill_overlay_pattern "robot_floor_manager/floor_manager_node"
@@ -254,6 +264,20 @@ wait_for_fresh_tf_transform() {
     return 0
   fi
   runtime_readiness_probe fresh-tf "${target_frame}" "${source_frame}" "${timeout_sec}" "${max_age_sec}"
+}
+
+wait_for_stable_local_state_observations() {
+  local timeout_sec="${1:-12}"
+  local required_consecutive_good="${2:-3}"
+  local odom_max_age_sec="${3:-0.75}"
+  local odom_max_future_sec="${4:-0.25}"
+  local tf_max_age_sec="${5:-0.25}"
+  runtime_readiness_probe stable-local-state \
+    "${timeout_sec}" \
+    "${required_consecutive_good}" \
+    "${odom_max_age_sec}" \
+    "${odom_max_future_sec}" \
+    "${tf_max_age_sec}"
 }
 
 local_costmap_tf_drop_count() {

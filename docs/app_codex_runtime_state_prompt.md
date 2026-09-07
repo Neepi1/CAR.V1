@@ -64,13 +64,44 @@ GET /api/v1/status
 
 导航页：
 
-1. `POST /api/v1/floors/switch`，带 `resume_navigation: true`
-2. 轮询 `GET /api/v1/status`
-3. `mode == NAVIGATION && navigation_active == true` 后显示导航链已启动
-4. 下发目标：`POST /api/v1/navigation/goal`
-5. 目标接受后继续轮询 `/status`
+1. 轮询 `GET /api/v1/status`
+2. `mode == NAVIGATION && navigation_active == true` 只表示驻留导航运行栈
+   已存在；在 status 报告导航 ready/running 且下一步位姿身份确认前，显示
+   “导航链启动中”，不要开放下发目标
+3. 调用 `GET /api/v1/robot/pose`，确认返回的
+   `building_id/floor_id/map_id` 就是目标点所属运行地图
+4. status 已就绪且位姿三元组确认后，才显示“导航就绪”并下发目标：
+   `POST /api/v1/navigation/goal`
+5. 目标接受后轮询 `GET /api/v1/navigation/state`，以
+   `task_complete`、Nav2 result 和 job state 判断本次任务
 6. 取消：`POST /api/v1/navigation/cancel`
-7. 直到 `navigation_active == false` 或 `mode == IDLE`，显示已停止
+7. 驻留导航链在单次目标结束后仍可保持 active；不要用
+   `navigation_active == false` 判断单次目标是否结束
+
+不要在导航页调用 `POST /api/v1/floors/switch` 并携带
+`resume_navigation:true`；该调用固定返回
+`LIVE_FLOOR_SWITCH_DISABLED`。运行中跨层切图使用独立事务：调用
+`POST /api/v1/floor-switch/start`，保存车端返回的 `transaction_id`，轮询
+`GET /api/v1/floor-switch/state` 到明确终态；取消仅调用
+`POST /api/v1/floor-switch/cancel` 后继续轮询。不得回退到离线选图或重新
+启动 Nav2。导航/定位运行栈可以保持常驻，但必须没有活动目标且车辆已停稳，
+由车端严格事务负责验证。
+
+地图编辑页：
+
+1. 编辑器选图只保存为 App 本地 `building_id/floor_id/map_id` 状态，按
+   `map_id` 读取地图和语义层，不调用 `/api/v1/floors/switch`
+2. 普通静态编辑不需要机器人当前位姿
+3. “现场标点”调用 `GET /api/v1/robot/pose`
+4. 只有返回的三元组与编辑器地图完全一致，并且本次目标已经结束、小车
+   已停稳，才允许保存当前位置
+5. 普通点调用 `/api/v1/maps/poses/save_current`
+6. 电梯 schema-v3 四类内部点（`hall_call`、`landing`、`cabin`、
+   `cabin_panel`）先 `GET /api/v1/elevator-config`，保留完整
+   configuration、两种面板左右侧和最新 draft revision；再把
+   `/api/v1/robot/pose` 的 `x/y/yaw` 写入所选角色，携带最新
+   `expected_draft_revision`，将完整 configuration 提交到
+   `PUT /api/v1/elevator-config/draft`
 
 ## UI 文案映射
 

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set +e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/runtime_process_patterns.sh"
+
 cleanup_shell_pid="$$"
 cleanup_parent_pid="${PPID}"
 
@@ -57,15 +61,45 @@ stop_exact_process_set() {
   [[ "${#pids[@]}" -gt 0 ]] || return 0
   echo "[njrh-systemd] killing exact stale ${label} pids=${pids[*]}" >&2
   kill -KILL "${pids[@]}" 2>/dev/null || true
+  wait_pids_gone 2 "${pids[@]}" || true
+
+  mapfile -t pids < <(pids_by_pattern "${pattern}")
+  if [[ "${#pids[@]}" -gt 0 ]]; then
+    echo "[njrh-systemd] failed to stop ${label}; remaining pids=${pids[*]}" >&2
+    return 1
+  fi
+  return 0
 }
 
-common_pattern="run_common_services.sh"
-node_pattern="run_driver.sh|run_pointcloud_accel_pipeline.sh|laser_scan_to_flatscan|hesai_ros_driver_node|pointcloud_accel_axis_node|pointcloud_axis_remap|imu_axis_remap|ranger_base_node|robot_description_static_tf_node|robot_eai_gs2/gs2_driver_node|gs2_driver_node --ros-args|ros2 launch robot_eai_gs2 gs2.launch.py|run_orbbec_336l_depth.sh|orbbec_camera|camera336l|run_orbbec_docking_perception.sh|orbbec_depth_dock_node|runtime_health_guard.py|run_runtime_health_guard.sh|ekf_node --ros-args.*__node:=robot_local_state|robot_localization/ekf_node|robot_local_perception/local_perception_node|robot_floor_manager/floor_manager_node|robot_safety/robot_safety_node|ranger_mini3_mode_controller/mode_controller_node|robot_docking_manager/docking_manager_node|docking_manager_node --ros-args|run_robot_api_server_supervised.sh|robot_api_server/robot_api_server_node|robot_api_server_node --ros-args|run_navigation_runtime_services.sh|nav2_lifecycle_sequence.py|call_global_localization_trigger.py|run_nav2_navigation.sh|run_occupancy_grid_localization.sh|standard_navigation.launch.py|occupancy_localization_stack.launch.py|occupancy_grid_localizer_container|occupancy_grid_localizer|robot_global_localization/global_localization_node|/install/robot_global_localization/lib/robot_global_localization/global_localization_node|robot_localization_bridge/localization_bridge_node|localization_bridge_node --ros-args|amcl --ros-args|nav2_amcl|amcl_scan_admission|__node:=map_server|__node:=controller_server|__node:=planner_server|__node:=bt_navigator|__node:=behavior_server|__node:=velocity_smoother|__node:=collision_monitor|__node:=lifecycle_manager_navigation|__node:=lifecycle_manager_costmap_filters"
-ros2_cli_pattern="/opt/ros/humble/bin/ros2 (lifecycle get|topic echo|topic hz|topic info|node info|service call /amcl/(change_state|get_state))|ros2 (lifecycle get|topic echo|topic hz|topic info|node info|service call /amcl/(change_state|get_state))"
+remaining_runtime_pids() {
+  pids_by_pattern "${NJRH_RUNTIME_ALL_PATTERN}"
+}
 
-stop_exact_process_set "stale ros2 diagnostics cli" "${ros2_cli_pattern}"
-stop_exact_process_set "common services" "${common_pattern}"
-stop_exact_process_set "runtime nodes" "${node_pattern}"
+if [[ "${1:-}" == "--check" ]]; then
+  mapfile -t remaining < <(remaining_runtime_pids)
+  if [[ "${#remaining[@]}" -gt 0 ]]; then
+    echo "[njrh-systemd] runtime processes remain: ${remaining[*]}" >&2
+    exit 1
+  fi
+  exit 0
+fi
+
+cleanup_failed=0
+stop_exact_process_set \
+  "stale ros2 diagnostics cli" \
+  "${NJRH_RUNTIME_ROS2_CLI_PATTERN}" || cleanup_failed=1
+stop_exact_process_set \
+  "common services" \
+  "${NJRH_RUNTIME_COMMON_PATTERN}" || cleanup_failed=1
+stop_exact_process_set \
+  "runtime nodes" \
+  "${NJRH_RUNTIME_NODE_PATTERN}" || cleanup_failed=1
+
+mapfile -t remaining < <(remaining_runtime_pids)
+if [[ "${#remaining[@]}" -gt 0 ]]; then
+  echo "[njrh-systemd] runtime cleanup left residual pids=${remaining[*]}" >&2
+  cleanup_failed=1
+fi
 
 rm -f \
   /tmp/njrh_runtime_map_context.json \
@@ -74,3 +108,5 @@ rm -f \
   /tmp/njrh_nav2_launch_hold_ready.env \
   /tmp/njrh_nav2_lifecycle_ready.env \
   2>/dev/null || true
+
+exit "${cleanup_failed}"

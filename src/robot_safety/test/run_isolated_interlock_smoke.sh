@@ -2,7 +2,10 @@
 set -eo pipefail
 
 source /opt/ros/humble/setup.bash
-source /workspaces/njrh-v3/workspace1/install/setup.bash
+workspace="${NJRH_WORKSPACE_CONTAINER:-/workspaces/njrh-v3/workspace1}"
+test_setup="${NJRH_ROBOT_SAFETY_TEST_SETUP:-${workspace}/install/setup.bash}"
+test_binary="${NJRH_ROBOT_SAFETY_TEST_BIN:-${workspace}/install/robot_safety/lib/robot_safety/robot_safety_node}"
+source "${test_setup}"
 set -u
 
 export ROS_DOMAIN_ID=181
@@ -20,7 +23,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-/workspaces/njrh-v3/workspace1/install/robot_safety/lib/robot_safety/robot_safety_node \
+"${test_binary}" \
   --ros-args \
   -r __node:=p6_isolated_safety \
   -p cmd_vel_in_topic:=/p6_test/input \
@@ -52,4 +55,4 @@ if ! kill -0 "${node_pid}" 2>/dev/null; then
   exit 1
 fi
 python3 \
-  /workspaces/njrh-v3/workspace1/src/robot_safety/test/isolated_interlock_smoke.py
+  "${workspace}/src/robot_safety/test/isolated_interlock_smoke.py"

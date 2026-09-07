@@ -38,6 +38,7 @@ bool valid_route(const ElevatorRoute & route)
     route.elevator_id,
     route.building_id,
     {route.source, route.target},
+    route.schema_version,
   };
   return validate_topology(topology).ok();
 }
@@ -61,6 +62,9 @@ ElevatorFsmOutput ElevatorFsm::start(
   }
   if (!safe_asset_id(transaction_id)) {
     return inert("invalid_transaction_id");
+  }
+  if (route.schema_version != 2U && route.schema_version != 3U) {
+    return inert("legacy_read_only");
   }
   if (!options_.mock_ports_enabled) {
     return inert("real_elevator_ports_not_integrated");
@@ -124,38 +128,6 @@ ElevatorFsmOutput ElevatorFsm::dispatch(const ElevatorEvent & event)
     return lock("event_received_before_start", true);
   }
 
-  if (state_ == ElevatorState::kVerifyingInside) {
-    if (event.kind == ElevatorEventKind::kFootprintInside) {
-      return transition(
-        ElevatorState::kAcquiringCabinHold,
-        make_effect(
-          ElevatorEffectKind::kAcquireSafetyHold, "", route_->source.floor_id, "",
-          "full_footprint_inside"));
-    }
-    if (event.kind == ElevatorEventKind::kFootprintOutside ||
-      event.kind == ElevatorEventKind::kFootprintStraddling)
-    {
-      return lock("full_inside_verification_failed", true);
-    }
-    return lock("unexpected_event_during_inside_verification", true);
-  }
-
-  if (state_ == ElevatorState::kVerifyingOutside) {
-    if (event.kind == ElevatorEventKind::kFootprintOutside) {
-      return transition(
-        ElevatorState::kAcquiringExitHold,
-        make_effect(
-          ElevatorEffectKind::kAcquireSafetyHold, "", route_->target.floor_id, "",
-          "full_footprint_outside"));
-    }
-    if (event.kind == ElevatorEventKind::kFootprintInside ||
-      event.kind == ElevatorEventKind::kFootprintStraddling)
-    {
-      return lock("full_outside_verification_failed", true);
-    }
-    return lock("unexpected_event_during_outside_verification", true);
-  }
-
   if (event.kind != ElevatorEventKind::kEffectSucceeded) {
     return lock("unexpected_event_for_pending_effect", true);
   }
@@ -172,17 +144,14 @@ ElevatorFsmOutput ElevatorFsm::advance_effect_success()
           ElevatorEffectKind::kAcquireSafetyHold, "", route_->source.floor_id, "",
           "settle_before_call"));
     case ElevatorState::kAcquiringHallHold:
-      return transition(
-        ElevatorState::kAcquiringExecutionLease,
-        make_effect(
-          ElevatorEffectKind::kAcquireExecutionLease, "", route_->source.floor_id, "",
-          "owner_scoped_session;adapter_renews_heartbeat"));
     case ElevatorState::kAcquiringExecutionLease:
-      return transition(
-        ElevatorState::kPressingCallButton,
-        make_effect(
+    {
+      auto effect = make_effect(
           ElevatorEffectKind::kMockPressCallButton, "", route_->source.floor_id, "",
-          "mock_port"));
+          "mock_port");
+      effect.panel_side = route_->source.hall_call_panel_side;
+      return transition(ElevatorState::kPressingCallButton, std::move(effect));
+    }
     case ElevatorState::kPressingCallButton:
       return transition(
         ElevatorState::kSettingElevatorWaitMode,
@@ -197,9 +166,9 @@ ElevatorFsmOutput ElevatorFsm::advance_effect_success()
           "call_complete"));
     case ElevatorState::kReleasingHallHold:
       return transition(
-        ElevatorState::kNavigatingHallWait,
-        navigation_effect(PoseRole::kHallWait, true));
-    case ElevatorState::kNavigatingHallWait:
+        ElevatorState::kNavigatingSourceLanding,
+        navigation_effect(PoseRole::kLanding, true));
+    case ElevatorState::kNavigatingSourceLanding:
       return transition(
         ElevatorState::kWaitingSourceDoor,
         make_effect(
@@ -212,23 +181,33 @@ ElevatorFsmOutput ElevatorFsm::advance_effect_success()
           ElevatorEffectKind::kSetOperatingMode, "", route_->source.floor_id, "DOORWAY"));
     case ElevatorState::kSettingDoorwayEntryMode:
       return transition(
-        ElevatorState::kNavigatingSourceDoorway,
-        navigation_effect(PoseRole::kDoorway, true));
-    case ElevatorState::kNavigatingSourceDoorway:
-      return transition(
         ElevatorState::kEnteringCabin,
         navigation_effect(PoseRole::kCabin, true));
     case ElevatorState::kEnteringCabin:
+      if (route_->schema_version == 3U) {
+        return transition(
+          ElevatorState::kNavigatingCabinPanel,
+          navigation_effect(PoseRole::kCabinPanel, true));
+      }
       return transition(
-        ElevatorState::kVerifyingInside,
+        ElevatorState::kAcquiringCabinHold,
         make_effect(
-          ElevatorEffectKind::kVerifyFootprintInside, "", route_->source.floor_id));
+          ElevatorEffectKind::kAcquireSafetyHold, "", route_->source.floor_id, "",
+          "cabin_pose_settled"));
+    case ElevatorState::kNavigatingCabinPanel:
+      return transition(
+        ElevatorState::kAcquiringCabinHold,
+        make_effect(
+          ElevatorEffectKind::kAcquireSafetyHold, "", route_->source.floor_id, "",
+          "cabin_panel_pose_settled"));
     case ElevatorState::kAcquiringCabinHold:
-      return transition(
-        ElevatorState::kPressingTargetButton,
-        make_effect(
+    {
+      auto effect = make_effect(
           ElevatorEffectKind::kMockPressTargetButton, "", route_->target.floor_id, "",
-          "mock_port"));
+          "mock_port");
+      effect.panel_side = route_->source.cabin_panel_side;
+      return transition(ElevatorState::kPressingTargetButton, std::move(effect));
+    }
     case ElevatorState::kPressingTargetButton:
       return transition(
         ElevatorState::kPausingCorrections,
@@ -255,8 +234,12 @@ ElevatorFsmOutput ElevatorFsm::advance_effect_success()
           "mock_target_door"));
     case ElevatorState::kWaitingTargetDoor:
     {
+      const auto anchor_role = route_->schema_version == 3U ?
+        PoseRole::kCabinPanel : PoseRole::kCabin;
       auto effect = make_effect(
-        ElevatorEffectKind::kBeginFloorTransition, "", route_->target.floor_id, "",
+        ElevatorEffectKind::kBeginFloorTransition,
+        find_pose_id(route_->target, anchor_role).value_or(""),
+        route_->target.floor_id, "",
         "floor_manager_acquires_pause_then_invalidates_source_context");
       effect.map_id = route_->target.map_id;
       return transition(ElevatorState::kBeginningFloorTransition, std::move(effect));
@@ -270,16 +253,24 @@ ElevatorFsmOutput ElevatorFsm::advance_effect_success()
           "floor_manager_pause_keeps_effective_pause_under_hold"));
     case ElevatorState::kResumingCorrections:
     {
+      const auto anchor_role = route_->schema_version == 3U ?
+        PoseRole::kCabinPanel : PoseRole::kCabin;
       auto effect = make_effect(
-        ElevatorEffectKind::kSwitchFloor, "", route_->target.floor_id, "",
+        ElevatorEffectKind::kSwitchFloor,
+        find_pose_id(route_->target, anchor_role).value_or(""),
+        route_->target.floor_id, "",
         "floor_manager_owns_pause_gap;hold_remains_active");
       effect.map_id = route_->target.map_id;
       return transition(ElevatorState::kSwitchingFloor, std::move(effect));
     }
     case ElevatorState::kSwitchingFloor:
     {
+      const auto anchor_role = route_->schema_version == 3U ?
+        PoseRole::kCabinPanel : PoseRole::kCabin;
       auto effect = make_effect(
-        ElevatorEffectKind::kVerifyFloorReady, "", route_->target.floor_id);
+        ElevatorEffectKind::kVerifyFloorReady,
+        find_pose_id(route_->target, anchor_role).value_or(""),
+        route_->target.floor_id);
       effect.map_id = route_->target.map_id;
       return transition(ElevatorState::kVerifyingFloorReady, std::move(effect));
     }
@@ -289,24 +280,32 @@ ElevatorFsmOutput ElevatorFsm::advance_effect_success()
         make_effect(
           ElevatorEffectKind::kSetOperatingMode, "", route_->target.floor_id, "DOORWAY"));
     case ElevatorState::kSettingDoorwayExitMode:
+      if (route_->schema_version == 3U) {
+        return transition(
+          ElevatorState::kReturningToCabinCenter,
+          navigation_effect(PoseRole::kCabin, false));
+      }
       return transition(
         ElevatorState::kReleasingCabinHold,
         make_effect(
           ElevatorEffectKind::kReleaseSafetyHold, "", route_->target.floor_id, "",
           "target_floor_ready"));
+    case ElevatorState::kReturningToCabinCenter:
+      return transition(
+        ElevatorState::kReleasingCabinHold,
+        make_effect(
+          ElevatorEffectKind::kReleaseSafetyHold, "", route_->target.floor_id, "",
+          "target_cabin_center_ready"));
     case ElevatorState::kReleasingCabinHold:
       return transition(
-        ElevatorState::kNavigatingTargetDoorway,
-        navigation_effect(PoseRole::kDoorway, false));
-    case ElevatorState::kNavigatingTargetDoorway:
+        ElevatorState::kNavigatingTargetLanding,
+        navigation_effect(PoseRole::kLanding, false));
+    case ElevatorState::kNavigatingTargetLanding:
       return transition(
-        ElevatorState::kExitingCabin,
-        navigation_effect(PoseRole::kExit, false));
-    case ElevatorState::kExitingCabin:
-      return transition(
-        ElevatorState::kVerifyingOutside,
+        ElevatorState::kAcquiringExitHold,
         make_effect(
-          ElevatorEffectKind::kVerifyFootprintOutside, "", route_->target.floor_id));
+          ElevatorEffectKind::kAcquireSafetyHold, "", route_->target.floor_id, "",
+          "target_landing_pose_settled"));
     case ElevatorState::kAcquiringExitHold:
       return transition(
         ElevatorState::kReleasingOperatingMode,
@@ -314,11 +313,6 @@ ElevatorFsmOutput ElevatorFsm::advance_effect_success()
           ElevatorEffectKind::kReleaseOperatingMode, "", route_->target.floor_id, "",
           "release_exact_mode_lease"));
     case ElevatorState::kReleasingOperatingMode:
-      return transition(
-        ElevatorState::kReleasingExecutionLease,
-        make_effect(
-          ElevatorEffectKind::kReleaseExecutionLease, "", route_->target.floor_id, "",
-          "release_exact_execution_session"));
     case ElevatorState::kReleasingExecutionLease:
       return transition(
         ElevatorState::kReleasingExitHold,
@@ -332,8 +326,6 @@ ElevatorFsmOutput ElevatorFsm::advance_effect_success()
           ElevatorEffectKind::kComplete, "", route_->target.floor_id, "",
           "mock_elevator_flow_complete"));
     case ElevatorState::kIdle:
-    case ElevatorState::kVerifyingInside:
-    case ElevatorState::kVerifyingOutside:
     case ElevatorState::kComplete:
     case ElevatorState::kFailureCleanup:
     case ElevatorState::kLocked:
@@ -398,6 +390,28 @@ ElevatorEffect ElevatorFsm::navigation_effect(
     "",
     to_string(role));
   effect.map_id = floor.map_id;
+  if (role == PoseRole::kHallCall) {
+    effect.navigation_intent = ElevatorNavigationIntent::kHallCall;
+  } else if (route_->schema_version == 3U) {
+    if (role == PoseRole::kLanding) {
+      effect.navigation_intent = source ?
+        ElevatorNavigationIntent::kReverseEntryStaging :
+        ElevatorNavigationIntent::kTargetLanding;
+    } else if (role == PoseRole::kCabin) {
+      effect.navigation_intent = source ?
+        ElevatorNavigationIntent::kReverseEnterCabin :
+        ElevatorNavigationIntent::kReturnCabinCenter;
+    } else if (role == PoseRole::kCabinPanel && source) {
+      effect.navigation_intent =
+        ElevatorNavigationIntent::kCabinPanelApproach;
+    }
+  } else if (role == PoseRole::kLanding) {
+    effect.navigation_intent = source ?
+      ElevatorNavigationIntent::kSourceLanding :
+      ElevatorNavigationIntent::kTargetLanding;
+  } else if (role == PoseRole::kCabin && source) {
+    effect.navigation_intent = ElevatorNavigationIntent::kEnterCabin;
+  }
   return effect;
 }
 
@@ -429,18 +443,16 @@ std::string to_string(const ElevatorState state)
       return "SETTING_ELEVATOR_WAIT_MODE";
     case ElevatorState::kReleasingHallHold:
       return "RELEASING_HALL_HOLD";
-    case ElevatorState::kNavigatingHallWait:
-      return "NAVIGATING_HALL_WAIT";
+    case ElevatorState::kNavigatingSourceLanding:
+      return "NAVIGATING_SOURCE_LANDING";
     case ElevatorState::kWaitingSourceDoor:
       return "WAITING_SOURCE_DOOR";
     case ElevatorState::kSettingDoorwayEntryMode:
       return "SETTING_DOORWAY_ENTRY_MODE";
-    case ElevatorState::kNavigatingSourceDoorway:
-      return "NAVIGATING_SOURCE_DOORWAY";
     case ElevatorState::kEnteringCabin:
       return "ENTERING_CABIN";
-    case ElevatorState::kVerifyingInside:
-      return "VERIFYING_INSIDE";
+    case ElevatorState::kNavigatingCabinPanel:
+      return "NAVIGATING_CABIN_PANEL";
     case ElevatorState::kAcquiringCabinHold:
       return "ACQUIRING_CABIN_HOLD";
     case ElevatorState::kPressingTargetButton:
@@ -463,14 +475,12 @@ std::string to_string(const ElevatorState state)
       return "VERIFYING_FLOOR_READY";
     case ElevatorState::kSettingDoorwayExitMode:
       return "SETTING_DOORWAY_EXIT_MODE";
+    case ElevatorState::kReturningToCabinCenter:
+      return "RETURNING_TO_CABIN_CENTER";
     case ElevatorState::kReleasingCabinHold:
       return "RELEASING_CABIN_HOLD";
-    case ElevatorState::kNavigatingTargetDoorway:
-      return "NAVIGATING_TARGET_DOORWAY";
-    case ElevatorState::kExitingCabin:
-      return "EXITING_CABIN";
-    case ElevatorState::kVerifyingOutside:
-      return "VERIFYING_OUTSIDE";
+    case ElevatorState::kNavigatingTargetLanding:
+      return "NAVIGATING_TARGET_LANDING";
     case ElevatorState::kAcquiringExitHold:
       return "ACQUIRING_EXIT_HOLD";
     case ElevatorState::kReleasingOperatingMode:
@@ -526,14 +536,35 @@ std::string to_string(const ElevatorEffectKind effect)
       return "SWITCH_FLOOR";
     case ElevatorEffectKind::kVerifyFloorReady:
       return "VERIFY_FLOOR_READY";
-    case ElevatorEffectKind::kVerifyFootprintInside:
-      return "VERIFY_FOOTPRINT_INSIDE";
-    case ElevatorEffectKind::kVerifyFootprintOutside:
-      return "VERIFY_FOOTPRINT_OUTSIDE";
     case ElevatorEffectKind::kComplete:
       return "COMPLETE";
     case ElevatorEffectKind::kHoldAndCancel:
       return "HOLD_AND_CANCEL";
+  }
+  return "NONE";
+}
+
+std::string to_string(const ElevatorNavigationIntent intent)
+{
+  switch (intent) {
+    case ElevatorNavigationIntent::kNone:
+      return "NONE";
+    case ElevatorNavigationIntent::kHallCall:
+      return "HALL_CALL";
+    case ElevatorNavigationIntent::kSourceLanding:
+      return "SOURCE_LANDING_FACE_CABIN";
+    case ElevatorNavigationIntent::kEnterCabin:
+      return "ENTER_CABIN";
+    case ElevatorNavigationIntent::kReverseEntryStaging:
+      return "REVERSE_ENTRY_STAGING";
+    case ElevatorNavigationIntent::kReverseEnterCabin:
+      return "REVERSE_ENTER_CABIN";
+    case ElevatorNavigationIntent::kCabinPanelApproach:
+      return "CABIN_PANEL_APPROACH";
+    case ElevatorNavigationIntent::kReturnCabinCenter:
+      return "RETURN_CABIN_CENTER";
+    case ElevatorNavigationIntent::kTargetLanding:
+      return "TARGET_LANDING_FACE_HALL";
   }
   return "NONE";
 }

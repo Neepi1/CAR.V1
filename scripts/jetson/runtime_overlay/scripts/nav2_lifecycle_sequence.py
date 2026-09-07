@@ -60,21 +60,42 @@ def call_service(node, client, request, node_name: str, operation: str, deadline
         0.2,
         float(os.environ.get("NJRH_NAV2_LIFECYCLE_GET_STATE_ATTEMPT_SEC", "2.0")),
     )
+    # Fast DDS may return a read-only state response after the retry interval.
+    # Keep every outstanding Future eligible so a newer probe cannot hide it.
+    pending_futures = []
+
+    def remove_pending(future) -> None:
+        try:
+            client.remove_pending_request(future)
+        except (AttributeError, KeyError):
+            pass
+
     while time.monotonic() < deadline:
         future = client.call_async(request)
+        pending_futures.append(future)
         attempt_deadline = deadline
         if retry_get_state:
             attempt_deadline = min(deadline, time.monotonic() + get_state_attempt_sec)
-        while rclpy.ok() and not future.done() and time.monotonic() < attempt_deadline:
+        while rclpy.ok() and time.monotonic() < attempt_deadline:
             rclpy.spin_once(node, timeout_sec=0.05)
-        if future.done():
-            try:
-                return future.result()
-            except Exception as exc:  # noqa: BLE001 - report and retry within deadline.
-                warn(f"lifecycle {operation} exception node={node_name}: {exc}")
-        elif retry_get_state:
+            completed = [candidate for candidate in pending_futures if candidate.done()]
+            for candidate in completed:
+                pending_futures.remove(candidate)
+                try:
+                    response = candidate.result()
+                except Exception as exc:  # noqa: BLE001 - report and retry within deadline.
+                    warn(f"lifecycle {operation} exception node={node_name}: {exc}")
+                    continue
+                if retry_get_state and candidate is not future:
+                    log(f"lifecycle get_state accepted delayed response node={node_name}")
+                for unresolved in pending_futures:
+                    remove_pending(unresolved)
+                return response
+        if retry_get_state:
             warn(f"lifecycle get_state attempt timed out node={node_name}; retrying within startup deadline")
         time.sleep(0.1)
+    for unresolved in pending_futures:
+        remove_pending(unresolved)
     raise TimeoutError(f"{operation} timed out for {node_name}")
 
 
