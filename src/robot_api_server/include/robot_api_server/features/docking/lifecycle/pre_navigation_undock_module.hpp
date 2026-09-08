@@ -14,12 +14,17 @@ namespace robot_api_server::features::docking
 struct PreNavigationUndockRequest
 {
   bool auto_undock_required{false};
+  bool pre_navigation_blocked{false};
   bool docking_active_not_docked_block{false};
   bool runtime_state_undocking{false};
   bool docking_status_indicates_undocking{false};
   bool charging_contact_at_gate{false};
   std::string runtime_docking_state;
   std::string auto_undock_reason{"not_docked"};
+  std::string recovery_action{"NONE"};
+  std::string pre_navigation_block_reason;
+  std::string resolved_dock_id;
+  std::string reconcile_evidence;
 };
 
 struct PreNavigationUndockServiceObservation
@@ -47,6 +52,8 @@ struct PreNavigationUndockPorts
   std::function<bool(const std::string &, std::string &)> release_stale_fine_pause;
   std::function<void()> join_docking_worker;
   std::function<application::runtime_mode::RuntimeModeSnapshot()> runtime_snapshot;
+  std::function<bool(const std::string &, const std::string &, std::string &)>
+  reconcile_stale_interlock;
   std::function<bool(std::string &)> ensure_manager_running;
   std::function<bool(
       std::string &,
@@ -82,7 +89,10 @@ public:
     bool & undock_performed);
 
 private:
-  bool start(std::string & detail, bool charging_contact_at_gate);
+  bool start(
+    std::string & detail,
+    bool charging_contact_at_gate,
+    const std::string & resolved_dock_id);
   bool wait_for_completion(std::string & detail);
 
   std::mutex & docking_start_mutex_;

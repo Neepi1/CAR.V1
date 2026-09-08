@@ -79,6 +79,15 @@ For push-in spring charging docks, controlled undocking must be a continuous low
 
 When `block_normal_motion_when_docked=true`, BMS contact, `/docking/status` docked/charging, or the persistent dock-contact latch blocks normal `/cmd_vel_collision_checked` output and publishes zero with `/safety/status=DOCKED_CONTACT_BLOCK`. A latch is treated as stale safety memory when fresh BMS says no contact and there is no current docked/charging status, so an old latch cannot permanently block navigation after a clean no-contact state is visible. `allow_docking_cmd_when_docked=true` keeps the docking channel available, but it no longer means that every docking Twist is legal after electrical contact. With `bms_docking_interlock_enabled=true`, the first fresh BMS contact immediately clears the cached docking command and publishes zero. That electrical-contact event is latched inside the final arbiter, so forward, lateral, and angular docking commands remain hard-blocked even if BMS messages later become stale or another publisher continues sending them. Only an exact zero or a pure negative-X command with a fresh controlled-undock reverse permit is accepted. The latch is released only after that explicit reverse session ends and fresh BMS feedback confirms no contact.
 
+`/safety/dock_interlock_state` publishes the final arbiter's live BMS-contact,
+private memory-latch, persistent-latch, and reverse-session state using reliable
+transient-local QoS. `/safety/reconcile_dock_interlock` may clear only the private
+memory latch, and only after the caller supplies outside-dock proof and the node
+independently verifies fresh stable BMS no-contact, no docked status, no reverse
+permit, and no fresh docking command. The API owns dock-pose geometry and the
+persistent latch; `robot_safety` does not infer position or clear the persistent
+file. See `docs/pre_navigation_dock_interlock_recovery.md` at repository root.
+
 The reverse-permit release and fresh no-contact observations may arrive in
 either callback order. Both callbacks evaluate the same release predicate, so
 an already-disabled reverse permit converges when the later BMS no-contact

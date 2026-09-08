@@ -128,6 +128,7 @@ public:
   : config_(std::move(config)), ports_(std::move(ports))
   {
     if (!ports_.runtime_snapshot || !ports_.bms_snapshot ||
+      !ports_.safety_interlock_snapshot || !ports_.dock_zone_snapshot ||
       !ports_.navigation_goal_running || !ports_.wall_time_seconds ||
       !ports_.timestamp_now || !ports_.warn)
     {
@@ -354,6 +355,11 @@ public:
     check.runtime = ports_.runtime_snapshot();
     check.bms = ports_.bms_snapshot();
     check.dock_latch = read_latch();
+    check.safety_interlock = ports_.safety_interlock_snapshot();
+    check.safety_interlock_memory_latched =
+      check.safety_interlock.available &&
+      check.safety_interlock.fresh &&
+      check.safety_interlock.memory_latched;
 
     const auto docking_state = lower_copy(check.runtime.docking_state);
     const auto docking_status = lower_copy(check.runtime.docking_status);
@@ -580,6 +586,51 @@ public:
       check.dock_occupancy_reason = "no_strong_dock_evidence";
     }
 
+    check.resolved_dock_id = !check.runtime.docking_dock_id.empty() ?
+      check.runtime.docking_dock_id :
+      (!check.dock_latch.dock_id.empty() ?
+      check.dock_latch.dock_id : check.safety_interlock.dock_id);
+    if (check.resolved_dock_id == "none") {
+      check.resolved_dock_id.clear();
+    }
+    check.safety_interlock_state_block =
+      config_.require_safety_interlock_state &&
+      (!check.safety_interlock.available || !check.safety_interlock.fresh);
+    if (check.safety_interlock_state_block) {
+      check.pre_navigation_block_reason = !check.safety_interlock.available ?
+        "dock safety interlock state has not been received" :
+        "dock safety interlock state is stale";
+      check.docked_warnings.push_back(
+        !check.safety_interlock.available ?
+        "safety_interlock_state_unavailable" : "safety_interlock_state_stale");
+    }
+
+    if (check.safety_interlock_memory_latched) {
+      check.dock_zone = ports_.dock_zone_snapshot(
+        check.dock_latch, check.safety_interlock, check.runtime);
+      const bool proven_outside =
+        check.dock_zone.state == "CLEAR" &&
+        !check.safety_interlock.live_bms_contact;
+      if (proven_outside) {
+        check.clear_stale_safety_interlock_required = true;
+        check.dock_occupancy_state = "CONFIRMED_UNDOCKED";
+        check.dock_occupancy_reason = "safety_memory_latch_but_robot_proven_outside_dock_zone";
+        check.dock_occupancy_evidence.push_back(
+          "dock_zone_clear:" + check.dock_zone.reason);
+      } else {
+        check.dock_occupancy_state = "UNCERTAIN_ON_DOCK";
+        check.dock_occupancy_reason = check.safety_interlock.live_bms_contact ?
+          "safety_memory_latch_with_live_bms_contact" :
+          (check.dock_zone.state == "NEAR" ?
+          "safety_memory_latch_near_dock" :
+          "safety_memory_latch_position_unknown");
+        check.dock_occupancy_evidence.push_back(
+          "robot_safety_memory_latch:" + check.safety_interlock.reason);
+        check.dock_occupancy_evidence.push_back(
+          "dock_zone:" + check.dock_zone.state + ":" + check.dock_zone.reason);
+      }
+    }
+
     check.final_is_docked_or_charging =
       check.dock_occupancy_state == "CONFIRMED_DOCKED" ||
       check.dock_occupancy_state == "DOCKED_CHARGING" ||
@@ -593,6 +644,17 @@ public:
       !check.docking_status_indicates_undocking;
     check.can_auto_undock =
       check.final_auto_undock_required && !check.docking_active_not_docked_block;
+    if (check.safety_interlock_state_block) {
+      check.pre_navigation_recovery_action = "BLOCK";
+      check.pre_navigation_recovery_required = true;
+      check.can_auto_undock = false;
+    } else if (check.clear_stale_safety_interlock_required) {
+      check.pre_navigation_recovery_action = "CLEAR_STALE_INTERLOCK";
+      check.pre_navigation_recovery_required = true;
+    } else if (check.final_auto_undock_required) {
+      check.pre_navigation_recovery_action = "CONTROLLED_UNDOCK";
+      check.pre_navigation_recovery_required = true;
+    }
 
     if (check.strong_live_docked) {
       check.docked_state_class = "DOCKED_CONFIRMED";
@@ -606,7 +668,19 @@ public:
       check.docked_state_class = "UNKNOWN";
     }
 
-    if (check.final_auto_undock_required) {
+    if (check.safety_interlock_state_block) {
+      check.auto_undock_reason = "safety_interlock_state_unavailable_or_stale";
+    } else if (check.clear_stale_safety_interlock_required) {
+      check.auto_undock_reason = "safety_interlock_stale_outside_dock";
+    } else if (check.safety_interlock_memory_latched &&
+      check.safety_interlock.live_bms_contact)
+    {
+      check.auto_undock_reason = "safety_interlock_latched_live_contact";
+    } else if (check.safety_interlock_memory_latched && check.dock_zone.state == "NEAR") {
+      check.auto_undock_reason = "safety_interlock_latched_near_dock";
+    } else if (check.safety_interlock_memory_latched) {
+      check.auto_undock_reason = "safety_interlock_latched_position_unknown";
+    } else if (check.final_auto_undock_required) {
       check.auto_undock_reason =
         "dock_occupancy_state:" + check.dock_occupancy_state + ":" +
         check.dock_occupancy_reason;
@@ -716,6 +790,35 @@ public:
          << (check.live_bms_charging_contact_stable ? "true" : "false") << ","
          << "\"api_bms_charging_contact_reason\":" << json_string(check.bms.reason) << ","
          << "\"bms\":{" << bms_snapshot_json(check.bms) << "},"
+         << "\"safety_interlock\":{"
+         << "\"available\":" << (check.safety_interlock.available ? "true" : "false") << ","
+         << "\"fresh\":" << (check.safety_interlock.fresh ? "true" : "false") << ","
+         << "\"age_sec\":"
+         << json_nullable_number(
+      check.safety_interlock.age_sec >= 0.0, check.safety_interlock.age_sec) << ","
+         << "\"enabled\":" << (check.safety_interlock.enabled ? "true" : "false") << ","
+         << "\"memory_latched\":"
+         << (check.safety_interlock.memory_latched ? "true" : "false") << ","
+         << "\"active\":" << (check.safety_interlock.active ? "true" : "false") << ","
+         << "\"battery_sample_fresh\":"
+         << (check.safety_interlock.battery_sample_fresh ? "true" : "false") << ","
+         << "\"live_bms_contact\":"
+         << (check.safety_interlock.live_bms_contact ? "true" : "false") << ","
+         << "\"no_contact_duration_sec\":"
+         << check.safety_interlock.no_contact_duration_sec << ","
+         << "\"reverse_session_seen\":"
+         << (check.safety_interlock.reverse_session_seen ? "true" : "false") << ","
+         << "\"reverse_permit_active\":"
+         << (check.safety_interlock.reverse_permit_active ? "true" : "false") << ","
+         << "\"state\":" << json_string(check.safety_interlock.state) << ","
+         << "\"reason\":" << json_string(check.safety_interlock.reason) << "},"
+         << "\"dock_zone\":{"
+         << "\"state\":" << json_string(check.dock_zone.state) << ","
+         << "\"reason\":" << json_string(check.dock_zone.reason) << ","
+         << "\"dock_id\":" << json_string(check.dock_zone.dock_id) << ","
+         << "\"distance_m\":"
+         << json_nullable_number(check.dock_zone.distance_m >= 0.0, check.dock_zone.distance_m)
+         << "},"
          << "\"dock_contact_snapshot\":" << latch_snapshot_json(check.dock_latch) << ","
          << "\"dock_contact_latch_present\":"
          << (check.dock_contact_latch_present ? "true" : "false") << ","
@@ -808,6 +911,15 @@ public:
          << (check.final_is_docked_or_charging ? "true" : "false") << ","
          << "\"final_auto_undock_required\":"
          << (check.final_auto_undock_required ? "true" : "false") << ","
+         << "\"clear_stale_safety_interlock_required\":"
+         << (check.clear_stale_safety_interlock_required ? "true" : "false") << ","
+         << "\"pre_navigation_recovery_required\":"
+         << (check.pre_navigation_recovery_required ? "true" : "false") << ","
+         << "\"pre_navigation_recovery_action\":"
+         << json_string(check.pre_navigation_recovery_action) << ","
+         << "\"pre_navigation_block_reason\":"
+         << json_string(check.pre_navigation_block_reason) << ","
+         << "\"resolved_dock_id\":" << json_string(check.resolved_dock_id) << ","
          << "\"can_auto_undock\":" << (check.can_auto_undock ? "true" : "false") << ","
          << "\"docking_active_not_docked_block\":"
          << (check.docking_active_not_docked_block ? "true" : "false") << ","

@@ -74,6 +74,9 @@ struct NavigationPreGoalDockContext
 struct NavigationPreGoalDockSnapshot
 {
   bool auto_undock_required{false};
+  bool pre_navigation_recovery_required{false};
+  bool pre_navigation_blocked{false};
+  bool clear_stale_safety_interlock_required{false};
   bool can_auto_undock{false};
   bool docking_active_not_docked_block{false};
   bool runtime_state_undocking{false};
@@ -88,6 +91,12 @@ struct NavigationPreGoalDockSnapshot
   double dock_contact_latch_age_sec{-1.0};
   std::string dock_contact_latch_source;
   std::string auto_undock_reason{"not_docked"};
+  std::string pre_navigation_recovery_action{"NONE"};
+  std::string pre_navigation_block_reason;
+  std::string resolved_dock_id;
+  std::string dock_zone_state{"UNKNOWN"};
+  std::string dock_zone_reason{"not_evaluated"};
+  double dock_zone_distance_m{-1.0};
   std::string dock_occupancy_state{"UNKNOWN"};
   std::vector<std::string> dock_occupancy_evidence;
   std::string dock_occupancy_reason{"no_dock_evidence"};

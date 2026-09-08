@@ -86,6 +86,14 @@ robot_api_server:
     docking_target_observation_topic: "/dock/target_observation"
     docking_target_observation_source: "orbbec_336l_depth"
     docking_contact_latch_file: "/workspaces/njrh-v3/workspace1/maps_release/docking_contact_latch.json"
+    navigation_require_dock_safety_interlock_state: true
+    dock_safety_interlock_state_topic: "/safety/dock_interlock_state"
+    dock_safety_interlock_reconcile_service: "/safety/reconcile_dock_interlock"
+    dock_safety_interlock_state_max_age_sec: 1.0
+    dock_safety_interlock_reconcile_timeout_sec: 3.0
+    dock_interlock_zone_pose_max_age_sec: 0.5
+    dock_interlock_zone_near_radius_m: 1.0
+    dock_interlock_zone_clear_radius_m: 1.5
     dock_contact_latch_bms_ttl_sec: 300.0
     dock_contact_latch_bms_require_contact_sec: 2.0
     dock_contact_latch_bms_clear_no_contact_sec: 3.0

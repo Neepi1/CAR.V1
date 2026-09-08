@@ -44,16 +44,33 @@ struct Harness
 {
   application::runtime_mode::RuntimeModeSnapshot runtime;
   BmsChargingContactSnapshot bms;
+  DockSafetyInterlockSnapshot safety;
+  DockZoneSnapshot dock_zone;
   bool navigation_goal_running{false};
   double wall_time{1000.0};
   std::string timestamp{"1000"};
   std::vector<std::string> warnings;
+
+  Harness()
+  {
+    safety.available = true;
+    safety.fresh = true;
+    safety.state = "CLEAR";
+    safety.reason = "no_active_dock_interlock";
+  }
 
   DockContactInterlockPorts ports()
   {
     DockContactInterlockPorts result;
     result.runtime_snapshot = [this]() {return runtime;};
     result.bms_snapshot = [this]() {return bms;};
+    result.safety_interlock_snapshot = [this]() {return safety;};
+    result.dock_zone_snapshot = [this](
+      const DockContactLatchSnapshot &,
+      const DockSafetyInterlockSnapshot &,
+      const application::runtime_mode::RuntimeModeSnapshot &) {
+        return dock_zone;
+      };
     result.navigation_goal_running = [this]() {return navigation_goal_running;};
     result.wall_time_seconds = [this]() {return wall_time;};
     result.timestamp_now = [this]() {return timestamp;};
@@ -98,6 +115,117 @@ TEST(DockContactInterlockModuleTest, ConfirmedUndockedWithoutLatchAllowsNavigati
   EXPECT_FALSE(check.final_auto_undock_required);
   EXPECT_FALSE(check.can_auto_undock);
   EXPECT_EQ(check.auto_undock_reason, "confirmed_undocked");
+}
+
+TEST(DockContactInterlockModuleTest, SafetyMemoryLatchWithUnknownPositionRequiresControlledUndock)
+{
+  TemporaryLatchFile latch;
+  Harness harness;
+  harness.runtime.docking_state = "stopped";
+  harness.safety.memory_latched = true;
+  harness.safety.active = true;
+  harness.safety.state = "MEMORY_LATCHED";
+  harness.dock_zone.state = "UNKNOWN";
+  harness.dock_zone.reason = "robot_pose_unavailable";
+  DockContactInterlockModule module(config_for(latch.path()), harness.ports());
+
+  const auto check = module.snapshot();
+
+  EXPECT_TRUE(check.safety_interlock_memory_latched);
+  EXPECT_EQ(check.pre_navigation_recovery_action, "CONTROLLED_UNDOCK");
+  EXPECT_TRUE(check.final_auto_undock_required);
+  EXPECT_EQ(check.auto_undock_reason, "safety_interlock_latched_position_unknown");
+}
+
+TEST(DockContactInterlockModuleTest, SafetyMemoryLatchNearDockRequiresControlledUndock)
+{
+  TemporaryLatchFile latch;
+  Harness harness;
+  harness.safety.memory_latched = true;
+  harness.safety.active = true;
+  harness.safety.state = "MEMORY_LATCHED";
+  harness.dock_zone.state = "NEAR";
+  harness.dock_zone.reason = "distance_at_or_below_near_radius";
+  harness.dock_zone.distance_m = 0.8;
+  DockContactInterlockModule module(config_for(latch.path()), harness.ports());
+
+  const auto check = module.snapshot();
+
+  EXPECT_EQ(check.pre_navigation_recovery_action, "CONTROLLED_UNDOCK");
+  EXPECT_TRUE(check.final_auto_undock_required);
+  EXPECT_EQ(check.auto_undock_reason, "safety_interlock_latched_near_dock");
+}
+
+TEST(DockContactInterlockModuleTest, LiveContactNeverUsesNoMotionReconciliation)
+{
+  TemporaryLatchFile latch;
+  Harness harness;
+  harness.safety.memory_latched = true;
+  harness.safety.active = true;
+  harness.safety.live_bms_contact = true;
+  harness.safety.state = "MEMORY_LATCHED";
+  harness.dock_zone.state = "CLEAR";
+  harness.dock_zone.reason = "distance_at_or_above_clear_radius";
+  harness.dock_zone.distance_m = 2.0;
+  DockContactInterlockModule module(config_for(latch.path()), harness.ports());
+
+  const auto check = module.snapshot();
+
+  EXPECT_FALSE(check.clear_stale_safety_interlock_required);
+  EXPECT_EQ(check.pre_navigation_recovery_action, "CONTROLLED_UNDOCK");
+  EXPECT_TRUE(check.final_auto_undock_required);
+  EXPECT_EQ(check.auto_undock_reason, "safety_interlock_latched_live_contact");
+}
+
+TEST(DockContactInterlockModuleTest, ProvenRemoteUndockRequestsConstrainedInterlockClear)
+{
+  TemporaryLatchFile latch;
+  Harness harness;
+  harness.runtime.docking_state = "stopped";
+  harness.safety.memory_latched = true;
+  harness.safety.active = true;
+  harness.safety.state = "MEMORY_LATCHED";
+  harness.dock_zone.state = "CLEAR";
+  harness.dock_zone.reason = "distance_above_clear_radius";
+  harness.dock_zone.distance_m = 1.8;
+  DockContactInterlockModule module(config_for(latch.path()), harness.ports());
+
+  const auto check = module.snapshot();
+
+  EXPECT_TRUE(check.clear_stale_safety_interlock_required);
+  EXPECT_EQ(check.pre_navigation_recovery_action, "CLEAR_STALE_INTERLOCK");
+  EXPECT_FALSE(check.final_auto_undock_required);
+  EXPECT_EQ(check.dock_occupancy_state, "CONFIRMED_UNDOCKED");
+}
+
+TEST(DockContactInterlockModuleTest, MissingSafetyStateBlocksNavigationAdmission)
+{
+  TemporaryLatchFile latch;
+  Harness harness;
+  harness.safety = DockSafetyInterlockSnapshot{};
+  DockContactInterlockModule module(config_for(latch.path()), harness.ports());
+
+  const auto check = module.snapshot();
+
+  EXPECT_TRUE(check.safety_interlock_state_block);
+  EXPECT_EQ(check.pre_navigation_recovery_action, "BLOCK");
+  EXPECT_FALSE(check.can_auto_undock);
+}
+
+TEST(DockContactInterlockModuleTest, StaleSafetyStateBlocksNavigationAdmission)
+{
+  TemporaryLatchFile latch;
+  Harness harness;
+  harness.safety.available = true;
+  harness.safety.fresh = false;
+  harness.safety.age_sec = 1.5;
+  DockContactInterlockModule module(config_for(latch.path()), harness.ports());
+
+  const auto check = module.snapshot();
+
+  EXPECT_TRUE(check.safety_interlock_state_block);
+  EXPECT_EQ(check.pre_navigation_recovery_action, "BLOCK");
+  EXPECT_EQ(check.pre_navigation_block_reason, "dock safety interlock state is stale");
 }
 
 TEST(DockContactInterlockModuleTest, StableBmsContactCreatesStrongChargingSessionLatch)

@@ -59,6 +59,16 @@ public:
       };
     result.join_docking_worker = [this]() {++join_count;};
     result.runtime_snapshot = [this]() {return runtime.snapshot();};
+    result.reconcile_stale_interlock = [this](
+      const std::string & dock_id,
+      const std::string & evidence,
+      std::string & detail) {
+        ++reconcile_count;
+        reconcile_dock_id = dock_id;
+        reconcile_evidence = evidence;
+        detail = reconcile_detail;
+        return reconcile_ok;
+      };
     result.ensure_manager_running = [this](std::string & detail) {
         detail = ensure_detail;
         return ensure_ok;
@@ -160,6 +170,11 @@ public:
   int takeover_count{0};
   int join_count{0};
   int service_count{0};
+  bool reconcile_ok{true};
+  std::string reconcile_detail{"stale interlock cleared"};
+  std::string reconcile_dock_id;
+  std::string reconcile_evidence;
+  int reconcile_count{0};
   int observe_count{0};
   int sleep_count{0};
 };
@@ -200,6 +215,25 @@ TEST(PreNavigationUndockModuleTest, NoDockEvidenceAllowsNavigationWithoutSideEff
   EXPECT_EQ(harness.service_count, 0);
 }
 
+TEST(PreNavigationUndockModuleTest, ProvenRemoteUndockClearsInterlockWithoutMotion)
+{
+  PreNavigationUndockHarness harness;
+  auto module = harness.make_module();
+  PreNavigationUndockRequest request;
+  request.recovery_action = "CLEAR_STALE_INTERLOCK";
+  request.resolved_dock_id = "dock-a";
+  request.reconcile_evidence = "dock_zone=CLEAR distance_m=1.8";
+  std::string detail;
+  bool performed = true;
+
+  EXPECT_TRUE(module->run_if_needed(request, detail, performed));
+  EXPECT_FALSE(performed);
+  EXPECT_EQ(harness.reconcile_count, 1);
+  EXPECT_EQ(harness.reconcile_dock_id, "dock-a");
+  EXPECT_EQ(harness.clear_count, 0);
+  EXPECT_EQ(harness.service_count, 0);
+}
+
 TEST(PreNavigationUndockModuleTest, ActiveNonDockedDockingJobBlocksNavigation)
 {
   PreNavigationUndockHarness harness;
@@ -234,6 +268,42 @@ TEST(PreNavigationUndockModuleTest, ConcurrentNonUndockJobIsSafelySuperseded)
   EXPECT_EQ(harness.zero_count, 1);
   EXPECT_EQ(harness.takeover_count, 1);
   EXPECT_EQ(harness.service_count, 1);
+}
+
+TEST(PreNavigationUndockModuleTest, PersistedDockIdentityIsAppliedToControlledUndock)
+{
+  PreNavigationUndockHarness harness;
+  PreNavigationUndockConfig config;
+  config.relocalize_after_success = false;
+  auto module = harness.make_module(config);
+  auto request = required_request();
+  request.resolved_dock_id = "dock-from-persistent-latch";
+  harness.on_sleep = [&harness]() {harness.set_job_state("undocked");};
+  std::string detail;
+  bool performed = false;
+
+  EXPECT_TRUE(module->run_if_needed(request, detail, performed));
+  EXPECT_TRUE(performed);
+  EXPECT_EQ(harness.store->snapshot().dock_id, "dock-from-persistent-latch");
+  EXPECT_EQ(
+    harness.runtime.snapshot().docking_dock_id,
+    "dock-from-persistent-latch");
+}
+
+TEST(PreNavigationUndockModuleTest, MissingDockIdentityRejectsBlindUndock)
+{
+  PreNavigationUndockHarness harness;
+  harness.runtime.set_docking_identity("");
+  auto module = harness.make_module();
+  auto request = required_request();
+  request.resolved_dock_id.clear();
+  std::string detail;
+  bool performed = false;
+
+  EXPECT_FALSE(module->run_if_needed(request, detail, performed));
+  EXPECT_TRUE(performed);
+  EXPECT_EQ(detail, "controlled undock requires a resolved dock_id");
+  EXPECT_EQ(harness.service_count, 0);
 }
 
 TEST(PreNavigationUndockModuleTest, FailedTakeoverDoesNotSubmitUndock)

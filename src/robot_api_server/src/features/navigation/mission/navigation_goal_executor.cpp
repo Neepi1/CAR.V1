@@ -127,10 +127,10 @@ bool NavigationGoalExecutor::run_pre_send_sequence(
   (void)mission_runtime_.update_running(
     job_id,
     [&dock_snapshot](NavigationGoalJob & job) {
-      job.phase = dock_snapshot.auto_undock_required ?
-        "pre_navigation_undocking" : "waiting_for_goal_start_readiness";
-      job.detail = dock_snapshot.auto_undock_required ?
-        "performing controlled undock before Nav2 goal send" :
+      job.phase = dock_snapshot.pre_navigation_recovery_required ?
+        "pre_navigation_dock_recovery" : "waiting_for_goal_start_readiness";
+      job.detail = dock_snapshot.pre_navigation_recovery_required ?
+        "resolving dock safety state before Nav2 goal send" :
         "checking localization readiness before Nav2 goal send";
     });
 

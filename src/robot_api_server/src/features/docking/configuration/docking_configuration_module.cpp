@@ -65,6 +65,29 @@ DockingConfiguration DockingConfigurationModule::declare_parameters(
   config.contact_interlock.charging_current_min_a = inputs.charging_current_min_a;
   config.contact_interlock.full_soc_threshold_pct = inputs.full_soc_threshold_pct;
   config.contact_interlock.docking_status_topic = config.runtime.status_topic;
+  config.contact_interlock.require_safety_interlock_state = node.declare_parameter<bool>(
+    "navigation_require_dock_safety_interlock_state", true);
+  config.contact_interlock.safety_interlock_state_topic = node.declare_parameter<std::string>(
+    "dock_safety_interlock_state_topic", "/safety/dock_interlock_state");
+  config.contact_interlock.safety_interlock_reconcile_service =
+    node.declare_parameter<std::string>(
+    "dock_safety_interlock_reconcile_service", "/safety/reconcile_dock_interlock");
+  config.contact_interlock.safety_interlock_state_max_age_sec = std::max(
+    0.2,
+    node.declare_parameter<double>("dock_safety_interlock_state_max_age_sec", 1.0));
+  config.contact_interlock.safety_interlock_reconcile_timeout_sec = std::max(
+    0.5,
+    node.declare_parameter<double>("dock_safety_interlock_reconcile_timeout_sec", 3.0));
+  config.contact_interlock.dock_zone_pose_max_age_sec = std::max(
+    0.1,
+    node.declare_parameter<double>(
+      "dock_interlock_zone_pose_max_age_sec", inputs.robot_pose_freshness_sec));
+  config.contact_interlock.dock_zone_near_radius_m = std::max(
+    0.1,
+    node.declare_parameter<double>("dock_interlock_zone_near_radius_m", 1.0));
+  config.contact_interlock.dock_zone_clear_radius_m = std::max(
+    config.contact_interlock.dock_zone_near_radius_m + 0.1,
+    node.declare_parameter<double>("dock_interlock_zone_clear_radius_m", 1.5));
 
   config.http.pre_dock_distance_m = std::max(
     0.05,

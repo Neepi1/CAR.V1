@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -11,6 +12,8 @@
 
 #include "geometry_msgs/msg/twist.hpp"
 #include "nav2_msgs/action/navigate_to_pose.hpp"
+#include "robot_interfaces/msg/dock_safety_interlock_state.hpp"
+#include "robot_interfaces/srv/reconcile_dock_interlock.hpp"
 
 #include "robot_api_server/application/runtime_mode/runtime_mode_coordinator.hpp"
 #include "robot_api_server/features/docking/configuration/docking_configuration_module.hpp"
@@ -109,12 +112,41 @@ public:
       std::make_unique<predock_alignment::PredockAlignmentPolicy>(
       std::move(configuration_.alignment_policy));
 
+    rclcpp::SubscriptionOptions safety_subscription_options;
+    safety_subscription_options.callback_group = callback_group_;
+    const auto state_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
+    dock_safety_interlock_state_sub_ =
+      node_.create_subscription<robot_interfaces::msg::DockSafetyInterlockState>(
+      configuration_.contact_interlock.safety_interlock_state_topic,
+      state_qos,
+      [this](const robot_interfaces::msg::DockSafetyInterlockState::SharedPtr message) {
+        std::lock_guard<std::mutex> lock(dock_safety_interlock_mutex_);
+        dock_safety_interlock_message_ = *message;
+        dock_safety_interlock_received_at_ = std::chrono::steady_clock::now();
+        have_dock_safety_interlock_message_ = true;
+      },
+      safety_subscription_options);
+    dock_safety_interlock_reconcile_client_ =
+      node_.create_client<robot_interfaces::srv::ReconcileDockInterlock>(
+      configuration_.contact_interlock.safety_interlock_reconcile_service,
+      rmw_qos_profile_services_default,
+      callback_group_);
+
     DockContactInterlockPorts contact_ports;
     contact_ports.runtime_snapshot = [this]() {
         return dependencies_.runtime_mode->snapshot();
       };
     contact_ports.bms_snapshot = [this]() {
         return dependencies_.power->snapshot();
+      };
+    contact_ports.safety_interlock_snapshot = [this]() {
+        return dock_safety_interlock_snapshot();
+      };
+    contact_ports.dock_zone_snapshot = [this](
+      const DockContactLatchSnapshot & latch,
+      const DockSafetyInterlockSnapshot & safety,
+      const application::runtime_mode::RuntimeModeSnapshot & runtime) {
+        return evaluate_dock_zone(latch, safety, runtime);
       };
     contact_ports.navigation_goal_running = [this]() {
         return dependencies_.navigation_goal_running();
@@ -233,6 +265,12 @@ public:
     undock_ports.runtime_snapshot = [this]() {
         return dependencies_.runtime_mode->snapshot();
       };
+    undock_ports.reconcile_stale_interlock = [this](
+      const std::string & dock_id,
+      const std::string & evidence,
+      std::string & detail) {
+        return reconcile_stale_dock_interlock(dock_id, evidence, detail);
+      };
     undock_ports.ensure_manager_running = [this](std::string & detail) {
         return runtime_->ensure_manager_running(detail);
       };
@@ -282,6 +320,154 @@ public:
   ~Impl()
   {
     shutdown();
+  }
+
+  DockSafetyInterlockSnapshot dock_safety_interlock_snapshot()
+  {
+    std::lock_guard<std::mutex> lock(dock_safety_interlock_mutex_);
+    DockSafetyInterlockSnapshot snapshot;
+    if (!have_dock_safety_interlock_message_) {
+      return snapshot;
+    }
+    const auto & message = dock_safety_interlock_message_;
+    snapshot.available = true;
+    snapshot.age_sec = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - dock_safety_interlock_received_at_).count();
+    snapshot.fresh = snapshot.age_sec >= 0.0 &&
+      snapshot.age_sec <= configuration_.contact_interlock.safety_interlock_state_max_age_sec;
+    snapshot.enabled = message.enabled;
+    snapshot.memory_latched = message.memory_latched;
+    snapshot.active = message.active;
+    snapshot.battery_sample_fresh = message.battery_sample_fresh;
+    snapshot.live_bms_contact = message.live_bms_contact;
+    snapshot.no_contact_duration_sec = message.no_contact_duration_sec;
+    snapshot.persistent_dock_latched = message.persistent_dock_latched;
+    snapshot.persistent_dock_strong = message.persistent_dock_strong;
+    snapshot.reverse_session_seen = message.reverse_session_seen;
+    snapshot.reverse_permit_active = message.reverse_permit_active;
+    snapshot.dock_id = message.dock_id;
+    snapshot.building_id = message.building_id;
+    snapshot.floor_id = message.floor_id;
+    snapshot.map_id = message.map_id;
+    snapshot.state = message.state;
+    snapshot.reason = message.reason;
+    return snapshot;
+  }
+
+  DockZoneSnapshot evaluate_dock_zone(
+    const DockContactLatchSnapshot & latch,
+    const DockSafetyInterlockSnapshot & safety,
+    const application::runtime_mode::RuntimeModeSnapshot & runtime) const
+  {
+    DockZoneSnapshot zone;
+    zone.dock_id = !runtime.docking_dock_id.empty() ? runtime.docking_dock_id :
+      (!latch.dock_id.empty() ? latch.dock_id : safety.dock_id);
+    if (zone.dock_id.empty() || zone.dock_id == "none") {
+      zone.reason = "dock_identity_unavailable";
+      return zone;
+    }
+
+    const auto context = dependencies_.map_runtime_state_store->read_runtime_map_context();
+    if (!context || !context->confirmed) {
+      zone.reason = "runtime_map_context_unconfirmed";
+      return zone;
+    }
+    zone.building_id = context->building_id;
+    zone.floor_id = context->floor_id;
+    zone.map_id = context->map_id;
+    const std::string expected_building = !latch.building_id.empty() ?
+      latch.building_id : safety.building_id;
+    const std::string expected_floor = !latch.floor_id.empty() ?
+      latch.floor_id : safety.floor_id;
+    const std::string expected_map = !latch.map_id.empty() ? latch.map_id : safety.map_id;
+    if ((!expected_building.empty() && expected_building != context->building_id) ||
+      (!expected_floor.empty() && expected_floor != context->floor_id) ||
+      (!expected_map.empty() && expected_map != context->map_id))
+    {
+      zone.reason = "dock_and_runtime_map_identity_mismatch";
+      return zone;
+    }
+
+    const auto dock_pose = find_floor_catalog_pose(
+      dependencies_.maps->catalog(), context->building_id, context->floor_id, zone.dock_id);
+    if (!dock_pose) {
+      zone.reason = "dock_pose_not_found_in_active_floor";
+      return zone;
+    }
+    const auto robot_pose = dependencies_.localization->current_robot_pose_snapshot();
+    if (!robot_pose.available || robot_pose.frame_id != "map" ||
+      robot_pose.age_sec < 0.0 ||
+      robot_pose.age_sec > configuration_.contact_interlock.dock_zone_pose_max_age_sec)
+    {
+      zone.reason = "fresh_map_frame_robot_pose_unavailable";
+      return zone;
+    }
+
+    zone.distance_m = std::hypot(
+      robot_pose.x - dock_pose->x, robot_pose.y - dock_pose->y);
+    if (zone.distance_m <= configuration_.contact_interlock.dock_zone_near_radius_m) {
+      zone.state = "NEAR";
+      zone.reason = "distance_at_or_below_near_radius";
+    } else if (zone.distance_m >= configuration_.contact_interlock.dock_zone_clear_radius_m) {
+      zone.state = "CLEAR";
+      zone.reason = "distance_at_or_above_clear_radius";
+    } else {
+      zone.reason = "distance_inside_hysteresis_band";
+    }
+    return zone;
+  }
+
+  bool reconcile_stale_dock_interlock(
+    const std::string & dock_id,
+    const std::string & evidence,
+    std::string & detail)
+  {
+    const auto timeout = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::duration<double>(
+        configuration_.contact_interlock.safety_interlock_reconcile_timeout_sec));
+    if (!dock_safety_interlock_reconcile_client_->wait_for_service(timeout)) {
+      detail = "dock safety interlock reconcile service unavailable";
+      return false;
+    }
+    auto request =
+      std::make_shared<robot_interfaces::srv::ReconcileDockInterlock::Request>();
+    request->transaction_id = "pre-navigation-" + utc_timestamp_iso8601();
+    request->dock_id = dock_id;
+    request->outside_dock_zone_proven = true;
+    request->evidence = evidence;
+    auto future = dock_safety_interlock_reconcile_client_->async_send_request(request);
+    if (future.wait_for(timeout) != std::future_status::ready) {
+      detail = "timed out reconciling stale dock safety interlock";
+      return false;
+    }
+    const auto response = future.get();
+    if (!response->success) {
+      detail = response->message;
+      return false;
+    }
+
+    const auto old_latch = contact_interlock_->read_latch();
+    contact_interlock_->update_latch(
+      false,
+      "pre_navigation_reconcile",
+      "remote_undock_proven_outside_dock_zone",
+      dock_id,
+      old_latch.building_id,
+      old_latch.floor_id,
+      old_latch.map_id,
+      evidence);
+
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+      const auto state = dock_safety_interlock_snapshot();
+      if (state.available && state.fresh && !state.memory_latched && !state.active) {
+        detail = "stale dock safety interlock cleared after proven remote undock";
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    detail = "dock safety interlock remained active after reconciliation";
+    return false;
   }
 
   // Retire one stale/conflicting docking owner before an undock transaction.
@@ -885,6 +1071,14 @@ public:
   DockingFeatureModuleDependencies dependencies_;
   DockingFeatureLateDependencies late_dependencies_;
   std::mutex docking_start_mutex_;
+  std::mutex dock_safety_interlock_mutex_;
+  bool have_dock_safety_interlock_message_{false};
+  robot_interfaces::msg::DockSafetyInterlockState dock_safety_interlock_message_;
+  std::chrono::steady_clock::time_point dock_safety_interlock_received_at_{};
+  rclcpp::Subscription<robot_interfaces::msg::DockSafetyInterlockState>::SharedPtr
+    dock_safety_interlock_state_sub_;
+  rclcpp::Client<robot_interfaces::srv::ReconcileDockInterlock>::SharedPtr
+    dock_safety_interlock_reconcile_client_;
   DeferredWorkQueue service_work_queue_;
   std::unique_ptr<predock_alignment::PredockAlignmentPolicy> predock_alignment_policy_;
   std::unique_ptr<DockContactInterlockModule> contact_interlock_;

@@ -21,7 +21,8 @@ PreNavigationUndockModule::PreNavigationUndockModule(
   if (!ports_.clear_teleop_command || !ports_.publish_zero_motion ||
     !ports_.prepare_controlled_undock ||
     !ports_.release_stale_fine_pause || !ports_.join_docking_worker ||
-    !ports_.runtime_snapshot || !ports_.ensure_manager_running ||
+    !ports_.runtime_snapshot || !ports_.reconcile_stale_interlock ||
+    !ports_.ensure_manager_running ||
     !ports_.call_undock_with_charging_retry || !ports_.observe_undock_status ||
     !ports_.set_docking_runtime_state || !ports_.set_docking_identity ||
     !ports_.timestamp_now || !ports_.monotonic_now || !ports_.sleep_for)
@@ -36,6 +37,20 @@ bool PreNavigationUndockModule::run_if_needed(
   bool & undock_performed)
 {
   undock_performed = false;
+  if (request.pre_navigation_blocked || request.recovery_action == "BLOCK") {
+    detail = request.pre_navigation_block_reason.empty() ?
+      "pre-navigation dock safety state is unavailable" :
+      request.pre_navigation_block_reason;
+    return false;
+  }
+  if (request.recovery_action == "CLEAR_STALE_INTERLOCK") {
+    if (request.resolved_dock_id.empty()) {
+      detail = "cannot reconcile stale dock interlock without a resolved dock_id";
+      return false;
+    }
+    return ports_.reconcile_stale_interlock(
+      request.resolved_dock_id, request.reconcile_evidence, detail);
+  }
   if (!request.auto_undock_required) {
     if (request.docking_active_not_docked_block) {
       detail = "docking is active but not docked: " + request.runtime_docking_state;
@@ -48,7 +63,7 @@ bool PreNavigationUndockModule::run_if_needed(
   undock_performed = true;
   if (!request.runtime_state_undocking &&
     !request.docking_status_indicates_undocking &&
-    !start(detail, request.charging_contact_at_gate))
+    !start(detail, request.charging_contact_at_gate, request.resolved_dock_id))
   {
     return false;
   }
@@ -57,7 +72,8 @@ bool PreNavigationUndockModule::run_if_needed(
 
 bool PreNavigationUndockModule::start(
   std::string & detail,
-  const bool charging_contact_at_gate)
+  const bool charging_contact_at_gate,
+  const std::string & resolved_dock_id)
 {
   ports_.clear_teleop_command();
   ports_.publish_zero_motion();
@@ -89,7 +105,12 @@ bool PreNavigationUndockModule::start(
   ports_.join_docking_worker();
 
   const auto runtime = ports_.runtime_snapshot();
-  const std::string dock_id = runtime.docking_dock_id;
+  const std::string dock_id = !resolved_dock_id.empty() ?
+    resolved_dock_id : runtime.docking_dock_id;
+  if (dock_id.empty()) {
+    detail = "controlled undock requires a resolved dock_id";
+    return false;
+  }
   std::string ensure_detail;
   if (!ports_.ensure_manager_running(ensure_detail)) {
     detail = ensure_detail;

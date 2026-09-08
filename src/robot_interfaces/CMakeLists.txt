@@ -9,6 +9,7 @@ find_package(std_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ArmState.msg"
   "msg/CorrectionPauseState.msg"
+  "msg/DockSafetyInterlockState.msg"
   "msg/DockTargetObservation.msg"
   "msg/ElevatorObservation.msg"
   "msg/FloorSwitchStatus.msg"
@@ -25,6 +26,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/SetMode.srv"
   "srv/SetMotionHold.srv"
   "srv/ReleaseMotionHoldIfExecutionIdle.srv"
+  "srv/ReconcileDockInterlock.srv"
   "srv/SetExecutionLease.srv"
   "srv/SetCorrectionPause.srv"
   "srv/SetElevatorNavigationSession.srv"

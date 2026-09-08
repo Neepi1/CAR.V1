@@ -82,6 +82,9 @@ robot_safety:
     allow_docking_cmd_when_docked: true
     bms_docking_interlock_enabled: true
     bms_docking_interlock_allow_reverse_undock: true
+    bms_docking_interlock_reconcile_no_contact_sec: 3.0
+    dock_safety_interlock_state_topic: /safety/dock_interlock_state
+    dock_safety_interlock_reconcile_service: /safety/reconcile_dock_interlock
     charging_current_min_a: 0.10
     charging_contact_voltage_min_v: 40.0
     charging_contact_voltage_max_v: 1000.0

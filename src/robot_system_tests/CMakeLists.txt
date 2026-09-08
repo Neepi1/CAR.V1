@@ -14,6 +14,9 @@ if(BUILD_TESTING)
   ament_add_pytest_test(
     test_nav2_footprint_inflation_contract
     test/test_nav2_footprint_inflation_contract.py)
+  ament_add_pytest_test(
+    test_pre_navigation_dock_interlock_contract
+    test/test_pre_navigation_dock_interlock_contract.py)
   ament_add_pytest_test(test_workspace_contracts test/test_workspace_contracts.py)
   ament_add_pytest_test(test_build_production_release test/test_build_production_release.py)
   ament_add_pytest_test(test_production_provisioning test/test_production_provisioning.py)

@@ -15,8 +15,10 @@
 #include "geometry_msgs/msg/twist.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "robot_interfaces/msg/dock_safety_interlock_state.hpp"
 #include "robot_interfaces/msg/motion_interlock_state.hpp"
 #include "robot_interfaces/msg/operating_mode_state.hpp"
+#include "robot_interfaces/srv/reconcile_dock_interlock.hpp"
 #include "robot_interfaces/srv/release_motion_hold_if_execution_idle.hpp"
 #include "robot_interfaces/srv/set_execution_lease.hpp"
 #include "robot_interfaces/srv/set_motion_hold.hpp"
@@ -281,6 +283,15 @@ public:
       declare_parameter<bool>("bms_docking_interlock_enabled", true);
     bms_docking_interlock_allow_reverse_undock_ =
       declare_parameter<bool>("bms_docking_interlock_allow_reverse_undock", true);
+    bms_docking_interlock_reconcile_no_contact_sec_ = std::max(
+      0.0,
+      declare_parameter<double>(
+        "bms_docking_interlock_reconcile_no_contact_sec", 3.0));
+    dock_safety_interlock_state_topic_ = declare_parameter<std::string>(
+      "dock_safety_interlock_state_topic", "/safety/dock_interlock_state");
+    dock_safety_interlock_reconcile_service_name_ = declare_parameter<std::string>(
+      "dock_safety_interlock_reconcile_service",
+      "/safety/reconcile_dock_interlock");
     enable_bms_contact_guard_ = declare_parameter<bool>("enable_bms_contact_guard", true);
     enable_docking_status_guard_ = declare_parameter<bool>("enable_docking_status_guard", true);
     enable_docked_latch_file_guard_ = declare_parameter<bool>("enable_docked_latch_file_guard", true);
@@ -329,6 +340,9 @@ public:
     motion_interlock_state_pub_ =
       create_publisher<robot_interfaces::msg::MotionInterlockState>(
       motion_interlock_state_topic_, state_qos);
+    dock_safety_interlock_state_pub_ =
+      create_publisher<robot_interfaces::msg::DockSafetyInterlockState>(
+      dock_safety_interlock_state_topic_, state_qos);
     motion_hold_service_ = create_service<robot_interfaces::srv::SetMotionHold>(
       motion_hold_service_name_,
       std::bind(
@@ -348,6 +362,14 @@ public:
       execution_lease_service_name_,
       std::bind(
         &RobotSafetyNode::on_execution_lease,
+        this,
+        std::placeholders::_1,
+        std::placeholders::_2));
+    dock_safety_interlock_reconcile_service_ =
+      create_service<robot_interfaces::srv::ReconcileDockInterlock>(
+      dock_safety_interlock_reconcile_service_name_,
+      std::bind(
+        &RobotSafetyNode::on_reconcile_dock_interlock,
         this,
         std::placeholders::_1,
         std::placeholders::_2));
@@ -485,6 +507,7 @@ public:
       std::bind(&RobotSafetyNode::on_timer, this));
 
     publish_motion_interlock_state(motion_interlock_->snapshot(steady_now_sec()));
+    publish_dock_safety_interlock_state();
     if (publish_zero_on_startup) {
       publish_command(geometry_msgs::msg::Twist{}, SafetySnapshot{SafetyState::COMMAND_STALE, false});
     }
@@ -558,6 +581,142 @@ private:
     const robot_safety::MotionInterlockSnapshot & snapshot)
   {
     motion_interlock_state_pub_->publish(make_motion_interlock_state(snapshot));
+  }
+
+  double bms_no_contact_duration_sec() const
+  {
+    if (!fresh_battery_sample() || battery_contact_active_ ||
+      !std::isfinite(bms_no_contact_since_steady_sec_) ||
+      bms_no_contact_since_steady_sec_ <= 0.0)
+    {
+      return 0.0;
+    }
+    return std::max(0.0, steady_now_sec() - bms_no_contact_since_steady_sec_);
+  }
+
+  robot_interfaces::msg::DockSafetyInterlockState make_dock_safety_interlock_state()
+  {
+    const bool battery_fresh = enable_bms_contact_guard_ && fresh_battery_sample();
+    const bool live_contact = battery_fresh && battery_contact_active_;
+    const auto persistent = dock_contact_latch_evidence();
+    robot_interfaces::msg::DockSafetyInterlockState state;
+    state.stamp = now();
+    state.generation = ++dock_safety_interlock_generation_;
+    state.enabled = bms_docking_interlock_enabled_;
+    state.memory_latched = bms_docking_contact_latched_;
+    state.active = bms_docking_interlock_enabled_ &&
+      robot_safety::bms_docking_interlock_is_active(
+      bms_docking_contact_latched_, live_contact, persistent);
+    state.battery_sample_fresh = battery_fresh;
+    state.live_bms_contact = live_contact;
+    state.no_contact_duration_sec = bms_no_contact_duration_sec();
+    state.persistent_dock_latched = persistent.latched_docked;
+    state.persistent_dock_strong = persistent.strong;
+    state.reverse_session_seen = bms_interlock_reverse_session_seen_;
+    state.reverse_permit_active = reverse_permit_fresh(docking_reverse_permit_);
+    state.dock_id = persistent.dock_id;
+    state.building_id = persistent.building_id;
+    state.floor_id = persistent.floor_id;
+    state.map_id = persistent.map_id;
+    if (!state.enabled) {
+      state.state = "DISABLED";
+      state.reason = "bms_docking_interlock_disabled";
+    } else if (state.memory_latched) {
+      state.state = "MEMORY_LATCHED";
+      state.reason = bms_docking_interlock_reason_.empty() ?
+        "bms_contact_latched_in_memory" : bms_docking_interlock_reason_;
+    } else if (state.live_bms_contact) {
+      state.state = "LIVE_CONTACT";
+      state.reason = "fresh_bms_contact";
+    } else if (state.persistent_dock_strong) {
+      state.state = "PERSISTENT_DOCKED";
+      state.reason = "strong_persistent_dock_evidence:" + persistent.source;
+    } else {
+      state.state = "CLEAR";
+      state.reason = "no_active_dock_interlock";
+    }
+    return state;
+  }
+
+  void publish_dock_safety_interlock_state()
+  {
+    if (dock_safety_interlock_state_pub_) {
+      dock_safety_interlock_state_pub_->publish(make_dock_safety_interlock_state());
+    }
+  }
+
+  static std::uint8_t reconcile_result_code(const std::string & code)
+  {
+    using Service = robot_interfaces::srv::ReconcileDockInterlock;
+    if (code == "OK" || code == "ALREADY_CLEAR") {
+      return Service::Response::RESULT_OK;
+    }
+    if (code == "OUTSIDE_DOCK_ZONE_NOT_PROVEN") {
+      return Service::Response::RESULT_OUTSIDE_DOCK_ZONE_NOT_PROVEN;
+    }
+    if (code == "BMS_STATE_NOT_FRESH") {
+      return Service::Response::RESULT_BMS_STATE_NOT_FRESH;
+    }
+    if (code == "BMS_CONTACT_ACTIVE") {
+      return Service::Response::RESULT_BMS_CONTACT_ACTIVE;
+    }
+    if (code == "BMS_NO_CONTACT_NOT_STABLE") {
+      return Service::Response::RESULT_BMS_NO_CONTACT_NOT_STABLE;
+    }
+    if (code == "DOCKING_STATUS_DOCKED") {
+      return Service::Response::RESULT_DOCKING_STATUS_DOCKED;
+    }
+    if (code == "UNDOCK_REVERSE_ACTIVE") {
+      return Service::Response::RESULT_UNDOCK_REVERSE_ACTIVE;
+    }
+    if (code == "DOCKING_COMMAND_ACTIVE") {
+      return Service::Response::RESULT_DOCKING_COMMAND_ACTIVE;
+    }
+    return Service::Response::RESULT_INVALID_REQUEST;
+  }
+
+  void on_reconcile_dock_interlock(
+    const std::shared_ptr<robot_interfaces::srv::ReconcileDockInterlock::Request> request,
+    std::shared_ptr<robot_interfaces::srv::ReconcileDockInterlock::Response> response)
+  {
+    if (request->transaction_id.empty() || request->evidence.empty()) {
+      response->success = false;
+      response->result_code =
+        robot_interfaces::srv::ReconcileDockInterlock::Response::RESULT_INVALID_REQUEST;
+      response->message = "transaction_id and outside-dock evidence are required";
+      response->state = make_dock_safety_interlock_state();
+      return;
+    }
+
+    robot_safety::DockInterlockReconcileContext context;
+    context.memory_latched = bms_docking_contact_latched_;
+    context.outside_dock_zone_proven = request->outside_dock_zone_proven;
+    context.battery_sample_fresh =
+      enable_bms_contact_guard_ && fresh_battery_sample();
+    context.live_bms_contact = context.battery_sample_fresh && battery_contact_active_;
+    context.no_contact_duration_sec = bms_no_contact_duration_sec();
+    context.required_no_contact_duration_sec =
+      bms_docking_interlock_reconcile_no_contact_sec_;
+    context.docking_status_indicates_docked = docking_status_indicates_docked();
+    context.reverse_permit_active = reverse_permit_fresh(docking_reverse_permit_);
+    context.fresh_docking_command = fresh_docking_command_active();
+    const auto decision = robot_safety::evaluate_dock_interlock_reconcile(context);
+    response->success = decision.allowed;
+    response->result_code = reconcile_result_code(decision.code);
+    response->message = decision.code + ": " + decision.detail;
+    if (decision.allowed && bms_docking_contact_latched_) {
+      bms_docking_contact_latched_ = false;
+      bms_interlock_reverse_session_seen_ = false;
+      bms_docking_interlock_reason_ =
+        "reconciled_outside_dock_zone:" + request->transaction_id;
+      last_latch_read_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+      RCLCPP_WARN(
+        get_logger(),
+        "BMS_DOCKING_INTERLOCK reconciled without motion transaction=%s dock_id=%s evidence=%s",
+        request->transaction_id.c_str(), request->dock_id.c_str(), request->evidence.c_str());
+    }
+    response->state = make_dock_safety_interlock_state();
+    publish_dock_safety_interlock_state();
   }
 
   void clear_cached_commands_for_interlock_transition()
@@ -1175,6 +1334,7 @@ private:
     } else {
       publish_motion_interlock_state(motion_interlock_->snapshot(steady_now_sec()));
     }
+    publish_dock_safety_interlock_state();
     const bool elevator_entry_bypass =
       elevator_entry_collision_bypass_authorized_now();
     if (elevator_entry_collision_bypass_active_ && !elevator_entry_bypass) {
@@ -1287,6 +1447,11 @@ private:
       enable_bms_contact_guard_ && fresh_battery_sample() && battery_contact_active_;
     battery_contact_active_ = battery_indicates_charging_contact(*msg);
     last_battery_time_ = now();
+    if (battery_contact_active_) {
+      bms_no_contact_since_steady_sec_ = 0.0;
+    } else if (contact_was_active || bms_no_contact_since_steady_sec_ <= 0.0) {
+      bms_no_contact_since_steady_sec_ = steady_now_sec();
+    }
     const auto persistent_evidence = dock_contact_latch_evidence();
     if (bms_docking_interlock_enabled_ &&
       robot_safety::should_latch_bms_docking_interlock(
@@ -1295,12 +1460,16 @@ private:
         docking_status_indicates_docked(),
         persistent_evidence))
     {
+      if (!bms_docking_contact_latched_) {
+        bms_docking_interlock_reason_ = "fresh_bms_contact_with_docking_context";
+      }
       bms_docking_contact_latched_ = true;
     }
     if (bms_docking_interlock_enabled_ && battery_contact_active_ && !contact_was_active) {
       publish_bms_docking_interlock_stop("bms_contact_rising_edge");
     }
     try_release_bms_docking_interlock("battery_state");
+    publish_dock_safety_interlock_state();
   }
 
   bool bms_docking_interlock_active() const
@@ -1390,6 +1559,7 @@ private:
 
     bms_docking_contact_latched_ = false;
     bms_interlock_reverse_session_seen_ = false;
+    bms_docking_interlock_reason_ = std::string("released_after_standard_undock:") + trigger;
     RCLCPP_INFO(
       get_logger(),
       "BMS_DOCKING_INTERLOCK released after explicit reverse session and "
@@ -1937,6 +2107,7 @@ private:
   double api_cmd_priority_timeout_sec_{0.25};
   double docking_cmd_priority_timeout_sec_{0.25};
   double dock_contact_max_age_sec_{3.0};
+  double bms_docking_interlock_reconcile_no_contact_sec_{3.0};
   double charging_current_min_a_{0.10};
   double charging_contact_voltage_min_v_{40.0};
   double charging_contact_voltage_max_v_{1000.0};
@@ -2000,6 +2171,9 @@ private:
   std::string battery_state_topic_;
   std::string docking_status_topic_;
   std::string docking_contact_latch_file_;
+  std::string dock_safety_interlock_state_topic_{"/safety/dock_interlock_state"};
+  std::string dock_safety_interlock_reconcile_service_name_{
+    "/safety/reconcile_dock_interlock"};
   std::string status_topic_;
   std::string motion_allowed_topic_;
   std::string motion_hold_service_name_;
@@ -2033,6 +2207,9 @@ private:
   bool battery_contact_active_{false};
   bool bms_docking_contact_latched_{false};
   bool bms_interlock_reverse_session_seen_{false};
+  double bms_no_contact_since_steady_sec_{0.0};
+  std::uint64_t dock_safety_interlock_generation_{0U};
+  std::string bms_docking_interlock_reason_;
   int actual_motion_mode_code_{255};
   bool spin_to_drive_settle_pending_{false};
   rclcpp::Time spin_to_drive_settle_started_time_{0, 0, RCL_ROS_TIME};
@@ -2075,12 +2252,16 @@ private:
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr motion_allowed_pub_;
   rclcpp::Publisher<robot_interfaces::msg::MotionInterlockState>::SharedPtr
     motion_interlock_state_pub_;
+  rclcpp::Publisher<robot_interfaces::msg::DockSafetyInterlockState>::SharedPtr
+    dock_safety_interlock_state_pub_;
   rclcpp::Service<robot_interfaces::srv::SetMotionHold>::SharedPtr motion_hold_service_;
   rclcpp::Service<
     robot_interfaces::srv::ReleaseMotionHoldIfExecutionIdle>::SharedPtr
     recovery_hold_release_service_;
   rclcpp::Service<robot_interfaces::srv::SetExecutionLease>::SharedPtr
     execution_lease_service_;
+  rclcpp::Service<robot_interfaces::srv::ReconcileDockInterlock>::SharedPtr
+    dock_safety_interlock_reconcile_service_;
   rclcpp::Subscription<robot_interfaces::msg::OperatingModeState>::SharedPtr
     execution_mode_state_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;

@@ -363,6 +363,10 @@ public:
       context.has_direct_pose_query};
     NavigationPreGoalDockSnapshot snapshot;
     snapshot.auto_undock_required = check.final_auto_undock_required;
+    snapshot.pre_navigation_recovery_required = check.pre_navigation_recovery_required;
+    snapshot.pre_navigation_blocked = check.safety_interlock_state_block;
+    snapshot.clear_stale_safety_interlock_required =
+      check.clear_stale_safety_interlock_required;
     snapshot.can_auto_undock = check.can_auto_undock;
     snapshot.docking_active_not_docked_block = check.docking_active_not_docked_block;
     snapshot.runtime_state_undocking = check.runtime_state_undocking;
@@ -378,6 +382,12 @@ public:
     snapshot.dock_contact_latch_age_sec = check.dock_contact_latch_age_sec;
     snapshot.dock_contact_latch_source = check.dock_contact_latch_source;
     snapshot.auto_undock_reason = check.auto_undock_reason;
+    snapshot.pre_navigation_recovery_action = check.pre_navigation_recovery_action;
+    snapshot.pre_navigation_block_reason = check.pre_navigation_block_reason;
+    snapshot.resolved_dock_id = check.resolved_dock_id;
+    snapshot.dock_zone_state = check.dock_zone.state;
+    snapshot.dock_zone_reason = check.dock_zone.reason;
+    snapshot.dock_zone_distance_m = check.dock_zone.distance_m;
     snapshot.dock_occupancy_state = check.dock_occupancy_state;
     snapshot.dock_occupancy_evidence = check.dock_occupancy_evidence;
     snapshot.dock_occupancy_reason = check.dock_occupancy_reason;
@@ -412,6 +422,7 @@ public:
   {
     features::docking::PreNavigationUndockRequest request;
     request.auto_undock_required = dock_check.auto_undock_required;
+    request.pre_navigation_blocked = dock_check.pre_navigation_blocked;
     request.docking_active_not_docked_block =
       dock_check.docking_active_not_docked_block;
     request.runtime_state_undocking = dock_check.runtime_state_undocking;
@@ -420,6 +431,13 @@ public:
     request.charging_contact_at_gate = dock_check.bms_contact;
     request.runtime_docking_state = dock_check.runtime_docking_state;
     request.auto_undock_reason = dock_check.auto_undock_reason;
+    request.recovery_action = dock_check.pre_navigation_recovery_action;
+    request.pre_navigation_block_reason = dock_check.pre_navigation_block_reason;
+    request.resolved_dock_id = dock_check.resolved_dock_id;
+    request.reconcile_evidence =
+      "dock_zone=" + dock_check.dock_zone_state +
+      " distance_m=" + std::to_string(dock_check.dock_zone_distance_m) +
+      " reason=" + dock_check.dock_zone_reason;
     return dependencies_.pre_navigation_undock->run_if_needed(
       request, detail, undock_performed);
   }

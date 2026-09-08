@@ -68,6 +68,22 @@ PersistentDockEvidence parse_persistent_dock_evidence(const std::string & json)
   evidence.latched_docked =
     json_true(json, "latched_docked") || json_true(json, "docked");
   evidence.source = json_string(json, "source");
+  evidence.dock_id = json_string(json, "dock_id");
+  evidence.building_id = json_string(json, "building_id");
+  evidence.floor_id = json_string(json, "floor_id");
+  evidence.map_id = json_string(json, "map_id");
+  if (evidence.dock_id == "none") {
+    evidence.dock_id.clear();
+  }
+  if (evidence.building_id == "none") {
+    evidence.building_id.clear();
+  }
+  if (evidence.floor_id == "none") {
+    evidence.floor_id.clear();
+  }
+  if (evidence.map_id == "none") {
+    evidence.map_id.clear();
+  }
   evidence.strong = evidence.latched_docked && strong_source(evidence.source);
   return evidence;
 }
@@ -102,6 +118,39 @@ bool bms_docking_interlock_is_active(
   const PersistentDockEvidence & evidence)
 {
   return in_memory_latch || live_contact || evidence.strong;
+}
+
+DockInterlockReconcileDecision evaluate_dock_interlock_reconcile(
+  const DockInterlockReconcileContext & context)
+{
+  if (!context.outside_dock_zone_proven) {
+    return {false, "OUTSIDE_DOCK_ZONE_NOT_PROVEN", "robot is not proven outside the dock zone"};
+  }
+  if (!context.battery_sample_fresh) {
+    return {false, "BMS_STATE_NOT_FRESH", "fresh BMS feedback is required"};
+  }
+  if (context.live_bms_contact) {
+    return {false, "BMS_CONTACT_ACTIVE", "charging contact is still active"};
+  }
+  if (context.no_contact_duration_sec < context.required_no_contact_duration_sec) {
+    return {
+      false,
+      "BMS_NO_CONTACT_NOT_STABLE",
+      "BMS no-contact evidence has not remained stable long enough"};
+  }
+  if (context.docking_status_indicates_docked) {
+    return {false, "DOCKING_STATUS_DOCKED", "docking runtime still reports docked"};
+  }
+  if (context.reverse_permit_active) {
+    return {false, "UNDOCK_REVERSE_ACTIVE", "controlled undock reverse permit is active"};
+  }
+  if (context.fresh_docking_command) {
+    return {false, "DOCKING_COMMAND_ACTIVE", "a fresh docking command is still active"};
+  }
+  if (!context.memory_latched) {
+    return {true, "ALREADY_CLEAR", "BMS docking memory interlock is already clear"};
+  }
+  return {true, "OK", "stale BMS docking memory interlock may be reconciled"};
 }
 
 }  // namespace robot_safety
