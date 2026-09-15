@@ -110,12 +110,12 @@ def test_outer_entry_forwards_deferred_prestart_with_disabled_default(
     (f"unset {AFTER_STACK}", False),
     (f"export {AFTER_STACK}=false", False),
     (f"export {AFTER_STACK}=on", True),
-    ("navigation_start_source=api_resume", False),
+    ("navigation_start_source=api_resume", True),
     ("navigation_start_source=direct", False),
     ("export NJRH_POINTCLOUD_ACCEL_PROFILE=legacy", False),
     ("export NJRH_NAV_LOCAL_STATE_MODE=fastlio", False),
 ])
-def test_deferred_prestart_is_opt_in_normal_systemd_only(tmp_path, setup, deferred):
+def test_deferred_prestart_respects_entrypoint_and_explicit_opt_out(tmp_path, setup, deferred):
     delayed_prestart_harness(tmp_path, setup + "\nensure_common_local_state_ready_for_navigation_start() { :; }")
     result = subprocess.run([bash_executable(), "startup.sh"], cwd=tmp_path,
                             capture_output=True, text=True, timeout=8)

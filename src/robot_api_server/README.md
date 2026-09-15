@@ -1,5 +1,11 @@
 # robot_api_server
 
+Release candidates must rebuild the complete API from one approved source/header
+snapshot. Do not combine historical `.o` files after a header layout change.
+The [coherent-build procedure](../../docs/api_coherent_build.md) audits compiled
+header dependencies and tests concurrent real HTTP pose/status reads in isolated
+namespaces; production activation remains a separately authorized full restart.
+
 Unspecified single-config builds default to `RelWithDebInfo` (optimized, with
 debug symbols). Explicit `Debug`/`Release` and multi-config builds retain their
 chosen behavior. This does not change callback rates, HTTP fields, navigation,

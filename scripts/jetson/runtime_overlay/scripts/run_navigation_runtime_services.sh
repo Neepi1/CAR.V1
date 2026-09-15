@@ -367,7 +367,11 @@ on_signal() {
 on_exit() {
   local status=$?
   if [[ "${status}" -ne 0 && "${runtime_ready}" -ne 1 ]]; then
-    if ! write_runtime_map_context "failed" "false" "resident navigation runtime failed; check ${NJRH_NAVIGATION_RESUME_LOG_FILE:-/tmp/njrh_navigation_resume.log}"; then
+    local failure_message="resident navigation runtime failed; check ${NJRH_NAVIGATION_RESUME_LOG_FILE:-/tmp/njrh_navigation_resume.log}"
+    if [[ "${navigation_start_source}" == "api_resume" && -n "${localization_ready_failure_reason:-}" ]]; then
+      failure_message="${localization_ready_failure_reason}"
+    fi
+    if ! write_runtime_map_context "failed" "false" "${failure_message}"; then
       echo "[runtime-overlay] WARN: failed to persist runtime failure context; cleanup will still run" >&2
     fi
   fi
@@ -694,9 +698,18 @@ initial_localization_ready_from_bridge_after_wrapper_failure() {
 
 capture_initial_global_localization_baseline() {
   local baseline_started_sec=${SECONDS}
+  local baseline_wait_sec="${NJRH_INITIAL_LOCALIZATION_SEQUENCE_BASELINE_WAIT_SEC:-0}"
+  initial_global_localization_baseline_sequence=""
+  if [[ "${baseline_wait_sec}" == "0" ]]; then
+    # This optional observation only enables timeout reconciliation. The
+    # normal wrapper proves its own accepted sequence; do not delay dispatch
+    # or substitute an unobserved zero/old sequence for a missing baseline.
+    echo "[runtime-overlay] TRIGGER_SHELL_TIMING phase=baseline_observation elapsed_sec=0 result=skipped_optional" >&2
+    return 0
+  fi
   initial_global_localization_baseline_sequence="$(
     wait_for_bridge_relocalization_sequence_after \
-      "${NJRH_INITIAL_LOCALIZATION_SEQUENCE_BASELINE_WAIT_SEC:-8}" \
+      "${baseline_wait_sec}" \
       "-1" \
       "false"
   )" || true
@@ -1454,14 +1467,15 @@ recover_flatscan_helper_for_navigation() {
 set_localization_ready_failure() {
   local reason="$1"
   local detail="$2"
+  local context_state="${3:-failed}"
   local failure="${reason}: ${detail}"
   if [[ "${NJRH_RUNTIME_NONFATAL_LOCALIZATION_FAILURE:-false}" == "true" ]]; then
     echo "[runtime-overlay] nonfatal localization startup admission warning: ${failure}" >&2
     return 0
   fi
   localization_ready_failure_reason="${failure}"
-  echo "[runtime-overlay] localization startup admission failed: ${localization_ready_failure_reason}" >&2
-  write_runtime_map_context "failed" "false" "${localization_ready_failure_reason}"
+  echo "[runtime-overlay] localization startup ${context_state}: ${localization_ready_failure_reason}" >&2
+  write_runtime_map_context "${context_state}" "false" "${localization_ready_failure_reason}"
 }
 
 ensure_common_local_state_ready_for_navigation_start() {
@@ -1552,14 +1566,14 @@ ensure_localization_stack_ready_for_navigation() {
   if ! runtime_readiness_probe localization-stack \
     "${NAV2_MAP_YAML}" "/flatscan" "${stack_timeout}"; then
     set_localization_ready_failure "LOCALIZATION_INPUTS_NOT_READY" \
-      "target map/services/FlatScan not ready; Isaac has not been dispatched"
+      "target map/services/FlatScan not ready; Isaac has not been dispatched" "starting"
     return 1
   fi
   local remaining=$((deadline - SECONDS))
   (( remaining >= 0 )) || remaining=0
   if ! wait_for_isaac_startup_ready "${remaining}"; then
     set_localization_ready_failure "ISAAC_INITIALIZATION_NOT_READY" \
-      "Isaac internal graph not ready for this launch; Isaac has not been dispatched"
+      "Isaac internal graph not ready for this launch; Isaac has not been dispatched" "starting"
     return 1
   fi
   echo "[runtime-overlay] localization stack ready: target map, FlatScan owner and current Isaac graph; trigger wrapper verifies fresh input and result" >&2
@@ -1972,6 +1986,30 @@ if resident_navigation_ready; then
 fi
 
 echo "[runtime-overlay] navigation start source=${navigation_start_source}" >&2
+if [[ "${navigation_start_source}" == "api_resume" ]]; then
+  # A long-lived API inherits the already closed common-start session. Own
+  # only this new navigation subtree; never reopen or finish the API's session.
+  # Reuse returned above, and EXIT/TERM cleanup is installed before borrowing.
+  unset NJRH_STARTUP_CPU_SESSION NJRH_NAVIGATION_STARTUP_RECEIPT
+  if [[ "${NJRH_NAV_LOCAL_STATE_MODE:-ekf}" == "ekf" ]]; then
+    njrh_begin_startup_cpu_boost
+    if env_flag_true "${NJRH_NAV2_LIFECYCLE_BACKGROUND_START:-false}" \
+      && env_flag_true "${NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION:-true}"; then
+      # Keep one configure-all/activate-in-order worker. For the resident
+      # accelerated pipeline, stage Nav2 after map/Isaac initialization, but
+      # still overlap its startup with the initial localization request.
+      if [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE:-legacy}" != "legacy" ]]; then
+        export NJRH_NAV2_PRESTART_AFTER_LOCALIZATION_STACK="${NJRH_NAV2_PRESTART_AFTER_LOCALIZATION_STACK:-true}"
+        export NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK=true
+      else
+        export NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK=false
+      fi
+      export NJRH_NAV2_LIFECYCLE_CONFIGURE_ALL_FIRST=true
+      export NJRH_NAV2_LIFECYCLE_PARALLEL_CORE=false
+      echo "[runtime-overlay] API resume uses configure-all before activation; Nav2 startup overlaps the localization request, not its result wait" >&2
+    fi
+  fi
+fi
 write_runtime_map_context "starting" "false" "resident navigation runtime starting"
 if [[ "${navigation_start_source}" == "api_resume" ]]; then
   echo "[runtime-overlay] API navigation resume requires stable local_state before localization process startup" >&2
@@ -2005,7 +2043,7 @@ else
 fi
 
 nav2_prestart_after_localization_stack=0
-if [[ "${navigation_start_source}" == "systemd_autostart" \
+if [[ ( "${navigation_start_source}" == "systemd_autostart" || "${navigation_start_source}" == "api_resume" ) \
   && "${NJRH_NAV_LOCAL_STATE_MODE:-ekf}" == "ekf" \
   && "${NJRH_POINTCLOUD_ACCEL_PROFILE:-legacy}" != "legacy" ]] \
   && env_flag_true "${NJRH_NAV2_PRESTART_AFTER_LOCALIZATION_STACK:-false}"; then
@@ -2064,8 +2102,8 @@ if ! floor_handoff_requested; then
   log_startup_stage "localization_stack_ready"
 fi
 
-# Cold-start scheduling only: defer constructing the Nav2 graph, not waiting
-# for a localization result. Other entry paths retain their existing order.
+# Cold-start/API-resume scheduling: defer constructing the Nav2 graph, not
+# waiting for a localization result. Other entry paths retain their order.
 # A floor request may arrive during stack initialization; do not start its old
 # map here. The existing trigger/handoff path adopts the exact target later.
 if [[ "${nav2_prestart_after_localization_stack}" -eq 1 \
@@ -2106,6 +2144,18 @@ else
 fi
 
 if ! wait_for_initial_global_localization; then
+  if [[ "${navigation_start_source}" == "api_resume" && "${floor_startup_handoff_active:-0}" -eq 0 ]] \
+    && ! floor_handoff_requested; then
+    # The wrapper has exhausted its existing result/confirmation budget. It
+    # already reconciles late replies and retries only before Isaac dispatch.
+    # Do not turn a terminal App start back into an unbounded starting state.
+    # A floor handoff keeps its separate adoption path below.
+    export NJRH_RUNTIME_FAILURE_CODE="${NJRH_RUNTIME_FAILURE_CODE:-INITIAL_LOCALIZATION_FAILED}"
+    localization_ready_failure_reason="${localization_ready_failure_reason:-initial global localization did not complete}"
+    log_startup_stage "initial_global_localization_failed"
+    report_navigation_startup_finished failed
+    exit 1
+  fi
   log_startup_stage "waiting_for_localization"
   write_runtime_map_context "starting" "false" "waiting for later localization; ${localization_ready_failure_reason:-initial localization did not complete}"
   report_navigation_startup_finished waiting_for_localization

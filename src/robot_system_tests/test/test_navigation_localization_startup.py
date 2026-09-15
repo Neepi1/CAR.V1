@@ -83,6 +83,7 @@ write_runtime_map_context() {{ echo "context:$1:$2" >> events; }}
 clear_nav2_lifecycle_ready_status() {{ :; }}
 stop_existing_standard_nav_stack() {{ echo clean-nav >> events; }}
 stop_existing_localization_stack() {{ echo clean-loc >> events; }}
+njrh_begin_startup_cpu_boost() {{ :; }}
 ensure_helper_process_no_probe() {{ :; }}
 ensure_localization_stack_ready_for_navigation() {{ sleep 0.15; }}
 capture_initial_global_localization_baseline() {{ :; }}
@@ -187,7 +188,8 @@ printf 'NAV2_HOLD_READY=true\nNAV2_HOLD_READY_STAMP_SEC=1\nNAV2_HOLD_READY_WRAPP
     (2, [], {}, 130),
     (-1, [], {}, 130),
     (1, [], {"map_to_odom_publisher_owner": "other"}, 130),
-    (1, [], {"safe_for_goal_start": False}, 130),
+    # Relocalization completion no longer owns navigation admission.
+    (1, [], {"safe_for_goal_start": False}, 0),
     (1, [], {"correction_active": True}, 130),
     (1, [], {"has_map_to_odom": False}, 130),
     (1, [], {"current_sequence": 1}, 130),

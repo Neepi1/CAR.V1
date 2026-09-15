@@ -4,6 +4,19 @@ ROS 2 Humble multi-floor indoor/outdoor delivery robot navigation stack scaffold
 
 ## Current Status
 
+App navigation resume now keeps slow map/Isaac initialization in `starting`,
+owns a fresh startup CPU session, and stages Nav2 after map/Isaac initialization
+while overlapping configure-all/activation with the localization request.
+Terminal App localization failures finish instead of waiting indefinitely.
+Optional pre-trigger baseline observation defaults to off; localization
+acceptance and final readiness predicates are unchanged. See
+[navigation resume repair and pending hardware timing](docs/navigation_resume_startup.md).
+
+API release builds must use one complete approved source/header snapshot and
+a fresh build directory. Mixing historical object files can corrupt private
+mapping state and stall all HTTP workers. See
+[coherent API build and isolated query regression](docs/api_coherent_build.md).
+
 Relocalization completion no longer waits for navigation admission. A current,
 accepted and settled canonical TF result completes localization even while a
 floor transaction keeps `safe_for_goal_start=false`. Navigation's own checks

@@ -1,5 +1,14 @@
 # robot_system_tests
 
+`test_navigation_resume_startup.py` covers retryable initialization without a
+terminal failure, independent API-resume CPU scope and restoration, actual
+background-worker overlap/join, and the nonblocking optional sequence baseline.
+App resume additionally covers after-input Nav2 staging, retained configure-all,
+terminal localization failure without an unbounded observer, original failure
+details, and unchanged cancellation/floor handoff behavior.
+Tests use inert processes and simulated transports, not robot operations.
+See [resume repair and hardware acceptance](../../docs/navigation_resume_startup.md).
+
 `test_startup_cpu_affinity*.py` 覆盖八核冷启动、逐线程恢复原五核分配、进程身份、
 子树边界、延后启动及 shell/launch 接线。Linux 实测只操作测试自建进程；
 整链提速仍需授权重启验收，不连接 ROS、不移动小车。
