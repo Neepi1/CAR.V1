@@ -2,15 +2,21 @@ cmake_minimum_required(VERSION 3.8)
 project(robot_nav_config)
 
 find_package(ament_cmake REQUIRED)
+find_package(behaviortree_cpp_v3 REQUIRED)
+find_package(nav2_behavior_tree REQUIRED)
+find_package(nav2_msgs REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
 find_package(angles REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav2_core REQUIRED)
 find_package(nav2_costmap_2d REQUIRED)
+find_package(nav2_mppi_controller REQUIRED)
 find_package(nav2_rotation_shim_controller REQUIRED)
 find_package(nav2_smac_planner REQUIRED)
 find_package(nav2_util REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(ompl REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
@@ -23,6 +29,28 @@ find_package(Threads REQUIRED)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+add_library(ranger_dynamics_mppi_controller SHARED src/chassis_dynamics/mppi_controller.cpp)
+target_include_directories(ranger_dynamics_mppi_controller PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+ament_target_dependencies(ranger_dynamics_mppi_controller nav2_mppi_controller nav2_costmap_2d
+  nav2_core nav2_util pluginlib rclcpp rclcpp_lifecycle nav_msgs geometry_msgs)
+pluginlib_export_plugin_description_file(nav2_core robot_nav_config_dynamics_plugins.xml)
+install(TARGETS ranger_dynamics_mppi_controller LIBRARY DESTINATION lib COMPONENT chassis_dynamics)
+
+add_library(ranger_clearance_critic SHARED src/navigation_clearance/ranger_clearance_critic.cpp)
+target_include_directories(ranger_clearance_critic PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+ament_target_dependencies(ranger_clearance_critic nav2_mppi_controller nav2_costmap_2d
+  pluginlib rclcpp rclcpp_lifecycle)
+pluginlib_export_plugin_description_file(nav2_mppi_controller robot_nav_config_mppi_critics.xml)
+
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "srv/PrepareOrdinaryNavigationRecovery.srv"
+  DEPENDENCIES builtin_interfaces nav_msgs)
+rosidl_get_typesupport_target(recovery_typesupport ${PROJECT_NAME} "rosidl_typesupport_cpp")
+
 add_library(goal_scoped_rotation_shim_controller SHARED
   src/docking/dock_staging_goal_checker.cpp
   src/elevator_aware_progress_checker.cpp
@@ -31,8 +59,16 @@ add_library(goal_scoped_rotation_shim_controller SHARED
   src/elevator_scoped_search.cpp
   src/elevator_scoped_controller.cpp
   src/goal_scoped_rotation_shim_controller.cpp
+  src/ordinary_local_path_repair.cpp
+  src/ordinary_local_path_repair_runtime.cpp
+  src/ordinary_local_path_repair_worker.cpp
+  src/navigation_recovery/recovery_state.cpp
 )
 target_link_libraries(goal_scoped_rotation_shim_controller Threads::Threads)
+target_link_libraries(goal_scoped_rotation_shim_controller "${recovery_typesupport}")
+target_include_directories(goal_scoped_rotation_shim_controller BEFORE PRIVATE
+  "${CMAKE_CURRENT_BINARY_DIR}/rosidl_generator_cpp")
+target_link_libraries(goal_scoped_rotation_shim_controller ${OMPL_LIBRARIES})
 target_include_directories(goal_scoped_rotation_shim_controller PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
@@ -44,6 +80,7 @@ ament_target_dependencies(goal_scoped_rotation_shim_controller
   nav2_core
   nav2_costmap_2d
   nav2_rotation_shim_controller
+  nav2_smac_planner
   nav2_util
   nav_msgs
   pluginlib
@@ -54,6 +91,22 @@ ament_target_dependencies(goal_scoped_rotation_shim_controller
   tf2
   tf2_geometry_msgs
 )
+
+add_library(ordinary_navigation_recovery_bt_node SHARED
+  src/navigation_recovery/bt_nodes.cpp
+)
+target_compile_definitions(ordinary_navigation_recovery_bt_node PRIVATE BT_PLUGIN_EXPORT)
+target_include_directories(ordinary_navigation_recovery_bt_node PRIVATE include)
+target_include_directories(ordinary_navigation_recovery_bt_node BEFORE PRIVATE
+  "${CMAKE_CURRENT_BINARY_DIR}/rosidl_generator_cpp")
+ament_target_dependencies(ordinary_navigation_recovery_bt_node
+  behaviortree_cpp_v3 nav2_behavior_tree nav2_msgs robot_interfaces rclcpp nav_msgs std_msgs
+)
+# Reuse Humble's action adapter, including cancellation and same-action path updates.
+find_library(follow_path_bt_library NAMES nav2_follow_path_action_bt_node
+  HINTS "${nav2_behavior_tree_DIR}/../../../lib" REQUIRED)
+target_link_libraries(ordinary_navigation_recovery_bt_node "${follow_path_bt_library}")
+target_link_libraries(ordinary_navigation_recovery_bt_node "${recovery_typesupport}")
 
 add_library(ranger_mini3_lattice_planner SHARED
   src/elevator_scoped_clearance.cpp
@@ -87,7 +140,15 @@ pluginlib_export_plugin_description_file(
 )
 
 install(TARGETS
+  ranger_clearance_critic
   goal_scoped_rotation_shim_controller
+  ARCHIVE DESTINATION lib COMPONENT navigation_clearance
+  LIBRARY DESTINATION lib COMPONENT navigation_clearance
+  RUNTIME DESTINATION bin COMPONENT navigation_clearance
+)
+
+install(TARGETS
+  ordinary_navigation_recovery_bt_node
   ranger_mini3_lattice_planner
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
@@ -110,6 +171,52 @@ install(PROGRAMS
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(nav2_controller REQUIRED)
+  ament_add_gtest(test_chassis_response test/chassis_dynamics/test_response_model.cpp)
+  target_include_directories(test_chassis_response PRIVATE include)
+  add_executable(replay_chassis_can test/chassis_dynamics/replay_can.cpp)
+  target_include_directories(replay_chassis_can PRIVATE include)
+  ament_add_gtest(test_mppi_dynamics test/chassis_dynamics/test_mppi_dynamics.cpp)
+  target_include_directories(test_mppi_dynamics PRIVATE include)
+  ament_target_dependencies(test_mppi_dynamics nav2_mppi_controller nav2_costmap_2d
+    nav2_controller nav2_util nav2_core pluginlib rclcpp rclcpp_lifecycle)
+  target_compile_definitions(test_mppi_dynamics PRIVATE NAV_CONFIG_FILE="${CMAKE_CURRENT_SOURCE_DIR}/config/nav2.yaml")
+  set_tests_properties(test_mppi_dynamics PROPERTIES
+    ENVIRONMENT "ROS_DOMAIN_ID=212;ROS_LOCALHOST_ONLY=1;RMW_IMPLEMENTATION=rmw_fastrtps_cpp")
+  ament_add_gtest(test_ranger_clearance_critic test/navigation_clearance/test_ranger_clearance_critic.cpp)
+  ament_target_dependencies(test_ranger_clearance_critic nav2_mppi_controller nav2_costmap_2d
+    nav2_controller nav2_util rclcpp rclcpp_lifecycle)
+  target_compile_definitions(test_ranger_clearance_critic PRIVATE
+    NAV_CONFIG_FILE="${CMAKE_CURRENT_SOURCE_DIR}/config/nav2.yaml")
+  ament_add_gtest(test_ordinary_recovery_state
+    test/navigation_recovery/test_recovery_state.cpp
+    src/navigation_recovery/recovery_state.cpp)
+  target_include_directories(test_ordinary_recovery_state PRIVATE include)
+  ament_target_dependencies(test_ordinary_recovery_state nav_msgs)
+
+  ament_add_gtest(test_ordinary_recovery_bt
+    test/navigation_recovery/test_recovery_bt.cpp
+    src/navigation_recovery/recovery_state.cpp)
+  target_include_directories(test_ordinary_recovery_bt PRIVATE include)
+  ament_target_dependencies(test_ordinary_recovery_bt behaviortree_cpp_v3 nav_msgs rclcpp std_msgs)
+  target_include_directories(test_ordinary_recovery_bt BEFORE PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}/rosidl_generator_cpp")
+  target_link_libraries(test_ordinary_recovery_bt "${recovery_typesupport}")
+  target_compile_definitions(test_ordinary_recovery_bt PRIVATE
+    RECOVERY_BT_PLUGIN="$<TARGET_FILE:ordinary_navigation_recovery_bt_node>"
+    RECOVERY_BT_FILE="${CMAKE_CURRENT_SOURCE_DIR}/behavior_trees/navigate_to_pose_ranger_lattice_recovery.xml")
+
+  ament_add_gtest(test_ordinary_controller_recovery
+    test/navigation_recovery/test_controller_recovery.cpp)
+  target_include_directories(test_ordinary_controller_recovery PRIVATE include)
+  target_include_directories(test_ordinary_controller_recovery BEFORE PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}/rosidl_generator_cpp")
+  target_link_libraries(test_ordinary_controller_recovery goal_scoped_rotation_shim_controller)
+  ament_target_dependencies(test_ordinary_controller_recovery
+    nav2_controller nav2_costmap_2d nav2_util rclcpp tf2_ros robot_interfaces)
+  set_tests_properties(test_ordinary_controller_recovery PROPERTIES
+    ENVIRONMENT "ROS_DOMAIN_ID=212;ROS_LOCALHOST_ONLY=1;RMW_IMPLEMENTATION=rmw_fastrtps_cpp")
+
   ament_add_gtest(test_goal_scope_tracker
     test/test_goal_scope_tracker.cpp
   )
@@ -161,6 +268,15 @@ if(BUILD_TESTING)
     test/test_elevator_scoped_path.cpp
   )
   target_include_directories(test_elevator_scoped_path PRIVATE include)
+
+  find_package(nav_2d_utils REQUIRED)
+  ament_add_gtest(test_elevator_goal_stamp test/test_elevator_goal_stamp.cpp)
+  target_include_directories(test_elevator_goal_stamp PRIVATE include)
+  target_link_libraries(test_elevator_goal_stamp ranger_mini3_lattice_planner)
+  ament_target_dependencies(test_elevator_goal_stamp
+    nav2_controller nav_2d_utils nav2_costmap_2d nav2_util rclcpp tf2_geometry_msgs)
+  set_tests_properties(test_elevator_goal_stamp PROPERTIES
+    ENVIRONMENT "ROS_DOMAIN_ID=184;ROS_LOCALHOST_ONLY=1;RMW_IMPLEMENTATION=rmw_fastrtps_cpp")
 
   ament_add_gtest(test_elevator_scoped_clearance
     test/test_elevator_scoped_clearance.cpp
@@ -302,6 +418,56 @@ if(BUILD_TESTING)
     rclcpp
   )
 
+  ament_add_gtest(test_ordinary_local_path_repair
+    test/test_ordinary_local_path_repair.cpp
+    src/ordinary_local_path_repair.cpp
+  )
+  target_include_directories(test_ordinary_local_path_repair PRIVATE include)
+  target_link_libraries(test_ordinary_local_path_repair ${OMPL_LIBRARIES})
+  ament_target_dependencies(test_ordinary_local_path_repair
+    geometry_msgs
+    nav2_costmap_2d
+    nav2_smac_planner
+    nav2_util
+    nav_msgs
+    rclcpp
+    rclcpp_lifecycle
+    tf2
+  )
+
+  ament_add_gtest(test_ordinary_local_path_repair_worker
+    test/test_ordinary_local_path_repair_worker.cpp
+    src/ordinary_local_path_repair.cpp
+    src/ordinary_local_path_repair_worker.cpp
+  )
+  target_include_directories(test_ordinary_local_path_repair_worker PRIVATE include)
+  target_link_libraries(test_ordinary_local_path_repair_worker Threads::Threads)
+  target_link_libraries(test_ordinary_local_path_repair_worker ${OMPL_LIBRARIES})
+  ament_target_dependencies(test_ordinary_local_path_repair_worker
+    geometry_msgs
+    nav2_costmap_2d
+    nav2_smac_planner
+    nav2_util
+    nav_msgs
+    rclcpp
+    rclcpp_lifecycle
+    tf2
+  )
+
+  ament_add_gtest(test_ordinary_local_path_repair_runtime
+    test/test_ordinary_local_path_repair_runtime.cpp
+    src/ordinary_local_path_repair.cpp
+    src/ordinary_local_path_repair_worker.cpp
+    src/ordinary_local_path_repair_runtime.cpp
+  )
+  target_include_directories(test_ordinary_local_path_repair_runtime PRIVATE include)
+  target_link_libraries(test_ordinary_local_path_repair_runtime Threads::Threads)
+  target_link_libraries(test_ordinary_local_path_repair_runtime ${OMPL_LIBRARIES})
+  ament_target_dependencies(test_ordinary_local_path_repair_runtime
+    geometry_msgs nav2_costmap_2d nav2_smac_planner nav2_util nav_msgs
+    rclcpp rclcpp_lifecycle std_msgs tf2 tf2_geometry_msgs
+  )
+
 endif()
 
 ament_export_include_directories(include)
@@ -310,6 +476,11 @@ ament_export_libraries(
   ranger_mini3_lattice_planner
 )
 ament_export_dependencies(
+  nav2_mppi_controller
+  rosidl_default_runtime
+  behaviortree_cpp_v3
+  nav2_behavior_tree
+  nav2_msgs
   angles
   builtin_interfaces
   geometry_msgs

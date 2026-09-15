@@ -307,11 +307,6 @@ private:
       }
     }
     ports_.join_docking_worker();
-    auto motion_admission = elevator_module_.acquire_motion_admission(motion_admission_epoch);
-    if (!motion_admission.admitted()) {
-      return elevator_module_.motion_admission_failure_response(
-        "docking_start", motion_admission);
-    }
     if (const auto blocked = ports_.floor_runtime_interlock_response("docking_start_commit")) {
       return *blocked;
     }
@@ -341,7 +336,6 @@ private:
       docking_job_ = next_job;
     }
     runtime_mode_.accept_docking(dock_id, "docking accepted");
-    motion_admission.unlock();
 
     std::string launch_error;
     if (!ports_.launch_docking_worker(job_id, launch_error)) {
@@ -563,11 +557,6 @@ HttpResponse DockingHttpModule::Impl::handle_undock(
   if (const auto blocked = ports_.floor_runtime_interlock_response("docking_undock_commit")) {
     return *blocked;
   }
-  auto motion_admission = elevator_module_.acquire_motion_admission(motion_admission_epoch);
-  if (!motion_admission.admitted()) {
-    return elevator_module_.motion_admission_failure_response(
-      "docking_undock", motion_admission);
-  }
   std::string ensure_detail;
   if (!ports_.ensure_docking_manager_running(ensure_detail)) {
     return {500, "application/json", error_json(ensure_detail)};
@@ -594,7 +583,6 @@ HttpResponse DockingHttpModule::Impl::handle_undock(
   }
   runtime_mode_.set_docking(true, "undocking", "undocking accepted");
   runtime_mode_.set_docking_identity(dock_id, "undocking accepted");
-  motion_admission.unlock();
 
   std::string service_detail;
   DockingUndockServiceObservation service_observation;

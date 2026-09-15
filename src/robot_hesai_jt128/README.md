@@ -1,6 +1,37 @@
 # robot_hesai_jt128
 
+The IMU remap also exports `imu_axis_remap_core` for the IMU-only bringup host.
+Standalone use remains supported; only the canonical IMU edge can opt into
+intra-process delivery. See [IMU communication/ownership](../../docs/imu_intra_process_pipeline.md).
+
 JT128 wrapper that keeps vendor networking and frame IDs parameterized.
+
+## CPU fused normalization candidate
+
+The first-stage candidate fuses canonical axis remapping and normalized XYZI
+cache filling only for explicitly validated contiguous PointCloud2 layouts.
+It removes a separate normalization traversal, not all copies: the internal
+XYZI cache and existing trunk publication remain. Full trunk fields, point
+order, stamps, QoS, buffer ownership and publish-before-cache-exchange ordering
+are preserved; scan height limits, footprint self mask and output rate are unchanged.
+Other layouts retain their existing path, without claiming that path is newly safety-validated.
+
+Twelve targeted tests passed, including real-core private-topic integration.
+The isolated 40000-point algorithm CPU median fell from 417 to 247 us; this is
+not a whole-process CPU saving. The candidate is deployed on disk only: no
+full-runtime restart or supervised hardware acceptance has been completed.
+See [implementation scope and acceptance](../../docs/pointcloud_cpu_fused_normalization.md).
+
+## CUDA point parsing on Orin
+
+The runtime wrapper now selects `NJRH_HESAI_USE_GPU=true` by default in its
+generated driver YAML. The Hesai overlay defaults to a CUDA-enabled Release
+build targeting Orin (`CMAKE_CUDA_ARCHITECTURES=87`, CUDA C++17 for Humble).
+This changes only vendor point calculation: input networking, echo filtering,
+point fields, IMU callbacks, timestamps, SHM/DDS and CPU affinity are unchanged.
+An explicit CPU build uses `-DFIND_CUDA=OFF` and runtime
+`NJRH_HESAI_USE_GPU=false`; it is not an automatic fallback.
+See [deployment and acceptance](../../docs/jt128_cuda_parsing.md).
 
 ## Parameters
 
@@ -18,6 +49,7 @@ JT128 wrapper that keeps vendor networking and frame IDs parameterized.
 - `local_pointcloud_axis_remap_config`, `local_imu_axis_remap_config`: repository-owned canonical ingress remap configs reused by the Jetson runtime
 - `scan_republisher_node`: C++ `/scan_raw -> /scan` restamp/pass-through helper shared by 2D mapping and Isaac flatscan localization. 2D mapping preserves scan acquisition stamps by default to avoid self-spin TF time skew; it does not subscribe to odometry and does not drop scans because field tests showed spin-related scan gating degraded the live map.
 - `imu_axis_remap_node`: C++ canonical IMU remap helper. Field runtime enables gyro covariance override because the Hesai driver publishes zero covariance; `/lidar_imu` must be a weak yaw-rate input to EKF, not an exact heading source.
+  Fixed angular-velocity and linear-acceleration covariance overrides are built once at startup. When an override is enabled, the callback copies it directly instead of rotating covariance that would then be discarded; when disabled, the existing covariance rotation remains unchanged. Vector/orientation math, parameter validation, timestamps, message cadence, and QoS are unchanged. Output equivalence and callback CPU impact still require an isolated replay and supervised Jetson acceptance before deployment.
 - `pointcloud_axis_remap_node`: C++ canonical point cloud remap helper and the only production publisher for `/lidar_points` in the separate-process profile. Runtime receives the vendor raw cloud with `input_reliable=false` and depth `1` even though the upstream Hesai publisher offers reliable QoS; a reliable publisher can satisfy a best-effort subscriber, and the remap node must not request reliable delivery that can backpressure the raw ingress path. Production starts this node as a standalone process, publishes the full-density `/lidar_points` trunk first, and does not derive local obstacle PointCloud2 branches. It publishes `/lidar/axis_remap_status` at 1 Hz for source-side delivery diagnostics, including raw callback inter-arrival, `/lidar_points` publish interval, gap counters, trunk timing, subscriber counts, and QoS settings.
 - `PointCloudAccelCore`: shared C++ implementation used by standalone `pointcloud_accel_axis_node` and driver-integrated `hesai_accel_driver_node`. Production local dynamic-obstacle handling uses Nav2's standard LaserScan flow: the accel scan worker publishes `/scan`, Nav2 `ObstacleLayer` marks and raytraces from `/scan`, and `collision_monitor` also consumes `/scan`. Before binning, each candidate return is transformed into `base_link`; only endpoints inside the configured padded Ranger footprint (`x=-0.39..0.39m`, `y=-0.28..0.28m`) are removed as chassis/mechanical-arm self returns. The mask is not a radial blind zone, so real obstacles immediately outside the footprint remain visible. If the mask TF is unavailable, that scan is withheld instead of publishing unfiltered self returns, and status counters expose both filtered points and TF-unavailable events. The old local PointCloud2 obstacle/clearing worker is disabled by default and is not a production path.
 - FAST-LIO2 subscribes to the canonical `/lidar_points(lidar_link)` stream directly in the default runtime. The older `pointcloud_fastlio_remap` identity branch is not started by `run_driver.sh`; it remains only as a diagnostic config because the extra full-size pointcloud copy can backpressure the estimator input path.

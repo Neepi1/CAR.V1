@@ -61,6 +61,34 @@ install(
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME startup_trigger_completion
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/test_startup_trigger_completion.py)
+  foreach(trigger_api legacy tracked)
+    set(fresh_input_args)
+    if(trigger_api STREQUAL "tracked")
+      list(APPEND fresh_input_args --tracked)
+    endif()
+    add_test(NAME isolated_fresh_input_dispatch_${trigger_api}
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/isolated_fresh_input_dispatch.py
+        --node $<TARGET_FILE:global_localization_node> --case all ${fresh_input_args})
+    set_tests_properties(isolated_fresh_input_dispatch_${trigger_api} PROPERTIES
+      ENVIRONMENT "ROS_DOMAIN_ID=218;ROS_LOCALHOST_ONLY=1;FASTRTPS_DEFAULT_PROFILES_FILE=;FASTDDS_DEFAULT_PROFILES_FILE="
+      RUN_SERIAL TRUE TIMEOUT 120)
+  endforeach()
+  add_test(NAME isolated_trigger_confirmation
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/isolated_trigger_confirmation.py
+      --node $<TARGET_FILE:global_localization_node> --case all)
+  set_tests_properties(isolated_trigger_confirmation PROPERTIES
+    ENVIRONMENT "ROS_DOMAIN_ID=217;ROS_LOCALHOST_ONLY=1;FASTRTPS_DEFAULT_PROFILES_FILE=;FASTDDS_DEFAULT_PROFILES_FILE="
+    RUN_SERIAL TRUE TIMEOUT 120)
+  add_test(NAME isolated_tracked_trigger_confirmation
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/isolated_trigger_confirmation.py
+      --node $<TARGET_FILE:global_localization_node> --case all --tracked)
+  set_tests_properties(isolated_tracked_trigger_confirmation PROPERTIES
+    ENVIRONMENT "ROS_DOMAIN_ID=217;ROS_LOCALHOST_ONLY=1;FASTRTPS_DEFAULT_PROFILES_FILE=;FASTDDS_DEFAULT_PROFILES_FILE="
+    RUN_SERIAL TRUE TIMEOUT 120)
 
   add_test(
     NAME trigger_client_lifetime_contract

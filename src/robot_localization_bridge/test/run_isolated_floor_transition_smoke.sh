@@ -10,10 +10,11 @@ set -u
 
 export ROS_DOMAIN_ID="${NJRH_TEST_ROS_DOMAIN_ID:-183}"
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export ROS_LOCALHOST_ONLY=1
 
 install_prefix="${NJRH_TEST_INSTALL_PREFIX:-/workspaces/njrh-v3/workspace1/install}"
 source_root="${NJRH_TEST_SOURCE_ROOT:-/workspaces/njrh-v3/workspace1/src/robot_localization_bridge}"
-log_file="/tmp/p6_isolated_floor_transition_${$}.log"
+log_file="${NJRH_TEST_LOG_FILE:-/tmp/p6_isolated_floor_transition_${$}.log}"
 node_pid=
 
 cleanup() {
@@ -27,7 +28,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"${install_prefix}/robot_localization_bridge/lib/robot_localization_bridge/localization_bridge_node" \
+"${NJRH_TEST_NODE_EXECUTABLE:-${install_prefix}/robot_localization_bridge/lib/robot_localization_bridge/localization_bridge_node}" \
   --ros-args \
   -r __node:=p6_isolated_floor_transition_bridge \
   -p publish_tf:=false \

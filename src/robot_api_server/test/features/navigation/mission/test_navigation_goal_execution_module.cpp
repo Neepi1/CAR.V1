@@ -5,6 +5,10 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <thread>
+#include "std_msgs/msg/string.hpp"
+#include "rclcpp_action/create_server.hpp"
+#include "rclcpp_action/server_goal_handle.hpp"
 
 #include "rclcpp/rclcpp.hpp"
 
@@ -303,6 +307,54 @@ TEST_F(NavigationGoalExecutionModuleTest, FinishingMissionUpdatesRuntimeState)
   EXPECT_EQ(runtime_state_, "ready");
   EXPECT_EQ(runtime_detail_, "goal complete");
   EXPECT_TRUE(runtime_healthy_);
+}
+
+TEST_F(NavigationGoalExecutionModuleTest, RecoveryStatusIsBoundToRealAcceptedAction)
+{
+  using Action = navigation::NavigationActionRuntime::NavigateToPose;
+  std::shared_ptr<rclcpp_action::ServerGoalHandle<Action>> accepted;
+  auto server = rclcpp_action::create_server<Action>(node_, execution_config_.action_name,
+    [](const auto &, const auto &) {return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;},
+    [](const auto &) {return rclcpp_action::CancelResponse::ACCEPT;},
+    [&](const auto & handle) {accepted = handle;});
+  auto publisher = node_->create_publisher<std_msgs::msg::String>(
+    "/navigation/ordinary_recovery_status", rclcpp::QoS(1).reliable());
+  ASSERT_TRUE(action_runtime_->wait_for_action_server(std::chrono::seconds(2)));
+  Action::Goal goal;
+  goal.pose.header.stamp = node_->now();
+  const auto stamp = rclcpp::Time(goal.pose.header.stamp).nanoseconds();
+  auto future = action_runtime_->client()->async_send_goal(goal);
+  ASSERT_EQ(rclcpp::spin_until_future_complete(node_, future, std::chrono::seconds(2)),
+    rclcpp::FutureReturnCode::SUCCESS);
+  auto handle = future.get();
+  ASSERT_TRUE(handle);
+  action_runtime_->track_goal(handle, "test", "", "", stamp);
+  auto emit = [&](std::int64_t goal_stamp) {
+    std_msgs::msg::String msg;
+    msg.data = "{\"version\":1,\"goal_stamp_ns\":" + std::to_string(goal_stamp) +
+      ",\"stamp_ns\":" + std::to_string(node_->now().nanoseconds()) +
+      ",\"phase\":\"waiting\"}";
+    publisher->publish(msg);
+    rclcpp::spin_some(node_);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    rclcpp::spin_some(node_);
+  };
+  for (int i = 0; i < 20 && publisher->get_subscription_count() == 0; ++i) {
+    rclcpp::spin_some(node_);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_GT(publisher->get_subscription_count(), 0U);
+  emit(stamp - 1);
+  EXPECT_TRUE(action_runtime_->recovery_phase(handle).empty());
+  emit(stamp);
+  EXPECT_EQ(action_runtime_->recovery_phase(handle), "waiting");
+  action_runtime_->track_goal(handle, "replacement", "", "", stamp + 1);
+  emit(stamp);
+  EXPECT_TRUE(action_runtime_->recovery_phase(handle).empty());
+  ASSERT_TRUE(accepted);
+  accepted->abort(std::make_shared<Action::Result>());
+  action_runtime_->mark_terminal_proven(handle, true);
+  EXPECT_TRUE(action_runtime_->recovery_phase(handle).empty());
 }
 
 }  // namespace

@@ -4,6 +4,281 @@ ROS 2 Humble multi-floor indoor/outdoor delivery robot navigation stack scaffold
 
 ## Current Status
 
+Relocalization completion no longer waits for navigation admission. A current,
+accepted and settled canonical TF result completes localization even while a
+floor transaction keeps `safe_for_goal_start=false`. Navigation's own checks
+remain unchanged. See [scope and validation](docs/relocalization_completion_responsibility.md).
+
+Local-state cold startup now shares one 30-second readiness deadline across
+IMU preparation and the owned EKF endpoint check. Process checks verify the
+actual executable; failed-attempt logs are retained before retry. No sensor,
+EKF, CPU or motion policy changes. See [scope and acceptance](docs/local_state_startup_budget.md).
+
+Mapping startup has a scoped orchestration repair: reuse DDS discovery, start
+the private odom bridge early, combine scan/TF checks, and keep status responsive
+during shutdown. Algorithm/CPU/sensor parameters are unchanged. The API candidate
+requires a separately authorized activation; see
+[mapping startup repair](docs/mapping_startup_latency.md).
+
+The CPU pointcloud candidate fuses the validated canonical axis remap with
+normalized XYZI cache filling, preserving the full-density/full-fields trunk,
+scan behavior, QoS and publish-before-cache-exchange ordering. This stage is
+candidate deployment, not a full-runtime restart or hardware acceptance. Twelve
+targeted tests passed; isolated algorithm CPU median fell from 417 to 247 us per
+40000 points, not whole-process savings. See [scope and acceptance](docs/pointcloud_cpu_fused_normalization.md).
+
+The IMU conversion/filter chain now has a driver-owned, same-process transport
+option with independent executors; external interfaces and 100 Hz navigation
+output are unchanged. See [IMU IPC scope and acceptance](docs/imu_intra_process_pipeline.md).
+
+IMU remap/filter arithmetic now avoids overwritten covariance calculations and
+reuses unchanged rotation/covariance results. Per-sample TF lookup, bias learning,
+frequencies and timestamps stay unchanged. See
+[IMU optimization scope](src/robot_local_state/docs/imu_arithmetic_reuse.md);
+whole-process CPU benefit requires separate post-restart measurement.
+
+Isaac request admission now checks original FlatScan header age as well as
+receipt age, and never dispatches after failed post-arm input validation.
+Startup frequency fluctuation is not a new failure criterion; existing input
+windows and pre-dispatch startup retries remain unchanged. See
+[fresh-input dispatch](src/robot_global_localization/docs/fresh_input_dispatch.md)
+for isolated regression coverage and separate activation/acceptance status.
+
+完整导航冷启动支持临时八核调度，结束后恢复原五核逐模块分配，不改变导航算法、
+启动顺序或就绪判据。见 [启动 CPU 调度](docs/startup_cpu_boost.md)；实机提速待授权重启验收。
+
+Final startup context observation can prewarm its native client during Nav2
+activation. READY still requires a post-commit, post-service DDS status sample
+and the original exact-map/sequence commit; the Python compatibility path stays.
+See [context observer overlap](docs/restart_latency_40s.md#final-context-observer-overlap).
+
+Held Nav2 launch-receipt waiting now runs inside the existing lifecycle worker,
+so it no longer serializes the initial Isaac trigger. Launch ownership and final
+navigation readiness are unchanged; whole-restart timing still needs acceptance.
+See [startup overlap scope](docs/restart_latency_40s.md#held-launch-wait-overlap).
+
+Full-runtime restart optimization now overlaps map/bridge and early AMCL
+initialization, and reuses lifecycle service endpoints. The operator's target
+is under 40 seconds including shutdown, verified over five runs; it is not yet
+accepted. Early AMCL progress reporting no longer blocks initialization when
+the status observer is cold; final READY still requires committed evidence.
+One-shot startup clients omit unused parameter-service and log endpoints,
+while keeping their existing service calls, TF checks and ROS clocks.
+See [restart latency work](docs/restart_latency_40s.md).
+
+The one-shot lifecycle-active check retains late GetState replies within the
+existing total budget, avoiding repeated requests that discard valid active
+responses. Stationary full-restart acceptance remains pending.
+
+AMCL input preparation now combines map/scan/TF observation in one bounded
+context, retaining partial checkpoints; seed requests defer when their full
+client budget does not fit. No readiness condition or CPU allocation changes.
+See [AMCL startup verification](docs/amcl_startup_sequence.md); full-restart
+timing acceptance remains separate from isolated tests and deployment.
+
+Systemd cold startup now waits for the canonical scan owner with one continuous
+observer, avoiding a scan-enable request caused by an undiscovered graph.
+Mapping/API resume behavior is unchanged; restart timing acceptance is pending.
+See [cold-start scan ownership](docs/navigation_scan_cold_start.md).
+
+AMCL startup now resumes confirmed preparation for the same process/map/startup
+owner and uses one bounded completion path; seed retries do not repeat warmup.
+Offline regression passed; full-service restart timing acceptance is pending.
+See [AMCL startup sequence](docs/amcl_startup_sequence.md).
+
+The runtime health observer and snapshot queries now have C++ implementations
+with 1Hz sampling and a separate 3-second no-update grace period. Control-loop
+rates and safety watchdogs are unchanged. Deployment acceptance is recorded in
+[the runtime health design](docs/runtime_health_cpp.md).
+
+Management checks now use native process audits and the existing C++ health
+observer. Stationary 300-second measurement, including reaped child CPU, fell
+from 54.89% to 4.70% of one core. AMCL status and FlatScan metadata retain their
+public contracts without steady-state shell/DDS polling. See
+[runtime management design](docs/runtime_management_observer.md) for scope and
+deployment acceptance; navigation and safety control rates are unchanged.
+
+The official-source Fast DDS 2.6.12 **system-package** upgrade is installed in
+NJRH-car, without a second runtime prefix or changes to Humble/RMW. Isolated
+regression/transport tests passed, but full startup acceptance failed when the
+existing startup TF check caused localization teardown. Navigation recovery is
+not yet accepted. See [evidence and status](docs/fastdds_2612_system_upgrade.md).
+
+`robot_api_server` now defaults unspecified single-config builds to
+`RelWithDebInfo`, preserving explicit build-type selections. This is a build-only
+optimization; no API contracts or robot control policies change. Candidate
+deployment and live acceptance are tracked separately in
+[the API build optimization record](docs/robot_api_optimized_build.md).
+
+JT128 vendor point parsing supports the Orin CUDA production build and defaults
+to GPU in the runtime-generated driver configuration. This does not change
+pointcloud/IMU transport, timestamps or the five-core CPU allocation. See
+[CUDA scope, build and acceptance](docs/jt128_cuda_parsing.md).
+
+An opt-in five-core navigation affinity profile is available; the default remains
+the existing site allocation. It preserves field overrides for restoration and
+does not modify the arm black box or navigation algorithms. Synchronizing the
+profile is not activation or hardware acceptance. See
+[five-core scope, selection and tests](docs/navigation_five_cpu_profile.md).
+The active field trial keeps navigation on CPU0-4; it is not rolled back to eight
+cores. The grouped candidate separates driver/pointcloud work, the control/TF
+chain and navigation computation, including sensor-wrapper initialization.
+Earlier grouped trials failed sustained startup/frequency acceptance, even when
+one bounded capture approached the configured rates. Candidate T places the
+official JT128 driver on CPU3 and pointcloud/scan workers on CPU1,4. Both sensor
+startup entries use CPU3 before child-specific worker masks take effect; the
+whole lidar chain does not share CPU3. Other compute/helpers use
+CPU0,1,4; IMU/EKF/bridge remain on CPU2 and control on CPU1. System/API/supervision
+also uses CPU0,1,4, while CPU2 is excluded from that pool. This is process
+placement, not kernel/IRQ isolation. O completed AMCL seeding but scan remained
+12.04 Hz with substantial driver runqueue wait. P's added driver CPU3 access was
+removed after repeated startup failures; it was not accepted. The measured IMU
+input arrived after its readiness deadline. Q moves only the non-legacy sensor
+bootstrap off the congested CPU1,3 pool; startup order and waits are unchanged.
+Q restored first-start readiness, but scan measured 12.606 Hz. R keeps that
+bootstrap correction and tests driver runtime headroom only; it was not accepted.
+S swaps Q's physical CPU3/4 roles to compare cluster placement, without changing
+CPU frequency or power settings. Sustained rates and bridge continuity remain unverified.
+T also places existing FlatScan graph/rate CLI checks in the system pool instead
+of the driver core. T is not accepted: scan reached 15 Hz in a capture without
+working map-to-odom or AMCL, and Nav2 lifecycle activation failed. This is not
+a full-load result or proof of five-core whole-chain stability.
+The checks' timing and result handling are unchanged.
+Five-core sustained rates, repeat startup and moving control remain unaccepted.
+Read-only evidence identified concentrated eth1 IRQ work on CPU0; no IRQ/RPS/XPS
+changes have been made. See the profile document for placement and evidence.
+
+The API-only current-state floor interlock is deployed on Jetson. Historical
+`FAILED_LOCKED` no longer permanently overrides current typed evidence;
+active-switch exclusion and current-invalid navigation rejection remain.
+This does not change undock map admission or other floor/elevator cleanup code.
+See [deployment scope and verification](docs/floor_interlock_deployment_20260910.md).
+
+Manual relocalization now distinguishes its own settled Isaac result from
+unrelated AMCL candidate rejections. Request-scoped late completion prevents
+false 503 responses from becoming permanent 409 admission locks; the App no
+longer labels every 409 as a floor switch. See
+[confirmation protocol and validation](docs/relocalization_trigger_confirmation.md).
+Source changes, isolated verification and production activation are separate steps.
+
+Controlled undock now accepts the existing fresh safety memory latch. Failed or
+cancelled reverse attempts no longer count as successful undock when clearing it.
+See [dock-memory recovery](docs/pre_navigation_dock_interlock_recovery.md#memory-only-undock-admission-and-completion).
+
+336L common startup always enters its driver wrapper; the existing owner lock
+prevents duplicate camera instances. API frame names no longer skip the camera.
+Docking still starts last. See [ownership and validation](docs/orbbec_gemini_336l_container.md#336l-startup-ownership).
+
+Cabin center -> cabin panel has an isolated 0.20 m/s lateral speed profile;
+other elevator legs retain 0.40 m/s. See
+[scope and validation](src/robot_nav_config/docs/elevator_scoped_motion.md#cabin-panel-speed-isolation).
+Activation requires a separately authorized full-chain restart.
+
+The [floor-switch failure lifecycle correction](docs/floor_failure_terminal_cleanup.md)
+separates terminal transaction cleanup from map localization readiness. It
+addresses the retained bridge/API/elevator failure coupling that the preceding
+offline asset-edit admission change did not solve. Candidate verification and
+deployment are tracked separately; no hardware acceptance is implied.
+
+The [floor-failure asset admission fix](docs/floor_failure_asset_admission.md)
+separates offline point/configuration editing from retained runtime failures.
+It preserves motion protection and active-switch exclusion; 16 isolated C++
+regressions and the real isolated API admission test pass. The precise two-object
+API update has been deployed and loaded after a complete runtime restart.
+
+Cold-start map loading and Isaac initialization now start alongside the common
+sensor chain. Initial relocalization waits for the current Isaac process's
+post-GXF startup event, target map and FlatScan owner; the existing wrapper
+still validates fresh input before dispatch. See
+[parallel localization startup](docs/isaac_parallel_startup.md) for the exact
+scope, isolated tests and pending full-runtime restart acceptance.
+
+Nav2 process preload now overlaps Isaac startup and initial localization;
+the systemd runner, installed runtime.env and installation defaults must all
+set `NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION=true` for this to take effect.
+lifecycle activation still follows accepted localization. An unsuccessful first
+localization keeps both processes alive and waits for a later explicit result,
+without automatically retriggering Isaac. See
+[startup decoupling and pending hardware acceptance](docs/phase_s3_fast_resident_navigation_startup.md).
+
+Common startup overlaps static TF, JT128, Ranger and EKF. Common alone owns
+safety/floor/mode helpers; API starts before camera initialization. The docking
+camera, perception and manager start last, after HTTP is responsive and the
+first navigation startup finishes or enters explicit localization waiting.
+Dock observation timeout is docking-only degradation, not a whole-chain exit.
+No GPU/CPU allocation, localization algorithm or motion policy is changed.
+Full-service restart/timing acceptance is pending. See
+[docking-last startup and acceptance](docs/startup_docking_last.md).
+
+The [project gate inventory](docs/project_gate_inventory.md) documents each
+audited admission, motion, localization and handoff mechanism: its purpose,
+blocking conditions, release behavior, configuration status and source entry.
+It distinguishes enabled defaults, conditional paths and retired mechanisms;
+the inventory is not a snapshot of the robot's live blocking state.
+
+The [gate audit remediation record](docs/gate_audit_remediation_plan.md) tracks
+the eight findings. The first fix separates BEGIN from target-request dispatch:
+proven pre-dispatch failure restores the source without a retained failure lock.
+The floor-manager-only candidate is deployed on Jetson; full-runtime restart
+has loaded the verified executable. Real floor-switch fault/retry acceptance
+is still pending; no movement or switch was triggered during deployment.
+Restart verification found an initial Isaac result timeout: the API is online,
+but navigation remains unready until localization establishes `map -> odom`.
+
+Manual map switching no longer requires the source map to be localized or ready.
+Target loading/localization remains authoritative; no navigation start/stop was
+added. See [source-independent switching](docs/map_switch_source_independence.md)
+for scope, isolated verification and the separate runtime-startup limitation.
+
+Ordinary persistent navigation recovery is an **offline candidate**, not yet
+activated on the robot. It retains the original task after verified progress
+failures, backs off repeated attempts, and communicates goal-correlated waiting
+to the API. No physical acceptance or production deployment is claimed. See
+[candidate scope and acceptance](src/robot_nav_config/docs/ordinary_navigation_recovery.md).
+
+Ordinary navigation now reconciles the final BMS docking memory interlock before
+submitting a Nav2 goal. Live contact, dock-near, and uncertain cases reuse the
+existing standard controlled-undock path; only a fresh, exact-map proof that the
+robot is at least 1.5 m outside the commissioned dock can clear stale memory
+without motion. Missing safety state, stale evidence, or unresolved dock identity
+fails closed. See
+[pre-navigation dock interlock recovery](docs/pre_navigation_dock_interlock_recovery.md).
+
+The Ranger FollowPath candidate now predicts measured chassis response inside
+Humble MPPI, in `robot_nav_config/chassis_dynamics`: existing smoother dynamics,
+CAN-fitted longitudinal response and steering response precede trajectory scoring.
+It adds no stop gate or micro-motion policy and does not change terminal accuracy,
+elevator-specific control or docking contact control. See
+[chassis response model](src/robot_nav_config/docs/chassis_response_model.md)
+for source-data hashes, held-out replay, tests and pending authorized activation.
+
+MPPI output finalization also restores active speed and motion-model constraints
+after Humble's signed filter, before command selection/history commit/horizon
+shift. This closes filter-generated reverse and speed-limit overshoot without
+changing chassis stop-centering or adding a low-speed stop gate. See
+[post-filter constraints](src/robot_nav_config/docs/chassis_response_model.md#post-filter-output-constraints).
+
+The 2026-09-08 navigation clearance candidate separates the unchanged
+`0.39/0.28 m` scan mask / padded footprint, `0.47/0.36 m` StopZone, and
+`0.52/0.41 m` finite MPPI planning preference. Local repair shares the preference
+with an original-clearance fallback. No new velocity gate or expanded footprint
+clearing is introduced. See [planning clearance](src/robot_nav_config/docs/planning_clearance.md)
+for scope, isolated tests and pending authorized restart / hardware verification.
+
+`robot_safety` now recognizes spin-to-drive handoff from fresh actual chassis
+mode feedback, not low-speed Twist thresholds. Slow Ackermann obstacle bypass
+cannot arm spin settling; real spin-tail checks and the existing timeout remain.
+See [actual-mode handoff](src/robot_safety/docs/spin_to_drive_actual_mode.md)
+for isolated regression tests and the separately authorized hardware acceptance.
+
+Ordinary Ranger navigation now has one internal progress-failure recovery:
+retain the App/NavigateToPose goal, replan, explicitly re-evaluate startup
+alignment, and retry FollowPath once. Predock/elevator trees, terminal accuracy,
+obstacle maps and the velocity chain are unchanged. Deployment requires the
+next authorized complete-runtime restart; supervised hardware acceptance is
+separate from isolated software tests. See
+[ordinary navigation recovery](src/robot_nav_config/docs/ordinary_navigation_recovery.md).
+
 This repository currently contains the phase-ordered baseline required by `02_实现任务清单.yaml`:
 
 - `P0`: local car-project reuse scanning, TF audit tooling, canonical TF policy
@@ -100,11 +375,17 @@ The scoped exception covers every post-call elevator leg: source landing/entry
 staging, cabin entry, cabin-center to panel, panel back to cabin-center, and
 exit to the target landing. These exact elevator intents use an unchecked
 bounded Nav2 path and disable controller costmap clearance checks. Under an
-exact, fresh elevator transaction permit in `DOORWAY` mode, `/cmd_vel_nav`
+exact, fresh elevator transaction permit in `ELEVATOR_WAIT` (post-call staging)
+or `DOORWAY` (cabin entry/exit) mode, `/cmd_vel_nav`
 goes from `velocity_smoother` directly to `robot_safety`. Only the pre-call
 hall approach and ordinary navigation keep the canonical collision-monitor
 chain. `robot_safety` still enforces the hold/lease, estop, localization,
 watchdog, speed, reverse, and lateral gates.
+See [post-call collision scope](src/robot_safety/docs/elevator_post_call_collision_bypass.md)
+for the mode-mismatch fix, isolated regressions, and remaining hardware checks.
+The scoped safety patch has been deployed and restarted; the exact artifact,
+rollback backup, and startup verification are recorded in
+[deployment record](reports/elevator_post_call_collision_bypass/README.md).
 See [docs/production_jetson_provisioning.md](docs/production_jetson_provisioning.md).
 
 - Jetson host workspace: `/home/nvidia/workspaces/njrh-v3/workspace1`
@@ -171,8 +452,8 @@ See [docs/production_jetson_provisioning.md](docs/production_jetson_provisioning
 - Return-to-dock `rotate -> stop -> rotate` diagnosis uses `record_docking_rotation_trace.sh`. It is an SSH-friendly, single-participant, read-only recorder that correlates `/cmd_vel_nav_raw`, `/cmd_vel_docking`, the collision/safety/final velocity boundaries, wheel/local odometry, Ranger mode, safety state, and authenticated read-only docking/navigation phase snapshots. It creates no command publisher and never subscribes to scan or pointcloud; reports are written below `/tmp/njrh_reports`. See [docs/docking_rotation_trace.md](docs/docking_rotation_trace.md).
 - Elevator segmented-spin diagnosis is available directly from the Jetson SSH host through `record_elevator_spin_chain_ssh.sh`. The wrapper starts exactly one bounded ROS participant inside `NJRH-car`, records the five velocity boundaries plus mode/odom/IMU/map/elevator state, and reduces `/scan` to footprint/StopZone/SlowZone counters at 5 Hz without storing ranges or subscribing to PointCloud2. Reports are copied to `/tmp/njrh_reports`; the recorder auto-exits, supports clean `Ctrl+C`, and never publishes a command, goal, parameter, or service request.
 - Straight-line controller diagnosis uses the existing single-participant `record_navigation_odom_goal_closure.sh --assert-straightness` loop. It records Nav2 path shape, MPPI command reversals, wheel/local odometry, and Ranger feedback, then writes `straightness.md`; see [docs/navigation_straightness_diagnostic.md](docs/navigation_straightness_diagnostic.md). It changes no runtime parameter and does not publish velocity itself.
-- runtime health snapshot tool: `scripts/jetson/runtime_overlay/scripts/runtime_health_guard.py`. Common services start it while local odom comes up; startup scripts then read one lightweight JSON snapshot instead of repeatedly creating short-lived ROS graph probes. To keep the resident helper from competing with navigation, it refreshes ROS graph metadata every 5 seconds by default and does not subscribe to high-rate topic messages or `/tf`; strong topic/TF readiness remains owned by the compiled one-shot `robot_bringup/runtime_readiness_probe` gates. Set `NJRH_RUNTIME_HEALTH_OBSERVE_TOPIC_MESSAGES=true` only for targeted field diagnostics that need `/local_state/odometry`, `/scan`, `/localization_result`, or `/safety/status` freshness in the JSON snapshot. Set `NJRH_RUNTIME_HEALTH_OBSERVE_TF=true` only for targeted field diagnostics that need canonical TF edge freshness; then use `NJRH_RUNTIME_HEALTH_OBSERVE_ALL_TF=true` or override `NJRH_RUNTIME_HEALTH_TF_TRACKED_EDGES` if more than `map->odom` and `odom->base_link` is needed. Set `NJRH_RUNTIME_HEALTH_GUARD_AUTOSTART=false` only for field isolation. Common startup keeps `NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE=false`: selected-floor MapServer/Isaac loading waits for canonical local-state admission because field A/B showed earlier loading can starve TF/DDS discovery despite fresh odometry messages. Normal navigation startup then verifies `/map_server`, selected `/map`, `/flatscan`, bounded `/global_localization/trigger`, bridge acceptance, live `map -> odom`, and Nav2 activation. The old `/localization_result` publisher pre-gate is optional (`NJRH_INITIAL_LOCALIZATION_REQUIRE_RESULT_PUBLISHER=true`) because the trigger wrapper already verifies the real result and bridge acceptance.
-- local-state recovery no longer allows a fresh-but-empty resident health snapshot to overrule a live EKF by itself. When `runtime_health_guard` reports a local-state fault while the required process is alive, the common owner performs one bounded independent fresh-odom confirmation. A successful confirmation classifies observer-side DDS visibility loss and resets the complete-chain recovery counter; only independently confirmed failures retain the three-strike restart behavior.
+- runtime health snapshot writer: C++ `robot_bringup/runtime_health_guard`, launched by `scripts/jetson/runtime_overlay/scripts/run_runtime_health_guard.sh`. It samples persistent local-odom and docking-observation subscriptions at 1Hz, writes one atomic JSON snapshot per second, and checks ROS graph metadata every 5 seconds. `robot_bringup/runtime_health_check` reads the snapshot without Python or DDS. Optional scan/map/TF observation remains disabled by default; strong startup topic/TF readiness remains owned by `robot_bringup/runtime_readiness_probe`. See [runtime health design](docs/runtime_health_cpp.md) for sampling, compatibility, and deployment verification. Normal navigation startup still verifies the selected map, FlatScan input, localization result, bridge acceptance, canonical TF, and Nav2 activation.
+- local-state runtime health allows 3 seconds without fresh advancing odometry stamps before classifying a producer-fault candidate. Observer staleness, malformed snapshots and clock jumps never authorize recovery. The common owner requires three distinct fault snapshots and independent fresh-odom confirmation, even if process-name inspection reports a missing process; only confirmed failures can exit the owner for a complete systemd restart. Startup freshness and real-time safety watchdogs are unchanged.
 - startup readiness probes are diagnostic tools except for the deterministic navigation startup chain above. The compiled `robot_bringup/runtime_readiness_probe` binary remains available for explicit service/topic/TF/local-state checks, and `run_navigation_runtime_services.sh` uses it only for bounded one-shot gates that prove the initial localization and Nav2 activation are usable. It must not restore high-frequency rclpy/Python graph polling.
 - local perception PointCloud2 obstacle runtime is disabled. `scripts/jetson/runtime_overlay/scripts/run_local_perception.sh` exits intentionally so `/perception/obstacle_points` and `/perception/clearing_points` cannot reappear through a stale helper/profile. Use `/scan` diagnostics and `verify_pointcloud_accel_profile.sh` to confirm local costmap and `collision_monitor` subscribe to `/scan`, and that old `/perception/*` publisher counts are zero.
 - Run `diagnose_lidar_points_jitter.sh` first when `ros2 topic hz /lidar_points` looks low: its default mode does not subscribe to the full-density trunk and classifies publish-side low rate, stale binaries, excessive trunk subscribers, and CLI-only delivery loss from status topics and graph metadata. Use `--include-cli-hz` only for a short subscriber-side comparison. Run `run_lidar_trunk_pure_ab.sh --execute` only while stationary for source-side trunk isolation. Run `verify_lidar_trunk_jitter.sh`, `inspect_pointcloud_subscribers.sh`, `verify_pointcloud_delivery_matrix.sh`, `check_runtime_process_freshness.sh`, `inspect_pointcloud_cpu_affinity.sh`, and `record_pointcloud_nav_acceptance.sh --duration-sec 1200` for field diagnostics. These tools must not restore the retired `/perception/*` local obstacle path.
@@ -188,7 +469,7 @@ See [docs/production_jetson_provisioning.md](docs/production_jetson_provisioning
 - JT128 static translation is calibrated against that centered `base_link`: `base_link -> lidar_level_link` and `base_link -> imu_link` use the current field candidate `x=0.3450, y=0.0000, z=0.85`, with yaw `3.1764992386296798`. This supersedes the earlier approximate `x=0.25`, the intermediate `x=0.38, y=0.0`, and the first fit candidate `x=0.34152, y=-0.040216`; it still requires post-apply four-heading relocalization validation before treating it as final.
 - Field recalibration of `base_link -> lidar_level_link` XY/yaw uses `scripts/jetson/runtime_overlay/scripts/run_lidar_level_extrinsic_calibration.sh` plus the fitter in `fit_lidar_level_extrinsic_from_relocalize_samples.py`; the procedure is documented in [docs/lidar_level_extrinsic_calibration.md](docs/lidar_level_extrinsic_calibration.md). It changes only static sensor extrinsics after review and must be followed by a full `njrh-runtime.service` restart.
 - local Nav2 dynamic-obstacle handling now uses the standard 2D LaserScan flow: `local_costmap` runs `ObstacleLayer + InflationLayer`, and the single observation source is `/scan` with `marking=true`, `clearing=true`, and `inf_is_valid=true`. `collision_monitor` also consumes `/scan`. The previous custom `/perception/obstacle_points` marking cloud and `/perception/clearing_points` synthetic clearing cloud are disabled in the default accel config, so moved people are cleared by LaserScan free-space rays instead of a separate virtual PointCloud2 clearing model.
-- The collision stop envelope is coupled to the rectangular chassis geometry instead of being an independent small box: physical half extents `0.36 x 0.25m` + `0.03m` footprint padding + the MPPI `0.08m` collision margin are rounded outward on the 5cm grid to `0.50 x 0.40m`. Two adjacent scan returns trigger StopZone (`max_points=1`), a 2s `FootprintApproach` prediction slows/stops before the body enters that envelope, and `controller_server.failure_tolerance=10.0` keeps the same FollowPath alive for a transient MPPI no-trajectory interval. The 12s progress checker remains the upper stuck bound; no clear/spin/reverse recovery was added.
+- StopZone uses half extents `0.47 x 0.36m`, leaving an 8cm visible band outside the unchanged `0.39 x 0.28m` scan mask. MPPI separately prefers `0.52 x 0.41m` without enlarging the shared physical footprint or its clearing area. The two-return threshold (`max_points=1`), 2s FootprintApproach and velocity chain are unchanged. See [collision monitor geometry](src/robot_nav_config/docs/collision_monitor_geometry.md) for scope and outstanding low-speed hardware verification.
 - Local-costmap clearing uses `raytrace_min_range=0.20m` while obstacle marking keeps the `/scan` cutoff at `0.25m`. With the `0.05m` costmap resolution, the earlier `0.25m` clearing start produced repeatable integer-raytracing blind cells that could retain lethal costs after an obstacle left; the one-cell inward start cleared every observed stale cell. This does not make the lidar observe the `0.20..0.25m` annulus and does not replace near-field safety sensing.
 - The production local-obstacle `/scan` worker slices `lidar_level_link` at `-0.50m..0.35m` to reduce near-ground returns that can keep refreshing local-costmap obstacles after a moved object leaves. This is a navigation/local-costmap slice and does not change the separate `jt128_scan_slam2d.yaml` mapping/localization slice.
 - The navigation-owned `/scan` worker now removes chassis/mechanical-arm self returns by transforming each candidate endpoint to `base_link` and filtering only the padded Ranger footprint (`x=-0.39..0.39m`, `y=-0.28..0.28m`). It does not increase `range_min` or clear a surrounding radius, so real obstacles immediately outside the robot remain available to both Nav2 and `collision_monitor`. The scan status reports the active bounds, per-scan/total filtered-point counts, and TF-unavailable count; an unavailable mask TF fails closed for that scan.
@@ -204,8 +485,8 @@ See [docs/production_jetson_provisioning.md](docs/production_jetson_provisioning
 - Phase TF1 hardens that same relocalization handoff without changing TF tolerances or timestamp policy. `robot_localization_bridge` now separates the correction engine from the `map -> odom` publisher: Isaac/AMCL/manual correction callbacks only update bridge state, while an independent 50 Hz callback group is the only path that calls `sendTransform()`. `/localization/bridge_status` exposes the publish heartbeat (`map_odom_publish_loop_hz`, `map_odom_publish_gap_ms`, published/accepted sequence, paused/frozen state, and `publisher_decoupled_from_correction=true`). Use `verify_bridge_map_odom_publisher.sh` for a live contract check and `observe_tf_stability_after_relocalization.sh --duration-sec 180 --label <run>` around manual relocalization or undock transitions.
 - Phase R0-R2 removes high-risk implicit relocalization from normal motion paths and adds bridge current/target smoothing. Normal `POST /api/v1/navigation/goal` no longer calls `/global_localization/trigger`, `/robot_localization_bridge/force_accept_next_localization`, `/localization_result` wait, or the post-relocalization settle barrier; if localization has a goal-start-blocking degraded state, bridge smoothing is still active, or AMCL reports a non-standby pending/not-ready correction, it returns `LOCALIZATION_DEGRADED` or `LOCALIZATION_TRANSITION_ACTIVE` and leaves recovery to the explicit localization path when recovery is actually required. AMCL static standby while stopped is not a recovery requirement and does not block a goal when `map -> odom` is live and no-motion standby is clean. Docking normal path also defaults `docking_relocalize_before_predock=false`, `docking_relocalize_after_predock=false`, and `docking_relocalize_after_fine_docking=false`. The bridge now accepts corrections into a target `map -> odom` and slews the current output at bounded rates, reporting `correction_active`, `safe_for_goal_start`, remaining error, current/target sequence, and large-correction rejection counters. This does not change Nav2 plugins, MPPI/progress checker, TF tolerances, `max_odom_tf_age_ms`, pointcloud QoS/DDS, FAST-LIO2, Ranger odom, or EKF. See [docs/phase_r0_r2_runtime_force_accept_bridge_smoothing.md](docs/phase_r0_r2_runtime_force_accept_bridge_smoothing.md).
 - Phase R3 keeps that smoothing model but separates correction intent. AMCL gated and ordinary online corrections still use the default `0.20 m/s` and `0.25 rad/s` rates, while force-accepted explicit Isaac relocalization corrections above `1.0 m` or `0.35 rad` use a per-correction active rate sized to finish within `3.0 s`. `/localization/bridge_status` reports `smoothing_policy`, active rates, and configured rates so large manual/post-undock/floor-switch relocalization does not spend minutes in a half-updated `map -> odom` state. See [docs/phase_r3_explicit_relocalization_fast_smoothing.md](docs/phase_r3_explicit_relocalization_fast_smoothing.md).
-- MPPI now uses Ranger Mini 3's documented Ackermann radius envelope (`min_turning_r=0.81`, `wz_max=0.70`) instead of sampling sub-physical 0.35 m turns; its obstacle critic matches the local inflation layer (`inflation_radius=0.60`, `cost_scaling_factor=6.0`). The 0.60 m radius covers the padded rectangular footprint's approximately 0.480 m circumscribed radius plus the 0.08 m collision margin after rounding up to the 0.05 m costmap grid. `VelocityDeadbandCritic` encodes the field-calibrated low-speed command deadband (`deadband_velocities=[0.025, 0.0, 0.025]`, `cost_weight=90.0`) so MPPI avoids selecting tiny linear/yaw commands that the chassis will not execute. The live controller keeps the 1.2 m/s field speed target but matches the measured chassis response with a 4.0 s horizon (`time_steps=48`, `model_dt=0.0833333333`), velocity-smoother acceleration limits (`max_accel=[0.55, 0.0, 0.90]`, `max_decel=[-0.95, 0.0, -1.10]`), and lower MPPI sampling noise (`vx_std=0.35`, `wz_std=0.38`). RotationShim enters path-entry heading at `0.45rad` and disengages at `0.075rad`, while residual spin tail is handled downstream by `robot_safety` using actual `/wheel/odom` yaw-rate settle. Near-goal convergence is biased toward XY before terminal yaw by `GoalCritic`/`GoalAngleCritic` weights (`16.0`/`6.0`) and a `1.5 m` critic window. Normal API navigation also publishes `/speed_limit` from the measured remaining map-frame distance to the target: `>2.0m=1.20m/s`, `1.2..2.0m=0.70m/s`, `0.6..1.2m=0.40m/s`, `0.15..0.6m=0.25m/s`, and `<0.15m=0.10m/s`, then clears the limit with `speed_limit=0` when the Nav2 task exits. Ordinary Nav2/MPPI navigation now allows only a bounded terminal reverse correction (`vx_min=-0.08`, `min_velocity=[-0.08, 0.0, -1.00]`) after field diagnostics showed a 10m run could finish yaw-clean but 9.6cm past the target; `PreferForwardCritic` (`cost_weight=20.0`, `threshold_to_consider=0.50`) keeps long-range path following forward-biased while letting MPPI recover near-goal overshoot, and `PathFollowCritic.cost_weight=7.0` avoids the long-range low-speed local optimum seen in report `20260629T085207Z`. `TwirlingCritic` uses Humble's actual `cost_weight=1.0` key so large initial heading corrections are not suppressed by the plugin default. The local window is `10m x 10m`, and PathAlign is moderately reinforced (`cost_weight=2.4`, `max_path_occupancy_ratio=0.05`) so dynamic obstacles can be skirted without arriving laterally offset from the goal path. Single-pose navigation uses the repository stable behavior tree instead of Nav2's default periodic replanning tree so MPPI is not reset by unchanged global path updates every second. If Ackermann MPPI stalls near a pose-required goal, the API handoff reuses the canonical executable recovery envelope (`distance<=0.40m`, body-frame `|forward|<=0.15m`) after at least `3s` task time and `1.5s` without `0.02m` improvement, then cancels only that Nav2 goal and enters the guarded axis-staged correction path through `/cmd_vel_api -> robot_safety -> /cmd_vel`. A target outside that geometry remains owned by Nav2. Final commercial verification is stricter than goal admission: after Nav2 or API final yaw, the API requests one stationary AMCL `/request_nomotion_update` when gated AMCL is active and waits for `robot_localization_bridge` to clear pending/smoothing before `task_complete=true`, so a final-yaw pause cannot hide a delayed `map -> odom` correction.
-- MPPI terminal reverse is now enforced as a short lease rather than a global capability. `robot_api_server` publishes `/ranger_mini3/allow_reverse` only while an active Nav2 target is within `0.30m`, refreshes it every `0.20s`, and revokes it after leaving the `0.35m` hysteresis window or on result/cancel/timeout. `robot_safety` keeps `allow_reverse=false`, hard-caps permitted normal-navigation reverse at `-0.08m/s`, and rejects a forbidden reverse Twist atomically so a reverse Ackermann arc cannot be transformed into an unintended pure-spin command.
+- MPPI now uses Ranger Mini 3's documented Ackermann radius envelope (`min_turning_r=0.81`, `wz_max=0.70`) instead of sampling sub-physical 0.35 m turns; its obstacle critic matches the local inflation layer (`inflation_radius=0.60`, `cost_scaling_factor=6.0`). The 0.60 m radius covers the padded rectangular footprint's approximately 0.480 m circumscribed radius plus the 0.08 m collision margin after rounding up to the 0.05 m costmap grid. `VelocityDeadbandCritic` encodes the field-calibrated low-speed command deadband (`deadband_velocities=[0.025, 0.0, 0.025]`, `cost_weight=90.0`) so MPPI avoids selecting tiny linear/yaw commands that the chassis will not execute. The live controller keeps the 1.2 m/s field speed target but matches the measured chassis response with a 4.0 s horizon (`time_steps=48`, `model_dt=0.0833333333`), velocity-smoother acceleration limits (`max_accel=[0.55, 0.0, 0.90]`, `max_decel=[-0.95, 0.0, -1.10]`), and lower MPPI sampling noise (`vx_std=0.35`, `wz_std=0.38`). RotationShim enters path-entry heading at `0.45rad` and disengages at `0.075rad`, while residual spin tail is handled downstream by `robot_safety` using actual `/wheel/odom` yaw-rate settle. Near-goal convergence is biased toward XY before terminal yaw by `GoalCritic`/`GoalAngleCritic` weights (`16.0`/`6.0`) and a `1.5 m` critic window. Normal API navigation also publishes `/speed_limit` from the measured remaining map-frame distance to the target: `>2.0m=1.20m/s`, `1.2..2.0m=0.70m/s`, `0.6..1.2m=0.40m/s`, `0.15..0.6m=0.25m/s`, and `<0.15m=0.10m/s`, then clears the limit with `speed_limit=0` when the Nav2 task exits. Ordinary Nav2/MPPI tracking is now forward-only (`vx_min=0.0`); the existing controller-native terminal handoff owns bounded overshoot correction instead of letting mid-route MPPI select reverse commands that safety rejects. Velocity-smoother negative-X support and terminal reverse permits remain available. Existing critic weights are unchanged. `TwirlingCritic` uses Humble's actual `cost_weight=1.0` key so large initial heading corrections are not suppressed by the plugin default. The local window is `10m x 10m`, and PathAlign is moderately reinforced (`cost_weight=2.4`, `max_path_occupancy_ratio=0.05`) so dynamic obstacles can be skirted without arriving laterally offset from the goal path. Single-pose navigation uses the repository stable behavior tree instead of Nav2's default periodic replanning tree so MPPI is not reset by unchanged global path updates every second. If Ackermann MPPI stalls near a pose-required goal, the API handoff reuses the canonical executable recovery envelope (`distance<=0.40m`, body-frame `|forward|<=0.15m`) after at least `3s` task time and `1.5s` without `0.02m` improvement, then cancels only that Nav2 goal and enters the guarded axis-staged correction path through `/cmd_vel_api -> robot_safety -> /cmd_vel`. A target outside that geometry remains owned by Nav2. Final commercial verification is stricter than goal admission: after Nav2 or API final yaw, the API requests one stationary AMCL `/request_nomotion_update` when gated AMCL is active and waits for `robot_localization_bridge` to clear pending/smoothing before `task_complete=true`, so a final-yaw pause cannot hide a delayed `map -> odom` correction.
+- Terminal reverse execution remains explicitly scoped: the controller-native handoff admits a target behind the robot and outside the `0.06m` XY tolerance within the existing `distance<=0.40m`, `|forward|<=0.15m` envelope, even with no lateral residual. It reuses settling and bounded reverse with its existing permit. The legacy API near-goal permit (`0.30m` enter / `0.35m` exit) and safety reverse rejection remain unchanged; they no longer need to rescue ordinary MPPI reverse samples. See [ordinary forward and terminal reverse](src/robot_nav_config/docs/ordinary_forward_terminal_reverse.md).
 - local-costmap-only debug mode is repository-owned: Web `只启动局部障碍地图` starts JT128 driver prerequisites, chassis odometry, canonical TF helpers, and `src/robot_bringup/launch/local_costmap_debug.launch.py`; it publishes `/local_costmap/costmap` from the same `/scan` ObstacleLayer used by production navigation, without planner/BT/robot_safety control output.
 - Current Ranger velocity-smoother calibration supersedes the older acceleration values in the MPPI field summary above: Nav2 runs `velocity_smoother` in open-loop ramp mode (`feedback=OPEN_LOOP`, `smoothing_frequency=30.0`, `odom_duration=0.2`), uses `max_velocity=[1.20, 0.05, 0.70]`, `min_velocity=[-0.08, -0.05, -0.70]`, `max_accel=[0.55, 0.20, 0.90]`, and `max_decel=[-0.95, -0.30, -1.10]`. MPPI remains Ackermann with no lateral samples; the narrow smoother Y channel carries only a controller-native terminal side-slip protected by a fresh safety permit. The ordinary-navigation profile runs the controller at 15 Hz with `model_dt=0.0666666667`, uses `vx_std=0.30` and `wz_std=0.32`, and starts terminal `/speed_limit` reduction at `2.4m/1.5m/0.9m/0.35m` with `1.20/0.65/0.32/0.16m/s`, then `0.08m/s` inside the final band. Closed-loop velocity-smoother feedback remains disabled because odom=0 plus the chassis motion-mode deadband can pin low angular output before the chassis starts moving.
 - The non-Ackermann terminal residual is now controller-owned instead of API-cancel-owned. Inside the same `FollowPath` action, `GoalScopedRotationShimController` starts a bounded terminal state machine when distance is at most `0.40m`, body-frame forward error is at most `0.15m`, lateral error is at least `0.06m`, and either the residual is lateral-dominant or the remaining path is an Ackermann hairpin. It serializes yaw, side-slip, forward/reverse, and physical-stop settle; every translation is local-costmap checked and remains on `velocity_smoother -> collision_monitor -> robot_safety -> ranger_base`. Fresh lifecycle permits gate the `0.05m/s` lateral and `0.08m/s` reverse capabilities. `navigation_near_goal_stalled_handoff_enabled=false`, so the API no longer proactively cancels a live Nav2 goal and remains only the true-abort fallback.
@@ -288,6 +569,8 @@ See [docs/production_jetson_provisioning.md](docs/production_jetson_provisioning
 - The GS2 fine-docking global-correction pause is lifecycle-owned by the docking job. If a fine docking attempt is canceled, fails, stops, or is preempted after `/docking/start`, `robot_api_server` releases the `docking_fine` pause on job finish. Auto-undock-before-navigation and post-undock relocalization also clear stale `correction_pause_reason=docking_fine` before triggering localization, so a previous docking attempt cannot freeze `map->odom` and reject the next correction as `GLOBAL_CORRECTION_PAUSED`.
 - Phase V1 adds validation-only field tooling around the D3/N2 contract. Use `scripts/jetson/runtime_overlay/scripts/observe_pose_required_navigation.sh`, `verify_manual_relocalization_api.sh`, `observe_predock_yaw_alignment_trace.sh`, `run_predock_yaw_alignment_probe.sh`, `verify_fine_docking_entry_gate.sh`, and `run_v1_navigation_docking_validation.sh --observe-only --duration-sec 120` before any full docking attempt. The default V1 runner does not send goals, docking requests, relocalization triggers, velocity commands, or heavy pointcloud subscriptions; manual relocalization and the small predock yaw probe require explicit opt-in. See `docs/phase_v1_navigation_docking_validation.md`.
 - For ordinary navigation abort triage, use `scripts/jetson/runtime_overlay/scripts/observe_navigation_failure_minimal.sh --duration-sec 180 --label <run>` before sending the App goal. It creates one temporary `rclpy` participant, records API state, Nav2 action status, bridge/safety strings, the small Twist command chain, local-costmap summaries, and filtered `/rosout`, while deliberately avoiding `/tf`, PointCloud2, and LaserScan. For a reproducible moving-obstacle run, add `--store-costmap-snapshots --costmap-snapshot-period-sec 0.5 --output-dir /tmp/njrh_reports/<run>`; this stores exact sampled OccupancyGrid payloads plus PGM previews without changing navigation state.
+- Recorder v3 retains terminal-permit/progress evidence, `/ranger_base/status`, actual published footprint, changed repair-path geometry, startup parameter-file snapshots, unique report directories and orderly Ctrl+C completion. It adds stamped Nav2 feedback with approximate odometry pairing, original-stamped controller warnings with command context, sparse publisher inventory and process counters. Collision state is recorded only if actually published; `EVIDENCE_LIMITS` and `evidence_availability.json` explicitly report missing diagnostics. MPPI rejection reasons and optimizer computation duration are **not collected**; process counters are not a substitute. No controller instrumentation, live parameter changes or visualization are enabled. See [navigation obstacle capture](docs/navigation_obstacle_capture.md).
+- The September 7 dynamic-obstacle traces exposed missing local reference updates and defects in the subsequent repair loop. Ordinary `FollowPath` repairs its prefix on a detached local-costmap snapshot using forward-only Dubins Hybrid A* with the Ranger's `0.81m` radius and expanded rectangle. A blocked reference up to 4m ahead now requests background repair, not an automatic stop. Rejoin search extends within the local map, tries separated exits with independent search graphs and one shared budget, and rechecks attachment from the latest robot pose before calling MPPI `setPlan()`. Only the exact Humble MPPI no-valid-control exception becomes zero-command waiting with same-action retries; other faults still report errors. Background repair retains normal progress checking. Global planning, goal tolerances, elevator/fine-docking control, and the command chain are unchanged; predock travel shares ordinary FollowPath. Accepted paths are visible on `/ranger_mini3/ordinary_local_repair_path`; see `src/robot_nav_config/docs/ordinary_local_path_repair.md` for software regressions and remaining supervised hardware validation.
 - For slow terminal convergence triage, use `scripts/jetson/runtime_overlay/scripts/observe_navigation_terminal_adjustment.sh --duration-sec 40 --label <run> --stop-when-terminal` before sending the App goal. It is read-only and quantifies when the robot enters the 1.5 m / 0.25 m near-goal windows, how long Nav2 stays there with tiny `/cmd_vel_nav_raw`, the `/speed_limit` sequence, and when API `final_yaw_align` or `/cmd_vel_api` takes over. The observer only starts timing after it first sees a new `running` navigation goal id, so stale `succeeded` state from the previous App goal is preserved in raw samples but excluded from near-goal/task-complete timing. Report `20260630T023038Z_nav_terminal_01_420s` showed the `delivery_987692` path reached about `0.31m` from the target with roughly `145deg` yaw error, then spent more than a minute in tiny MPPI commands before API yaw took over; this is the reason the near-goal stalled handoff window is `0.35m` instead of the previous `0.12m`. A later `delivery_230891 -> delivery_987692` run exposed a separate 8s idle gap before yaw-first recovery and a `0.35rad/s` API yaw timeout on a `2.39rad` residual yaw; ordinary API final yaw is now capped at `0.60rad/s` and the yaw-first recovery path skips that idle salvage wait. Follow-up field state then showed `distance=0.041m` and yaw near `0.050rad` being marked `degraded` only because gated AMCL remained in stationary standby with `amcl_correction_pending=true`; final verification now tolerates that clean standby condition and API yaw internally targets `0.045rad` before the unchanged `0.05rad` commercial gate.
 - `20260630T061311Z_nav_230891_to_987692_fast_params_forward_xy_fix_60s` is the previous `delivery_230891 -> delivery_987692` terminal-convergence baseline: the goal completed in about `33s` from API accept to success with `final_distance_m=0.050476`, `final_yaw_error_rad=0.043281`, no Nav2 retry, and terminal XY correction taking about `1.0s`. Later field evidence showed mixed `linear.x`/`linear.y` terminal correction could enter the Ranger Mini3 official driver's parallel mode and increase XY error. Ordinary API terminal correction is now deterministic terminal-pose servo: compute signed yaw, forward, and lateral error from fresh `map -> base_link`; correct yaw first with pure `angular.z`, then lateral with pure `linear.y` in `side_slip`, then forward/reverse with pure `linear.x`. It does not mix angular and translation commands in the same terminal correction step.
 - A July 22 pre-dock reproduction exposed a deterministic policy gap: Nav2 stopped at `0.354192m` with `0.126303m` forward and `0.330907m` lateral residual, while the old direct-correction, retry, and failed-Nav2 gates ended independently at `0.30m`/`0.35m`. These paths now share `navigation_terminal_recovery_max_distance_m=0.40`; direct axis-staged correction admits at most `0.15m` forward residual and has a `20s` maximum budget for the largest admitted error. Each nonzero terminal translation also requires a fresh `/local_costmap/costmap` centerline corridor below cost `50`, then remains routed through `/cmd_vel_api -> robot_safety`. The commercial success gate remains `0.06m` / `0.05rad`, and errors outside `0.40m` still fail closed instead of being hidden by terminal servo.
@@ -448,6 +731,14 @@ python3 scripts/resolve_third_party.py --root .
 - `docs/phase_s2_navigation_runtime_ownership.md`
 
 ## P6 multi-floor/elevator work
+
+2026-09-09 deployed candidate: floor switching can hand an exact target to an
+unlocalized resident startup after explicit inactive-lifecycle and stopped-robot
+proof. Normal hot switching keeps its existing path. The docking-observation
+startup teardown was isolated and the runtime restarted with fresh docking data;
+see [startup failure scope](docs/docking_startup_failure_isolation.md).
+Real floor-switch/localization hardware acceptance is still pending;
+see [unready-startup handoff, tests and limits](docs/floor_switch_unready_startup.md).
 
 P6 now contains the pure-core scaffold for mission sequencing, elevator
 schema-v1/v2/v3 topology/YAML loading, schema-v2 compatibility sequencing,
@@ -743,3 +1034,16 @@ the latch by itself. Both `ON_DOCK` and `UNCERTAIN_ON_DOCK` block ordinary Nav2
 motion while retaining the dedicated controlled-undock path. An undock request
 may safely retire a stale/running docking owner before it starts, preventing a
 failed docking job from permanently deadlocking the only recovery action.
+
+# 2026-09-14 建图保存协议补充
+
+建图不再使用电梯测试准入锁。新增显式异步保存与请求 ID 查询，分别报告资产
+提交和建图退出；客户端须同步更新。范围、兼容性和实机验收见
+[建图保存协议](docs/mapping_save_async.md)。
+
+## Explicit relocalization application (2026-09-14)
+
+Explicit stationary Isaac relocalization applies the accepted `map -> odom`
+target immediately, including small corrections; ordinary AMCL smoothing is
+unchanged. Completion still uses the published target. See
+[application contract and validation](docs/explicit_relocalization_immediate.md).

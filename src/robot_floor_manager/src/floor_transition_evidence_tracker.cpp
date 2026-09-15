@@ -10,6 +10,7 @@ namespace
 {
 
 constexpr std::size_t kMaximumOdomSamples = 256U;
+constexpr double kMaximumNavLifecycleAgeSec = 0.75;
 
 bool contains(
   const std::vector<std::string> & values,
@@ -57,7 +58,11 @@ void FloorTransitionEvidenceTracker::observe_nav_graph_ready(
     }
     nav_graph_ready_ = false;
     nav_graph_ready_since_steady_sec_ = -1.0;
-    nav_active_ = {};
+    // Discovery loss invalidates idle proof, not a known active goal. Only a
+    // subsequent authoritative action-status sample may resolve that conflict.
+    if (!nav_active_.value) {
+      nav_active_ = {};
+    }
     return;
   }
   if (!nav_graph_ready_) {
@@ -74,6 +79,24 @@ void FloorTransitionEvidenceTracker::observe_nav_activity(
   // services discovered. Preserve that authoritative sample; the graph probe
   // will establish the bootstrap generation independently.
   nav_active_ = {active, received_steady_sec};
+}
+
+void FloorTransitionEvidenceTracker::observe_nav_lifecycle_state(
+  const NavLifecycleEndpoint endpoint,
+  const std::uint8_t state_id,
+  const double received_steady_sec)
+{
+  // lifecycle_msgs/State primary IDs; keep the evidence tracker ROS-free.
+  const BinaryObservation stopped{
+    state_id == 1U || state_id == 2U, received_steady_sec};
+  switch (endpoint) {
+    case NavLifecycleEndpoint::kBtNavigator:
+      bt_navigator_stopped_ = stopped;
+      break;
+    case NavLifecycleEndpoint::kControllerServer:
+      controller_server_stopped_ = stopped;
+      break;
+  }
 }
 
 void FloorTransitionEvidenceTracker::observe_wheel_odom(
@@ -148,6 +171,20 @@ void FloorTransitionEvidenceTracker::mark_costmaps_cleared(
   costmaps_cleared_steady_sec_ = steady_now_sec;
 }
 
+bool FloorTransitionEvidenceTracker::nav_runtime_inactive(
+  const double steady_now_sec,
+  const double max_age_sec) const
+{
+  return !nav_active_.value &&
+    bt_navigator_stopped_.value && controller_server_stopped_.value &&
+    fresh(
+    bt_navigator_stopped_.received_steady_sec, steady_now_sec,
+    std::min(max_age_sec, kMaximumNavLifecycleAgeSec)) &&
+    fresh(
+    controller_server_stopped_.received_steady_sec, steady_now_sec,
+    std::min(max_age_sec, kMaximumNavLifecycleAgeSec));
+}
+
 FloorTransitionEvidence FloorTransitionEvidenceTracker::preconditions(
   const double steady_now_sec,
   const double max_age_sec,
@@ -170,7 +207,7 @@ FloorTransitionEvidence FloorTransitionEvidenceTracker::preconditions(
   // for a bounded grace period, the absence of any retained/live status is a
   // cold-start idle proof. Any later status sample becomes authoritative and
   // remains latched until the action graph disappears or another sample
-  // arrives.
+  // arrives. Active evidence survives graph loss: absence is not cancellation.
   const bool status_proves_idle =
     nav_graph_ready_ &&
     nav_active_.received_steady_sec >= 0.0 &&
@@ -182,7 +219,9 @@ FloorTransitionEvidence FloorTransitionEvidenceTracker::preconditions(
     steady_now_sec >= nav_graph_ready_since_steady_sec_ &&
     steady_now_sec - nav_graph_ready_since_steady_sec_ >=
     std::max(0.0, nav_idle_bootstrap_grace_sec);
-  evidence.nav_idle = status_proves_idle || cold_start_proves_idle;
+  evidence.nav_idle = !nav_active_.value &&
+    (status_proves_idle || cold_start_proves_idle ||
+    nav_runtime_inactive(steady_now_sec, max_age_sec));
   evidence.stopped =
     odom_stopped(
     wheel_odom_, steady_now_sec, max_age_sec, stable_duration_sec,

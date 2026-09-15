@@ -449,7 +449,9 @@ public:
         rclcpp::SensorDataQoS(),
         std::bind(&RobotSafetyNode::on_spin_to_drive_imu, this, std::placeholders::_1));
     }
-    if (mode_exit_guard_enabled_ && !mode_controller_status_topic_.empty()) {
+    if ((mode_exit_guard_enabled_ || spin_to_drive_settle_enabled_) &&
+      !mode_controller_status_topic_.empty())
+    {
       mode_controller_status_sub_ = create_subscription<std_msgs::msg::String>(
         mode_controller_status_topic_,
         rclcpp::QoS(10),
@@ -707,6 +709,8 @@ private:
     if (decision.allowed && bms_docking_contact_latched_) {
       bms_docking_contact_latched_ = false;
       bms_interlock_reverse_session_seen_ = false;
+      bms_interlock_undock_in_progress_ = false;
+      bms_interlock_undock_succeeded_ = false;
       bms_docking_interlock_reason_ =
         "reconciled_outside_dock_zone:" + request->transaction_id;
       last_latch_read_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
@@ -1526,6 +1530,22 @@ private:
   {
     latest_docking_status_ = lower_copy(msg->data);
     last_docking_status_time_ = now();
+    // Status and reverse permit are separate topics; accept either terminal ordering.
+    // A retained success from before this attempt must not release a later failed attempt.
+    if (latest_docking_status_ == "undocking" || starts_with(latest_docking_status_, "undocking ")) {
+      bms_interlock_undock_in_progress_ = true;
+      bms_interlock_undock_succeeded_ = false;
+    } else if (starts_with(latest_docking_status_, "undocked phase=succeeded ")) {
+      if (bms_interlock_undock_in_progress_) {
+        bms_interlock_undock_succeeded_ = true;
+        bms_interlock_undock_in_progress_ = false;
+      }
+    } else {
+      bms_interlock_undock_in_progress_ = false;
+      bms_interlock_undock_succeeded_ = false;
+    }
+    try_release_bms_docking_interlock("docking_status");
+    publish_dock_safety_interlock_state();
   }
 
   void on_mode_controller_status(const std_msgs::msg::String::SharedPtr msg)
@@ -1534,6 +1554,21 @@ private:
     if (!mode_code.has_value() || !mode_status_actual_fresh(msg->data)) {
       return;
     }
+    // Arm once per observed entry into the chassis' actual SPINNING mode.
+    // Slow Ackermann arcs are not spins; repeated mode heartbeats must neither
+    // reset the hold timeout nor rearm an episode already settled/timed out.
+    if (spin_to_drive_settle_enabled_ && mode_code.value() == 2 &&
+      actual_motion_mode_code_ != 2)
+    {
+      spin_to_drive_settle_pending_ = true;
+      spin_to_drive_stable_sample_count_ = 0;
+      spin_to_drive_local_stable_sample_count_ = 0;
+      spin_to_drive_local_stable_anchor_valid_ = false;
+      spin_to_drive_local_stable_since_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+      spin_to_drive_imu_stable_since_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+      spin_to_drive_linear_hold_started_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    }
+    // Leaving SPINNING does not prove that physical yaw has settled.
     actual_motion_mode_code_ = mode_code.value();
     latest_actual_motion_mode_time_ = now();
   }
@@ -1551,6 +1586,7 @@ private:
     if (!bms_docking_interlock_enabled_ ||
       !bms_docking_contact_latched_ ||
       !bms_interlock_reverse_session_seen_ ||
+      !bms_interlock_undock_succeeded_ ||
       docking_reverse_permit_.enabled ||
       !fresh_no_contact)
     {
@@ -1559,16 +1595,21 @@ private:
 
     bms_docking_contact_latched_ = false;
     bms_interlock_reverse_session_seen_ = false;
+    bms_interlock_undock_in_progress_ = false;
+    bms_interlock_undock_succeeded_ = false;
     bms_docking_interlock_reason_ = std::string("released_after_standard_undock:") + trigger;
     RCLCPP_INFO(
       get_logger(),
-      "BMS_DOCKING_INTERLOCK released after explicit reverse session and "
+      "BMS_DOCKING_INTERLOCK released after successful undock, explicit reverse session and "
       "fresh no-contact feedback trigger=%s",
       trigger);
   }
 
   void on_docking_reverse_enable(const bool enabled)
   {
+    if (enabled && !docking_reverse_permit_.enabled) {
+      bms_interlock_undock_succeeded_ = false;
+    }
     update_reverse_permit(docking_reverse_permit_, enabled);
     if (enabled) {
       if (bms_docking_interlock_active()) {
@@ -1683,13 +1724,6 @@ private:
     spin_to_drive_imu_stable_since_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
   }
 
-  bool command_is_pure_spin(const geometry_msgs::msg::Twist & cmd) const
-  {
-    return std::abs(cmd.angular.z) >= spin_to_drive_wz_threshold_radps_ &&
-           std::abs(cmd.linear.x) < spin_to_drive_linear_epsilon_mps_ &&
-           std::abs(cmd.linear.y) < spin_to_drive_linear_epsilon_mps_;
-  }
-
   bool command_has_linear_motion(const geometry_msgs::msg::Twist & cmd) const
   {
     return std::abs(cmd.linear.x) >= spin_to_drive_linear_epsilon_mps_ ||
@@ -1702,8 +1736,11 @@ private:
     if (actual_pos == std::string::npos) {
       return std::nullopt;
     }
+    const auto actual_end = status.find('}', actual_pos);
     const auto code_pos = status.find("\"code\":", actual_pos);
-    if (code_pos == std::string::npos) {
+    if (actual_end == std::string::npos || code_pos == std::string::npos ||
+      code_pos >= actual_end)
+    {
       return std::nullopt;
     }
     std::size_t pos = code_pos + std::string("\"code\":").size();
@@ -1723,9 +1760,19 @@ private:
     while (pos < status.size() && std::isdigit(static_cast<unsigned char>(status[pos]))) {
       have_digit = true;
       value = (value * 10) + (status[pos] - '0');
+      // Known chassis modes are 0..3. Reject unknown/overflowed feedback;
+      // it cannot be used as evidence of a mode transition.
+      if (value > 3) {
+        return std::nullopt;
+      }
       ++pos;
     }
-    if (!have_digit) {
+    while (pos < actual_end && std::isspace(static_cast<unsigned char>(status[pos]))) {
+      ++pos;
+    }
+    if (!have_digit || sign < 0 || pos > actual_end ||
+      (status[pos] != ',' && status[pos] != '}'))
+    {
       return std::nullopt;
     }
     return sign * value;
@@ -1737,10 +1784,11 @@ private:
     if (actual_pos == std::string::npos) {
       return false;
     }
-    const auto actual_end = status.find("},\"actual_motion_mode_source\"", actual_pos);
-    const auto block = status.substr(
-      actual_pos,
-      actual_end == std::string::npos ? std::string::npos : actual_end - actual_pos);
+    const auto actual_end = status.find('}', actual_pos);
+    if (actual_end == std::string::npos) {
+      return false;
+    }
+    const auto block = status.substr(actual_pos, actual_end - actual_pos);
     return block.find("\"available\":true") != std::string::npos &&
            block.find("\"fresh\":true") != std::string::npos;
   }
@@ -1959,34 +2007,19 @@ private:
       return cmd;
     }
 
+    // Command magnitude only decides whether this request needs translation
+    // handoff; it never identifies the chassis mode. Rotation/stop requests
+    // must not consume a pending episode before the real spin has even begun.
+    if (!spin_to_drive_settle_pending_ || !command_has_linear_motion(cmd)) {
+      return cmd;
+    }
+
     const auto now_time = now();
-    if (command_is_pure_spin(cmd)) {
-      if (!spin_to_drive_settle_pending_) {
-        spin_to_drive_stable_sample_count_ = 0;
-        spin_to_drive_local_stable_sample_count_ = 0;
-        spin_to_drive_local_stable_anchor_valid_ = false;
-        spin_to_drive_local_stable_since_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
-        spin_to_drive_imu_stable_since_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
-      }
-      spin_to_drive_settle_pending_ = true;
-      spin_to_drive_settle_started_time_ = now_time;
-      spin_to_drive_linear_hold_started_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
-      return cmd;
-    }
-
-    if (!spin_to_drive_settle_pending_) {
-      return cmd;
-    }
-
     if (spin_to_drive_actual_wz_stable() && spin_to_drive_local_odom_stable() &&
       spin_to_drive_imu_stable())
     {
       spin_to_drive_settle_pending_ = false;
       spin_to_drive_linear_hold_started_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
-      return cmd;
-    }
-
-    if (!command_has_linear_motion(cmd)) {
       return cmd;
     }
 
@@ -2207,12 +2240,13 @@ private:
   bool battery_contact_active_{false};
   bool bms_docking_contact_latched_{false};
   bool bms_interlock_reverse_session_seen_{false};
+  bool bms_interlock_undock_in_progress_{false};
+  bool bms_interlock_undock_succeeded_{false};
   double bms_no_contact_since_steady_sec_{0.0};
   std::uint64_t dock_safety_interlock_generation_{0U};
   std::string bms_docking_interlock_reason_;
   int actual_motion_mode_code_{255};
   bool spin_to_drive_settle_pending_{false};
-  rclcpp::Time spin_to_drive_settle_started_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time spin_to_drive_linear_hold_started_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time spin_to_drive_local_stable_since_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time spin_to_drive_imu_stable_since_time_{0, 0, RCL_ROS_TIME};

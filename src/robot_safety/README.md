@@ -5,8 +5,8 @@ Final command arbitration point before the chassis bridge.
 ## Canonical Contract
 
 - normal navigation/App command input: `/cmd_vel_collision_checked`
-- elevator-entry raw navigation input: `/cmd_vel_nav` (inactive unless the
-  exact transaction-scoped entry permit is valid)
+- post-call elevator velocity-smoother input: `/cmd_vel_nav` (inactive unless
+  the exact transaction-scoped permit is valid; not raw controller output)
 - elevator-entry bypass permit:
   `/ranger_mini3/elevator_entry_collision_bypass`
 - docking command input: `/cmd_vel_docking`
@@ -33,7 +33,8 @@ The navigation exception covers every post-call elevator intent:
 `TARGET_LANDING`. The elevator runtime refreshes a
 permit containing the exact active `transaction_id`; while the same
 transaction owns the exact `robot_elevator_manager` operating-mode contract,
-the hold is clear, and the operating mode is `DOORWAY`, `robot_safety` accepts
+the hold is clear, and the operating mode is `ELEVATOR_WAIT` (post-call staging)
+or `DOORWAY` (cabin entry/exit), `robot_safety` accepts
 velocity-smoother output from
 `/cmd_vel_nav` instead of the collision-monitor-checked stream. Permit expiry,
 transaction/mode/lease change, command staleness, cancellation, or any
@@ -41,6 +42,10 @@ terminal result produces zero. Only the pre-call hall approach and ordinary
 navigation remain on `/cmd_vel_collision_checked`. Estop,
 localization health, final speed clamps, reverse/lateral permits, and command
 watchdogs remain enforced in both paths.
+
+Neither mode alone enables the exception. The pre-call hall approach sends no
+bypass permit; stationary `ELEVATOR_RIDE` and ordinary `NORMAL` are rejected.
+See [post-call collision scope](docs/elevator_post_call_collision_bypass.md).
 
 Command topics are treated as latest-only control streams, not durable command queues. The node creates the normal, API, docking, final, and mirror Twist endpoints with `KEEP_LAST(1)` QoS by default so old nonzero velocity samples cannot be drained after a newer stop command. A near-zero command from the active command owner is also stop-dominant: `robot_safety` immediately publishes zero, keeps a short zero burst window, and rejects late nonzero samples during that window. This prevents spin/drive/arc commands from continuing only because an upstream queue or source-priority cache still contains older velocity samples.
 
@@ -60,7 +65,16 @@ The current arbitration order is:
 
 When a fresh `/cmd_vel_docking` message exists, normal `/cmd_vel_collision_checked` messages are ignored for `docking_cmd_priority_timeout_sec`. This keeps App zero bursts and Nav2/collision-monitor zero output from interleaving with controlled docking motion.
 
-After a pure yaw command, `robot_safety` can hold the first following linear command at zero until the spin tail has settled. The gate checks `/wheel/odom.twist.twist.angular.z` and, by default, `/lidar_imu_bias_corrected.angular_velocity.z` because the Ranger wheel twist can report zero before the physical body yaw-rate has actually stopped. `/local_state/odometry` remains an optional diagnostic gate only; production release is based on raw wheel odom plus the corrected 100 Hz IMU tail detector. The local-state runtime must keep `imu_gyro_bias_filter_node` resident even when the EKF profile is wheel-only; otherwise this gate can only fail open after its timeout. This handles Ranger Mini 3 spin stop tail: upstream Nav2/API may have already published zero yaw, while the chassis is still rotating for a short interval. The gate is intentionally placed in `robot_safety` because this package is the final command arbitration point before `/cmd_vel`; it does not change Nav2, AMCL, or the chassis SDK motion model.
+After a fresh actual entry into SPINNING reported by `/ranger_base/status`, `robot_safety` can hold the first following linear command at zero until the spin tail has settled. Low-speed Twist values and desired mode never prove actual spin. The gate checks `/wheel/odom.twist.twist.angular.z` and, by default, `/lidar_imu_bias_corrected.angular_velocity.z` because the Ranger wheel twist can report zero before the physical body yaw-rate has actually stopped. `/local_state/odometry` remains an optional diagnostic gate only; production release is based on raw wheel odom plus the corrected 100 Hz IMU tail detector. The local-state runtime must keep `imu_gyro_bias_filter_node` resident even when the EKF profile is wheel-only; otherwise this gate can only fail open after its timeout. This handles Ranger Mini 3 spin stop tail: upstream Nav2/API may have already published zero yaw, while the chassis is still rotating for a short interval. The gate is intentionally placed in `robot_safety` because this package is the final command arbitration point before `/cmd_vel`; it does not change Nav2, AMCL, or the chassis SDK motion model.
+
+Repeated SPINNING feedback does not reset settling or rearm a consumed episode.
+Rotation/zero commands pass without consuming the pending handoff; mode exit or
+feedback loss does not erase an already observed spin tail. Release still uses
+the existing wheel/IMU stability or bounded timeout, without waiting for an
+Ackermann acknowledgement. Missing actual feedback does not create a new motion
+gate. The existing status subscription is shared by spin settling and the mode
+exit guard; disabling the latter must not disconnect the former. See
+[actual-mode handoff](docs/spin_to_drive_actual_mode.md).
 
 After docking or lateral capture, the Ranger chassis can keep reporting `MOTION_MODE_PARALLEL` while all command topics are already zero. `robot_safety` observes `/ranger_base/status` for its outer mode-exit guard. The authoritative transition is now inside `ranger_base`: any probe or requested drive is held at zero until the firmware confirms DUAL_ACKERMAN, so a safety-layer probe cannot leak physical motion during mode change. Docking commands are exempt from the outer guard so fine docking can intentionally request lateral motion; the chassis core still performs the same confirmed transition.
 
@@ -77,7 +91,7 @@ Terminal pose recovery may need a small side-slip command after Ackermann MPPI r
 
 For push-in spring charging docks, controlled undocking must be a continuous low-speed motion through the charger switch travel. `robot_safety` stores the last fresh `/cmd_vel_docking` command and republishes it from the safety timer while the docking-priority window is active, so watchdog/status refreshes do not insert zero commands between valid undock updates.
 
-When `block_normal_motion_when_docked=true`, BMS contact, `/docking/status` docked/charging, or the persistent dock-contact latch blocks normal `/cmd_vel_collision_checked` output and publishes zero with `/safety/status=DOCKED_CONTACT_BLOCK`. A latch is treated as stale safety memory when fresh BMS says no contact and there is no current docked/charging status, so an old latch cannot permanently block navigation after a clean no-contact state is visible. `allow_docking_cmd_when_docked=true` keeps the docking channel available, but it no longer means that every docking Twist is legal after electrical contact. With `bms_docking_interlock_enabled=true`, the first fresh BMS contact immediately clears the cached docking command and publishes zero. That electrical-contact event is latched inside the final arbiter, so forward, lateral, and angular docking commands remain hard-blocked even if BMS messages later become stale or another publisher continues sending them. Only an exact zero or a pure negative-X command with a fresh controlled-undock reverse permit is accepted. The latch is released only after that explicit reverse session ends and fresh BMS feedback confirms no contact.
+When `block_normal_motion_when_docked=true`, BMS contact, `/docking/status` docked/charging, or the persistent dock-contact latch blocks normal `/cmd_vel_collision_checked` output and publishes zero with `/safety/status=DOCKED_CONTACT_BLOCK`. A latch is treated as stale safety memory when fresh BMS says no contact and there is no current docked/charging status, so an old latch cannot permanently block navigation after a clean no-contact state is visible. `allow_docking_cmd_when_docked=true` keeps the docking channel available, but it no longer means that every docking Twist is legal after electrical contact. With `bms_docking_interlock_enabled=true`, the first fresh BMS contact immediately clears the cached docking command and publishes zero. That electrical-contact event is latched inside the final arbiter, so forward, lateral, and angular docking commands remain hard-blocked even if BMS messages later become stale or another publisher continues sending them. Only an exact zero or a pure negative-X command with a fresh controlled-undock reverse permit is accepted. The latch is released only after the current undock reports `undocked phase=succeeded`, the explicit reverse session ends, and fresh BMS feedback confirms no contact. Cancellation, motion-start failure, or no-progress failure cannot release it merely by disabling reverse. Status/permit arrival order is supported in either direction; an old success is not carried into a new attempt.
 
 `/safety/dock_interlock_state` publishes the final arbiter's live BMS-contact,
 private memory-latch, persistent-latch, and reverse-session state using reliable
@@ -314,7 +328,10 @@ only and do not authorize a real elevator entry or exit.
 - `allow_docking_cmd_when_docked`: keep controlled `/cmd_vel_docking` motion available while normal motion is blocked
 - `bms_docking_interlock_enabled`: on fresh BMS contact, immediately zero and latch rejection of subsequent forward/lateral/angular docking commands until confirmed undock
 - `bms_docking_interlock_allow_reverse_undock`: while the BMS interlock is latched, allow only pure negative-X docking motion with a fresh docking reverse permit
-- `spin_to_drive_settle_enabled`: hold linear drive briefly after pure spin until actual wheel odom yaw rate is settled
+- `bms_docking_interlock_reconcile_no_contact_sec`: continuous fresh BMS no-contact duration required before a proven remote-undock reconciliation, default `3.0`
+- `dock_safety_interlock_state_topic`: reliable transient-local BMS docking-interlock state output, default `/safety/dock_interlock_state`
+- `dock_safety_interlock_reconcile_service`: constrained no-motion reconciliation service, default `/safety/reconcile_dock_interlock`
+- `spin_to_drive_settle_enabled`: hold linear drive briefly after confirmed actual SPINNING until the existing physical tail checks settle
 - `spin_to_drive_odom_topic`: odom topic used for the actual yaw-rate settle check, default `/wheel/odom`
 - `spin_to_drive_wz_threshold_radps`: actual yaw-rate threshold treated as stopped, default `0.02`
 - `spin_to_drive_stable_samples`: consecutive settled odom samples required before releasing linear drive
@@ -331,7 +348,7 @@ only and do not authorize a real elevator entry or exit.
 - `spin_to_drive_imu_stable_duration_sec`: minimum continuous IMU-stable duration before releasing linear drive, default `0.30`
 - `spin_to_drive_imu_max_age_sec`: maximum accepted age of the IMU settle sample, default `0.10`
 - `spin_to_drive_timeout_sec`: fail-open timeout after the first held linear-drive request, default `2.0`
-- `spin_to_drive_linear_epsilon_mps`: linear command threshold used to distinguish pure spin from drive
+- `spin_to_drive_linear_epsilon_mps`: existing translation-request threshold for handoff/mode-exit checks; never used to infer actual SPINNING
 - `spin_to_drive_odom_max_age_sec`: maximum accepted age of the odom yaw-rate sample
 - `mode_exit_guard_enabled`: guard normal/API drive commands from starting at full speed while the chassis still reports a lateral motion mode
 - `mode_controller_status_topic`: compatibility parameter naming the actual Ranger mode status source, default `/ranger_base/status`
@@ -360,3 +377,7 @@ only and do not authorize a real elevator entry or exit.
 - `allow_reverse=true` cannot authorize `DOCKING` reverse. Docking always requires a fresh `/ranger_mini3/docking_allow_reverse` permit; while a legacy execution session or the exact elevator operating-mode contract is active, reverse is restricted to the normal Nav2 source with its fresh terminal-reverse permit.
 - Jetson runtime executes the compiled C++ node directly and fails fast if the binary is missing; the Python fallback path has been removed.
 - `/cmd_vel_safe` is a diagnostic mirror when the runtime publishes the final command on `/cmd_vel`; the effective chassis command remains owned by `robot_safety`.
+
+Built archives and the final executable require regression checks as well as
+source review. See [elevator bypass build-artifact regression](docs/elevator_bypass_build_artifacts.md)
+for the stale-library failure, artifact checker, and staged deployment boundary.

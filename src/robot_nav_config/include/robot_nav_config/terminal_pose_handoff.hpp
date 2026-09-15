@@ -76,9 +76,18 @@ inline bool should_start_terminal_handoff(
   constexpr double kMinimumChordM = 1.0e-3;
   if (!parameters.enabled || !terminal_values_are_finite(error, path) ||
     error.distance_m > parameters.max_distance_m ||
-    std::abs(error.forward_m) > parameters.max_abs_forward_m ||
-    std::abs(error.lateral_m) < parameters.minimum_abs_lateral_m)
+    std::abs(error.forward_m) > parameters.max_abs_forward_m)
   {
+    return false;
+  }
+
+  // Forward-only MPPI cannot close a target already behind the robot. Reuse
+  // the existing bounded, permitted terminal controller even with no lateral
+  // residual; do not relax the goal tolerance or the recovery envelope.
+  if (error.forward_m < 0.0 && error.distance_m > parameters.goal_xy_tolerance_m) {
+    return true;
+  }
+  if (std::abs(error.lateral_m) < parameters.minimum_abs_lateral_m) {
     return false;
   }
 

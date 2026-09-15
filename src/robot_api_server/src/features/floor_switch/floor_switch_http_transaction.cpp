@@ -27,41 +27,24 @@ FloorSwitchHttpRuntimeAdmission evaluate_floor_switch_runtime_admission(
   const FloorSwitchHttpTarget & target,
   const FloorSwitchHttpRuntimeContext & runtime)
 {
-  if (!runtime.available) {
-    return {
-      false, false, "FLOOR_SWITCH_RUNTIME_CONTEXT_MISSING",
-      "no authoritative runtime map context is available"};
-  }
-  if (
-    !runtime.confirmed || runtime.state != "ready" ||
-    runtime.asset_epoch == 0U || runtime.asset_digest.empty() ||
-    runtime.explicit_relocalization_sequence == 0U)
-  {
-    return {
-      false, false, "FLOOR_SWITCH_RUNTIME_NOT_READY",
-      "source runtime map context is not ready and explicitly localized"};
-  }
-
+  // Source readiness proves an idempotent no-op, not permission to load a target.
+  // In particular, a failed initial localization must not prevent map selection.
   const bool same_logical_map =
     runtime.building_id == target.building_id &&
     runtime.floor_id == target.floor_id &&
     runtime.map_id == target.map_id;
-  if (same_logical_map &&
-    (runtime.asset_epoch != target.asset_epoch ||
-    runtime.asset_digest != target.asset_digest))
+  if (same_logical_map && runtime.available && runtime.confirmed &&
+    runtime.state == "ready" && runtime.explicit_relocalization_sequence != 0U &&
+    runtime.asset_epoch != 0U && !runtime.asset_digest.empty() &&
+    runtime.asset_epoch == target.asset_epoch && runtime.asset_digest == target.asset_digest)
   {
-    return {
-      false, false, "FLOOR_SWITCH_RUNTIME_IDENTITY_MISMATCH",
-      "the requested map matches the active map id but not its exact asset identity"};
-  }
-  if (same_logical_map) {
     return {
       true, true, "FLOOR_SWITCH_ALREADY_ACTIVE",
       "the exact requested floor asset is already the confirmed runtime"};
   }
   return {
     true, false, "OK",
-    "source runtime is ready for an exact floor transition"};
+    "load and localize the requested target independently of source readiness"};
 }
 
 bool FloorSwitchHttpSnapshot::terminal() const noexcept

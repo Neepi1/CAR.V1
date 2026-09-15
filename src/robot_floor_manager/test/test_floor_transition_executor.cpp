@@ -114,7 +114,7 @@ public:
     }
     if (effect.kind == FloorTransitionEffectKind::kLoadNavMap) {
       result.failure_code = "NAV_MAP_LOAD_FAILED";
-      result.detail = "target Nav map load was rejected";
+      result.detail = "target Nav map preflight failed before request dispatch";
       return result;
     }
     if (effect.kind == FloorTransitionEffectKind::kHoldAndLock) {
@@ -122,6 +122,14 @@ public:
       bridge_abort_called = bridge_begin_established;
       hold_active = !restore_source_;
       evidence.runtime_context_invalid = !restore_source_;
+      evidence.runtime_context_valid = restore_source_;
+      if (restore_source_) {
+        // This fake supplies an already-proven cleanup result. Real bridge
+        // command selection is covered by test_floor_transition_cleanup.
+        evidence.active_floor_id = "F1";
+        evidence.active_map_id = "map-f1";
+        evidence.asset_epoch = 41U;
+      }
       evidence.motion_hold_active = hold_active;
       result.success = bridge_abort_called;
       result.detail = restore_source_ ?
@@ -209,7 +217,7 @@ TEST(FloorTransitionExecutor, CommitsExactTargetAfterEveryRuntimeBarrier)
     FloorTransitionEffectKind::kComplete);
 }
 
-TEST(FloorTransitionExecutor, FailureAfterBeginRestoresSourceWithoutRecoveryLock)
+TEST(FloorTransitionExecutor, FailureBeforeTargetDispatchAcceptsProvenSourceCleanup)
 {
   FailureAfterBeginRuntime runtime;
   FloorTransitionExecutor executor(runtime);
@@ -225,6 +233,10 @@ TEST(FloorTransitionExecutor, FailureAfterBeginRestoresSourceWithoutRecoveryLock
   EXPECT_TRUE(runtime.bridge_abort_called);
   EXPECT_FALSE(runtime.hold_active);
   EXPECT_EQ(runtime.cleanup_count, 1U);
+  EXPECT_EQ(result.active_floor_id, "F1");
+  EXPECT_EQ(result.active_map_id, "map-f1");
+  EXPECT_EQ(result.asset_epoch, 41U);
+  EXPECT_NE(result.message.find("source runtime restored"), std::string::npos);
 }
 
 TEST(FloorTransitionExecutor, UnprovenPostBeginCleanupRetainsRecoveryLock)
@@ -303,6 +315,22 @@ TEST(FloorTransitionExecutor, ProjectsPreBeginCancellationAsCanceled)
   EXPECT_STREQ(disposition.stage, "CANCELED");
   EXPECT_TRUE(disposition.canceled);
   EXPECT_FALSE(disposition.recovery_locked);
+}
+
+TEST(FloorTransitionExecutor, FailedSwitchWithReleasedResourcesDoesNotBecomeGlobalLock)
+{
+  FloorTransitionExecutionResult result;
+  result.state = FloorTransitionState::kFailed;
+  result.failure_code = "FILTER_LOAD_FAILED";
+  result.runtime_context_valid = false;
+  result.recovery_required = false;
+
+  const auto disposition = floor_transition_failure_disposition(result);
+
+  EXPECT_STREQ(disposition.state, "FAILED");
+  EXPECT_STREQ(disposition.stage, "FAILED");
+  EXPECT_FALSE(disposition.recovery_locked);
+  EXPECT_FALSE(result.runtime_context_valid);
 }
 
 TEST(FloorTransitionExecutor, PublishesStablePauseHandoffStageAfterBegin)

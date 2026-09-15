@@ -79,7 +79,7 @@ private:
   bool tracked_process_running_locked();
   bool recover_process_locked();
   MappingProcessSnapshot snapshot_locked(bool running) const;
-  std::size_t terminate_process_groups_locked();
+  std::size_t terminate_process_groups_locked(pid_t tracked_pid);
   std::size_t terminate_residual_processes() const;
   std::size_t restore_lidar_rps_xps_state() const;
   void update_runtime_state(
@@ -92,7 +92,10 @@ private:
   MappingProcessRuntimeConfig config_;
   RuntimeStateCallback runtime_state_callback_;
   LogCallback log_callback_;
+  // Serialize ownership changes, not status reads, across child-exit waits.
+  std::mutex operation_mutex_;
   mutable std::mutex mutex_;
+  bool stopping_{false};
   pid_t pid_{-1};
   bool active_{false};
   std::chrono::steady_clock::time_point started_at_{};

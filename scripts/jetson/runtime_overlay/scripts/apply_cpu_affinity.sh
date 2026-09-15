@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export NJRH_OVERLAY_ROOT="${NJRH_OVERLAY_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 source "${SCRIPT_DIR}/cpu_affinity.sh"
+source "${SCRIPT_DIR}/imu_pipeline_helpers.sh"
 
 apply_pattern() {
   local service_name="$1"
@@ -35,6 +36,7 @@ apply_pattern pointcloud_axis_remap "pointcloud_axis_remap"
 apply_pattern pointcloud_downsample "pointcloud_downsample"
 apply_pattern pointcloud_fastlio_remap "pointcloud_fastlio_remap"
 apply_pattern imu_axis_remap "imu_axis_remap"
+njrh_apply_imu_pipeline_host_affinity
 apply_pattern nav_cloud_preprocessor "nav_cloud_preprocessor"
 apply_pattern robot_local_perception "local_perception_node"
 

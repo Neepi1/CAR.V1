@@ -15,6 +15,9 @@
 #include "nav_msgs/msg/path.hpp"
 #include "rclcpp_lifecycle/lifecycle_publisher.hpp"
 #include "robot_nav_config/goal_scope_tracker.hpp"
+#include "robot_nav_config/ordinary_local_path_repair_runtime.hpp"
+#include "robot_nav_config/navigation_recovery/recovery_state.hpp"
+#include "robot_nav_config/srv/prepare_ordinary_navigation_recovery.hpp"
 #include "robot_nav_config/startup_alignment_guard.hpp"
 #include "robot_nav_config/terminal_pose_handoff.hpp"
 #include "std_msgs/msg/bool.hpp"
@@ -37,6 +40,7 @@ public:
 
   void activate() override;
   void deactivate() override;
+  void cleanup() override;
   void setPlan(const nav_msgs::msg::Path & path) override;
 
   geometry_msgs::msg::TwistStamped computeVelocityCommands(
@@ -80,6 +84,12 @@ private:
     terminal_lateral_permit_pub_;
   rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::Bool>::SharedPtr
     terminal_reverse_permit_pub_;
+  std::unique_ptr<OrdinaryLocalPathRepairRuntime> ordinary_local_repair_runtime_;
+  std::shared_ptr<navigation_recovery::RecoveryState> ordinary_recovery_state_;
+  rclcpp::Service<robot_nav_config::srv::PrepareOrdinaryNavigationRecovery>::SharedPtr
+    ordinary_recovery_service_;
+  bool recovery_alignment_active_{false};
+  bool recovery_alignment_logged_{false};
   bool rotate_to_heading_once_{true};
   double goal_change_xy_threshold_{0.01};
   double goal_change_yaw_threshold_{0.01};

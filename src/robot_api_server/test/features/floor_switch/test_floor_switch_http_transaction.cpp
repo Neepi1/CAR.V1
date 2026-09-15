@@ -27,18 +27,19 @@ robot_api_server::FloorSwitchHttpRuntimeContext ready_runtime()
     7U};
 }
 
-TEST(FloorSwitchHttpTransaction, BlocksSubmissionUntilSourceRuntimeIsReady)
+TEST(FloorSwitchHttpTransaction, AllowsSubmissionAfterSourceLocalizationFailed)
 {
   auto runtime = ready_runtime();
   runtime.confirmed = false;
-  runtime.state = "starting";
+  runtime.state = "failed";
+  runtime.explicit_relocalization_sequence = 0U;
 
   const auto decision =
     robot_api_server::evaluate_floor_switch_runtime_admission(target(), runtime);
 
-  EXPECT_FALSE(decision.permitted);
+  EXPECT_TRUE(decision.permitted);
   EXPECT_FALSE(decision.already_active);
-  EXPECT_EQ(decision.code, "FLOOR_SWITCH_RUNTIME_NOT_READY");
+  EXPECT_EQ(decision.code, "OK");
 }
 
 TEST(FloorSwitchHttpTransaction, RecognizesExactActiveTargetAsIdempotent)
@@ -52,7 +53,7 @@ TEST(FloorSwitchHttpTransaction, RecognizesExactActiveTargetAsIdempotent)
   EXPECT_EQ(decision.code, "FLOOR_SWITCH_ALREADY_ACTIVE");
 }
 
-TEST(FloorSwitchHttpTransaction, RejectsSameMapIdWithDifferentAssetIdentity)
+TEST(FloorSwitchHttpTransaction, ReloadsSameMapIdWithDifferentAssetIdentity)
 {
   auto runtime = ready_runtime();
   ++runtime.asset_epoch;
@@ -60,8 +61,27 @@ TEST(FloorSwitchHttpTransaction, RejectsSameMapIdWithDifferentAssetIdentity)
   const auto decision =
     robot_api_server::evaluate_floor_switch_runtime_admission(target(), runtime);
 
-  EXPECT_FALSE(decision.permitted);
-  EXPECT_EQ(decision.code, "FLOOR_SWITCH_RUNTIME_IDENTITY_MISMATCH");
+  EXPECT_TRUE(decision.permitted);
+  EXPECT_FALSE(decision.already_active);
+  EXPECT_EQ(decision.code, "OK");
+}
+
+TEST(FloorSwitchHttpTransaction, MissingOrUnlocalizedSourceNeverMakesTargetANoop)
+{
+  auto runtime = ready_runtime();
+  runtime.available = false;
+  for (const auto & state : {"starting", "failed", "ready", ""}) {
+    runtime.state = state;
+    const auto decision =
+      robot_api_server::evaluate_floor_switch_runtime_admission(target(), runtime);
+    EXPECT_TRUE(decision.permitted);
+    EXPECT_FALSE(decision.already_active);
+  }
+  runtime = ready_runtime();
+  runtime.explicit_relocalization_sequence = 0U;
+  EXPECT_TRUE(robot_api_server::evaluate_floor_switch_runtime_admission(target(), runtime).permitted);
+  EXPECT_FALSE(robot_api_server::evaluate_floor_switch_runtime_admission(target(), runtime).already_active);
+  EXPECT_TRUE(robot_api_server::evaluate_floor_switch_runtime_admission(target(), {}).permitted);
 }
 
 TEST(FloorSwitchHttpTransaction, AllowsDifferentTargetFromReadySourceRuntime)

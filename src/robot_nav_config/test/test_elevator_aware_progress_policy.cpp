@@ -39,15 +39,21 @@ TEST(ElevatorAwareProgressPolicy, ExplicitWaitDoesNotConsumeMotionAllowance) {
       policy.check(origin, 25.0, ElevatorScopedProgressState::kWaitClear));
   EXPECT_TRUE(
       policy.check(origin, 50.0, ElevatorScopedProgressState::kReplanning));
+  EXPECT_TRUE(policy.check(
+      origin, 75.0,
+      ElevatorScopedProgressState::kOrdinaryLocalReplanning));
+  EXPECT_TRUE(policy.check(
+      origin, 100.0,
+      ElevatorScopedProgressState::kOrdinaryLocalWaitClear));
 
   // Resuming motion starts a fresh progress window instead of immediately
   // inheriting the time spent deliberately stopped.
   EXPECT_TRUE(
-      policy.check(origin, 50.1, ElevatorScopedProgressState::kTracking));
+      policy.check(origin, 100.1, ElevatorScopedProgressState::kTracking));
   EXPECT_TRUE(
-      policy.check(origin, 70.0, ElevatorScopedProgressState::kTracking));
+      policy.check(origin, 120.0, ElevatorScopedProgressState::kTracking));
   EXPECT_FALSE(
-      policy.check(origin, 70.2, ElevatorScopedProgressState::kTracking));
+      policy.check(origin, 120.2, ElevatorScopedProgressState::kTracking));
 }
 
 } // namespace

@@ -129,7 +129,7 @@ def test_ranger_lattice_is_opt_in_and_only_overrides_planner_server():
     assert "ranger_lattice)" in runtime
     assert "validate_ranger_mini3_lattice.py" in runtime
     assert "navigate_to_pose.xml" in runtime
-    assert "navigate_to_pose_ranger_lattice.xml" in runtime
+    assert "navigate_to_pose_ranger_lattice_recovery.xml" in runtime
     assert 'nav_to_pose_bt_xml:="${nav_to_pose_bt_xml}"' in runtime
     assert 'planner_profile_file:="${planner_profile_file}"' in runtime
     assert 'ranger_lattice_filepath:="${ranger_lattice_file}"' in runtime

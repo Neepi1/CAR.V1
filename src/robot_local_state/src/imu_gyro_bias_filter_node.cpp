@@ -23,6 +23,8 @@
 #include "tf2_ros/transform_listener.h"
 
 #include "robot_local_state/stationary_gate.hpp"
+#include "robot_local_state/imu_rotation_cache.hpp"
+#include "robot_local_state/imu_node_factory.hpp"
 
 namespace
 {
@@ -52,60 +54,15 @@ double stamp_seconds(const builtin_interfaces::msg::Time & stamp)
   return static_cast<double>(stamp.sec) + static_cast<double>(stamp.nanosec) * 1e-9;
 }
 
-geometry_msgs::msg::Vector3 rotate_vector(
-  const geometry_msgs::msg::Vector3 & input,
-  const tf2::Matrix3x3 & rotation_matrix)
-{
-  const tf2::Vector3 rotated = rotation_matrix * tf2::Vector3(input.x, input.y, input.z);
-  geometry_msgs::msg::Vector3 output;
-  output.x = rotated.x();
-  output.y = rotated.y();
-  output.z = rotated.z();
-  return output;
-}
-
-std::array<double, 9> rotate_covariance(
-  const std::array<double, 9> & covariance,
-  const tf2::Matrix3x3 & rotation_matrix)
-{
-  std::array<double, 9> rotated{};
-  for (int row = 0; row < 3; ++row) {
-    for (int col = 0; col < 3; ++col) {
-      double value = 0.0;
-      for (int left = 0; left < 3; ++left) {
-        for (int right = 0; right < 3; ++right) {
-          value += rotation_matrix[row][left] * covariance[left * 3 + right] *
-            rotation_matrix[col][right];
-        }
-      }
-      rotated[row * 3 + col] = value;
-    }
-  }
-  return rotated;
-}
-
-tf2::Matrix3x3 rotation_matrix_from_quaternion(
-  const geometry_msgs::msg::Quaternion & quaternion_msg)
-{
-  tf2::Quaternion quaternion(
-    quaternion_msg.x,
-    quaternion_msg.y,
-    quaternion_msg.z,
-    quaternion_msg.w);
-  if (quaternion.length2() <= 0.0) {
-    quaternion.setValue(0.0, 0.0, 0.0, 1.0);
-  } else {
-    quaternion.normalize();
-  }
-  return tf2::Matrix3x3(quaternion);
-}
 }  // namespace
 
 class ImuGyroBiasFilterNode : public rclcpp::Node
 {
 public:
-  ImuGyroBiasFilterNode()
-  : Node("imu_gyro_bias_filter")
+  explicit ImuGyroBiasFilterNode(
+    const rclcpp::NodeOptions & options = rclcpp::NodeOptions(),
+    bool intra_process_input = false)
+  : Node("imu_gyro_bias_filter", rclcpp::NodeOptions(options).use_intra_process_comms(false))
   {
     imu_topic_ = declare_parameter<std::string>("imu_topic", "/lidar_imu");
     odom_topic_ = declare_parameter<std::string>("odom_topic", "/wheel/odom_ekf");
@@ -191,10 +148,14 @@ public:
         rclcpp::QoS(20),
         std::bind(&ImuGyroBiasFilterNode::on_cmd_vel, this, std::placeholders::_1));
     }
+    rclcpp::SubscriptionOptions imu_subscription_options;
+    imu_subscription_options.use_intra_process_comm = intra_process_input ?
+      rclcpp::IntraProcessSetting::Enable : rclcpp::IntraProcessSetting::Disable;
     imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
       imu_topic_,
       rclcpp::SensorDataQoS(),
-      std::bind(&ImuGyroBiasFilterNode::on_imu, this, std::placeholders::_1));
+      std::bind(&ImuGyroBiasFilterNode::on_imu, this, std::placeholders::_1),
+      imu_subscription_options);
 
     if (corrected_output_latest_on_timer_) {
       corrected_output_timer_ = create_wall_timer(
@@ -481,15 +442,9 @@ private:
         corrected.header.frame_id,
         rclcpp::Time(0),
         rclcpp::Duration::from_seconds(transform_lookup_timeout_sec_));
-      const auto rotation_matrix = rotation_matrix_from_quaternion(transform.transform.rotation);
-      corrected.angular_velocity = rotate_vector(corrected.angular_velocity, rotation_matrix);
-      corrected.linear_acceleration = rotate_vector(corrected.linear_acceleration, rotation_matrix);
-      corrected.angular_velocity_covariance = rotate_covariance(
-        corrected.angular_velocity_covariance,
-        rotation_matrix);
-      corrected.linear_acceleration_covariance = rotate_covariance(
-        corrected.linear_acceleration_covariance,
-        rotation_matrix);
+      // Cache arithmetic only, never TF availability. A changed transform or
+      // covariance is recomputed immediately; lookup failure keeps its old policy.
+      output_rotation_cache_.apply(corrected, transform.transform.rotation);
       corrected.header.frame_id = output_target_frame_;
       return true;
     } catch (const tf2::TransformException & ex) {
@@ -579,6 +534,7 @@ private:
   std::uint64_t output_transform_failure_count_{0};
 
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+  robot_local_state::ImuRotationCache output_rotation_cache_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr corrected_imu_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr bias_pub_;
@@ -589,6 +545,19 @@ private:
   rclcpp::TimerBase::SharedPtr bias_publish_timer_;
 };
 
+namespace robot_local_state
+{
+
+std::shared_ptr<rclcpp::Node> make_imu_gyro_bias_filter_node(
+  const rclcpp::NodeOptions & options,
+  bool intra_process_input)
+{
+  return std::make_shared<ImuGyroBiasFilterNode>(options, intra_process_input);
+}
+
+}  // namespace robot_local_state
+
+#ifndef ROBOT_IMU_LIBRARY_ONLY
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
@@ -596,3 +565,4 @@ int main(int argc, char ** argv)
   rclcpp::shutdown();
   return 0;
 }
+#endif  // ROBOT_IMU_LIBRARY_ONLY

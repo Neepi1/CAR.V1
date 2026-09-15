@@ -19,6 +19,7 @@
 #include "ranger_msgs/msg/motion_state.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "robot_docking_manager/near_field_docking_controller.hpp"
+#include "robot_interfaces/msg/dock_safety_interlock_state.hpp"
 #include "robot_interfaces/msg/dock_target_observation.hpp"
 #include "sensor_msgs/msg/battery_state.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
@@ -113,6 +114,13 @@ public:
     } else {
       throw std::invalid_argument("unsupported observation_backend: " + observation_backend_);
     }
+
+    dock_interlock_sub_ = create_subscription<robot_interfaces::msg::DockSafetyInterlockState>(
+      dock_interlock_state_topic_, rclcpp::QoS(1).reliable().transient_local(),
+      [this](robot_interfaces::msg::DockSafetyInterlockState::SharedPtr msg) {
+        latest_dock_interlock_ = std::move(msg);
+        last_dock_interlock_time_ = now();
+      });
 
     battery_sub_ = create_subscription<sensor_msgs::msg::BatteryState>(
       charging_state_topic_, rclcpp::QoS(10),
@@ -259,6 +267,10 @@ private:
     stop_service_ = declare_parameter<std::string>("stop_service", "/docking/stop");
     undock_service_ = declare_parameter<std::string>("undock_service", "/docking/undock");
     charging_state_topic_ = declare_parameter<std::string>("charging_state_topic", "/battery_state");
+    dock_interlock_state_topic_ = declare_parameter<std::string>(
+      "dock_safety_interlock_state_topic", "/safety/dock_interlock_state");
+    dock_interlock_max_age_sec_ = std::max(0.1, declare_parameter<double>(
+      "dock_safety_interlock_state_max_age_sec", 1.0));
     docking_contact_latch_file_ = declare_parameter<std::string>(
       "docking_contact_latch_file",
       "/workspaces/njrh-v3/workspace1/maps_release/docking_contact_latch.json");
@@ -552,6 +564,22 @@ private:
     publish_status(reason);
   }
 
+  bool safety_memory_allows_undock() const
+  {
+    if (!latest_dock_interlock_ || !latest_dock_interlock_->enabled ||
+      !latest_dock_interlock_->active || !latest_dock_interlock_->memory_latched)
+    {
+      return false;
+    }
+    const auto stamp = now();
+    const auto source_stamp = rclcpp::Time(latest_dock_interlock_->stamp);
+    const double source_age = (stamp - source_stamp).seconds();
+    const double receipt_age = (stamp - last_dock_interlock_time_).seconds();
+    return source_stamp.nanoseconds() > 0 && source_age >= 0.0 &&
+           source_age <= dock_interlock_max_age_sec_ && receipt_age >= 0.0 &&
+           receipt_age <= dock_interlock_max_age_sec_;
+  }
+
   bool start_undocking(std::string & message)
   {
     if (state_ == State::ContactStopping) {
@@ -566,11 +594,14 @@ private:
     charging_detected_ = latest_battery_ && battery_indicates_charging(*latest_battery_);
     charging_contact_detected_ = latest_battery_ && battery_indicates_charging_contact(*latest_battery_);
     const bool dock_latch_detected = dock_contact_latch_is_docked();
+    const bool safety_memory_detected = safety_memory_allows_undock();
     if (state_ == State::Undocking) {
       message = "undocking already active";
       return true;
     }
-    if (state_ != State::Docked && !charging_contact_detected_ && !dock_latch_detected) {
+    if (state_ != State::Docked && !charging_contact_detected_ && !dock_latch_detected &&
+      !safety_memory_detected)
+    {
       message = "undock rejected: robot is not docked and no charging contact is detected";
       publish_status("undock_rejected_not_docked");
       return false;
@@ -583,8 +614,12 @@ private:
     publish_park(false);
     publish_forced_mode(release_forced_mode_);
     publish_reverse_enable(true);
-    message = "undocking started";
-    publish_status("undocking preparing phase=preparing cmd_count=0 reverse_enable=true reverse_enable_count=1");
+    // Memory authorizes this explicit recovery request, never a synthetic Docked state.
+    message = safety_memory_detected ?
+      "undocking started reason=safety_memory_latch" : "undocking started";
+    publish_status(std::string(
+      "undocking preparing phase=preparing cmd_count=0 reverse_enable=true reverse_enable_count=1") +
+      (safety_memory_detected ? " admission=safety_memory_latch" : " admission=dock_contact"));
     return true;
   }
 
@@ -2106,6 +2141,8 @@ private:
   std::string stop_service_;
   std::string undock_service_;
   std::string charging_state_topic_;
+  std::string dock_interlock_state_topic_;
+  double dock_interlock_max_age_sec_{1.0};
   std::string docking_contact_latch_file_;
   mutable bool have_last_dock_contact_latch_write_{false};
   mutable bool last_dock_contact_latch_docked_{false};
@@ -2261,6 +2298,7 @@ private:
   Detection filtered_detection_;
   rclcpp::Time state_entered_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_scan_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_dock_interlock_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_target_observation_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_odom_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_wheel_odom_time_{0, 0, RCL_ROS_TIME};
@@ -2278,6 +2316,7 @@ private:
   sensor_msgs::msg::LaserScan::SharedPtr latest_scan_;
   robot_interfaces::msg::DockTargetObservation::SharedPtr latest_target_observation_;
   sensor_msgs::msg::BatteryState::SharedPtr latest_battery_;
+  robot_interfaces::msg::DockSafetyInterlockState::SharedPtr latest_dock_interlock_;
   nav_msgs::msg::Odometry::SharedPtr latest_odom_;
   nav_msgs::msg::Odometry::SharedPtr latest_wheel_odom_;
   ranger_msgs::msg::MotionState::SharedPtr latest_motion_state_;
@@ -2287,6 +2326,7 @@ private:
   rclcpp::Subscription<robot_interfaces::msg::DockTargetObservation>::SharedPtr
     target_observation_sub_;
   rclcpp::Subscription<sensor_msgs::msg::BatteryState>::SharedPtr battery_sub_;
+  rclcpp::Subscription<robot_interfaces::msg::DockSafetyInterlockState>::SharedPtr dock_interlock_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr wheel_odom_sub_;
   rclcpp::Subscription<ranger_msgs::msg::MotionState>::SharedPtr motion_state_sub_;

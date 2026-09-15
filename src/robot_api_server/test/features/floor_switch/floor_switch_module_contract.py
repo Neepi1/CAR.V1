@@ -67,6 +67,17 @@ def main() -> None:
     require(header, "FloorRuntimeInterlockDecision interlock_decision", args.module_header)
     require(header, "void shutdown()", args.module_header)
 
+    # Both runtime callers and HTTP admission must carry the exact operation to
+    # the same policy. A generic decision here would reintroduce the asset lock.
+    require(module, "return interlock_.decision_for_operation(operation);", args.module_source)
+    for signature, following in (
+        ("bool operation_blocked(", "std::optional<HttpResponse> interlock_response("),
+        ("std::optional<HttpResponse> interlock_response(", "void shutdown()"),
+    ):
+        body = module.split(signature, 1)[1].split(following, 1)[0]
+        require(body, "interlock_decision(operation)", args.module_source)
+        forbid(body, "interlock_decision()", args.module_source)
+
     for route in (
         "/api/v1/floor-switch/start",
         "/api/v1/floor-switch/state",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 from pathlib import Path
 
 from launch import LaunchDescription
@@ -20,6 +21,15 @@ def cpu_affinity_prefix(service_name: str) -> str | None:
     cpuset = os.environ.get(f"NJRH_CPUSET_{key}", "")
     if not cpuset:
         return None
+    session = os.environ.get("NJRH_STARTUP_CPU_SESSION", "")
+    if (session and os.environ.get("NJRH_NAVIGATION_CPU_PROFILE") == "navigation_5cpu"
+            and key in ("POINTCLOUD_ACCEL_CONTAINER", "LASER_SCAN_TO_FLATSCAN")):
+        overlay = Path(os.environ.get("NJRH_OVERLAY_ROOT", Path(__file__).resolve().parents[1]))
+        return shlex.join([
+            "python3", (overlay / "scripts/startup_cpu_affinity.py").as_posix(),
+            "exec", "--session", session, "--steady-cpus", cpuset,
+            "--role", key.lower(), "--",
+        ])
     return f"taskset -c {cpuset}"
 
 

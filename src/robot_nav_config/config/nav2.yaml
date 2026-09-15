@@ -137,7 +137,7 @@ controller_server:
     failure_tolerance: 10.0
     progress_checker_plugin: "progress_checker"
     goal_checker_plugins: ["goal_checker", "dock_staging_goal_checker"]
-    controller_plugins: ["FollowPath", "FollowPathFallback", "ElevatorFollowPath", "ElevatorHallFollowPath", "ElevatorReverseEntryStagingFollowPath", "ElevatorReverseDockingFollowPath", "ElevatorCabinEntryDirectFollowPath"]
+    controller_plugins: ["FollowPath", "FollowPathFallback", "ElevatorFollowPath", "ElevatorHallFollowPath", "ElevatorReverseEntryStagingFollowPath", "ElevatorReverseDockingFollowPath", "ElevatorCabinEntryDirectFollowPath", "ElevatorCabinPanelFollowPath"]
     progress_checker:
       # Ordinary navigation retains the proven PoseProgressChecker limits.
       # A fresh typed state from ElevatorScopedController selects the
@@ -355,9 +355,39 @@ controller_server:
       lateral_permit_topic: /ranger_mini3/nav_terminal_lateral_enable
       reverse_permit_topic: /ranger_mini3/nav_terminal_reverse_enable
       progress_state_topic: /ranger_mini3/nav_elevator_scoped_progress_state
+    ElevatorCabinPanelFollowPath:
+      plugin: "robot_nav_config::ElevatorScopedController"
+      max_distance_m: 2.5
+      goal_xy_tolerance_m: 0.06
+      goal_yaw_tolerance_rad: 0.05
+      yaw_max_speed_radps: 0.50
+      lateral_max_speed_mps: 0.20
+      forward_max_speed_mps: 0.40
+      reverse_max_speed_mps: 0.40
+      total_timeout_sec: 60.0
+      command_clearance_check_enabled: false
+      route_revision_enabled: false
+      localization_replan_enabled: false
+      lateral_permit_topic: /ranger_mini3/nav_terminal_lateral_enable
+      reverse_permit_topic: /ranger_mini3/nav_terminal_reverse_enable
+      progress_state_topic: /ranger_mini3/nav_elevator_scoped_progress_state
     FollowPath:
       plugin: "robot_nav_config::GoalScopedRotationShimController"
-      primary_controller: "nav2_mppi_controller::MPPIController"
+      primary_controller: "robot_nav_config::RangerMPPIController"
+      RangerDynamics:
+        enabled: true
+        # CAN 2026-06-30: fitted on 011801/013101; held out 011908/013457.
+        linear_delay_sec: 0.11
+        linear_tau_sec: 0.01823
+        acceleration_mps2: 0.61888
+        deceleration_mps2: 1.80150
+        steering_delay_sec: 0.11
+        steering_tau_sec: 0.05402
+        wheelbase_m: 0.494
+        track_m: 0.364
+        # Prediction of the existing downstream smoother, not a second output limiter.
+        smoother_max_accel: [0.55, 0.20, 0.90]
+        smoother_max_decel: [-0.95, -0.30, -1.10]
       # Humble's stock RotationShim re-arms on every setPlan(). Keep periodic
       # global replanning, but only arm startup heading alignment when the
       # navigation goal itself changes. Terminal goal-yaw rotation is separate
@@ -413,6 +443,28 @@ controller_server:
       terminal_handoff_costmap_lookahead_m: 0.15
       terminal_handoff_lateral_permit_topic: /ranger_mini3/nav_terminal_lateral_enable
       terminal_handoff_reverse_permit_topic: /ranger_mini3/nav_terminal_reverse_enable
+      # The rolling local costmap is the only navigation map that contains
+      # people and other transient obstacles. When they persistently invalidate
+      # the active path, repair its prefix with forward-only Hybrid A* and feed
+      # the replacement to the same MPPI FollowPath action.
+      ordinary_local_repair_enabled: true
+      ordinary_local_repair_collision_margin_m: 0.08
+      ordinary_local_repair_minimum_goal_distance_m: 0.75
+      ordinary_local_repair_inspection_period_sec: 0.20
+      ordinary_local_repair_persistence_sec: 0.20
+      ordinary_local_repair_retry_period_sec: 0.50
+      ordinary_local_repair_minimum_turning_radius_m: 0.81
+      ordinary_local_repair_lookahead_distance_m: 4.0
+      ordinary_local_repair_rejoin_distance_m: 0.80
+      ordinary_local_repair_goal_tolerance_m: 0.05
+      ordinary_local_repair_max_planning_time_sec: 0.40
+      ordinary_local_repair_lookup_table_size_m: 5.0
+      ordinary_local_repair_analytic_expansion_max_length_m: 4.05
+      ordinary_local_repair_max_iterations: 60000
+      ordinary_local_repair_max_on_approach_iterations: 500
+      ordinary_local_repair_angle_quantization_bins: 72
+      ordinary_local_repair_progress_topic: /ranger_mini3/nav_elevator_scoped_progress_state
+      ordinary_local_repair_path_topic: /ranger_mini3/ordinary_local_repair_path
       simulate_ahead_time: 1.0
       # RotationShim owns ordinary pose_required terminal heading and docking
       # predock staging heading before the Nav2 action succeeds.
@@ -439,15 +491,14 @@ controller_server:
       vy_std: 0.0
       wz_std: 0.32
       vx_max: 1.20
-      # Allow only a low-speed terminal reverse correction. PreferForwardCritic
-      # keeps long-range path following forward-biased, while this gives MPPI a
-      # way to recover the measured near-goal forward overshoot instead of
-      # stalling outside the 6 cm goal checker tolerance.
-      vx_min: -0.08
+      # Ordinary MPPI must not optimize reverse trajectories rejected downstream.
+      # Near-goal overshoot is owned by the permitted terminal handoff instead.
+      vx_min: 0.0
       vy_max: 0.0
       wz_max: 0.70
       critics:
         - "ObstaclesCritic"
+        - "RangerClearanceCritic"
         - "GoalCritic"
         - "GoalAngleCritic"
         - "PathAlignCritic"
@@ -481,6 +532,15 @@ controller_server:
         inflation_radius: 0.60
         cost_scaling_factor: 6.0
         inflation_layer_name: "local_inflation_layer"
+      # Separate finite planning preference, NOT footprint_padding or a stop gate.
+      # Same width is consumed by local repair; native collision/clearing stay unchanged.
+      RangerClearanceCritic:
+        enabled: true
+        stop_half_x: 0.47
+        stop_half_y: 0.36
+        preferred_margin: 0.05
+        cost_weight: 30.0
+        near_goal_distance: 0.75
       PathAlignCritic:
         enabled: true
         cost_power: 1
@@ -493,9 +553,7 @@ controller_server:
       PathFollowCritic:
         enabled: true
         cost_power: 1
-        # Keep long-range goals from falling into the low-speed terminal
-        # correction local optimum after vx_min is opened for final overshoot
-        # recovery.
+        # Keep the existing forward path-following weight.
         cost_weight: 7.0
         offset_from_furthest: 10
         threshold_to_consider: 0.35
@@ -514,9 +572,7 @@ controller_server:
       PreferForwardCritic:
         enabled: true
         cost_power: 1
-        # Strongly bias long-range samples forward; this critic drops out near
-        # the goal so the bounded -0.08 m/s terminal reverse correction remains
-        # available.
+        # Retain the existing preference; vx_min enforces forward-only sampling.
         cost_weight: 20.0
         threshold_to_consider: 0.50
       VelocityDeadbandCritic:
@@ -577,6 +633,7 @@ bt_navigator:
     default_nav_to_pose_bt_xml: /workspaces/njrh-v3/workspace1/install/robot_nav_config/share/robot_nav_config/behavior_trees/navigate_to_pose.xml
     default_nav_through_poses_bt_xml: /workspaces/njrh-v3/workspace1/install/robot_nav_config/share/robot_nav_config/behavior_trees/navigate_through_poses.xml
     plugin_lib_names:
+      - ordinary_navigation_recovery_bt_node
       - nav2_compute_path_to_pose_action_bt_node
       - nav2_compute_path_through_poses_action_bt_node
       - nav2_follow_path_action_bt_node
@@ -734,9 +791,9 @@ collision_monitor:
     polygons: ["StopZone", "SlowZone", "FootprintApproach"]
     StopZone:
       type: "polygon"
-      # Physical footprint (0.36 x 0.25 m half extents) + 0.03 m costmap
-      # padding + 0.08 m MPPI margin, rounded outward to the 0.05 m grid.
-      points: [0.50, 0.40, 0.50, -0.40, -0.50, -0.40, -0.50, 0.40]
+      # 8 cm visible band outside the unchanged scan mask (0.39 x 0.28 m).
+      # Planning prefers a further 5 cm; neither expands footprint clearing.
+      points: [0.47, 0.36, 0.47, -0.36, -0.47, -0.36, -0.47, 0.36]
       action_type: "stop"
       # Two adjacent scan returns stop the robot; one isolated return is treated
       # as noise. The failed 2026-09-07 trace had two returns before MPPI failed.

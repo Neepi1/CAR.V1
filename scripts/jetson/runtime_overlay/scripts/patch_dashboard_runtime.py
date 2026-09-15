@@ -93,7 +93,10 @@ NEW_DRIVER_READY_BLOCK = """    def _driver_stack_running(self) -> bool:
         return (
             self._process_exists('hesai_ros_driver_node')
             and self._process_exists('pointcloud_axis_remap')
-            and self._process_exists('imu_axis_remap')
+            and (
+                self._process_exists('imu_axis_remap')
+                or self._process_exists('[/]imu_pipeline_node( |$)')
+            )
         )
 
     def _driver_axis_status(self) -> dict:
@@ -207,12 +210,12 @@ NEW_DRIVER_READY_BLOCK = """    def _driver_stack_running(self) -> bool:
         needs_restart = False
         if needs_restart:
             self._stop('driver')
-            self._kill_patterns(['hesai_ros_driver_node', 'ros2 run hesai_ros_driver', 'pointcloud_axis_remap', 'imu_axis_remap'])
+            self._kill_patterns(['hesai_ros_driver_node', 'ros2 run hesai_ros_driver', 'pointcloud_axis_remap', 'imu_axis_remap', '[/]imu_pipeline_node( |$)'])
             self.ros_state.clear_lidar_cache()
             actions.append(f'driver restarted with {profile} timestamp profile')
         elif self._driver_running() and not self._driver_stack_running():
             self._stop('driver')
-            self._kill_patterns(['hesai_ros_driver_node', 'ros2 run hesai_ros_driver', 'pointcloud_axis_remap', 'imu_axis_remap'])
+            self._kill_patterns(['hesai_ros_driver_node', 'ros2 run hesai_ros_driver', 'pointcloud_axis_remap', 'imu_axis_remap', '[/]imu_pipeline_node( |$)'])
             self.ros_state.clear_lidar_cache()
             actions.append('stale driver stack restarted for canonical lidar ingress')
         if not self._driver_running():

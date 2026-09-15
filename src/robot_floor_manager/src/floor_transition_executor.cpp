@@ -94,7 +94,6 @@ FloorTransitionFailureDisposition floor_transition_failure_disposition(
   FloorTransitionFailureDisposition disposition;
   disposition.recovery_locked =
     execution.recovery_required ||
-    !execution.runtime_context_valid ||
     execution.state == FloorTransitionState::kFailedLocked;
   disposition.canceled =
     execution.failure_code == "CANCELLED" &&
@@ -218,7 +217,13 @@ FloorTransitionExecutionResult FloorTransitionExecutor::terminal_result(
   result.message = message.empty() ? output.message : message;
   result.runtime_context_valid = output.runtime_context_valid;
   result.recovery_required = output.recovery_required;
-  if (result.success) {
+  const bool source_restored = !result.success &&
+    result.runtime_context_valid && !result.recovery_required &&
+    evidence.runtime_context_valid;
+  if (source_restored) {
+    result.message += "; source runtime restored; this floor switch failed, retry is allowed";
+  }
+  if (result.success || source_restored) {
     result.active_building_id = evidence.active_building_id;
     result.active_floor_id = evidence.active_floor_id;
     result.active_map_id = evidence.active_map_id;

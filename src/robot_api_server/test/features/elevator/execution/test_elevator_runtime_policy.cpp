@@ -25,6 +25,7 @@ using robot_api_server::ElevatorPreparedSourceEvidence;
 using robot_api_server::ElevatorTargetMapPoseTracker;
 using robot_api_server::RetainedRecoveryCancelResponse;
 using robot_api_server::assess_elevator_cleanup_runtime_identity;
+using robot_api_server::check_elevator_cleanup_runtime_readiness;
 using robot_api_server::assess_elevator_motion_admission;
 using robot_api_server::elevator_cleanup_context_equal;
 using robot_api_server::elevator_cleanup_context_rebind_allowed;
@@ -50,6 +51,54 @@ using robot_elevator_manager::ElevatorRuntimePose;
 using robot_elevator_manager::FrozenElevatorRelease;
 using robot_elevator_manager::PoseRole;
 using robot_elevator_manager::PanelSide;
+
+TEST(ElevatorRuntimePolicy, NonpersistentCleanupDoesNotWaitForUnlocalizedRuntime)
+{
+  for (const auto disposition : {ElevatorCleanupDisposition::kSourceOutside,
+      ElevatorCleanupDisposition::kTargetOutside}) {
+    int readiness_calls = 0;
+    const auto result = check_elevator_cleanup_runtime_readiness(
+      false, disposition, [&readiness_calls]() {
+        ++readiness_calls;
+        return robot_elevator_manager::ElevatorRuntimeResult{
+          false, "ELEVATOR_CLEANUP_RUNTIME_CONTEXT_UNPROVEN", "ABORTED_CONTEXT_INVALID"};
+      });
+    EXPECT_TRUE(result.success);
+    EXPECT_EQ(readiness_calls, 0);
+    EXPECT_FALSE(result.safety_hold_proven);
+    EXPECT_FALSE(result.safety_hold_absence_proven);
+    EXPECT_FALSE(result.dual_odom_stop_proven);
+    EXPECT_FALSE(result.runtime_resources_reconciled);
+  }
+}
+
+TEST(ElevatorRuntimePolicy, PersistentCleanupRetainsExactReadinessFailure)
+{
+  int readiness_calls = 0;
+  const auto result = check_elevator_cleanup_runtime_readiness(
+    true, ElevatorCleanupDisposition::kSourceOutside, [&readiness_calls]() {
+      ++readiness_calls;
+      return robot_elevator_manager::ElevatorRuntimeResult{
+        false, "ELEVATOR_CLEANUP_RUNTIME_CONTEXT_UNPROVEN", "ABORTED_CONTEXT_INVALID"};
+    });
+  EXPECT_FALSE(result.success);
+  EXPECT_EQ(result.code, "ELEVATOR_CLEANUP_RUNTIME_CONTEXT_UNPROVEN");
+  EXPECT_EQ(result.detail, "ABORTED_CONTEXT_INVALID");
+  EXPECT_EQ(readiness_calls, 1);
+}
+
+TEST(ElevatorRuntimePolicy, NonpersistentCleanupDoesNotTurnRetainLockIntoOutside)
+{
+  int readiness_calls = 0;
+  const auto result = check_elevator_cleanup_runtime_readiness(
+    false, ElevatorCleanupDisposition::kRetainLock, [&readiness_calls]() {
+      ++readiness_calls;
+      return robot_elevator_manager::ElevatorRuntimeResult{true, "OK", "ready"};
+    });
+  EXPECT_FALSE(result.success);
+  EXPECT_EQ(result.code, "ELEVATOR_CLEANUP_DISPOSITION_UNSAFE");
+  EXPECT_EQ(readiness_calls, 0);
+}
 
 ElevatorRuntimePose pose(
   const PoseRole role,
@@ -491,6 +540,29 @@ TEST(ElevatorRuntimePolicy, SourceLandingKeepsConfiguredHeading)
   EXPECT_NEAR(source_target->yaw, -1.5, 1.0e-9);
 }
 
+TEST(ElevatorRuntimePolicy, V2SourceLandingKeepsScopedTuningAndPostCallBypass)
+{
+  auto frozen = release();
+  frozen.schema_version = 2U;
+  ElevatorEffect effect;
+  effect.pose_id = "landing_f1";
+  effect.floor_id = "F1";
+  effect.map_id = "map_f1";
+  effect.navigation_intent = ElevatorNavigationIntent::kSourceLanding;
+
+  const auto request = resolve_elevator_navigation_request(frozen, effect);
+
+  ASSERT_TRUE(request.has_value());
+  EXPECT_EQ(request->profile, ElevatorNavigationProfile::kElevatorScoped);
+  EXPECT_EQ(
+    elevator_controller_id_for_profile(request->profile, request->target.role),
+    std::optional<std::string>{"ElevatorFollowPath"});
+  EXPECT_TRUE(elevator_navigation_bypasses_collision_monitor(request->navigation_intent));
+  EXPECT_NEAR(request->target.x, 0.0, 1.0e-9);
+  EXPECT_NEAR(request->target.y, 0.0, 1.0e-9);
+  EXPECT_NEAR(request->target.yaw, -1.5, 1.0e-9);
+}
+
 TEST(
   ElevatorRuntimePolicy,
   EnterCabinKeepsCommissionedCabinHeadingInsteadOfDoorChordOrLandingHeading)
@@ -772,6 +844,26 @@ TEST(ElevatorRuntimePolicy, ScopedProfilesResolveTheExactBehaviorTreeController)
     elevator_controller_id_for_profile(
       ElevatorNavigationProfile::kOrdinaryNav2, PoseRole::kHallCall)
     .has_value());
+}
+
+TEST(ElevatorRuntimePolicy, CabinPanelSelectsItsOwnControllerAndSiblingTree)
+{
+  using robot_api_server::elevator_cabin_behavior_tree_for_role;
+  const std::string direct = "/custom/trees/navigate_elevator_cabin_entry_direct.xml";
+  EXPECT_EQ(
+    elevator_controller_id_for_profile(
+      ElevatorNavigationProfile::kElevatorCabinDirect, PoseRole::kCabinPanel),
+    std::optional<std::string>{"ElevatorCabinPanelFollowPath"});
+  EXPECT_EQ(
+    elevator_cabin_behavior_tree_for_role(direct, PoseRole::kCabinPanel),
+    "/custom/trees/navigate_elevator_cabin_panel.xml");
+  for (const auto role : {PoseRole::kCabin, PoseRole::kLanding}) {
+    EXPECT_EQ(
+      elevator_controller_id_for_profile(
+        ElevatorNavigationProfile::kElevatorCabinDirect, role),
+      std::optional<std::string>{"ElevatorCabinEntryDirectFollowPath"});
+    EXPECT_EQ(elevator_cabin_behavior_tree_for_role(direct, role), direct);
+  }
 }
 
 TEST(ElevatorRuntimePolicy, ControllerSessionIdentityUsesEffectNotGoalPose)

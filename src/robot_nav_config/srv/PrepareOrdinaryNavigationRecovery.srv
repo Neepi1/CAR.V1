@@ -1,0 +1,14 @@
+# Nav2-internal path preparation, not a motion command or permission.
+# Only an actual progress failure after attempt_started is recoverable.
+# Only the exact post-failure path may consume the one-shot preparation.
+builtin_interfaces/Time attempt_started
+nav_msgs/Path path
+bool inspect_only
+builtin_interfaces/Time task_started
+---
+bool prepared
+string reason
+bool matched
+bool recoverable
+bool waiting
+uint64 progress_epoch

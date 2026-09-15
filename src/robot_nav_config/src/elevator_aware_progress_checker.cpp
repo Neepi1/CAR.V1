@@ -33,6 +33,7 @@ void ElevatorAwareProgressChecker::initialize(
   }
   logger_ = node->get_logger();
   clock_ = node->get_clock();
+  ordinary_recovery_state_ = navigation_recovery::for_node(node->get_node_base_interface().get());
   plugin_name_ = plugin_name;
 
   const auto declare_double = [&node, this](const char *suffix,
@@ -128,6 +129,14 @@ bool ElevatorAwareProgressChecker::check(
   last_elevator_scoped_ = elevator_scoped;
   const bool progressing =
       policy_->check(sample, now.seconds(), progress_state);
+  if (elevator_scoped) {
+    ordinary_recovery_state_->reset_progress();
+  } else {
+    ordinary_recovery_state_->observe_pose(sample.x, sample.y,
+      progress_state == ElevatorScopedProgressState::kOrdinaryLocalWaitClear,
+      now.nanoseconds(), current_pose.header.frame_id);
+    ordinary_recovery_state_->observe_progress(progressing, now.nanoseconds());
+  }
   if (profile_changed) {
     RCLCPP_INFO(logger_, "Progress checker profile changed to %s",
                 elevator_scoped ? "elevator_scoped" : "normal");
@@ -137,6 +146,9 @@ bool ElevatorAwareProgressChecker::check(
 
 void ElevatorAwareProgressChecker::reset() {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (ordinary_recovery_state_) {
+    ordinary_recovery_state_->reset_progress();
+  }
   if (policy_) {
     policy_->reset();
   }

@@ -1,0 +1,38 @@
+<!-- Persistent ordinary-task recovery. Predock and elevator trees do not select it.
+     Humble FollowPath has no error code: controller-side progress evidence
+     authorizes rearming only the exact post-failure path, never a timer. -->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <OrdinaryRecoveryLoop name="OrdinaryProgressRecovery">
+      <PipelineSequence name="NavigateRangerLatticeWithValidPath">
+        <RateController hz="1.0">
+          <Fallback name="KeepValidRangerLatticePath">
+            <ReactiveSequence name="CheckRangerLatticePath">
+              <Inverter><GlobalUpdatedGoal/></Inverter>
+              <IsPathValid path="{path}"/>
+            </ReactiveSequence>
+            <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+          </Fallback>
+        </RateController>
+        <OrdinaryFollowPath path="{path}" controller_id="FollowPath"
+          goal_checker_id="goal_checker" aborted="{ordinary_follow_aborted}"
+          attempt_started="{ordinary_attempt_started}"/>
+      </PipelineSequence>
+      <Sequence name="ReplanAndPrepareOrdinaryRetry">
+        <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+        <PrepareOrdinaryRecovery path="{path}" attempt_started="{ordinary_attempt_started}"/>
+        <!-- Follow exactly the prepared path. Do not pass back through the
+             valid-path selector and accidentally replace it before rearming. -->
+        <PipelineSequence name="RetryWithoutIgnoringOuterGoalUpdates">
+          <Fallback name="KeepPreparedPathUnlessGoalReplaced">
+            <OrdinaryPathTargetsGoal path="{path}" goal="{goal}"/>
+            <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+          </Fallback>
+          <OrdinaryFollowPath path="{path}" controller_id="FollowPath"
+            goal_checker_id="goal_checker" aborted="{ordinary_follow_aborted}"
+            attempt_started="{ordinary_attempt_started}"/>
+        </PipelineSequence>
+      </Sequence>
+    </OrdinaryRecoveryLoop>
+  </BehaviorTree>
+</root>

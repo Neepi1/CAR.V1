@@ -1,0 +1,7 @@
+<library path="ranger_dynamics_mppi_controller">
+  <class name="robot_nav_config::RangerMPPIController"
+         type="robot_nav_config::RangerMPPIController"
+         base_class_type="nav2_core::Controller">
+    <description>Humble MPPI optimizer with measured Ranger Ackermann response prediction.</description>
+  </class>
+</library>

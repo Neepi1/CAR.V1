@@ -13,7 +13,8 @@
    retains 30 seconds of history for the wrapper's 20-second result window and
    never substitutes latest TF;
 6. require explicit bridge sequence advance, settled bridge-owned
-   `map -> odom`, and goal-start readiness before returning success.
+   `map -> odom` before returning success. Navigation admission is not part of
+   localization completion; see [responsibility boundary](relocalization_completion_responsibility.md).
 
 The result contains `dispatch_state=not_dispatched|dispatched` on failures.
 Startup and FloorSwitch may retry only the former. A post-dispatch timeout may

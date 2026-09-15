@@ -73,7 +73,9 @@ public:
     GoalHandle::SharedPtr goal_handle,
     std::string pose_id,
     std::string building_id,
-    std::string floor_id);
+    std::string floor_id,
+    std::int64_t goal_stamp_ns = 0);
+  std::string recovery_phase(const GoalHandle::SharedPtr & goal_handle) const;
   GoalHandle::SharedPtr active_goal() const;
   NavigationTrackedGoalSnapshot tracked_goal_snapshot() const;
   NavigationActionStatusSnapshot status_snapshot() const;

@@ -78,6 +78,13 @@ ament_export_targets(export_correction_pause_arbiter HAS_LIBRARY_TARGET)
 ament_export_include_directories(include)
 
 if(BUILD_TESTING)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME isolated_correction_application
+    COMMAND ${CMAKE_COMMAND} -E env
+      ROS_DOMAIN_ID=219 ROS_LOCALHOST_ONLY=1 RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/isolated_correction_application.py
+      --bridge $<TARGET_FILE:localization_bridge_node>)
+  set_tests_properties(isolated_correction_application PROPERTIES TIMEOUT 45 RUN_SERIAL TRUE)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_se2_correction test/test_se2_correction.cpp)
   target_include_directories(test_se2_correction PRIVATE include)

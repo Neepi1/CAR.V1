@@ -42,6 +42,7 @@
 #include "tf2_ros/transform_listener.h"
 
 #include "robot_hesai_jt128/pointcloud_accel_core.hpp"
+#include "robot_hesai_jt128/detail/fused_normalization.hpp"
 #include "robot_hesai_jt128/scan_self_mask.hpp"
 
 namespace
@@ -952,9 +953,12 @@ private:
   }
 
   std::shared_ptr<LatestNormalizedBuffer> build_latest_normalized_buffer(
-    const sensor_msgs::msg::PointCloud2 & cloud)
+    const sensor_msgs::msg::PointCloud2 & cloud,
+    std::shared_ptr<LatestNormalizedBuffer> buffer = {})
   {
-    auto buffer = take_reusable_normalized_buffer();
+    if (!buffer) {
+      buffer = take_reusable_normalized_buffer();
+    }
     buffer->stamp = rclcpp::Time(cloud.header.stamp);
     buffer->frame_id = cloud.header.frame_id;
     buffer->seq = 0U;
@@ -1129,6 +1133,23 @@ private:
       output->point_step >= 3U * sizeof(float) &&
       (fast_path_raw_y_neg_raw_x || fast_path_neg_raw_y_neg_raw_x))
     {
+      auto normalized = take_reusable_normalized_buffer();
+      const auto previous_capacity = normalized->points.capacity();
+      const auto fused = robot_hesai_jt128::detail::try_fused_axis_normalize(
+        *output, rotation_, normalized->points);
+      if (fused.has_value()) {
+        if (normalized->points.capacity() > previous_capacity) {
+          ++normalized_buffer_allocation_count_;
+        }
+        normalized->stamp = rclcpp::Time(output->header.stamp);
+        normalized->frame_id = output->header.frame_id;
+        normalized->seq = 0U;
+        normalized->update_time = Clock::time_point{};
+        normalized->source_bytes = output->data.size();
+        normalized->has_intensity = *fused;
+        publish_fast_path(std::move(output), callback_start, std::move(normalized));
+        return;
+      }
       for (std::size_t index = 0U; index < point_count; ++index) {
         auto * point = output->data.data() + index * output->point_step;
         auto * xyz = reinterpret_cast<float *>(point);
@@ -1137,7 +1158,7 @@ private:
         xyz[0] = fast_path_raw_y_neg_raw_x ? raw_y : -raw_y;
         xyz[1] = -raw_x;
       }
-      auto normalized = build_latest_normalized_buffer(*output);
+      normalized = build_latest_normalized_buffer(*output, std::move(normalized));
       publish_fast_path(std::move(output), callback_start, std::move(normalized));
       return;
     }

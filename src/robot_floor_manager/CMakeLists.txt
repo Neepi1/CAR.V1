@@ -12,6 +12,7 @@ find_package(robot_interfaces REQUIRED)
 find_package(robot_map_asset_identity REQUIRED)
 find_package(robot_safety REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
 add_library(executor_runtime_policy
   src/executor_runtime_policy.cpp
@@ -86,6 +87,7 @@ add_library(runtime_map_context_writer
   src/runtime_map_context_writer.cpp
 )
 target_compile_features(runtime_map_context_writer PUBLIC cxx_std_17)
+target_link_libraries(runtime_map_context_writer yaml-cpp)
 target_include_directories(runtime_map_context_writer PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
@@ -137,10 +139,20 @@ install(
 
 ament_export_targets(export_floor_transition_core HAS_LIBRARY_TARGET)
 ament_export_include_directories(include)
-ament_export_dependencies(robot_map_asset_identity)
+ament_export_dependencies(robot_map_asset_identity yaml-cpp)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(ament_cmake_pytest REQUIRED)
+  find_package(robot_localization_bridge REQUIRED)
+  ament_add_gtest(test_floor_transition_cleanup test/test_floor_transition_cleanup.cpp)
+  target_link_libraries(test_floor_transition_cleanup
+    floor_transition_core
+    robot_localization_bridge::floor_transition_context
+  )
+  ament_add_pytest_test(test_floor_manager_cleanup_contract
+    test/test_floor_manager_cleanup_contract.py
+  )
   ament_add_gtest(
     test_executor_runtime_policy
     test/test_executor_runtime_policy.cpp
@@ -275,6 +287,27 @@ if(BUILD_TESTING)
     test/test_floor_switch_preflight.cpp
   )
   target_link_libraries(test_floor_switch_preflight floor_transition_core)
+
+  ament_add_gtest(test_floor_manager_startup_action
+    test/test_floor_manager_startup_action.cpp
+    TIMEOUT 90
+  )
+  target_compile_definitions(test_floor_manager_startup_action
+    PRIVATE ROBOT_FLOOR_MANAGER_DISABLE_MAIN
+  )
+  ament_target_dependencies(test_floor_manager_startup_action
+    action_msgs lifecycle_msgs nav_msgs nav2_msgs rclcpp rclcpp_action
+    robot_interfaces robot_map_asset_identity std_msgs
+  )
+  target_link_libraries(test_floor_manager_startup_action
+    navigate_action_graph floor_asset_snapshot_loader floor_transition_core
+    floor_transition_executor floor_transition_evidence_tracker
+    runtime_map_context_writer robot_safety::persistent_sequence_allocator
+  )
+  set_tests_properties(test_floor_manager_startup_action PROPERTIES
+    ENVIRONMENT "ROS_DOMAIN_ID=213;ROS_LOCALHOST_ONLY=1"
+    RUN_SERIAL TRUE
+  )
 endif()
 
 ament_package()

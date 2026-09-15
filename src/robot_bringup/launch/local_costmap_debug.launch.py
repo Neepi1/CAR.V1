@@ -1,4 +1,6 @@
 import os
+import shlex
+from pathlib import Path
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
@@ -17,6 +19,20 @@ def cpu_affinity_prefix(service_name):
     cpuset = os.environ.get(f"NJRH_CPUSET_{key}", "")
     if not cpuset:
         return None
+    session = os.environ.get("NJRH_STARTUP_CPU_SESSION", "")
+    if (session and os.environ.get("NJRH_NAVIGATION_CPU_PROFILE") == "navigation_5cpu"
+            and key in ("CONTROLLER_SERVER", "NAV2_LIFECYCLE_MANAGER")):
+        overlay = os.environ.get("NJRH_OVERLAY_ROOT") or next((
+            parent / "scripts/jetson/runtime_overlay"
+            for parent in Path(__file__).resolve().parents
+            if (parent / "scripts/jetson/runtime_overlay/scripts").is_dir()
+        ), None)
+        if overlay:
+            return shlex.join([
+                "python3", (Path(overlay) / "scripts/startup_cpu_affinity.py").as_posix(),
+                "exec", "--session", session, "--steady-cpus", cpuset,
+                "--role", key.lower(), "--",
+            ])
     return f"taskset -c {cpuset}"
 
 

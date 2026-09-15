@@ -47,18 +47,6 @@ public:
         [this](const std::uint64_t motion_admission_epoch,
                const std::string &operation,
                const AdmittedSafetyOperation &work) {
-          auto *elevator = dependencies_.elevator();
-          if (elevator == nullptr) {
-            return HttpResponse{
-                503, "application/json",
-                error_json("elevator module is not initialized")};
-          }
-          auto admission =
-              elevator->acquire_motion_admission(motion_admission_epoch);
-          if (!admission.admitted()) {
-            return elevator->motion_admission_failure_response(operation,
-                                                               admission);
-          }
           return work();
         };
     ports.clear_teleop_command = [this]() {

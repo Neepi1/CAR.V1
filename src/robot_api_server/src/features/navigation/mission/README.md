@@ -1,5 +1,10 @@
 # Navigation mission
 
+The persistent-recovery candidate keeps the original job while Nav2 reports
+goal-correlated `waiting`/`recovering` phases. The ordinary result budget excludes
+only those fresh intervals; the final-yaw-drift reposition deadline and final
+pose criteria are unchanged. This is staged code, not physical acceptance.
+
 Owns the App-visible navigation goal model, goal HTTP payloads, completion
 policy selection, position-only yaw selection, final-pose evaluation, bounded
 retry classification, acceptance-slack policy, and the complete ordinary-goal

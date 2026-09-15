@@ -26,6 +26,12 @@ wrapper around the stock controller:
 - after a controller idle interval, an identical target can be treated as a new
   action attempt.
 
+Ordinary Ranger task recovery can now explicitly rearm startup alignment once
+for an exact post-failure path, without waiting for that idle interval. The
+normal hot-update rule remains unchanged. See
+[ordinary navigation recovery](ordinary_navigation_recovery.md) for failure
+evidence, cancellation, deployment and hardware-validation limits.
+
 ## Terminal pose handoff
 
 The wrapper also owns the bounded terminal case that an Ackermann trajectory

@@ -1279,7 +1279,7 @@ private:
     maybe_seed_active_floor_source();
     const auto floor = floor_transition_snapshot();
     const auto & identity =
-      (floor.transition_active || floor.failed_locked) &&
+      (floor.transition_active || !floor.runtime_context_valid) &&
       !floor.pending.transaction_id.empty() ?
       floor.pending : floor.active;
     const bool effective_safe =
@@ -1326,6 +1326,7 @@ private:
     // runtime context must remain invalid until COMMIT, while the settled
     // target transform still needs typed proof so COMMIT can be authorized.
     const bool pending_or_active_bridge_ready =
+      (floor.transition_active || floor.runtime_context_valid) &&
       has_map_to_odom_ &&
       map_odom_state_valid &&
       map_state.valid &&
@@ -1559,12 +1560,12 @@ private:
     const std::shared_ptr<std_srvs::srv::Trigger::Response> response)
   {
     const auto floor = floor_transition_snapshot();
-    if (floor.failed_locked) {
+    if (floor.failed_locked || (!floor.transition_active && !floor.runtime_context_valid)) {
       force_accept_next_pose_ = false;
       force_accept_next_pose_explicit_trigger_ = false;
       response->success = false;
       response->message =
-        "FAILED_LOCKED: explicit localization is blocked until floor recovery";
+        "FLOOR_CONTEXT_INVALID: start a new floor switch before explicit localization";
       return;
     }
     force_accept_armed_sec_ = now().seconds();
@@ -2577,42 +2578,16 @@ private:
     map_to_odom_ = state.transform;
   }
 
-  bool explicit_relocalization_uses_fast_smoothing(
-    const CandidateCorrection & candidate,
-    const bool initial_lock) const
-  {
-    if (
-      initial_lock ||
-      !explicit_relocalization_fast_smoothing_enabled_ ||
-      !candidate.explicit_trigger ||
-      candidate.source != "isaac_triggered")
-    {
-      return false;
-    }
-    return candidate.correction_translation_m >= explicit_relocalization_fast_correction_translation_m_ ||
-           candidate.correction_yaw_rad >= explicit_relocalization_fast_correction_yaw_rad_;
-  }
-
   void configure_correction_smoothing_locked(
     MapOdomState & state,
-    const CandidateCorrection & candidate,
-    const bool initial_lock) const
+    const CandidateCorrection & candidate) const
   {
-    state.smoothing_policy = "default";
+    // Business relocalization occurs while stopped: apply its complete pose,
+    // including small corrections. Continuous AMCL retains its normal rates.
+    state.smoothing_policy = candidate.explicit_trigger && candidate.source == "isaac_triggered" ?
+      "explicit_relocalization_immediate" : "default";
     state.smoothing_translation_rate_mps = map_odom_smoothing_translation_rate_mps_;
     state.smoothing_yaw_rate_radps = map_odom_smoothing_yaw_rate_radps_;
-
-    if (!explicit_relocalization_uses_fast_smoothing(candidate, initial_lock)) {
-      return;
-    }
-
-    state.smoothing_policy = "explicit_relocalization_fast";
-    state.smoothing_translation_rate_mps = std::max(
-      map_odom_smoothing_translation_rate_mps_,
-      candidate.correction_translation_m / explicit_relocalization_fast_max_duration_sec_);
-    state.smoothing_yaw_rate_radps = std::max(
-      map_odom_smoothing_yaw_rate_radps_,
-      candidate.correction_yaw_rad / explicit_relocalization_fast_max_duration_sec_);
   }
 
   void update_map_odom_state_from_candidate(
@@ -2640,7 +2615,7 @@ private:
     state.correction_paused = correction_paused_;
     state.frozen_due_to_pause = correction_paused_;
     state.smoothing_enabled = map_odom_smoothing_enabled_;
-    configure_correction_smoothing_locked(state, candidate, initial_lock);
+    configure_correction_smoothing_locked(state, candidate);
     state.smoothing_total_duration_sec = std::max(
       candidate.correction_translation_m / state.smoothing_translation_rate_mps,
       candidate.correction_yaw_rad / state.smoothing_yaw_rate_radps);
@@ -2648,7 +2623,8 @@ private:
     state.smoothing_progress = state.smoothing_total_duration_sec > 0.0 ? 0.0 : 1.0;
     state.large_correction_requires_recovery = map_odom_large_correction_requires_recovery_;
 
-    const bool snap_immediately = initial_lock || !map_odom_smoothing_enabled_;
+    const bool snap_immediately = initial_lock || !map_odom_smoothing_enabled_ ||
+      (candidate.explicit_trigger && candidate.source == "isaac_triggered");
     if (snap_immediately || !state.valid || state.current_sequence == 0U) {
       state.current_transform = state.target_transform;
       state.current_z = state.target_z;
@@ -2656,6 +2632,7 @@ private:
       state.current_source = state.target_source;
       state.last_step_translation_m = candidate.correction_translation_m;
       state.last_step_yaw_rad = candidate.correction_yaw_rad;
+      state.smoothing_total_duration_sec = 0.0;
       state.smoothing_remaining_duration_sec = 0.0;
       state.smoothing_progress = 1.0;
       ++online_correction_snap_count_;
@@ -3365,7 +3342,7 @@ private:
     }
     const auto floor_context = floor_transition_snapshot();
     const auto & floor_identity =
-      (floor_context.transition_active || floor_context.failed_locked) &&
+      (floor_context.transition_active || !floor_context.runtime_context_valid) &&
       !floor_context.pending.transaction_id.empty() ?
       floor_context.pending : floor_context.active;
     const bool effective_map_odom_safe_for_goal_start =

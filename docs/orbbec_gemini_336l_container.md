@@ -25,10 +25,26 @@ another container rebuild or restart.
 | Container architecture | `arm64` |
 | Container | `NJRH-car` |
 
-Runtime ownership is matched by the dedicated `camera336l` process identity.
-The generic `orbbec_camera` executable name is intentionally insufficient:
-another Orbbec used by arm/vision may run at the same time and must not make
-the docking 336L appear ready when its commissioned process is absent.
+### 336L startup ownership
+
+Common startup always invokes `run_orbbec_336l_depth.sh`, after API/Nav2
+initialization. It does not use `pgrep camera336l` or generic `orbbec_camera`
+matches: the API itself carries `camera336l_depth_optical_frame` in its arguments,
+and another Orbbec camera can belong to arm/vision.
+
+The unchanged wrapper's non-blocking `flock` is the sole duplicate-owner check.
+Exit 73 means another owner holds the lock; common startup accepts that without
+launching a second SDK pipeline. An unlocked leftover lock file does not prevent
+startup. Other early exits remain startup failures. Lock ownership does not
+prove a healthy image stream; the existing fresh-observation check still applies.
+
+`test_orbbec_common_owner_start.py` exercises the real camera call site and real
+lock block with a fake driver: API/other-camera arguments, held lock, repeated
+start, and genuine startup failure. These are Linux-only, hardware-free tests.
+`test_common_startup_docking_last.py` checks that docking remains last and missing
+observations do not terminate common services. Hardware acceptance still needs a
+separately authorized full runtime restart and fresh 336L/observation verification;
+the code change alone does not establish camera or docking success.
 
 ## Active close-range preset
 

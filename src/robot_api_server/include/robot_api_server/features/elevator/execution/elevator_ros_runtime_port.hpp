@@ -77,9 +77,9 @@ struct ElevatorRosRuntimeOptions
     "/controller_server"};
 
   // A non-empty transaction id is refreshed only while an explicitly scoped
-  // cabin-transit NavigateToPose action owns the exact elevator transaction.
-  // robot_safety independently validates the lease, DOORWAY mode, hold state,
-  // and id. The compatibility parameter/topic name remains unchanged.
+  // post-call NavigateToPose action owns the exact elevator transaction.
+  // robot_safety independently validates the ELEVATOR_WAIT/DOORWAY mode
+  // contract, hold state, fresh permit, and id. The topic name is unchanged.
   std::string elevator_entry_collision_bypass_permit_topic{
     "/ranger_mini3/elevator_entry_collision_bypass"};
 

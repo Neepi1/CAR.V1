@@ -17,8 +17,11 @@
   <depend>robot_map_asset_identity</depend>
   <depend>robot_safety</depend>
   <depend>std_msgs</depend>
+  <depend>yaml-cpp</depend>
 
   <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>robot_localization_bridge</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

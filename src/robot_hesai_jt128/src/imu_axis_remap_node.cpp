@@ -3,6 +3,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "rclcpp/rclcpp.hpp"
@@ -11,6 +12,8 @@
 #include "tf2/LinearMath/Matrix3x3.h"
 #include "tf2/LinearMath/Quaternion.h"
 #include "tf2/LinearMath/Vector3.h"
+
+#include "robot_hesai_jt128/imu_node_factory.hpp"
 
 namespace
 {
@@ -99,8 +102,11 @@ std::array<double, 9> make_diagonal_covariance(const std::array<double, 3> & dia
 class ImuAxisRemapNode : public rclcpp::Node
 {
 public:
-  ImuAxisRemapNode()
-  : Node("imu_axis_remap"), logged_ready_(false)
+  explicit ImuAxisRemapNode(
+    const rclcpp::NodeOptions & options = rclcpp::NodeOptions(),
+    bool intra_process_output = false)
+  : Node("imu_axis_remap", rclcpp::NodeOptions(options).use_intra_process_comms(false)),
+    logged_ready_(false)
   {
     declare_parameter<std::string>("input_topic", "/jt128/vendor/imu_raw");
     declare_parameter<std::string>("output_topic", "/lidar_imu");
@@ -124,14 +130,17 @@ public:
     override_linear_acceleration_covariance_ =
       get_parameter("override_linear_acceleration_covariance").as_bool();
     mark_orientation_unavailable_ = get_parameter("mark_orientation_unavailable").as_bool();
-    angular_velocity_covariance_diagonal_ = load_diagonal_parameter(
-      *this, "angular_velocity_covariance_diagonal", {0.10, 0.10, 0.25});
-    linear_acceleration_covariance_diagonal_ = load_diagonal_parameter(
-      *this, "linear_acceleration_covariance_diagonal", {0.50, 0.50, 0.50});
+    angular_velocity_covariance_override_ = make_diagonal_covariance(load_diagonal_parameter(
+      *this, "angular_velocity_covariance_diagonal", {0.10, 0.10, 0.25}));
+    linear_acceleration_covariance_override_ = make_diagonal_covariance(load_diagonal_parameter(
+      *this, "linear_acceleration_covariance_diagonal", {0.50, 0.50, 0.50}));
     load_rotation_matrix();
 
+    rclcpp::PublisherOptions publisher_options;
+    publisher_options.use_intra_process_comm = intra_process_output ?
+      rclcpp::IntraProcessSetting::Enable : rclcpp::IntraProcessSetting::Disable;
     publisher_ = create_publisher<sensor_msgs::msg::Imu>(
-      output_topic_, make_qos(50, RMW_QOS_POLICY_RELIABILITY_RELIABLE));
+      output_topic_, make_qos(50, RMW_QOS_POLICY_RELIABILITY_RELIABLE), publisher_options);
     subscription_ = create_subscription<sensor_msgs::msg::Imu>(
       input_topic_,
       make_qos(50, RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT),
@@ -156,22 +165,23 @@ private:
 
   void on_imu(const sensor_msgs::msg::Imu::SharedPtr msg)
   {
-    sensor_msgs::msg::Imu output = *msg;
+    auto output_message = std::make_unique<sensor_msgs::msg::Imu>(*msg);
+    auto & output = *output_message;
     output.header.frame_id = output_frame_id_;
 
     output.angular_velocity = rotate_vector(msg->angular_velocity, rotation_matrix_);
     output.linear_acceleration = rotate_vector(msg->linear_acceleration, rotation_matrix_);
-    output.angular_velocity_covariance = rotate_covariance(msg->angular_velocity_covariance, rotation_matrix_);
-    output.linear_acceleration_covariance = rotate_covariance(
-      msg->linear_acceleration_covariance, rotation_matrix_);
-
     if (override_angular_velocity_covariance_) {
-      output.angular_velocity_covariance =
-        make_diagonal_covariance(angular_velocity_covariance_diagonal_);
+      output.angular_velocity_covariance = angular_velocity_covariance_override_;
+    } else {
+      output.angular_velocity_covariance = rotate_covariance(
+        msg->angular_velocity_covariance, rotation_matrix_);
     }
     if (override_linear_acceleration_covariance_) {
-      output.linear_acceleration_covariance =
-        make_diagonal_covariance(linear_acceleration_covariance_diagonal_);
+      output.linear_acceleration_covariance = linear_acceleration_covariance_override_;
+    } else {
+      output.linear_acceleration_covariance = rotate_covariance(
+        msg->linear_acceleration_covariance, rotation_matrix_);
     }
 
     if (mark_orientation_unavailable_) {
@@ -199,7 +209,7 @@ private:
       output.orientation_covariance = rotate_covariance(msg->orientation_covariance, rotation_matrix_);
     }
 
-    publisher_->publish(output);
+    publisher_->publish(std::move(output_message));
 
     if (!logged_ready_) {
       RCLCPP_INFO(
@@ -220,14 +230,27 @@ private:
   bool override_linear_acceleration_covariance_;
   bool mark_orientation_unavailable_;
   bool logged_ready_;
-  std::array<double, 3> angular_velocity_covariance_diagonal_;
-  std::array<double, 3> linear_acceleration_covariance_diagonal_;
+  std::array<double, 9> angular_velocity_covariance_override_;
+  std::array<double, 9> linear_acceleration_covariance_override_;
   tf2::Matrix3x3 rotation_matrix_;
   tf2::Quaternion rotation_quaternion_;
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr publisher_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr subscription_;
 };
 
+namespace robot_hesai_jt128
+{
+
+std::shared_ptr<rclcpp::Node> make_imu_axis_remap_node(
+  const rclcpp::NodeOptions & options,
+  bool intra_process_output)
+{
+  return std::make_shared<ImuAxisRemapNode>(options, intra_process_output);
+}
+
+}  // namespace robot_hesai_jt128
+
+#ifndef ROBOT_IMU_LIBRARY_ONLY
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
@@ -236,3 +259,4 @@ int main(int argc, char ** argv)
   rclcpp::shutdown();
   return 0;
 }
+#endif  // ROBOT_IMU_LIBRARY_ONLY

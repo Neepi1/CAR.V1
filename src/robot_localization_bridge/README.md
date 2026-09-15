@@ -23,8 +23,8 @@ independently from the navigation chain.
   `/robot_localization_bridge/begin_floor_transition`.
 - `live_floor_transition_service_enabled`: defaults to `false`. While disabled,
   BEGIN and COMMIT are rejected with `LIVE_FLOOR_TRANSITION_DISABLED`; ABORT
-  remains available to converge an already-active transaction to a locked safe
-  state. Isolated transaction tests opt in explicitly, but the Jetson runtime
+  remains available to end an already-active transaction with invalid runtime
+  context. Isolated transaction tests opt in explicitly, but the Jetson runtime
   profile stays disabled.
 - `floor_transition_pause_owner`: exact owner required for the transaction
   pause record, defaults to `robot_floor_manager`.
@@ -41,10 +41,10 @@ independently from the navigation chain.
 - `correction_pause_state_topic`: transient-local `robot_interfaces/msg/CorrectionPauseState`, defaults to `/localization/correction_pause_state`
 - `publish_rate_hz`: `map -> odom` publish cadence; Jetson runtime uses `50.0`
 - `map_odom_publish_gap_warn_ms`, `map_odom_publish_gap_fail_ms`: publisher heartbeat thresholds exposed in `/localization/bridge_status`; Jetson runtime uses `100.0` and `250.0`
-- `map_odom_smoothing_enabled`: defaults to `true`; accepted corrections update a target transform and the publisher slews current `map -> odom` toward it
+- `map_odom_smoothing_enabled`: defaults to `true`; ordinary accepted corrections update a target transform and the publisher slews current `map -> odom` toward it. Explicit Isaac relocalization while stopped applies the whole correction immediately, regardless of its size; the same publisher broadcasts the target before completion is reported.
 - `map_odom_smoothing_translation_rate_mps`, `map_odom_smoothing_yaw_rate_radps`: physical `map -> base_link` correction-rate limits used to choose one shared smoothing duration; Jetson runtime uses `0.20 m/s` and `0.25 rad/s`. The resulting `map -> odom` x/y/yaw parameters advance with one progress factor so yaw and its lever-arm translation compensation cannot separate transiently.
 - `map_odom_smoothing_snap_translation_epsilon_m`, `map_odom_smoothing_snap_yaw_epsilon_rad`: small remaining-error snap thresholds
-- `explicit_relocalization_fast_smoothing_enabled`, `explicit_relocalization_fast_correction_translation_m`, `explicit_relocalization_fast_correction_yaw_rad`, `explicit_relocalization_fast_max_duration_sec`: force-accepted explicit Isaac relocalization keeps smoothing enabled, but large business corrections use a per-correction active rate sized to finish within the configured duration. AMCL gated corrections and ordinary online corrections continue to use the normal smoothing rates.
+- `explicit_relocalization_fast_smoothing_enabled`, `explicit_relocalization_fast_correction_translation_m`, `explicit_relocalization_fast_correction_yaw_rad`, `explicit_relocalization_fast_max_duration_sec`: legacy parameters retained for configuration/status compatibility; they no longer control explicit Isaac application. `smoothing_policy=explicit_relocalization_immediate` and zero duration identify the new behavior. Ordinary AMCL rates remain unchanged. See [the application contract](../../docs/explicit_relocalization_immediate.md).
 - `map_odom_large_correction_translation_m`, `map_odom_large_correction_yaw_rad`, `map_odom_large_correction_requires_recovery`: online large-correction policy metadata and recovery contract
 - `map_odom_online_hard_reject_translation_m`, `map_odom_online_hard_reject_yaw_rad`: hard reject thresholds for non-forced online corrections
 - `tf_future_stamp_offset_sec`: optional future-dating offset; Jetson runtime keeps this at `0.0` so TF timestamps remain measurement-time truthful
@@ -139,27 +139,40 @@ encodes this ownership handoff. The bridge now implements the typed
 `BeginFloorTransition` BEGIN/COMMIT/ABORT fence and publishes typed floor
 health. BEGIN requires the exact floor-manager pause and invalidates the source
 runtime context. COMMIT requires every pause released, a newer explicit
-localization sequence, and a settled/published `map -> odom`. ABORT keeps the
-context invalid as `FAILED_LOCKED`; force-accept cannot bypass that lock.
+localization sequence, and a settled/published `map -> odom`. ABORT ends only
+that transaction (`ABORTED_CONTEXT_INVALID`), without a permanent failure or
+recovery latch. The context remains invalid; force-accept cannot invent readiness.
+A new transaction with its own exact floor-manager pause can BEGIN again, and
+only its fresh target evidence can COMMIT valid runtime context.
 
 BEGIN/COMMIT/ABORT commands share a monotonic transaction command sequence.
 The bridge consumes the sequence even for a semantic rejection and retains a
 per-transaction tombstone, so a delayed lower-sequence BEGIN cannot execute
-after cleanup. `OP_ABORT_PREMUTATION` is the sole non-locking compensation:
+after cleanup. An ended transaction cannot BEGIN again even with a higher
+sequence. `OP_ABORT_PREMUTATION` is the source-preserving compensation:
 it carries the exact source identity and a higher sequence. It restores the
 source context only when the exact floor pause remains owned, the source
 localizer and map-to-odom are still ready, and no new explicit localization
 sequence has occurred. If it arrives before a delayed BEGIN, it is an
 idempotent source-ready no-op whose tombstone rejects that later BEGIN. Normal
-ABORT and every unproven source/mutation state remain `FAILED_LOCKED`.
+ABORT leaves unproven source/mutation state invalid, not permanently locked.
+The bridge does not prove that map-server/localizer writes have drained:
+FloorManager must settle or isolate outstanding writes before admitting a new
+transaction and release only its exact owned pause/hold resources. See
+`docs/floor_transition_abort_contract.md` for the end-state contract.
 
 The packaged bridge configuration keeps
 `live_floor_transition_service_enabled=false` as a safe standalone default.
 The production Jetson wrapper explicitly enables it only together with the
 strict FloorManager Action and its real asset, localization, costmap, hold, and
 sequence-fence adapters. A direct caller still cannot bypass those proofs:
-BEGIN requires the exact floor-manager pause plus the verified current source
-identity, and COMMIT requires the complete target evidence contract.
+BEGIN requires the exact floor-manager pause and valid target identity, not a
+previously localized source. FloorManager may omit source identity when no valid
+source localization exists. The bridge keeps its actual source state unchanged
+and never seeds a fictitious source merely to start switching. Supplied source
+metadata must remain complete and consistent with an already-bound source.
+COMMIT still requires the complete target evidence contract. See
+[`map_switch_source_independence.md`](../../docs/map_switch_source_independence.md).
 
 If a legacy or unrelated owner still holds correction pause, floor switching
 must fail locked. It must not clear that record or release motion. After the
@@ -207,8 +220,9 @@ The disabled-gate smoke proves the production default rejects BEGIN without
 invalidating runtime context. The opt-in transaction smoke uses a separate ROS
 domain, proves BEGIN rejects a missing exact pause,
 proves BEGIN invalidates the runtime context, checks typed health does not
-overstate localizer/TF readiness, then proves ABORT enters `FAILED_LOCKED` and
-force-accept remains rejected. Its wrapper terminates the probe and bridge on
+overstate localizer/TF readiness, then proves ABORT ends its transaction while
+force-accept remains rejected for invalid context. A fresh paused transaction
+can BEGIN, and a delayed old ABORT cannot end the replacement. Its wrapper terminates the probe and bridge on
 every exit path; never point it at the live navigation process.
 
 ## TF Contract

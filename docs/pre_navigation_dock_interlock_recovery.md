@@ -83,6 +83,41 @@ The safety reconciliation response uses explicit result codes for missing
 outside-zone proof, stale BMS, live contact, insufficient no-contact duration,
 docked runtime status, active reverse permit, and active docking command.
 
+## Memory-only undock admission and completion
+
+The 2026-09-10 field case exposed a split contract: the API selected
+`CONTROLLED_UNDOCK` from fresh safety memory plus `NEAR`, while the docking
+manager accepted only `Docked`, live contact, or the persistent latch. The
+manager now consumes the existing `DockSafetyInterlockState` topic directly
+and accepts its enabled, active, fresh memory latch as an additional explicit
+undock admission source. Source and receipt ages must both be within the
+existing API freshness default (1.0 s). No map query, lease, new service, synthetic
+Docked state, or velocity publisher is introduced. Docked/contact/persistent-latch
+admission and ContactStopping remain unchanged; the new topic does not become
+a prerequisite for those existing paths.
+
+Safety clearing now distinguishes a successful undock from a failed/cancelled
+reverse session. It consumes the existing ordered `undocking ...` then
+`undocked phase=succeeded ...` status progression, resets success evidence for
+each new reverse attempt, and requires reverse disabled plus fresh BMS
+no-contact before clearing. Either status-first or permit-first delivery works.
+Failure/stop does not impersonate successful departure. The separate proven
+outside-dock reconciliation service remains unchanged.
+
+Hardware-free regression:
+`src/robot_system_tests/test/test_dock_memory_undock_isolated.py` runs the real
+candidate executables in a separate network namespace, ROS domain 183, with all
+motion outputs remapped to `/dock_memory_test`. It covers each admission source,
+stale/missing/clear memory, full-battery-only rejection, failed/cancelled cleanup,
+both success callback orders, old-success rejection, live contact retention, and
+both nodes together with fake odometry success/failure. It refuses normal host
+networking and does not launch any chassis or camera driver.
+
+Candidates must be deployed together during an authorized full restart window.
+Only the two changed translation units are rebuilt; existing supporting link
+inputs are retained. Never replace a running executable under the exact-exe
+health guard: stage it first, then activate while its owner is stopped.
+
 ## Required hardware validation
 
 Run these as separate supervised cases before commercial release:

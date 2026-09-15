@@ -61,9 +61,19 @@ HttpResponse ApplicationRouterModule::route(
   const HttpRequest & request,
   const bool maintenance_peer_is_loopback) const
 {
-  const auto motion_admission_epoch = ports_.capture_motion_admission_epoch();
-  if (const auto blocked = ports_.elevator_interlock(request)) {
-    return *blocked;
+  // Test admission is private to elevator routes. Retain the legacy epoch
+  // argument for binary compatibility; unrelated features do not acquire it.
+  const bool elevator_request =
+    request.path == "/api/v1/elevator-test" ||
+    starts_with(request.path, "/api/v1/elevator-test/") ||
+    request.path == "/api/v1/elevator-config" ||
+    starts_with(request.path, "/api/v1/elevator-config/");
+  const auto motion_admission_epoch = elevator_request ?
+    ports_.capture_motion_admission_epoch() : 0U;
+  if (elevator_request) {
+    if (const auto blocked = ports_.elevator_interlock(request)) {
+      return *blocked;
+    }
   }
 
   if (const auto response = ports_.system_status(request)) {

@@ -16,6 +16,13 @@ owns the resident `/tf` and `/tf_static` observations, composed
 pause client, AMCL no-motion client, AMCL post-Isaac refinement wait, and the
 `POST /api/v1/localization/trigger` transaction.
 
+Ordinary localization does not request navigation admission. AMCL refinement
+completion requires the matching explicit sequence and applied TF target, not
+`safe_for_goal_start`. HTTP responses expose `localization_complete` and
+`localization_detail` independently of the optional legacy `wait_for_settle:true`
+navigation postcheck. The legacy aggregate HTTP status and `ok` remain compatible;
+navigation/docking consumers retain their own existing settle checks.
+
 The module consumes the canonical TF tree but never publishes TF. In
 particular, it cannot become a second `map -> odom` or `odom -> base_link`
 owner. Navigation, docking, teleop, status, and floor-switch code consume

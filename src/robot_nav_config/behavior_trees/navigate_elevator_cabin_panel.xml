@@ -1,0 +1,14 @@
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Sequence name="navigate_elevator_cabin_panel">
+      <ComputePathToPose
+        goal="{goal}"
+        path="{path}"
+        planner_id="ElevatorCabinEntryDirect"/>
+      <FollowPath
+        path="{path}"
+        controller_id="ElevatorCabinPanelFollowPath"
+        goal_checker_id="goal_checker"/>
+    </Sequence>
+  </BehaviorTree>
+</root>

@@ -70,6 +70,12 @@ struct LocalizerApplyOutcome
   std::string detail;
 };
 
+enum class NavLifecycleEndpoint
+{
+  kBtNavigator,
+  kControllerServer,
+};
+
 // Thread-compatible value tracker once externally serialized. It converts
 // typed ROS observations into exact, fresh transaction evidence and never
 // performs ROS calls or filesystem writes.
@@ -84,6 +90,15 @@ public:
     double received_steady_sec);
   void observe_nav_graph_ready(bool ready, double received_steady_sec);
   void observe_nav_activity(bool active, double received_steady_sec);
+  // Only explicit GetState responses are evidence. Pass state 0 to invalidate
+  // an endpoint after a failed/unknown response; discovery absence is not idle.
+  // Both bt_navigator and controller_server must be unconfigured (1) or
+  // inactive (2), at most 0.75 seconds old (or the tighter preconditions age).
+  // An observed active action vetoes this proof until a terminal/idle status.
+  void observe_nav_lifecycle_state(
+    NavLifecycleEndpoint endpoint,
+    std::uint8_t state_id,
+    double received_steady_sec);
   void observe_wheel_odom(
     double linear_x,
     double linear_y,
@@ -112,6 +127,10 @@ public:
     double received_steady_sec);
 
   void mark_costmaps_cleared(double steady_now_sec);
+
+  // Explicit stopped-lifecycle proof only; action graph/terminal status alone
+  // cannot select a cold-runtime handoff through this query.
+  bool nav_runtime_inactive(double steady_now_sec, double max_age_sec) const;
 
   FloorTransitionEvidence preconditions(
     double steady_now_sec,
@@ -194,6 +213,8 @@ private:
   bool nav_graph_ready_{false};
   double nav_graph_ready_since_steady_sec_{-1.0};
   BinaryObservation nav_active_;
+  BinaryObservation bt_navigator_stopped_;
+  BinaryObservation controller_server_stopped_;
   std::deque<VelocityObservation> wheel_odom_;
   std::deque<VelocityObservation> local_odom_;
   KeyObservation correction_pause_;

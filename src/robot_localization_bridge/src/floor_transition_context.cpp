@@ -87,10 +87,10 @@ FloorTransitionContextDecision FloorTransitionContext::seed_active_source(
       false, false, FloorTransitionDecisionCode::kInvalidRequest,
       "active source seed requires an exact verified identity");
   }
-  if (state_.transition_active || state_.failed_locked) {
+  if (state_.transition_active || state_.failed_locked || !state_.runtime_context_valid) {
     return decision(
       false, false, FloorTransitionDecisionCode::kConflict,
-      "active source cannot be seeded during a transition or recovery lock");
+      "active source cannot be seeded during a transition or invalid runtime context");
   }
   if (valid_identity(state_.active)) {
     if (same_asset(state_.active, identity)) {
@@ -119,10 +119,12 @@ FloorTransitionContextDecision FloorTransitionContext::begin(
   const std::uint64_t current_explicit_relocalization_sequence,
   const std::uint64_t command_sequence)
 {
-  if (!valid_identity(identity) || !valid_identity(source)) {
+  const bool source_supplied = !source.building_id.empty() || !source.floor_id.empty() ||
+    !source.map_id.empty() || source.asset_epoch != 0U || !source.asset_digest.empty();
+  if (!valid_identity(identity) || (source_supplied && !valid_identity(source))) {
     return decision(
       false, false, FloorTransitionDecisionCode::kInvalidRequest,
-      "BEGIN requires exact valid target and source identities");
+      "BEGIN requires an exact target identity; supplied source metadata must be complete");
   }
   FloorTransitionContextDecision sequence_rejection;
   if (!command_sequence_valid(
@@ -130,18 +132,15 @@ FloorTransitionContextDecision FloorTransitionContext::begin(
   {
     return sequence_rejection;
   }
-  if (state_.failed_locked) {
+  if (terminated_transactions_.count(identity.transaction_id) != 0U) {
     return decision(
-      false, false, FloorTransitionDecisionCode::kFailedLocked,
-      "floor transition is failure-locked and requires an explicit recovery protocol");
-  }
-  if (!valid_identity(state_.active)) {
-    return decision(
-      false, false, FloorTransitionDecisionCode::kPreMutationUnproven,
-      "BEGIN requires a bridge-verified active source identity",
+      false, false, FloorTransitionDecisionCode::kStaleCommand,
+      "an ended floor transaction cannot BEGIN again; use a new transaction",
       command_sequence);
   }
-  if (!same_asset(state_.active, source)) {
+  // Source identity is optional rollback metadata, never a localization prerequisite.
+  // Do not seed/confirm an unknown source just to allow loading the target.
+  if (source_supplied && valid_identity(state_.active) && !same_asset(state_.active, source)) {
     return decision(
       false, false, FloorTransitionDecisionCode::kIdentityMismatch,
       "BEGIN source identity does not match the bridge-verified active source",
@@ -166,6 +165,7 @@ FloorTransitionContextDecision FloorTransitionContext::begin(
   state_.pending = identity;
   state_.transition_active = true;
   state_.runtime_context_valid = false;
+  state_.failed_locked = false;
   state_.recovery_required = true;
   state_.begin_explicit_relocalization_sequence =
     current_explicit_relocalization_sequence;
@@ -194,7 +194,7 @@ FloorTransitionContextDecision FloorTransitionContext::commit(
   }
   if (
     !state_.transition_active && state_.runtime_context_valid &&
-    same_asset(state_.active, identity))
+    same_identity(state_.active, identity))
   {
     return decision(
       true, true, FloorTransitionDecisionCode::kOk,
@@ -258,10 +258,14 @@ FloorTransitionContextDecision FloorTransitionContext::abort(
   {
     return sequence_rejection;
   }
-  if (state_.failed_locked && same_identity(state_.pending, identity)) {
+  if (
+    !state_.transition_active && !state_.runtime_context_valid &&
+    terminated_transactions_.count(identity.transaction_id) != 0U &&
+    same_identity(state_.pending, identity))
+  {
     return decision(
       true, true, FloorTransitionDecisionCode::kOk,
-      "idempotent ABORT replay; failure lock retained", command_sequence);
+      "idempotent ABORT replay; transaction remains ended", command_sequence);
   }
   if (!state_.transition_active || !same_identity(state_.pending, identity)) {
     return decision(
@@ -271,12 +275,13 @@ FloorTransitionContextDecision FloorTransitionContext::abort(
 
   state_.transition_active = false;
   state_.runtime_context_valid = false;
-  state_.failed_locked = true;
-  state_.recovery_required = true;
-  state_.detail = "FAILED_LOCKED";
+  state_.failed_locked = false;
+  state_.recovery_required = false;
+  state_.detail = "ABORTED_CONTEXT_INVALID";
+  terminated_transactions_.insert(identity.transaction_id);
   return decision(
     true, false, FloorTransitionDecisionCode::kOk,
-    "floor transition aborted; invalid runtime context and recovery lock retained",
+    "floor transaction ended; runtime context remains invalid until a new switch commits",
     command_sequence);
 }
 
@@ -296,10 +301,10 @@ FloorTransitionContextDecision FloorTransitionContext::abort_pre_mutation(
   {
     return sequence_rejection;
   }
-  if (state_.failed_locked) {
+  if (state_.failed_locked || (!state_.transition_active && !state_.runtime_context_valid)) {
     return decision(
-      false, false, FloorTransitionDecisionCode::kFailedLocked,
-      "pre-mutation ABORT cannot clear an existing recovery lock",
+      false, false, FloorTransitionDecisionCode::kPreMutationUnproven,
+      "pre-mutation ABORT cannot restore an already invalid ended context",
       command_sequence);
   }
   if (!evidence.source_assets_unchanged) {
@@ -327,6 +332,7 @@ FloorTransitionContextDecision FloorTransitionContext::abort_pre_mutation(
     state_.failed_locked = false;
     state_.recovery_required = false;
     state_.detail = "PREMUTATION_ABORTED";
+    terminated_transactions_.insert(identity.transaction_id);
     return decision(
       true, false, FloorTransitionDecisionCode::kOk,
       "pending BEGIN fenced and exact source runtime context restored",
@@ -336,6 +342,7 @@ FloorTransitionContextDecision FloorTransitionContext::abort_pre_mutation(
     state_.runtime_context_valid &&
     same_asset(state_.active, evidence.source))
   {
+    terminated_transactions_.insert(identity.transaction_id);
     return decision(
       true, true, FloorTransitionDecisionCode::kOk,
       "no BEGIN was active; higher command sequence fenced delayed BEGIN",
@@ -351,7 +358,7 @@ bool FloorTransitionContext::candidate_allowed(
   const bool explicit_trigger,
   const bool corrections_paused) const
 {
-  if (state_.failed_locked) {
+  if (state_.failed_locked || (!state_.transition_active && !state_.runtime_context_valid)) {
     return false;
   }
   if (!state_.transition_active) {

@@ -1,5 +1,11 @@
 # Ranger Mini 3 Chassis Dynamics Calibration
 
+The 2026-09-08 [MPPI response model](../src/robot_nav_config/docs/chassis_response_model.md)
+uses the original June 30 CAN captures in actual trajectory prediction, not only
+downstream smoothing. Its identification and held-out replay supersede the old
+assumption that configuring velocity_smoother alone models chassis dynamics.
+Historical profiles below are not necessarily the current runtime configuration.
+
 This document defines the field test used to measure Ranger Mini 3 chassis
 dynamics that are not specified in the vendor manual.
 

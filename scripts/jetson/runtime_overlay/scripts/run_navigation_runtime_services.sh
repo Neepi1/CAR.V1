@@ -4,6 +4,8 @@ set -euo pipefail
 startup_epoch_sec="$(date +%s)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/commercial_runtime_helpers.sh"
+source "${SCRIPT_DIR}/navigation_startup_receipt.sh"
+source "${SCRIPT_DIR}/floor_startup_handoff_helpers.sh"
 source "${SCRIPT_DIR}/floor_asset_helpers.sh"
 source "${SCRIPT_DIR}/cpu_affinity.sh"
 source "${SCRIPT_DIR}/scan_ownership_helpers.sh"
@@ -17,6 +19,8 @@ export NJRH_RUNTIME_LAST_TRIGGERED_RELOCALIZATION_OK=""
 export NJRH_RUNTIME_MAP_TO_ODOM_AGE_MS=""
 export NJRH_RUNTIME_EXPLICIT_RELOCALIZATION_SEQUENCE=""
 export NJRH_AMCL_RUNTIME_STATUS_FILE="${NJRH_AMCL_RUNTIME_STATUS_FILE:-/tmp/njrh_amcl_runtime_status.env}"
+export NJRH_AMCL_STATUS_OWNER_PID="${NJRH_STARTUP_OWNER_PID}"
+export NJRH_AMCL_STATUS_OWNER_GENERATION="${NJRH_FLOOR_STARTUP_HANDOFF_NONCE:-${startup_epoch_sec}}"
 export NJRH_LOCALIZATION_MAP_EXTERNAL_LIFECYCLE_BRINGUP="${NJRH_LOCALIZATION_MAP_EXTERNAL_LIFECYCLE_BRINGUP:-true}"
 navigation_start_source="${NJRH_NAVIGATION_START_SOURCE:-direct}"
 
@@ -37,9 +41,12 @@ localization_pid=""
 navigation_pid=""
 amcl_resident_pid=""
 amcl_readiness_pid=""
-amcl_status_heartbeat_pid=""
 nav2_lifecycle_bringup_pid=""
+startup_context_observer_pid=""
+startup_context_observer_dir=""
+startup_context_observer_sequence=""
 initial_global_localization_pid=""
+initial_global_localization_baseline_sequence=""
 nav2_prestarted=0
 nav2_lifecycle_background_started=0
 amcl_runtime_started=0
@@ -64,7 +71,8 @@ cleanup_stale_amcl_runtime_status_owner() {
     pids="$(stale_amcl_heartbeat_pids)"
     [[ -z "${pids}" ]] || kill -TERM ${pids} 2>/dev/null || true
   fi
-  rm -f "${NJRH_AMCL_RUNTIME_STATUS_FILE}" 2>/dev/null || true
+  # Only the guard replaces public status; startup registration invalidates
+  # evidence from the previous owner without a second file writer.
 }
 
 cleanup_stale_amcl_runtime_status_owner
@@ -95,8 +103,95 @@ log_startup_stage() {
   fi
 }
 
+start_startup_context_observer_if_enabled() {
+  [[ -z "${startup_context_observer_pid:-}" ]] || return 0
+  [[ "${navigation_start_source:-}" == "systemd_autostart" &&
+    "${nav2_lifecycle_background_started:-0}" -eq 1 &&
+    "${floor_startup_handoff_active:-0}" -eq 0 &&
+    "${NJRH_RUNTIME_EXPLICIT_RELOCALIZATION_SEQUENCE:-}" =~ ^[1-9][0-9]*$ ]] || return 0
+  floor_handoff_requested && return 0
+  local binary="${NJRH_STARTUP_CONTEXT_OBSERVER_BIN:-${SCRIPT_DIR}/../../../../install/robot_bringup/lib/robot_bringup/startup_context_observer}"
+  [[ -x "${binary}" ]] || {
+    echo "[runtime-overlay] native startup observer unavailable; retaining final cold observation" >&2
+    return 0
+  }
+  startup_context_observer_dir="$(mktemp -d "${TMPDIR:-/tmp}/njrh-context-observer.XXXXXX")" || return 0
+  startup_context_observer_sequence="${NJRH_RUNTIME_EXPLICIT_RELOCALIZATION_SEQUENCE}"
+  local service_timeout="${NJRH_GLOBAL_LOCALIZATION_RESIDENT_SERVICE_WAIT_SEC:-10}"
+  local bridge_timeout="${NJRH_RUNTIME_READY_BRIDGE_STATUS_WAIT_SEC:-15}"
+  local warmup_timeout observer_timeout
+  warmup_timeout="$(awk -v lifecycle="${NJRH_NAV2_EXTERNAL_LIFECYCLE_READY_TIMEOUT:-210}" \
+    -v costmap="${NJRH_NAV_GLOBAL_COSTMAP_READY_TIMEOUT:-90}" 'BEGIN {print lifecycle + costmap}')"
+  observer_timeout="$(awk -v warm="${warmup_timeout}" -v service="${service_timeout}" \
+    -v bridge="${bridge_timeout}" 'BEGIN {print warm + service + bridge + 5}')"
+  timeout --signal=TERM --kill-after=2s "${observer_timeout}s" "${binary}" \
+    --commit-file "${startup_context_observer_dir}/commit" --warmup-wait-sec "${warmup_timeout}" \
+    --service-wait-sec "${service_timeout}" --bridge-wait-sec "${bridge_timeout}" \
+    --minimum-sequence "$((startup_context_observer_sequence - 1))" \
+    >"${startup_context_observer_dir}/proof" &
+  startup_context_observer_pid=$!
+  echo "[runtime-overlay] startup context observer warming in background pid=${startup_context_observer_pid}; no readiness committed" >&2
+}
+
+stop_startup_context_observer() {
+  if [[ -n "${startup_context_observer_pid:-}" ]]; then
+    terminate_child "${startup_context_observer_pid}" "startup context observer"
+    startup_context_observer_pid=""
+  fi
+  # Only remove this worker's known IPC files, never an entire temporary tree.
+  if [[ "${startup_context_observer_dir:-}" == */njrh-context-observer.* &&
+    -d "${startup_context_observer_dir}" ]]; then
+    rm -f -- "${startup_context_observer_dir}/commit.tmp" \
+      "${startup_context_observer_dir}/commit" "${startup_context_observer_dir}/proof"
+    rmdir -- "${startup_context_observer_dir}" 2>/dev/null || true
+  fi
+  startup_context_observer_dir=""
+  startup_context_observer_sequence=""
+}
+
+collect_startup_context_observer() {
+  startup_context_observation_output=""
+  [[ -n "${startup_context_observer_pid:-}" ]] || return 77
+  if [[ "${startup_context_observer_sequence:-}" != "${NJRH_RUNTIME_EXPLICIT_RELOCALIZATION_SEQUENCE:-}" ]]; then
+    stop_startup_context_observer
+    return 77
+  fi
+  if ! floor_handoff_guard; then
+    stop_startup_context_observer
+    return 20
+  fi
+  # Publish the commit boundary atomically; the observer rejects older DDS
+  # source timestamps even when those messages remain queued in the reader.
+  if ! date +%s%N >"${startup_context_observer_dir}/commit.tmp" ||
+    ! mv -- "${startup_context_observer_dir}/commit.tmp" "${startup_context_observer_dir}/commit"; then
+    stop_startup_context_observer
+    return 77
+  fi
+  local rc=0
+  # Direct parent wait, never a command-substitution subshell waiting a sibling.
+  wait "${startup_context_observer_pid}" || rc=$?
+  startup_context_observer_pid=""
+  startup_context_observation_output="$(cat "${startup_context_observer_dir}/proof")"
+  stop_startup_context_observer
+  floor_handoff_guard || return 20
+  case "${rc}" in
+    0|2|3|20) return "${rc}" ;;
+    *) echo "[runtime-overlay] startup observer prewarm unavailable rc=${rc}; using original cold observation" >&2
+       return 77 ;;
+  esac
+}
+
 commit_runtime_ready_context() {
   local message="$1"
+  local commit_start_sec=${SECONDS}
+  if [[ "${floor_startup_handoff_active:-0}" -eq 1 ]]; then
+    if [[ -n "${startup_context_observer_pid:-}" ]]; then
+      stop_startup_context_observer
+    fi
+    complete_startup_floor_handoff
+    return $?
+  fi
+  floor_handoff_guard || return 1
   local expected_sequence="${NJRH_RUNTIME_EXPLICIT_RELOCALIZATION_SEQUENCE:-}"
   local explicit_sequence
   if [[ ! "${expected_sequence}" =~ ^[1-9][0-9]*$ ]]; then
@@ -106,12 +201,48 @@ commit_runtime_ready_context() {
     echo "[runtime-overlay] ERROR: no transaction-scoped explicit relocalization sequence is available; refusing strong ready context" >&2
     return 1
   fi
-  if ! explicit_sequence="$(
-    wait_for_bridge_relocalization_sequence_after \
-      "${NJRH_RUNTIME_READY_BRIDGE_STATUS_WAIT_SEC:-15}" \
-      "$((expected_sequence - 1))" \
-      "true"
-  )"; then
+  local bridge_observation_ok=false
+  if [[ "${2:-}" == "observe_wrapper_service" ]]; then
+    local observation_output observation_rc=0 service_proof
+    local service_timeout="${NJRH_GLOBAL_LOCALIZATION_RESIDENT_SERVICE_WAIT_SEC:-10}"
+    local bridge_timeout="${NJRH_RUNTIME_READY_BRIDGE_STATUS_WAIT_SEC:-15}"
+    local observer_timeout
+    observer_timeout="$(awk -v service="${service_timeout}" -v bridge="${bridge_timeout}" \
+      'BEGIN {printf "%g", service + bridge + 5}')"
+    if [[ -n "${startup_context_observer_pid:-}" ]]; then
+      collect_startup_context_observer || observation_rc=$?
+      observation_output="${startup_context_observation_output:-}"
+    else
+      observation_rc=77
+    fi
+    if [[ "${observation_rc}" -eq 77 ]]; then
+      observation_rc=0
+      observation_output="$(timeout --signal=TERM --kill-after=2s "${observer_timeout}s" \
+        python3 "${SCRIPT_DIR}/observe_startup_context.py" \
+        --service-wait-sec "${service_timeout}" --bridge-wait-sec "${bridge_timeout}" \
+        --minimum-sequence "$((expected_sequence - 1))")" || observation_rc=$?
+    fi
+    floor_handoff_guard || return 1
+    [[ "${observation_rc}" -ne 20 ]] || return 1
+    service_proof="$(grep -Ex 'service_ready: true' <<<"${observation_output}" || true)"
+    if [[ "${service_proof}" != "service_ready: true" ]]; then
+      set_localization_ready_failure "GLOBAL_LOCALIZATION_RESIDENT_SERVICE_MISSING" \
+        "/global_localization/trigger not ready after resident wrapper check within ${service_timeout}s"
+      return 1
+    fi
+    explicit_sequence="$(sed -n 's/^explicit_sequence: \([0-9][0-9]*\)$/\1/p' <<<"${observation_output}")"
+    if [[ "${observation_rc}" -eq 0 && "${explicit_sequence}" =~ ^[1-9][0-9]*$ ]]; then
+      bridge_observation_ok=true
+    fi
+  elif explicit_sequence="$(
+      wait_for_bridge_relocalization_sequence_after \
+        "${NJRH_RUNTIME_READY_BRIDGE_STATUS_WAIT_SEC:-15}" \
+        "$((expected_sequence - 1))" \
+        "true"
+    )"; then
+    bridge_observation_ok=true
+  fi
+  if [[ "${bridge_observation_ok}" != "true" ]]; then
     if [[ "${NJRH_RUNTIME_LAST_TRIGGERED_RELOCALIZATION_OK:-}" != "true" ]]; then
       echo "[runtime-overlay] ERROR: live bridge did not confirm the accepted explicit relocalization sequence and this runtime has no accepted trigger transaction; refusing strong ready context" >&2
       return 1
@@ -141,6 +272,7 @@ commit_runtime_ready_context() {
       "${NJRH_MAP_CONTEXT_FLOOR_ID:-${NJRH_FLOOR_ID:-unknown}}" \
       "${NJRH_MAP_ASSET_EPOCH:-0}"
   )"
+  local persist_start_sec=${SECONDS}
   if ! write_runtime_map_context "ready" "true" "${message}"; then
     echo "[runtime-overlay] ERROR: failed to persist confirmed runtime map context; refusing to mark runtime ready" >&2
     return 1
@@ -149,7 +281,9 @@ commit_runtime_ready_context() {
     echo "[runtime-overlay] ERROR: persisted runtime map context does not confirm the selected floor; refusing to mark runtime ready" >&2
     return 1
   fi
+  echo "[runtime-overlay] CONTEXT_STEP phase=persist_and_verify elapsed_sec=$((SECONDS - persist_start_sec)) result=ready" >&2
   runtime_ready=1
+  echo "[runtime-overlay] CONTEXT_STEP phase=ready_commit elapsed_sec=$((SECONDS - commit_start_sec)) result=ready" >&2
 }
 
 log_startup_stage "script_start"
@@ -202,6 +336,12 @@ cleanup() {
   fi
   cleanup_started=1
   trap - EXIT INT TERM
+  if [[ -n "${NJRH_STARTUP_CPU_SESSION:-}" ]]; then
+    njrh_finish_startup_cpu_boost navigation_exit
+  fi
+  if [[ -n "${startup_context_observer_pid:-}" || -n "${startup_context_observer_dir:-}" ]]; then
+    stop_startup_context_observer
+  fi
   if [[ "${runtime_ready}" -eq 1 ]]; then
     return 0
   fi
@@ -213,7 +353,6 @@ cleanup() {
   terminate_child "${navigation_pid}" "resident Nav2 layer"
   terminate_child "${amcl_resident_pid}" "AMCL resident warmup"
   terminate_child "${amcl_readiness_pid}" "AMCL readiness completion"
-  terminate_child "${amcl_status_heartbeat_pid}" "AMCL runtime status heartbeat"
   terminate_child "${localization_pid}" "resident localization layer"
   stop_existing_standard_nav_stack
   stop_existing_localization_stack
@@ -553,7 +692,24 @@ initial_localization_ready_from_bridge_after_wrapper_failure() {
   echo "[runtime-overlay] initial localization accepted: bridge_status.has_map_to_odom=true and map->odom are ready" >&2
 }
 
+capture_initial_global_localization_baseline() {
+  local baseline_started_sec=${SECONDS}
+  initial_global_localization_baseline_sequence="$(
+    wait_for_bridge_relocalization_sequence_after \
+      "${NJRH_INITIAL_LOCALIZATION_SEQUENCE_BASELINE_WAIT_SEC:-8}" \
+      "-1" \
+      "false"
+  )" || true
+  echo "[runtime-overlay] TRIGGER_SHELL_TIMING phase=baseline_observation elapsed_sec=$((SECONDS - baseline_started_sec))" >&2
+  if [[ "${initial_global_localization_baseline_sequence}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "[runtime-overlay] captured pre-trigger bridge explicit sequence baseline=${initial_global_localization_baseline_sequence}" >&2
+  else
+    echo "[runtime-overlay] pre-trigger bridge sequence baseline unavailable; accepted wrapper output remains valid, but timeout fallback will stay disabled" >&2
+  fi
+}
+
 trigger_global_localization_for_navigation() {
+  floor_handoff_guard || return 20
   local reason="resident_navigation_start:${NJRH_BUILDING_ID}/${NJRH_FLOOR_ID}"
   local call_timeout="${NJRH_GLOBAL_LOCALIZATION_TRIGGER_CALL_TIMEOUT:-90}"
   local attempt_timeout="${NJRH_GLOBAL_LOCALIZATION_TRIGGER_ATTEMPT_TIMEOUT:-75}"
@@ -570,23 +726,14 @@ trigger_global_localization_for_navigation() {
   local process_timeout_sec
   local process_grace_sec=5
   local process_kill_after_sec=2
+  local attempt_started_sec
   local trigger_rc=1
   local accepted=false
-  local baseline_explicit_sequence=""
+  local baseline_explicit_sequence="${initial_global_localization_baseline_sequence}"
 
   echo "[runtime-overlay] requesting global localization through wrapper and waiting for bridge/map->odom" >&2
-  baseline_explicit_sequence="$(
-    wait_for_bridge_relocalization_sequence_after \
-      "${NJRH_INITIAL_LOCALIZATION_SEQUENCE_BASELINE_WAIT_SEC:-8}" \
-      "-1" \
-      "false"
-  )" || true
-  if [[ "${baseline_explicit_sequence}" =~ ^(0|[1-9][0-9]*)$ ]]; then
-    echo "[runtime-overlay] captured pre-trigger bridge explicit sequence baseline=${baseline_explicit_sequence}" >&2
-  else
-    echo "[runtime-overlay] pre-trigger bridge sequence baseline unavailable; accepted wrapper output remains valid, but timeout fallback will stay disabled" >&2
-  fi
   while (( SECONDS < deadline )); do
+    floor_handoff_guard || return 20
     remaining=$((deadline - SECONDS))
     this_timeout="${attempt_timeout}"
     if (( this_timeout > remaining )); then
@@ -595,13 +742,19 @@ trigger_global_localization_for_navigation() {
     if (( this_timeout < 5 )); then
       this_timeout=5
     fi
-    process_timeout_sec=$((this_timeout + process_grace_sec))
+    # TF observation now shares the trigger client; retain its former separate
+    # wait budget inside the outer process limit.
+    process_timeout_sec="$(awk -v trigger="${this_timeout}" -v tf="${tf_timeout}" \
+      -v grace="${process_grace_sec}" 'BEGIN {printf "%g", trigger + tf + grace}')"
     echo "[runtime-overlay] global localization trigger attempt=${attempt} timeout=${this_timeout}s remaining=${remaining}s" >&2
+    attempt_started_sec=${SECONDS}
     if trigger_output="$(timeout --signal=TERM --kill-after="${process_kill_after_sec}s" "${process_timeout_sec}s" \
       python3 "${SCRIPT_DIR}/call_global_localization_trigger.py" \
       --reason "${reason}" \
-      --timeout-sec "${this_timeout}" 2>&1)"; then
+      --timeout-sec "${this_timeout}" \
+      --map-odom-wait-sec "${tf_timeout}" 2>&1)"; then
       trigger_rc=0
+      echo "[runtime-overlay] TRIGGER_SHELL_TIMING phase=trigger_process attempt=${attempt} elapsed_sec=$((SECONDS - attempt_started_sec)) rc=${trigger_rc}" >&2
       if grep -Eq 'accepted[=:][[:space:]]*(True|true)|accepted:[[:space:]]*true' <<<"${trigger_output}"; then
         accepted=true
         break
@@ -616,6 +769,7 @@ trigger_global_localization_for_navigation() {
       break
     else
       trigger_rc=$?
+      echo "[runtime-overlay] TRIGGER_SHELL_TIMING phase=trigger_process attempt=${attempt} elapsed_sec=$((SECONDS - attempt_started_sec)) rc=${trigger_rc}" >&2
       wrapper_code="$(extract_failure_code "${trigger_output}")"
       if trigger_output_reports_retryable_before_dispatch "${trigger_output}" && (( SECONDS < deadline )); then
         echo "[runtime-overlay] global localization trigger attempt=${attempt} proved Isaac was not dispatched; retrying: wrapper_code=${wrapper_code:-none}" >&2
@@ -627,6 +781,9 @@ trigger_global_localization_for_navigation() {
     fi
   done
 
+  # The old RPC has returned. Do not retry or consume its old-map readiness
+  # once floor-manager has requested ownership of startup.
+  floor_handoff_guard || return 20
   if [[ "${accepted}" != "true" ]]; then
     wrapper_code="$(extract_failure_code "${trigger_output}")"
     if initial_localization_ready_from_bridge_after_wrapper_failure \
@@ -692,12 +849,19 @@ trigger_global_localization_for_navigation() {
       return 1
     }
   fi
-  wait_for_tf_transform "map" "odom" "${tf_timeout}" || {
+  local startup_tf_observed
+  startup_tf_observed="$(grep -Ex 'startup_tf_observed: (true|false)' <<<"${trigger_output}" || true)"
+  if [[ "${startup_tf_observed}" == "startup_tf_observed: true" ]]; then
+    echo "[runtime-overlay] trigger client observed actual map->odom TF after bridge acceptance" >&2
+  elif [[ "${startup_tf_observed}" == "startup_tf_observed: false" ]] ||
+    ! wait_for_tf_transform "map" "odom" "${tf_timeout}"; then
+    # An explicit false already consumed the TF budget. Legacy helper output
+    # without a standalone proof line still uses the original TF probe.
     export NJRH_RUNTIME_FAILURE_CODE="MAP_TO_ODOM_TIMEOUT"
     export NJRH_RUNTIME_LAST_TRIGGERED_RELOCALIZATION_OK="false"
     set_localization_ready_failure "MAP_TO_ODOM_TIMEOUT" "map->odom TF was not published after bridge acceptance"
     return 1
-  }
+  fi
   export NJRH_RUNTIME_FAILURE_CODE=""
   echo "[runtime-overlay] initial localization accepted: bridge_status.has_map_to_odom=true and map->odom are ready" >&2
 }
@@ -725,8 +889,13 @@ start_initial_global_localization_background() {
 
 wait_for_initial_global_localization() {
   if [[ -z "${initial_global_localization_pid}" ]]; then
-    trigger_global_localization_for_navigation
-    return $?
+    local foreground_rc=0
+    trigger_global_localization_for_navigation || foreground_rc=$?
+    if floor_handoff_requested; then
+      adopt_startup_floor_handoff
+      return $?
+    fi
+    return "${foreground_rc}"
   fi
   local pid="${initial_global_localization_pid}"
   local rc=0
@@ -735,6 +904,10 @@ wait_for_initial_global_localization() {
   rc=$?
   set -e
   initial_global_localization_pid=""
+  if floor_handoff_requested; then
+    adopt_startup_floor_handoff
+    return $?
+  fi
   if [[ "${rc}" -ne 0 ]]; then
     echo "[runtime-overlay] initial global localization background returned rc=${rc}" >&2
     return "${rc}"
@@ -751,6 +924,24 @@ wait_for_initial_global_localization() {
   export NJRH_RUNTIME_EXPLICIT_RELOCALIZATION_SEQUENCE="${joined_explicit_sequence}"
   wait_for_bridge_has_map_to_odom 1 >/dev/null 2>&1 || true
   echo "[runtime-overlay] initial global localization background joined successfully" >&2
+}
+
+wait_for_later_initial_localization() {
+  echo "[runtime-overlay] keeping Nav2 and Isaac processes; waiting for a later accepted localization, without retriggering Isaac" >&2
+  python3 "${SCRIPT_DIR}/call_global_localization_trigger.py" \
+    --reason "resident_navigation_wait:${NJRH_BUILDING_ID}/${NJRH_FLOOR_ID}" \
+    --wait-for-bridge-after "${initial_global_localization_baseline_sequence:--1}" &
+  initial_global_localization_pid=$!
+  while kill -0 "${initial_global_localization_pid}" 2>/dev/null; do
+    ensure_localization_layer_alive || return 1
+    if [[ -n "${navigation_pid}" ]]; then
+      ensure_navigation_layer_alive || return 1
+    fi
+    sleep 2
+  done
+  wait_for_initial_global_localization || return 1
+  localization_ready_failure_reason=""
+  export NJRH_RUNTIME_FAILURE_CODE=""
 }
 
 amcl_mode_for_navigation() {
@@ -781,17 +972,19 @@ load_amcl_runtime_status() {
   SCAN_ADMISSION_STATUS_PUBLISHER_COUNT="0"
   AMCL_POSE_PUBLISHER_COUNT="0"
   AMCL_SEED_SUCCEEDED="false"
-  if [[ -f "${NJRH_AMCL_RUNTIME_STATUS_FILE}" ]]; then
-    if ! bash -n "${NJRH_AMCL_RUNTIME_STATUS_FILE}" >/dev/null 2>&1; then
-      echo "[runtime-overlay] ignoring invalid AMCL runtime status file: ${NJRH_AMCL_RUNTIME_STATUS_FILE}" >&2
-      return 0
-    fi
-    # shellcheck disable=SC1090
-    if ! source "${NJRH_AMCL_RUNTIME_STATUS_FILE}"; then
-      echo "[runtime-overlay] failed to source AMCL runtime status file: ${NJRH_AMCL_RUNTIME_STATUS_FILE}" >&2
-      return 0
-    fi
+  local snapshot key value
+  if ! snapshot="$(amcl_status_client_for_navigation read)"; then
+    AMCL_STATUS_STALE=true
+    echo "[runtime-overlay] AMCL status observer unavailable; no new AMCL health evidence" >&2
+    return 0
   fi
+  while IFS='=' read -r key value; do
+    [[ "${key}" =~ ^[A-Z][A-Z0-9_]*$ ]] || continue
+    case "${key}" in
+      AMCL_*|SCAN_ADMISSION_*|SCAN_AMCL_PUBLISHER_COUNT|MAP_TO_ODOM_OWNER|TIMESTAMP)
+        printf -v "${key}" '%s' "${value}" ;;
+    esac
+  done <<<"${snapshot}"
 }
 
 amcl_resident_runtime_status_ready_for_seed() {
@@ -808,6 +1001,7 @@ log_amcl_runtime_status() {
 }
 
 run_amcl_localization_step() {
+  floor_handoff_guard || return 1
   local mode="$1"
   local phase="$2"
   shift 2
@@ -822,6 +1016,11 @@ run_amcl_localization_step() {
   case "${rc}" in
     0)
       return 0
+      ;;
+    26)
+      echo "[runtime-overlay] AMCL initialization pending phase=${phase}; retaining resident nodes and completed preparation" >&2
+      [[ "${phase}" != "complete-readiness" ]] || return 26
+      return 1
       ;;
     10)
       if [[ "${mode}" == "shadow" ]]; then
@@ -919,6 +1118,7 @@ wait_for_amcl_resident_background_if_running() {
 }
 
 start_amcl_readiness_background_if_enabled_for_navigation() {
+  floor_handoff_guard || return 1
   local mode="${NJRH_AMCL_LOCALIZATION_MODE:-disabled}"
   mode="$(amcl_mode_for_navigation)" || return 1
   case "${mode}" in
@@ -931,17 +1131,21 @@ start_amcl_readiness_background_if_enabled_for_navigation() {
     return 0
   fi
   if [[ -n "${amcl_resident_pid}" ]]; then
+    if [[ "${NJRH_REQUIRE_AMCL_TRACKING_FOR_NAV_READY:-false}" != true ]] &&
+      kill -0 "${amcl_resident_pid}" 2>/dev/null; then
+      # Parent retains ownership and reaps this child on a later supervision
+      # cycle. Waiting here would serialize Nav2 behind early AMCL preparation.
+      echo "[runtime-overlay] AMCL readiness deferred while resident warmup is still running pid=${amcl_resident_pid}" >&2
+      return 0
+    fi
     wait_for_amcl_resident_background_if_running || {
-      echo "[runtime-overlay] AMCL resident warmup did not complete cleanly before readiness; readiness background will retry start-resident" >&2
+      echo "[runtime-overlay] AMCL resident warmup did not complete cleanly; readiness background will resume missing initialization steps" >&2
     }
   fi
   (
     set +e
-    if amcl_resident_runtime_status_ready_for_seed; then
-      echo "[runtime-overlay] AMCL resident already warm from status file; skipping repeated resident warmup before readiness seed" >&2
-    elif ! NJRH_RUNTIME_NONFATAL_LOCALIZATION_FAILURE=true start_amcl_resident_if_enabled_for_navigation; then
-      echo "[runtime-overlay] AMCL readiness background could not finish start-resident; continuing into bounded complete-readiness retries so a transient lifecycle timeout can recover without a runtime restart" >&2
-    fi
+    # Complete owns launch/activation/preparation/seed as one resumable path.
+    # Do not run start-resident and then repeat that work in a second client.
     if complete_amcl_readiness_with_retries_for_navigation; then
       echo "[runtime-overlay] AMCL readiness completed in background" >&2
       exit 0
@@ -972,6 +1176,11 @@ wait_for_amcl_readiness_background_if_running() {
 }
 
 maintain_amcl_readiness_background_for_navigation() {
+  # The original startup remains the process supervisor after later hot
+  # switches, but it no longer owns map-dependent restart/seed work.
+  if ! floor_handoff_guard; then
+    return 0
+  fi
   local mode="${NJRH_AMCL_LOCALIZATION_MODE:-disabled}"
   mode="$(amcl_mode_for_navigation)" || return 1
   if [[ "${mode}" == "disabled" ]]; then
@@ -1003,25 +1212,31 @@ maintain_amcl_readiness_background_for_navigation() {
   start_amcl_readiness_background_if_enabled_for_navigation
 }
 
-start_amcl_status_heartbeat_if_enabled_for_navigation() {
-  local mode="${NJRH_AMCL_LOCALIZATION_MODE:-disabled}"
+amcl_status_client_for_navigation() {
+  local binary="${NJRH_AMCL_STATUS_CPP_BIN:-${NJRH_PROJECT_ROOT}/install/robot_bringup/lib/robot_bringup/runtime_amcl_status}"
+  [[ -x "${binary}" ]] || return 1
+  "${binary}" --status-file "${NJRH_AMCL_RUNTIME_STATUS_FILE}" \
+    --timeout-ms "${NJRH_AMCL_STATUS_REQUEST_TIMEOUT_MS:-1000}" "$@"
+}
+
+register_amcl_status_for_navigation() {
+  local mode result="starting" ready=false
   mode="$(amcl_mode_for_navigation)" || return 1
-  case "${mode}" in
-    disabled)
-      return 0
-      ;;
-  esac
-  if [[ -n "${amcl_status_heartbeat_pid}" ]] && kill -0 "${amcl_status_heartbeat_pid}" 2>/dev/null; then
-    return 0
-  fi
-  (
-    set +e
-    NJRH_AMCL_LOCALIZATION_MODE="${mode}" \
-      NJRH_AMCL_RUNTIME_STATUS_FILE="${NJRH_AMCL_RUNTIME_STATUS_FILE}" \
-      bash "${SCRIPT_DIR}/run_amcl_shadow_localization.sh" --mode "${mode}" --heartbeat
-  ) &
-  amcl_status_heartbeat_pid=$!
-  echo "[runtime-overlay] AMCL runtime status heartbeat running in background pid=${amcl_status_heartbeat_pid}" >&2
+  [[ "${mode}" != "disabled" ]] || { result=disabled; ready=true; }
+  local params="${NJRH_AMCL_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/amcl_shadow.yaml}"
+  local map_generation="${NJRH_BUILDING_ID:-}|${NJRH_FLOOR_ID:-}|${NJRH_NAV_MAP_ID:-${NJRH_MAP_ID:-}}|${NJRH_MAP_ASSET_EPOCH:-}|${NJRH_MAP_ASSET_DIGEST:-}|${NAV2_MAP_YAML:-}|${params}"
+  amcl_status_client_for_navigation register \
+    --owner-pid "${NJRH_STARTUP_OWNER_PID}" --owner-generation "${NJRH_AMCL_STATUS_OWNER_GENERATION}" \
+    --map-generation "${map_generation}" \
+    --set "AMCL_MODE=${mode}" --set "AMCL_START_RESULT=${result}" \
+    --set "AMCL_READY=${ready}" --set "AMCL_DEGRADED=false" \
+    --set "AMCL_STARTUP_EPOCH_SEC=${startup_epoch_sec}" >/dev/null
+}
+
+start_amcl_status_heartbeat_if_enabled_for_navigation() {
+  # The existing health guard is the only recurring AMCL status owner.
+  # This bounded IPC ping exits immediately; no Shell heartbeat is launched.
+  amcl_status_client_for_navigation ping >/dev/null
 }
 
 complete_amcl_readiness_if_enabled_for_navigation() {
@@ -1033,9 +1248,7 @@ complete_amcl_readiness_if_enabled_for_navigation() {
       ;;
   esac
   echo "[runtime-overlay] completing AMCL readiness from accepted triggered localization mode=${mode}" >&2
-  if ! run_amcl_localization_step "${mode}" "complete-readiness" --complete-readiness; then
-    return 1
-  fi
+  run_amcl_localization_step "${mode}" "complete-readiness" --complete-readiness || return $?
   amcl_runtime_started=1
 }
 
@@ -1051,16 +1264,23 @@ complete_amcl_readiness_with_retries_for_navigation() {
 
   local timeout_sec="${NJRH_AMCL_READINESS_COMPLETION_TIMEOUT_SEC:-45}"
   local retry_sec="${NJRH_AMCL_READINESS_COMPLETION_RETRY_SEC:-3}"
-  local deadline=$((SECONDS + timeout_sec))
+  source "${SCRIPT_DIR}/amcl_startup_progress.sh"
+  local NJRH_AMCL_STARTUP_DEADLINE_MS=""
+  amcl_budget_begin "${timeout_sec}" || return $?
   local attempt=1
   local rc=1
   local previous_nonfatal="${NJRH_RUNTIME_NONFATAL_LOCALIZATION_FAILURE:-false}"
   export NJRH_RUNTIME_NONFATAL_LOCALIZATION_FAILURE=true
   while true; do
+    amcl_budget_timeout 1 >/dev/null || break
+    if ! floor_handoff_guard; then
+      export NJRH_RUNTIME_NONFATAL_LOCALIZATION_FAILURE="${previous_nonfatal}"
+      return 1
+    fi
     echo "[runtime-overlay] AMCL readiness completion attempt=${attempt} timeout_sec=${timeout_sec}" >&2
     set +e
-    complete_amcl_readiness_if_enabled_for_navigation
-    rc=$?
+    rc=0
+    complete_amcl_readiness_if_enabled_for_navigation || rc=$?
     if [[ "${rc}" -eq 0 ]]; then
       set -e
       export NJRH_RUNTIME_NONFATAL_LOCALIZATION_FAILURE="${previous_nonfatal}"
@@ -1068,18 +1288,21 @@ complete_amcl_readiness_with_retries_for_navigation() {
       return 0
     fi
     set -e
-    if (( SECONDS >= deadline )); then
-      break
+    # A retained pending sequence needs a fresh attempt budget, not another
+    # invocation under the same insufficient tail. The resident supervisor
+    # already owns rescheduling; no new retry loop or process restart is added.
+    if [[ "${rc}" -eq 26 && "${NJRH_REQUIRE_AMCL_TRACKING_FOR_NAV_READY:-false}" != true ]]; then
+      export NJRH_RUNTIME_NONFATAL_LOCALIZATION_FAILURE="${previous_nonfatal}"
+      echo "[runtime-overlay] AMCL readiness pending; returning completed preparation to supervisor for a fresh attempt budget" >&2
+      return 26
     fi
     echo "[runtime-overlay] AMCL readiness attempt=${attempt} failed rc=${rc}; retrying in ${retry_sec}s" >&2
-    sleep "${retry_sec}"
+    amcl_budget_sleep "${retry_sec}" || break
     attempt=$((attempt + 1))
   done
   export NJRH_RUNTIME_NONFATAL_LOCALIZATION_FAILURE="${previous_nonfatal}"
-  set_localization_ready_failure \
-    "AMCL_READINESS_TIMEOUT" \
-    "AMCL did not become ready within ${timeout_sec}s after Nav2 activation; last rc=${rc}: ${AMCL_FAILURE_REASON:-unknown}"
-  return "${rc}"
+  echo "[runtime-overlay] AMCL readiness attempt budget ${timeout_sec}s exhausted; initialization remains pending, resident nodes are retained" >&2
+  return 26
 }
 
 scan_flatscan_admission_diagnostics() {
@@ -1165,7 +1388,9 @@ start_flatscan_helper_for_navigation_repair() {
   echo "[runtime-overlay] starting standalone /flatscan repair helper without restarting pointcloud profile params=${params}" >&2
   if njrh_affinity_enabled && [[ -n "${cpuset}" ]]; then
     echo "[runtime-overlay] cpu affinity: laser_scan_to_flatscan -> CPU ${cpuset}" >&2
-    nohup taskset -c "${cpuset}" "${helper_bin}" \
+    local affinity=()
+    njrh_affinity_prefix affinity laser_scan_to_flatscan
+    nohup "${affinity[@]}" "${helper_bin}" \
       --ros-args --params-file "${params}" \
       -r scan:=/scan -r flatscan:=/flatscan \
       >"${log_file}" 2>&1 &
@@ -1311,65 +1536,35 @@ ensure_common_local_state_ready_for_navigation_start() {
   echo "[runtime-overlay] common local_state ready for navigation startup: /local_state/odometry and odom->base_link are fresh" >&2
 }
 
-ensure_localization_stack_ready_for_navigation() {
-  local service_timeout="${NJRH_INITIAL_LOCALIZATION_SERVICE_WAIT_SEC:-45}"
-  local map_server_timeout="${NJRH_INITIAL_LOCALIZATION_MAP_SERVER_WAIT_SEC:-45}"
-  local map_timeout="${NJRH_INITIAL_LOCALIZATION_MAP_WAIT_SEC:-45}"
-  local flatscan_timeout="${NJRH_INITIAL_LOCALIZATION_FLATSCAN_WAIT_SEC:-5}"
-  local flatscan_repair_timeout="${NJRH_INITIAL_LOCALIZATION_FLATSCAN_REPAIR_WAIT_SEC:-20}"
-  local publisher_timeout="${NJRH_INITIAL_LOCALIZATION_RESULT_PUBLISHER_WAIT_SEC:-45}"
-  local require_result_publisher="${NJRH_INITIAL_LOCALIZATION_REQUIRE_RESULT_PUBLISHER:-false}"
-  local stack_timeout="${NJRH_INITIAL_LOCALIZATION_STACK_WAIT_SEC:-45}"
-
-  if runtime_readiness_probe localization-stack \
-    "${NAV2_MAP_YAML}" "/flatscan" "${stack_timeout}"; then
-    echo "[runtime-overlay] localization stack passed the single-participant startup gate" >&2
-    if env_flag_true "${require_result_publisher}"; then
-      if ! wait_for_topic_publisher "/localization_result" "${publisher_timeout}"; then
-        set_localization_ready_failure "LOCALIZATION_RESULT_PUBLISHER_MISSING" "/localization_result publisher not ready within ${publisher_timeout}s"
-        return 1
-      fi
-    else
-      echo "[runtime-overlay] skipping /localization_result publisher pre-gate; trigger wrapper verifies result, bridge acceptance, and map->odom" >&2
-    fi
-    echo "[runtime-overlay] localization stack ready for initial relocalization" >&2
-    return 0
-  fi
-  echo "[runtime-overlay] falling back to detailed localization readiness diagnostics and FlatScan repair" >&2
-
-  if ! wait_for_ros_service "/global_localization/trigger" "${service_timeout}"; then
-    set_localization_ready_failure "GLOBAL_LOCALIZATION_TRIGGER_SERVICE_MISSING" "/global_localization/trigger not ready within ${service_timeout}s"
-    return 1
-  fi
-  if ! wait_for_ros_service "/trigger_grid_search_localization" "${service_timeout}"; then
-    set_localization_ready_failure "GRID_SEARCH_LOCALIZATION_SERVICE_MISSING" "/trigger_grid_search_localization not ready within ${service_timeout}s"
-    return 1
-  fi
-  if ! ensure_map_server_active "${NAV2_MAP_YAML:-}" "${map_server_timeout}"; then
-    set_localization_ready_failure "MAP_SERVER_NOT_ACTIVE" "/map_server did not publish selected map within ${map_server_timeout}s"
-    return 1
-  fi
-  if ! wait_for_occupancy_grid "/map" "${map_timeout}" >/dev/null; then
-    set_localization_ready_failure "MAP_TOPIC_MISSING" "/map OccupancyGrid not ready within ${map_timeout}s"
-    return 1
-  fi
-  if ! wait_for_flatscan_publisher_ready "${flatscan_timeout}"; then
-    scan_flatscan_admission_diagnostics
-    if ! recover_flatscan_helper_for_navigation "${flatscan_repair_timeout}"; then
-      set_localization_ready_failure "FLATSCAN_MISSING" "/flatscan publisher was not ready within ${flatscan_timeout}s and repair did not recover it within ${flatscan_repair_timeout}s"
-      return 1
-    fi
-  fi
-  if env_flag_true "${require_result_publisher}"; then
-    if ! wait_for_topic_publisher "/localization_result" "${publisher_timeout}"; then
-      set_localization_ready_failure "LOCALIZATION_RESULT_PUBLISHER_MISSING" "/localization_result publisher not ready within ${publisher_timeout}s"
-      return 1
-    fi
-  else
-    echo "[runtime-overlay] skipping /localization_result publisher pre-gate; trigger wrapper verifies result, bridge acceptance, and map->odom" >&2
-  fi
-  echo "[runtime-overlay] localization stack ready for initial relocalization" >&2
+wait_for_isaac_startup_ready() {
+  # No DDS participant or trigger here: read only the current launch receipt.
+  [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE:-ipc_worker}" != "legacy" ]] || return 0
+  python3 "${SCRIPT_DIR}/isaac_startup_state.py" \
+    --file "${NJRH_ISAAC_STARTUP_STATE_FILE}" --map-yaml "${NAV2_MAP_YAML}" \
+    --timeout-sec "$1"
 }
+
+ensure_localization_stack_ready_for_navigation() {
+  local stack_timeout="${NJRH_INITIAL_LOCALIZATION_STACK_WAIT_SEC:-45}"
+  local deadline=$((SECONDS + stack_timeout))
+  # Map, Isaac and the sensor pipeline initialize concurrently. Observing them
+  # uses one shared budget, not a second series of 45-second fallback waits.
+  if ! runtime_readiness_probe localization-stack \
+    "${NAV2_MAP_YAML}" "/flatscan" "${stack_timeout}"; then
+    set_localization_ready_failure "LOCALIZATION_INPUTS_NOT_READY" \
+      "target map/services/FlatScan not ready; Isaac has not been dispatched"
+    return 1
+  fi
+  local remaining=$((deadline - SECONDS))
+  (( remaining >= 0 )) || remaining=0
+  if ! wait_for_isaac_startup_ready "${remaining}"; then
+    set_localization_ready_failure "ISAAC_INITIALIZATION_NOT_READY" \
+      "Isaac internal graph not ready for this launch; Isaac has not been dispatched"
+    return 1
+  fi
+  echo "[runtime-overlay] localization stack ready: target map, FlatScan owner and current Isaac graph; trigger wrapper verifies fresh input and result" >&2
+}
+
 
 wait_for_nav2_layer_ready() {
   local lifecycle_timeout="${NJRH_NAV_LIFECYCLE_READY_TIMEOUT:-}"
@@ -1393,6 +1588,7 @@ wait_for_nav2_layer_ready() {
 }
 
 start_resident_navigation_layer() {
+  floor_handoff_guard || return 1
   local lifecycle_hold="$1"
   local stage="$2"
   local verb="$3"
@@ -1412,6 +1608,7 @@ start_resident_navigation_layer() {
 }
 
 run_nav2_lifecycle_sequence() {
+  floor_handoff_guard || return 1
   local timeout_sec="${1:-180}"
   shift || true
   local nodes=("$@")
@@ -1445,6 +1642,10 @@ run_nav2_lifecycle_sequence() {
     local rc=0
     echo "[runtime-overlay] Nav2 lifecycle parallel core activation enabled: ${core_nodes[*]}" >&2
     for node in "${core_nodes[@]}"; do
+      if ! floor_handoff_guard; then
+        rc=1
+        break
+      fi
       run_nav2_lifecycle_sequence_until_active "${timeout_sec}" "${node}" &
       pids+=("$!")
     done
@@ -1470,6 +1671,7 @@ run_nav2_lifecycle_sequence() {
 }
 
 run_nav2_lifecycle_sequence_until_active() {
+  floor_handoff_guard || return 1
   local timeout_sec="${1:-180}"
   shift || true
   local nodes=("$@")
@@ -1497,7 +1699,7 @@ run_nav2_lifecycle_sequence_until_active() {
   local poll_sec="${NJRH_NAV2_LIFECYCLE_ACTIVE_POLL_INTERVAL_SEC:-0.5}"
   local quick_deadline=$((SECONDS + timeout_sec))
   while (( SECONDS < quick_deadline )); do
-    if nav_lifecycle_nodes_active_quick "${nodes[@]}"; then
+    if [[ "${floor_startup_handoff_active:-0}" -eq 0 ]] && ! floor_handoff_requested && nav_lifecycle_nodes_active_quick "${nodes[@]}"; then
       echo "[runtime-overlay] lifecycle nodes active; stopping lifecycle helper pid=${helper_pid}: ${nodes[*]}" >&2
       kill -TERM "${helper_pid}" 2>/dev/null || true
       wait "${helper_pid}" 2>/dev/null || true
@@ -1525,6 +1727,7 @@ run_nav2_lifecycle_sequence_until_active() {
 }
 
 activate_prestarted_nav2_lifecycle() {
+  floor_handoff_guard || return 1
   [[ "${nav2_prestarted}" -eq 1 ]] || return 0
   if [[ "${nav2_lifecycle_background_started}" -eq 1 ]]; then
     if wait_for_prestarted_nav2_lifecycle_background; then
@@ -1557,13 +1760,19 @@ activate_prestarted_nav2_lifecycle() {
 
 wait_for_prestarted_nav2_launch_hold_ready() {
   local timeout_sec="${NJRH_NAV2_PRESTART_HOLD_READY_TIMEOUT_SEC:-25}"
-  local max_age_sec="${NJRH_NAV2_PRESTART_HOLD_READY_MAX_AGE_SEC:-60}"
   local status_file="${NJRH_NAV2_HOLD_READY_FILE:-/tmp/njrh_nav2_launch_hold_ready.env}"
   local deadline=$((SECONDS + timeout_sec))
-  local now_sec
-  local age_sec
   while (( SECONDS < deadline )); do
-    ensure_navigation_layer_alive || return 1
+    if [[ "${1:-}" == "background" ]]; then
+      # This worker is the launch owner's sibling, not its parent. It may
+      # observe liveness but must not reap that PID or write failure context.
+      if ! kill -0 "${navigation_pid}" 2>/dev/null; then
+        echo "[runtime-overlay] Nav2 launch owner exited while waiting for held receipt pid=${navigation_pid}" >&2
+        return 1
+      fi
+    else
+      ensure_navigation_layer_alive || return 1
+    fi
     if [[ -f "${status_file}" ]]; then
       NAV2_HOLD_READY=""
       NAV2_HOLD_READY_STAMP_SEC=""
@@ -1572,11 +1781,10 @@ wait_for_prestarted_nav2_launch_hold_ready() {
       NAV2_HOLD_READY_CONTROLLER_PID=""
       # shellcheck disable=SC1090
       source "${status_file}" 2>/dev/null || true
-      now_sec="$(date +%s)"
-      age_sec=$((now_sec - ${NAV2_HOLD_READY_STAMP_SEC:-0}))
+      # This is a one-shot launch receipt, not a heartbeat. Localization may
+      # take arbitrarily long; matching live process ownership remains required.
       if [[ "${NAV2_HOLD_READY:-false}" == "true" ]] \
         && [[ "${NAV2_HOLD_READY_WRAPPER_PID:-}" == "${navigation_pid}" || "${NAV2_HOLD_READY_BASHPID:-}" == "${navigation_pid}" ]] \
-        && (( age_sec <= max_age_sec )) \
         && [[ -n "${NAV2_HOLD_READY_CONTROLLER_PID:-}" ]] \
         && kill -0 "${NAV2_HOLD_READY_CONTROLLER_PID}" 2>/dev/null; then
         echo "[runtime-overlay] prestarted Nav2 held launch ready from ${status_file}: wrapper_pid=${navigation_pid} controller_pid=${NAV2_HOLD_READY_CONTROLLER_PID}; lifecycle activation may start" >&2
@@ -1590,6 +1798,7 @@ wait_for_prestarted_nav2_launch_hold_ready() {
 }
 
 start_prestarted_nav2_lifecycle_background() {
+  floor_handoff_guard || return 1
   [[ "${nav2_prestarted}" -eq 1 ]] || return 0
   [[ "${nav2_lifecycle_background_started}" -eq 0 ]] || return 0
   local timeout_sec="${NJRH_NAV2_LIFECYCLE_BRINGUP_TIMEOUT_SEC:-180}"
@@ -1603,15 +1812,20 @@ start_prestarted_nav2_lifecycle_background() {
     bt_navigator
   )
   ensure_navigation_layer_alive || return 1
-  wait_for_prestarted_nav2_launch_hold_ready || return 1
-  echo "[runtime-overlay] starting prestarted Nav2 lifecycle in background with retrying lifecycle sequence timeout=${timeout_sec}s" >&2
-  log_startup_stage "nav2_lifecycle_activation_started"
+  echo "[runtime-overlay] scheduling held Nav2 readiness and lifecycle in background; initial localization does not wait for the launch receipt" >&2
+  log_startup_stage "nav2_lifecycle_worker_started"
   (
+    # Keep receipt waiting in the same owned worker as lifecycle execution.
+    # No context writes here: the parent alone joins and reports readiness.
+    # Exit 70 is reserved here for receipt failure, distinct from timeout's
+    # 124/125 results and the lifecycle client's normal failure codes.
+    wait_for_prestarted_nav2_launch_hold_ready background || exit 70
+    echo "[runtime-overlay] held Nav2 receipt confirmed; starting background lifecycle sequence timeout=${timeout_sec}s" >&2
     run_nav2_lifecycle_sequence "${timeout_sec}" "${nodes[@]}"
   ) &
   nav2_lifecycle_bringup_pid=$!
   nav2_lifecycle_background_started=1
-  echo "[runtime-overlay] Nav2 lifecycle activation running in background pid=${nav2_lifecycle_bringup_pid}" >&2
+  echo "[runtime-overlay] Nav2 startup worker running in background pid=${nav2_lifecycle_bringup_pid}" >&2
 }
 
 wait_for_prestarted_nav2_lifecycle_background() {
@@ -1631,26 +1845,9 @@ wait_for_prestarted_nav2_lifecycle_background() {
     bt_navigator
   )
   local rc=0
-  local poll_sec="${NJRH_NAV2_LIFECYCLE_BACKGROUND_ACTIVE_POLL_SEC:-0.5}"
-  local active_wait_sec="${NJRH_NAV2_LIFECYCLE_BACKGROUND_ACTIVE_WAIT_SEC:-45}"
-  local deadline=$((SECONDS + active_wait_sec))
-
-  while (( SECONDS < deadline )); do
-    if nav_lifecycle_nodes_active_quick "${nodes[@]}"; then
-      echo "[runtime-overlay] prestarted Nav2 lifecycle nodes active before background helper exit; stopping helper pid=${nav2_lifecycle_bringup_pid}" >&2
-      kill -TERM "${nav2_lifecycle_bringup_pid}" 2>/dev/null || true
-      wait "${nav2_lifecycle_bringup_pid}" 2>/dev/null || true
-      nav2_lifecycle_bringup_pid=""
-      nav2_lifecycle_background_started=0
-      echo "[runtime-overlay] lifecycle_manager_navigation external lifecycle sequence: Managed nodes are active" >&2
-      return 0
-    fi
-    if ! ps -p "${nav2_lifecycle_bringup_pid}" >/dev/null 2>&1; then
-      break
-    fi
-    sleep "${poll_sec}"
-  done
-
+  # The owned sequence already confirms every transition and has an outer
+  # timeout. Joining it avoids a competing stream of cold DDS participants.
+  # Retain its PID while waiting so the existing signal cleanup still owns it.
   if wait "${nav2_lifecycle_bringup_pid}"; then
     rc=0
   else
@@ -1658,8 +1855,15 @@ wait_for_prestarted_nav2_lifecycle_background() {
   fi
   nav2_lifecycle_bringup_pid=""
   nav2_lifecycle_background_started=0
+  if [[ "${rc}" -eq 70 ]]; then
+    # Launch ownership was required before dispatch when this wait was inline.
+    # An unrelated active graph cannot replace the required held-launch proof.
+    echo "[runtime-overlay] Nav2 background startup did not prove held launch readiness; refusing active-state fallback" >&2
+    return "${rc}"
+  fi
   if [[ "${rc}" -ne 0 ]]; then
-    if nav_lifecycle_nodes_active_quick "${nodes[@]}"; then
+    if [[ "${floor_startup_handoff_active:-0}" -eq 0 ]] \
+      && ! floor_handoff_requested && nav_lifecycle_nodes_active_quick "${nodes[@]}"; then
       echo "[runtime-overlay] prestarted Nav2 lifecycle helper exited rc=${rc}, but managed nodes are active" >&2
       echo "[runtime-overlay] lifecycle_manager_navigation external lifecycle sequence: Managed nodes are active" >&2
       return 0
@@ -1673,6 +1877,10 @@ wait_for_prestarted_nav2_lifecycle_background() {
 ensure_helper_process_no_probe() {
   local helper_name="$1"
   shift
+  if [[ "${NJRH_COMMON_SERVICES_MANAGED:-false}" == "true" ]]; then
+    echo "[runtime-overlay] ${helper_name} is common-owned; navigation cannot create a competing helper" >&2
+    return 0
+  fi
   local helper_pattern=""
   helper_pattern="$(helper_process_pattern "${helper_name}" 2>/dev/null || true)"
   if [[ -n "${helper_pattern}" ]] && helper_process_running "${helper_pattern}"; then
@@ -1686,6 +1894,7 @@ ensure_helper_process_no_probe() {
 }
 
 ensure_global_localization_wrapper_resident() {
+  local owner_start_sec=${SECONDS}
   local helper_name="global_localization_localization"
   local service_timeout="${NJRH_GLOBAL_LOCALIZATION_RESIDENT_SERVICE_WAIT_SEC:-10}"
   local helper_pattern=""
@@ -1694,7 +1903,13 @@ ensure_global_localization_wrapper_resident() {
     echo "[runtime-overlay] resident global localization wrapper already running" >&2
   else
     echo "[runtime-overlay] resident global localization wrapper missing after startup trigger; starting persistent wrapper" >&2
+    floor_handoff_guard || return 1
     ensure_helper_process_no_probe "${helper_name}" bash "${SCRIPT_DIR}/run_global_localization.sh"
+  fi
+  echo "[runtime-overlay] CONTEXT_STEP phase=wrapper_owner elapsed_sec=$((SECONDS - owner_start_sec)) result=running" >&2
+  if [[ "${1:-}" == "defer_service_observation" && "${floor_startup_handoff_active:-0}" -eq 0 ]]; then
+    # Final commit checks service and bridge on one newly created ROS node.
+    return 0
   fi
   if ! wait_for_ros_service "/global_localization/trigger" "${service_timeout}"; then
     set_localization_ready_failure \
@@ -1735,13 +1950,16 @@ ensure_navigation_layer_alive() {
 # A killed mapping launcher cannot leave the resident scan publisher disabled
 # forever.  Navigation startup explicitly reacquires and proves unique /scan
 # ownership before any localization or Nav2 readiness checks.
+if [[ "${navigation_start_source}" != "systemd_autostart" ]]; then
 restore_navigation_scan_owner "/scan" || {
   echo "[runtime-overlay] navigation startup blocked: canonical /scan ownership recovery failed" >&2
   exit 1
 }
 log_startup_stage "navigation_scan_owner_ready"
+fi
 
 if resident_navigation_ready; then
+  report_navigation_startup_finished reused
   echo "[runtime-overlay] resident navigation runtime already ready for ${NJRH_BUILDING_ID}/${NJRH_FLOOR_ID}" >&2
   if ! commit_runtime_ready_context "existing resident navigation context matches selected floor"; then
     echo "[runtime-overlay] existing resident runtime could not persist its confirmed map context; stopping it fail-closed" >&2
@@ -1766,12 +1984,18 @@ if [[ "${navigation_start_source}" == "api_resume" ]]; then
   log_startup_stage "common_local_state_ready"
 fi
 echo "[runtime-overlay] starting resident navigation localization layer for ${NJRH_BUILDING_ID}/${NJRH_FLOOR_ID}" >&2
+register_amcl_status_for_navigation || {
+  echo "[runtime-overlay] AMCL status observer registration unavailable; startup submissions will report their commit result" >&2
+}
+# Per-invocation evidence cannot reuse another boot's completed GXF marker.
+isaac_startup_dir="$(mktemp -d "${TMPDIR:-/tmp}/njrh_isaac_startup.XXXXXX")"
+export NJRH_ISAAC_STARTUP_STATE_FILE="${isaac_startup_dir}/state.json"
 NJRH_BUILDING_ID="${NJRH_BUILDING_ID}" \
 NJRH_FLOOR_ID="${NJRH_FLOOR_ID}" \
 bash "${SCRIPT_DIR}/run_occupancy_grid_localization.sh" &
 localization_pid=$!
 log_startup_stage "localization_layer_started"
-if [[ "${NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION:-false}" == "true" ]]; then
+if [[ "${NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION:-true}" == "true" ]]; then
   echo "[runtime-overlay] prestarting resident AMCL warmup before initial global localization" >&2
   start_amcl_resident_background_if_enabled_for_navigation || {
     echo "[runtime-overlay] AMCL resident warmup background failed to launch; readiness phase will retry after initial localization" >&2
@@ -1780,13 +2004,22 @@ else
   echo "[runtime-overlay] deferring resident AMCL warmup until after initial global localization" >&2
 fi
 
-if [[ "${NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION:-false}" == "true" ]]; then
+nav2_prestart_after_localization_stack=0
+if [[ "${navigation_start_source}" == "systemd_autostart" \
+  && "${NJRH_NAV_LOCAL_STATE_MODE:-ekf}" == "ekf" \
+  && "${NJRH_POINTCLOUD_ACCEL_PROFILE:-legacy}" != "legacy" ]] \
+  && env_flag_true "${NJRH_NAV2_PRESTART_AFTER_LOCALIZATION_STACK:-false}"; then
+  nav2_prestart_after_localization_stack=1
+fi
+if [[ "${NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION:-true}" == "true" \
+  && "${nav2_prestart_after_localization_stack}" -eq 0 ]]; then
   start_resident_navigation_layer "true" "nav2_layer_prestarted" "prestarting"
   nav2_prestarted=1
   sleep "${NJRH_NAV2_PRESTART_SETTLE_SEC:-0.1}"
   ensure_navigation_layer_alive || exit 1
   log_startup_stage "nav2_layer_started"
-  if [[ "${NJRH_NAV2_LIFECYCLE_BACKGROUND_START:-true}" == "true" ]]; then
+  if [[ "${NJRH_NAV2_LIFECYCLE_BACKGROUND_START:-false}" == "true" ]] \
+    && ! env_flag_true "${NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK:-false}"; then
     start_prestarted_nav2_lifecycle_background || {
       write_runtime_map_context "failed" "false" "prestarted resident Nav2 lifecycle background activation failed to launch"
       echo "[runtime-overlay] prestarted resident Nav2 lifecycle background activation failed to launch; localization layer remains running for diagnostics and retry" >&2
@@ -1795,6 +2028,20 @@ if [[ "${NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION:-false}" == "true" ]]; t
   fi
 fi
 
+sleep "${NJRH_NAV_LOCALIZATION_START_SETTLE_SEC:-0.1}"
+ensure_localization_layer_alive || exit 1
+until ensure_localization_stack_ready_for_navigation; do
+  # The existing floor transaction may take over even before initial trigger.
+  # Leave adoption to wait_for_initial_global_localization, not a new stop path.
+  if floor_handoff_requested; then break; fi
+  ensure_localization_layer_alive || exit 1
+  if [[ -n "${navigation_pid}" ]]; then ensure_navigation_layer_alive || exit 1; fi
+  write_runtime_map_context "starting" "false" "${localization_ready_failure_reason}; waiting for initialization, no localization request sent"
+  report_navigation_startup_finished waiting_for_initialization
+  # Keep healthy owners alive. Recheck initialization, never dispatch while
+  # incomplete and never turn a slow initializer into a localization timeout.
+  sleep 1
+done
 if [[ "${common_local_state_ready}" -ne 1 ]]; then
   ensure_common_local_state_ready_for_navigation_start "fresh" || {
     write_runtime_map_context "failed" "false" "${localization_ready_failure_reason:-resident robot_local_state was not ready before initial localization}"
@@ -1803,19 +2050,42 @@ if [[ "${common_local_state_ready}" -ne 1 ]]; then
   common_local_state_ready=1
   log_startup_stage "common_local_state_ready"
 fi
+if [[ "${navigation_start_source}" == "systemd_autostart" ]]; then
+  # Common cold-start already enables the resident scan worker. Keep one
+  # observer through discovery; a new client's empty graph is not evidence
+  # that scan was disabled. Mapping/API resume retain the restore path above.
+  wait_for_scan_owner "/scan" "${RESIDENT_SCAN_OWNER_NODE}" 1 \
+    "${SCAN_OWNERSHIP_TIMEOUT_SEC}" || exit 1
+  log_startup_stage "navigation_scan_owner_ready"
+fi
+if ! floor_handoff_requested; then
+  localization_ready_failure_reason=""
+  export NJRH_RUNTIME_FAILURE_CODE=""
+  log_startup_stage "localization_stack_ready"
+fi
 
-sleep "${NJRH_NAV_LOCALIZATION_START_SETTLE_SEC:-0.1}"
-ensure_localization_layer_alive || exit 1
-ensure_localization_stack_ready_for_navigation || {
-  write_runtime_map_context "failed" "false" "${localization_ready_failure_reason:-resident localization stack did not become ready before initial relocalization}"
-  exit 1
-}
-log_startup_stage "localization_stack_ready"
+# Cold-start scheduling only: defer constructing the Nav2 graph, not waiting
+# for a localization result. Other entry paths retain their existing order.
+# A floor request may arrive during stack initialization; do not start its old
+# map here. The existing trigger/handoff path adopts the exact target later.
+if [[ "${nav2_prestart_after_localization_stack}" -eq 1 \
+  && "${NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION:-true}" == "true" \
+  && "${floor_startup_handoff_active:-0}" -eq 0 ]] && ! floor_handoff_requested; then
+  if start_resident_navigation_layer "true" "nav2_layer_prestarted" "prestarting after localization stack"; then
+    nav2_prestarted=1
+    sleep "${NJRH_NAV2_PRESTART_SETTLE_SEC:-0.1}"
+    ensure_navigation_layer_alive || exit 1
+    log_startup_stage "nav2_layer_started"
+  elif ! floor_handoff_requested; then
+    exit 1
+  fi
+fi
 
 if [[ "${nav2_prestarted}" -eq 1 ]] \
   && [[ "${nav2_lifecycle_background_started}" -eq 0 ]] \
-  && env_flag_true "${NJRH_NAV2_LIFECYCLE_BACKGROUND_START:-true}" \
-  && env_flag_true "${NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK:-false}"; then
+  && env_flag_true "${NJRH_NAV2_LIFECYCLE_BACKGROUND_START:-false}" \
+  && { env_flag_true "${NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK:-false}" \
+    || [[ "${nav2_prestart_after_localization_stack}" -eq 1 ]]; }; then
   echo "[runtime-overlay] starting prestarted Nav2 lifecycle background after localization stack readiness; final ready still waits for bridge map->odom and active Nav2" >&2
   start_prestarted_nav2_lifecycle_background || {
     echo "[runtime-overlay] prestarted Nav2 lifecycle background after localization stack readiness did not launch; foreground activation will retry after initial localization" >&2
@@ -1828,16 +2098,19 @@ ensure_helper_process_no_probe "mode_manager" bash "${SCRIPT_DIR}/run_mode_manag
 echo "[runtime-overlay] resident localization layer already owns map/localizer loading; floor_manager source preflight is not repeated during runtime startup because current/ was committed and verified before launch" >&2
 log_startup_stage "floor_asset_context_verified"
 
+capture_initial_global_localization_baseline
 if env_flag_true "${NJRH_INITIAL_GLOBAL_LOCALIZATION_BACKGROUND_START:-false}"; then
   start_initial_global_localization_background
 else
   echo "[runtime-overlay] initial global localization trigger is starting after full localization-stack and floor-context readiness" >&2
 fi
 
-wait_for_initial_global_localization || {
-  write_runtime_map_context "failed" "false" "initial global localization did not pass trigger wrapper, bridge, and map->odom gates"
-  exit 1
-}
+if ! wait_for_initial_global_localization; then
+  log_startup_stage "waiting_for_localization"
+  write_runtime_map_context "starting" "false" "waiting for later localization; ${localization_ready_failure_reason:-initial localization did not complete}"
+  report_navigation_startup_finished waiting_for_localization
+  wait_for_later_initial_localization || exit 1
+fi
 log_startup_stage "initial_global_localization_ready"
 
 if [[ -z "${navigation_pid}" ]] && env_flag_true "${NJRH_NAV2_HELD_PRESTART_AFTER_LOCAL_STATE:-true}"; then
@@ -1861,12 +2134,16 @@ if [[ -z "${navigation_pid}" ]] && env_flag_true "${NJRH_NAV2_HELD_PRESTART_AFTE
 fi
 
 if env_flag_true "${NJRH_REQUIRE_AMCL_TRACKING_FOR_NAV_READY:-false}" || \
-  env_flag_true "${NJRH_AMCL_READINESS_BEFORE_NAV2_LIFECYCLE:-false}"; then
+  env_flag_true "${NJRH_AMCL_READINESS_BEFORE_NAV2_LIFECYCLE:-true}"; then
   echo "[runtime-overlay] starting AMCL readiness in parallel with Nav2 lifecycle activation" >&2
   start_amcl_readiness_background_if_enabled_for_navigation || {
     echo "[runtime-overlay] AMCL readiness background failed to launch; readiness completion will retry after Nav2 ready" >&2
   }
-  log_startup_stage "amcl_readiness_started"
+  if [[ -n "${amcl_readiness_pid}" ]]; then
+    log_startup_stage "amcl_readiness_started"
+  else
+    log_startup_stage "amcl_resident_warming"
+  fi
 else
   echo "[runtime-overlay] deferring AMCL readiness until after Nav2 lifecycle activation; runtime ready is gated by bridge map->odom and Nav2 active state" >&2
   log_startup_stage "amcl_readiness_deferred"
@@ -1886,6 +2163,7 @@ fi
 sleep "${NJRH_NAV_RUNTIME_READY_MARK_DELAY_SEC:-0.0}"
 ensure_localization_layer_alive || exit 1
 ensure_navigation_layer_alive || exit 1
+start_startup_context_observer_if_enabled
 if ! activate_prestarted_nav2_lifecycle; then
   write_runtime_map_context "failed" "false" "prestarted resident Nav2 lifecycle activation failed after initial relocalization"
   echo "[runtime-overlay] prestarted resident Nav2 lifecycle activation failed; tearing down the incomplete navigation runtime" >&2
@@ -1899,6 +2177,7 @@ if ! wait_for_nav2_layer_ready; then
   exit 1
 else
   log_startup_stage "nav2_layer_ready"
+  context_amcl_status_start_sec=${SECONDS}
   if env_flag_true "${NJRH_REQUIRE_AMCL_TRACKING_FOR_NAV_READY:-false}"; then
     if ! wait_for_amcl_readiness_background_if_running; then
       echo "[runtime-overlay] AMCL readiness background did not complete cleanly; foreground readiness will restart or repair it" >&2
@@ -1916,18 +2195,14 @@ else
     fi
     log_startup_stage "amcl_tracking_ready"
   else
-    maintain_amcl_readiness_background_for_navigation || {
-      echo "[runtime-overlay] AMCL readiness background failed to launch after Nav2 ready; continuing with bridge map->odom and Nav2 active runtime ready" >&2
-    }
     load_amcl_runtime_status
     local_ready_message="resident navigation runtime ready after trigger wrapper, bridge map->odom, and Nav2 activation; AMCL tracking continues in background"
   fi
   start_amcl_status_heartbeat_if_enabled_for_navigation || {
-    write_runtime_map_context "failed" "false" "resident navigation runtime could not start AMCL runtime status heartbeat"
-    echo "[runtime-overlay] AMCL runtime status heartbeat failed to launch" >&2
-    exit 1
+    echo "[runtime-overlay] AMCL observer unavailable; do not classify an observer failure as a navigation producer failure" >&2
   }
-  ensure_global_localization_wrapper_resident || {
+  echo "[runtime-overlay] CONTEXT_STEP phase=amcl_status elapsed_sec=$((SECONDS - context_amcl_status_start_sec)) result=checked" >&2
+  ensure_global_localization_wrapper_resident defer_service_observation || {
     write_runtime_map_context "failed" "false" "${localization_ready_failure_reason:-resident global localization wrapper was not available after startup}"
     echo "[runtime-overlay] resident global localization wrapper failed to stay available after startup" >&2
     exit 1
@@ -1937,11 +2212,16 @@ else
   else
     ready_context_message="${local_ready_message}"
   fi
-  if ! commit_runtime_ready_context "${ready_context_message}"; then
+  if ! commit_runtime_ready_context "${ready_context_message}" observe_wrapper_service; then
     echo "[runtime-overlay] resident navigation runtime could not durably confirm its map context; tearing down the incomplete runtime" >&2
     exit 1
   fi
+  report_navigation_startup_finished ready
   if ! env_flag_true "${NJRH_REQUIRE_AMCL_TRACKING_FOR_NAV_READY:-false}"; then
+    # Complete the bridge proof before starting another set of DDS clients.
+    maintain_amcl_readiness_background_for_navigation || {
+      echo "[runtime-overlay] AMCL readiness background failed to launch after confirmed navigation readiness; supervision will retry" >&2
+    }
     if [[ "${NJRH_AMCL_LOCALIZATION_MODE:-disabled}" != "disabled" && "${AMCL_READY:-false}" == "true" ]]; then
       log_startup_stage "amcl_tracking_ready"
     else
@@ -1956,13 +2236,6 @@ while true; do
   maintain_amcl_readiness_background_for_navigation || {
     echo "[runtime-overlay] AMCL background readiness maintenance could not launch a recovery attempt; the next runtime supervision cycle will retry" >&2
   }
-  if [[ -n "${amcl_status_heartbeat_pid}" ]] && ! kill -0 "${amcl_status_heartbeat_pid}" 2>/dev/null; then
-    wait "${amcl_status_heartbeat_pid}" || exit_code=$?
-    echo "[runtime-overlay] AMCL runtime status heartbeat exited with ${exit_code}" >&2
-    write_runtime_map_context "failed" "false" "AMCL runtime status heartbeat exited with ${exit_code}"
-    runtime_ready=0
-    exit "${exit_code}"
-  fi
   if [[ -n "${localization_pid}" ]] && ! kill -0 "${localization_pid}" 2>/dev/null; then
     wait "${localization_pid}" || exit_code=$?
     echo "[runtime-overlay] resident localization layer exited with ${exit_code}" >&2

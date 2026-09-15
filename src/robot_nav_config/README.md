@@ -4,19 +4,72 @@ Fixed Nav2 and canonical TF defaults for the first production-oriented scaffold.
 
 ## Parameters
 
+- Elevator direct-path endpoints use latest TF for Nav2 arrival checking,
+  matching the controller's canonical map goal. Path creation time, geometry,
+  0.06 m / 0.05 rad tolerances and collision policy are unchanged. See
+  [goal timestamp regression](docs/elevator_goal_stamp.md).
+
+- Cabin center -> cabin panel uses the independent `ElevatorCabinPanelFollowPath`
+  instance with a `0.20 m/s` lateral cap. Entry, return-center and egress retain
+  `0.40 m/s`; ordinary navigation, goal tolerances and motion policy are unchanged.
+  See [panel speed isolation](docs/elevator_scoped_motion.md#cabin-panel-speed-isolation).
+
+- Ordinary persistent-recovery candidate: the Ranger recovery tree retains the
+  same outer task, retries verified progress failures after 0/5/10-second backoff,
+  and allows one startup rearm per actual progress episode. It reports explicit
+  wait/recovery status for the API execution budget. This candidate is staged
+  only; the preceding MPPI output-filter change still needs physical acceptance.
+  No YAML geometry, motion limit, elevator or predock tree changes are included.
+  See [recovery protocol](docs/ordinary_navigation_recovery.md).
+
+- MPPI output finalization now reapplies the active velocity and native motion-model
+  constraints after Humble's signed Savitzky-Golay filter, before command selection
+  and horizon shifting. Its history records the constrained selected command.
+  Ordinary forward-only MPPI cannot leak filter-generated reverse commands; current
+  speed limits and Ackermann curvature remain enforced. No low-speed stop gate,
+  steering-centering change or task-recovery redesign is included. See
+  [output constraints](docs/chassis_response_model.md#post-filter-output-constraints).
+
+- MPPI now has a measured-response adapter, `robot_nav_config::RangerMPPIController`,
+  in the independent `chassis_dynamics` module. It retains Humble's optimizer and
+  critics but predicts the existing smoother plus CAN-identified acceleration,
+  braking and steering response before scoring trajectories. No new stop gate or
+  micro-motion suppression is added. Predock transit shares this FollowPath;
+  elevator-specific and contact docking control are unchanged. See
+  [response model](docs/chassis_response_model.md) for coefficients, evidence
+  limits, isolated tests and separately authorized activation/hardware validation.
+
+- The 2026-09-08 clearance candidate keeps the scan mask and padded physical
+  footprint at `0.39/0.28 m`, changes StopZone to `0.47/0.36 m`, and adds a
+  separate finite MPPI planning preference at `0.52/0.41 m`. Local repair first
+  searches that preferred envelope with a bounded fallback to its original
+  hard clearance. No footprint-clearing enlargement or new stop gate is used.
+  Near-goal control, elevator profiles and docking contact control are unchanged.
+  See [planning clearance](docs/planning_clearance.md); activation and moving
+  validation require separate explicit authorization.
+
+- Ordinary Ranger navigation now selects
+  `navigate_to_pose_ranger_lattice_recovery.xml`. A real progress-checker abort
+  gets at most one internal replan/startup-alignment/FollowPath retry while the
+  original NavigateToPose stays active. Humble has an empty FollowPath result,
+  so a Nav2-private preparation service checks the actual progress-failure
+  evidence and binds rearming to the exact freshly planned path. Normal hot
+  path updates do not rearm rotation. Predock, elevator and the Smac2D baseline
+  trees are unchanged. See [ordinary task recovery](docs/ordinary_navigation_recovery.md).
+
 - Planner: `nav2_smac_planner/SmacPlanner2D`
 - Optional planner profile reserved for `SmacHybrid`
-- Controller: `nav2_mppi_controller::MPPIController`
+- Controller: `robot_nav_config::RangerMPPIController` (installed Humble MPPI optimizer)
 - Fallback controller: `nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController`
-- Ranger-matched MPPI: the controller keeps the 1.2 m/s field speed target,
-  but measured chassis response is handled by `velocity_smoother`
-  in open-loop ramp mode (`smoothing_frequency=30.0`,
-  `max_accel=[0.55, 0.0, 0.45]`,
-  `max_decel=[-0.70, 0.0, -0.45]`, `max_velocity=[1.20, 0.0, 0.70]`)
+- Ranger-matched MPPI: the controller keeps the 1.2 m/s field speed target.
+  Candidate trajectories now predict the measured chassis response together
+  with the unchanged `velocity_smoother` open-loop ramp (`smoothing_frequency=30.0`,
+  `max_accel=[0.55, 0.20, 0.90]`,
+  `max_decel=[-0.95, -0.30, -1.10]`)
   and 1.5 m near-goal critic windows. The primary controller runs at 15 Hz with
   `model_dt=0.0666666667`, `vx_std=0.30`, and `wz_std=0.32` so ordinary
-  building navigation uses less jagged sample commands without changing the
-  Nav2 plugin types. Closed-loop velocity-smoother feedback is
+  building navigation retains its sampling settings. The optimizer is still
+  Humble MPPI, hosted by the Ranger response adapter. Closed-loop velocity-smoother feedback is
   avoided on Ranger Mini 3 because odom=0 plus the chassis motion-mode deadband
   can pin angular output at the single-cycle acceleration increment before the
   chassis starts moving. Normal API point navigation publishes a
@@ -36,10 +89,32 @@ Fixed Nav2 and canonical TF defaults for the first production-oriented scaffold.
   a mid-route pure-spin/replan chain. `controller_server.failure_tolerance=10.0`
   keeps the same `FollowPath` alive while a short-lived pedestrian obstacle
   clears, while remaining below the ordinary 12 s progress-checker bound.
-  Collision monitoring uses a grid-rounded `0.50 x 0.40 m` half-envelope around
-  the padded body plus MPPI's `0.08 m` collision margin, and a 2 s projected
+  Collision monitoring uses the user-selected `0.47 x 0.36 m` hard-stop half-envelope,
+  independent of MPPI's `0.08 m` soft collision margin, and a 2 s projected
   footprint approach check. It does not clear costmaps, spin, reverse, or create
   a new navigation goal while waiting.
+  See [collision monitor geometry](docs/collision_monitor_geometry.md) for clearances
+  and the remaining hardware validation.
+- Ordinary local path repair closes the `ranger_lattice` dynamic-obstacle gap:
+  its global costmap intentionally remains static, so a local-only person does
+  not invalidate the BT's retained path. `OrdinaryLocalPathRepairRuntime`
+  inspects the next 4.0 m of that path on a detached rolling-local-costmap
+  snapshot every 0.20 s. A persistent lethal/unknown intersection runs
+  forward-only Dubins Hybrid A* with the same `0.81 m` minimum turning radius
+  and the padded rectangular footprint plus the retained `0.08 m` hard repair
+  margin. The independent preferred-clearance first pass adds another `0.05 m`,
+  with fallback to that original hard envelope. A valid
+  prefix is joined back to the untouched path suffix and passed to MPPI through
+  the existing `setPlan()` while the same `FollowPath` action remains active.
+  A blocked distant reference or missing rejoin does not force zero: MPPI keeps
+  computing while the worker retries. Only MPPI's confirmed Humble no-control
+  exception requests zero and pauses progress, with computation retried on every
+  cycle. Other faults still propagate. Rejoin exits are spatially separated,
+  extend beyond the inspection horizon within the local map, and use independent
+  graphs with one shared search budget. Returned paths reattach to the latest
+  robot pose through a footprint-checked forward connector. Accepted replacements are observable on
+  `/ranger_mini3/ordinary_local_repair_path`. See
+  [`docs/ordinary_local_path_repair.md`](docs/ordinary_local_path_repair.md).
 - Pre-dock navigation uses `navigate_to_predock.xml`, not the ordinary 1 Hz
   replanning tree. It computes one SmacPlanner2D path per Nav2 action attempt and
   follows that path without replacing it every second. This prevents a
@@ -58,7 +133,9 @@ Fixed Nav2 and canonical TF defaults for the first production-oriented scaffold.
 - Smoother server: `nav2_smoother::SimpleSmoother` remains configured for
   lifecycle compatibility and tooling; the active field BT does not call
   `SmoothPath`.
-- Progress checker: `nav2_controller::PoseProgressChecker`
+- Progress checker: `robot_nav_config::ElevatorAwareProgressChecker`; ordinary
+  tracking and background local repair retain the original pose-progress limits;
+  explicit elevator waits and ordinary MPPI no-control waits pause the timer.
 - Ordinary/elevator goal checker: `nav2_controller::SimpleGoalChecker` with
   `stateful=false`, plus
   Humble RotationShim's private `.position_checker.stateful=false`,
@@ -87,10 +164,16 @@ Fixed Nav2 and canonical TF defaults for the first production-oriented scaffold.
   `sqrt(2 * max_angular_accel * remaining_yaw)`. Startup speed and MPPI path
   tracking are unchanged; set the switch to `false` for a one-parameter
    rollback.
+- Ordinary MPPI is forward-only (`vx_min=0.0`): terminal overshoot is handled by
+  the existing controller-native handoff, not by mid-route MPPI reverse samples
+  that the final arbiter cannot execute. The velocity smoother retains negative-X
+  support for terminal, elevator and docking motion. See
+  [ordinary forward and terminal reverse](docs/ordinary_forward_terminal_reverse.md).
 - Controller-native terminal pose handoff: when a pose-required goal is within
   `0.40 m`, body-frame forward residual is within `0.15 m`, lateral residual is
   at least `0.06 m`, and the residual is either lateral-dominant or represented
-  by an Ackermann hairpin,
+  by an Ackermann hairpin, or the target is behind the robot and outside the
+  XY goal tolerance within the same distance/forward envelope,
   `GoalScopedRotationShimController` keeps the same `FollowPath` action running
   and serializes yaw, side-slip, forward/reverse, and stop settle. MPPI remains
   Ackermann-only. Side-slip and reverse require fresh controller lifecycle

@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common_env.sh"
 source "${SCRIPT_DIR}/cpu_affinity.sh"
+source "${SCRIPT_DIR}/imu_pipeline_helpers.sh"
 
 PROFILE="baseline"
 APPLY=false
@@ -269,6 +270,7 @@ apply_live() {
   pids="$(pid_list_for_pattern "hesai_ros_driver_node")"; [[ -n "${pids}" ]] && njrh_apply_affinity_to_pids hesai_ros_driver ${pids}
   pids="$(pid_list_for_pattern "pointcloud_axis_remap")"; [[ -n "${pids}" ]] && njrh_apply_affinity_to_pids pointcloud_axis_remap ${pids}
   pids="$(pid_list_for_pattern "imu_axis_remap")"; [[ -n "${pids}" ]] && njrh_apply_affinity_to_pids imu_axis_remap ${pids}
+  njrh_apply_imu_pipeline_host_affinity
   pids="$(pid_list_for_pattern "local_perception_node|robot_local_perception")"; [[ -n "${pids}" ]] && njrh_apply_affinity_to_pids robot_local_perception ${pids}
   pids="$(pid_list_for_pattern "nav_cloud_preprocessor")"; [[ -n "${pids}" ]] && njrh_apply_affinity_to_pids nav_cloud_preprocessor ${pids}
   pids="$(pid_list_for_pattern "pointcloud_to_laserscan")"; [[ -n "${pids}" ]] && njrh_apply_affinity_to_pids pointcloud_to_laserscan ${pids}

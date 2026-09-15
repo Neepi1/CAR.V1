@@ -26,6 +26,7 @@ ament_export_libraries(pointcloud_accel_core)
 ament_export_targets(export_pointcloud_accel_core HAS_LIBRARY_TARGET)
 
 add_library(pointcloud_accel_core src/pointcloud_accel_core.cpp)
+target_compile_features(pointcloud_accel_core PUBLIC cxx_std_17)
 target_include_directories(pointcloud_accel_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
@@ -65,12 +66,35 @@ ament_target_dependencies(
 add_executable(pointcloud_downsample_node src/pointcloud_downsample_node.cpp)
 ament_target_dependencies(pointcloud_downsample_node rclcpp sensor_msgs)
 add_executable(imu_axis_remap_node src/imu_axis_remap_node.cpp)
+target_compile_features(imu_axis_remap_node PUBLIC cxx_std_17)
+target_include_directories(imu_axis_remap_node PRIVATE include)
 ament_target_dependencies(imu_axis_remap_node rclcpp sensor_msgs tf2)
+add_library(imu_axis_remap_core SHARED src/imu_axis_remap_node.cpp)
+target_compile_features(imu_axis_remap_core PUBLIC cxx_std_17)
+target_compile_definitions(imu_axis_remap_core PRIVATE ROBOT_IMU_LIBRARY_ONLY)
+target_include_directories(imu_axis_remap_core PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+ament_target_dependencies(imu_axis_remap_core rclcpp sensor_msgs tf2)
+ament_export_targets(export_imu_axis_remap_core HAS_LIBRARY_TARGET)
 add_executable(scan_republisher_node src/scan_republisher_node.cpp)
 ament_target_dependencies(scan_republisher_node rclcpp sensor_msgs)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_fused_normalization test/test_fused_normalization.cpp)
+  target_compile_features(test_fused_normalization PRIVATE cxx_std_17)
+  target_include_directories(test_fused_normalization PRIVATE include)
+  ament_target_dependencies(test_fused_normalization sensor_msgs)
+  ament_add_gtest(test_pointcloud_accel_core test/test_pointcloud_accel_core.cpp)
+  target_compile_features(test_pointcloud_accel_core PRIVATE cxx_std_17)
+  target_link_libraries(test_pointcloud_accel_core pointcloud_accel_core)
+  ament_target_dependencies(test_pointcloud_accel_core rclcpp sensor_msgs std_msgs)
+  add_executable(benchmark_fused_normalization test/benchmark_fused_normalization.cpp)
+  target_compile_features(benchmark_fused_normalization PRIVATE cxx_std_17)
+  target_include_directories(benchmark_fused_normalization PRIVATE include)
+  ament_target_dependencies(benchmark_fused_normalization sensor_msgs)
   ament_add_gtest(test_scan_self_mask test/test_scan_self_mask.cpp)
   target_include_directories(test_scan_self_mask PRIVATE include)
 endif()
@@ -79,6 +103,12 @@ install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)
 install(TARGETS pointcloud_accel_core
   EXPORT export_pointcloud_accel_core
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION lib/${PROJECT_NAME}
+)
+install(TARGETS imu_axis_remap_core
+  EXPORT export_imu_axis_remap_core
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}

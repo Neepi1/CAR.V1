@@ -3,6 +3,19 @@
 Wrapper for pointcloud-to-flatscan and Isaac Occupancy Grid Localizer responsibilities.
 
 The runtime wrapper node is the compiled C++ executable `global_localization_node`.
+
+Manual trigger confirmation uses the explicit Isaac sequence and settled TF,
+not the all-source rejection counter. The legacy trigger service is preserved;
+API clients use the tracked request/outcome interface. See
+[protocol, limits and isolated tests](../../docs/relocalization_trigger_confirmation.md).
+
+Isaac and its wrapper use CPU3 without moving the common localization/AMCL
+pool off CPU6. See [CPU placement, field override and acceptance](docs/isaac_cpu_affinity.md).
+
+The production cold-start coordinator now waits for the current launch's
+post-GXF Isaac initialization event before its first trigger, while map loading
+and sensor initialization overlap. The C++ trigger/reload algorithm is unchanged.
+See [startup scope and acceptance](../../docs/isaac_parallel_startup.md).
 The former Python script is kept only as historical reference during migration and is not installed or launched by the runtime path.
 
 ## Parameters
@@ -13,12 +26,12 @@ The former Python script is kept only as historical reference during migration a
 - `default_floor_id`: mock floor asset binding
 - `grid_search_trigger_service`: Isaac relocalization trigger service, defaults to `/trigger_grid_search_localization`
 - `service_call_timeout_sec`, `result_wait_timeout_sec`, `bridge_accept_timeout_sec`, `map_to_odom_wait_timeout_sec`: staged `/global_localization/trigger` timeouts
-- `localizer_input_freshness_enabled`, `localizer_input_topic`, `localizer_input_wait_timeout_sec`, `localizer_input_max_age_sec`, `localizer_input_min_fov_deg`: bounded pre-trigger admission for Isaac's localizer input. The default waits up to 1 second for a fresh `/flatscan` whose angular coverage is at least 115 degrees, matching the localizer's own minimum-FOV gate.
+- `localizer_input_freshness_enabled`, `localizer_input_topic`, `localizer_input_wait_timeout_sec`, `localizer_input_max_age_sec`, `localizer_input_min_fov_deg`: bounded pre-trigger admission for Isaac's localizer input. Each existing input wait defaults to at most 1 second and returns early on valid input. Both receipt age and original header age must be within 0.5 seconds; angular coverage must be at least 115 degrees. Startup's existing pre-dispatch retry budget is unchanged; no Isaac request is sent while input validation fails.
 - `post_reload_minimum_settle_sec`, `post_reload_readiness_timeout_sec`, and
   `post_reload_required_service_ready_samples`: generation-fenced readiness
   barrier after a non-idempotent component replacement. Defaults are `1.0 s`,
   `8.0 s`, and three consecutive ready samples.
-- After bridge force-accept is armed, the wrapper waits for the first newly received `/flatscan` before recording its trigger baseline and calling Isaac. This prevents the explicit trigger from consuming an arm-before-input sample without widening the bridge's pre-trigger timestamp slack.
+- After bridge force-accept is armed, the wrapper requires the existing two distinct, advancing, fresh `/flatscan` samples before recording its trigger baseline and calling Isaac. Failure returns `LOCALIZER_INPUT_NOT_FRESH dispatch_state=not_dispatched`, never a fall-through dispatch. A confirmed arm without any attempted Isaac call is a known not-dispatched outcome, not an unresolved computation; this does not claim that the bridge arm was cancelled. Unknown arm replies and attempted dispatches retain their existing UNKNOWN handling. See [fresh-input dispatch](docs/fresh_input_dispatch.md).
 - `result_allowed_pretrigger_age_sec`: rejects stale `/localization_result` messages that arrive after a trigger but were stamped before the trigger window.
 - `bridge_status_topic`: defaults to `/localization/bridge_status`
 - `bridge_force_accept_service`: defaults to `/robot_localization_bridge/force_accept_next_localization`
@@ -44,6 +57,8 @@ The former Python script is kept only as historical reference during migration a
 - `localizer_component_timeout_sec`: bounded timeout for every composition and
   parameter service operation. A late or timed-out operation is never reported
   as success.
+  The shipped YAML sets this to `15.0 s`; successful confirmation returns early.
+  See [configuration scope and activation](../../docs/isaac_component_timeout.md).
 - The production Isaac component uses `component_container_isolated` rather
   than `component_container_mt`. Humble stops and joins the component's
   dedicated executor before destruction. The launch owner respawns only the
@@ -159,7 +174,7 @@ The full ownership, failure, and field-validation contract is recorded in
 `/trigger_grid_search_localization`; navigation resume must wait for the
 wrapper service and the Isaac trigger service before calling floor switch.
 
-Phase L1.1 makes the trigger service a staged success gate and the only owner of one explicit-localization transaction. It arms `robot_localization_bridge` exactly once, records an immutable arm time, calls Isaac's `std_srvs/Empty` grid-search trigger once, waits for a current-arm `/localization_result`, then requires bridge acceptance, `has_map_to_odom=true`, and a live `map -> odom` owned by `robot_localization_bridge`. A pre-arm result is drained without completing the result wait, changing the arm time, extending the deadline, or issuing another Isaac trigger. The wrapper also requires `safe_for_goal_start=true`, `correction_active=false`, equal current/target sequences, and either the completed Isaac target or a completed AMCL refine tied to the same explicit sequence. A successful response therefore means the triggered correction has reached the canonical TF tree, not merely that a candidate incremented an acceptance counter. Failure messages include `failure_code=` and `dispatch_state=not_dispatched|dispatched` so callers can retry only before dispatch.
+Phase L1.1 makes the trigger service a staged success gate and the only owner of one explicit-localization transaction. It arms `robot_localization_bridge` exactly once, records an immutable arm time, calls Isaac's `std_srvs/Empty` grid-search trigger once, waits for a current-arm `/localization_result`, then requires bridge acceptance, `has_map_to_odom=true`, and a live `map -> odom` owned by `robot_localization_bridge`. A pre-arm result is drained without completing the result wait, changing the arm time, extending the deadline, or issuing another Isaac trigger. The wrapper also requires `correction_active=false`, equal current/target sequences, and either the completed Isaac target or a completed AMCL refine tied to the same explicit sequence. It does not require `safe_for_goal_start`: navigation admission belongs to the consuming operation, not localization completion. A successful response therefore means the triggered correction has reached the canonical TF tree, not merely that a candidate incremented an acceptance counter. Failure messages include `failure_code=` and `dispatch_state=not_dispatched|dispatched` so callers can retry only before dispatch. See [responsibility boundary and regression coverage](../../docs/relocalization_completion_responsibility.md).
 
 Phase A2 keeps Isaac as triggered global relocalization only. Runtime continuous localization candidates come from AMCL on `/scan`; no runtime path forwards `/flatscan` into Isaac's trigger input for background updates.
 

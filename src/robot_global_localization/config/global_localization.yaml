@@ -43,7 +43,7 @@ robot_global_localization:
     localizer_component_remap_rules:
       - "flatscan:=/flatscan"
       - "localization_result:=/localization_result"
-    localizer_component_timeout_sec: 5.0
+    localizer_component_timeout_sec: 15.0
     floor_asset_max_yaml_bytes: 2097152
     floor_asset_max_png_bytes: 536870912
     local_flatscan_config: D:/codespace/car/nav2_test/params/jt128_flatscan.yaml

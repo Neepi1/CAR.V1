@@ -9,7 +9,9 @@
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <set>
 #include <system_error>
+#include <yaml-cpp/yaml.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -125,6 +127,31 @@ bool validate(
       "relocalization sequence";
     return false;
   }
+  if (record.startup_handoff) {
+    if (record.confirmed || !safe_identifier(record.request_nonce) ||
+      (record.state != "requested" && record.state != "committed" && record.state != "failed"))
+    {
+      error = "startup handoff requires a unique nonce and an unconfirmed request state";
+      return false;
+    }
+    const fs::path root(record.asset_root);
+    if (!root.is_absolute() || root.lexically_normal() != root) {
+      error = "startup handoff requires an absolute immutable asset root";
+      return false;
+    }
+    for (const auto & role : {record.nav_map_yaml, record.localizer_map_png,
+        record.localizer_params_yaml, record.keepout_mask_yaml, record.speed_mask_yaml})
+    {
+      const fs::path path(role);
+      const auto relative = path.lexically_relative(root);
+      if (!path.is_absolute() || path.lexically_normal() != path || relative.empty() ||
+        *relative.begin() == "..")
+      {
+        error = "startup asset paths must stay inside the verified immutable bundle";
+        return false;
+      }
+    }
+  }
   return true;
 }
 
@@ -133,7 +160,8 @@ std::string serialize(const RuntimeMapContextRecord & record)
   std::ostringstream body;
   body << std::fixed << std::setprecision(6)
        << "{"
-       << "\"schema\":\"njrh.runtime_map_context.v1\","
+       << "\"schema\":" << json_string(record.startup_handoff ?
+    "njrh.floor_startup_handoff.v1" : "njrh.runtime_map_context.v1") << ","
        << "\"state\":" << json_string(record.state) << ","
        << "\"startup_stage\":\"\","
        << "\"confirmed\":" << (record.confirmed ? "true" : "false") << ","
@@ -148,8 +176,19 @@ std::string serialize(const RuntimeMapContextRecord & record)
        << "\"localizer_generation\":" << record.localizer_generation << ","
        << "\"explicit_relocalization_sequence\":"
        << record.explicit_relocalization_sequence << ","
-       << "\"updated_at\":" << record.updated_at_sec
-       << "}\n";
+       << "\"updated_at\":" << record.updated_at_sec;
+  if (record.startup_handoff) {
+    body << ",\"version\":1,\"request_nonce\":" << json_string(record.request_nonce)
+         << ",\"explicit_sequence_baseline\":" << record.explicit_sequence_baseline
+         << ",\"speed_filter_enabled\":" << (record.speed_filter_enabled ? "true" : "false")
+         << ",\"asset_root\":" << json_string(record.asset_root)
+         << ",\"nav_map_yaml\":" << json_string(record.nav_map_yaml)
+         << ",\"localizer_map_png\":" << json_string(record.localizer_map_png)
+         << ",\"localizer_params_yaml\":" << json_string(record.localizer_params_yaml)
+         << ",\"keepout_mask_yaml\":" << json_string(record.keepout_mask_yaml)
+         << ",\"speed_mask_yaml\":" << json_string(record.speed_mask_yaml);
+  }
+  body << "}\n";
   return body.str();
 }
 
@@ -173,6 +212,54 @@ bool write_all(const int descriptor, const std::string & value)
 #endif
 
 }  // namespace
+
+std::optional<FloorStartupHandoffAck> read_floor_startup_handoff_ack(
+  const fs::path & path, const RuntimeMapContextRecord & expected)
+{
+  try {
+    if (!fs::is_regular_file(fs::symlink_status(path)) || fs::file_size(path) > 65536U) {
+      return std::nullopt;
+    }
+    const auto root = YAML::LoadFile(path.string());
+    if (!root.IsMap()) {return std::nullopt;}
+    std::set<std::string> keys;
+    for (const auto & field : root) {
+      if (!field.first.IsScalar() || !field.second.IsScalar() ||
+        !keys.insert(field.first.as<std::string>()).second)
+      {
+        return std::nullopt;
+      }
+    }
+    if (root["schema"].as<std::string>() != "njrh.floor_startup_handoff_ack.v1" ||
+      root["version"].as<unsigned int>() != 1U ||
+      root["transaction_id"].as<std::string>() != expected.transaction_id ||
+      root["request_nonce"].as<std::string>() != expected.request_nonce ||
+      root["building_id"].as<std::string>() != expected.building_id ||
+      root["floor_id"].as<std::string>() != expected.floor_id ||
+      root["map_id"].as<std::string>() != expected.map_id ||
+      root["asset_epoch"].as<std::uint64_t>() != expected.asset_epoch ||
+      root["asset_digest"].as<std::string>() != expected.asset_digest)
+    {
+      return std::nullopt;
+    }
+    FloorStartupHandoffAck ack;
+    ack.state = root["state"].as<std::string>();
+    ack.failure = root["failure"] ? root["failure"].as<std::string>() : "";
+    ack.detail = root["detail"] ? root["detail"].as<std::string>() : "";
+    if (ack.state != "adopted" && ack.state != "runtime_ready" && ack.state != "failed") {
+      return std::nullopt;
+    }
+    if (ack.state == "runtime_ready") {
+      ack.explicit_relocalization_sequence = root["explicit_relocalization_sequence"].as<std::uint64_t>();
+      ack.localizer_generation = root["localizer_generation"].as<std::uint64_t>();
+      if (ack.explicit_relocalization_sequence <= expected.explicit_sequence_baseline ||
+        ack.localizer_generation == 0U) {return std::nullopt;}
+    }
+    return ack;
+  } catch (const std::exception &) {
+    return std::nullopt;
+  }
+}
 
 bool AtomicRuntimeMapContextWriter::write(
   const fs::path & path,

@@ -3215,12 +3215,6 @@ private:
     if (const auto blocked = ports_.floor_runtime_interlock_response("keepout_update_commit")) {
       return *blocked;
     }
-    auto motion_admission =
-      ports_.acquire_motion_admission(motion_admission_epoch);
-    if (!motion_admission.admitted()) {
-      return motion_admission_failure_response(
-        "keepout_update", motion_admission);
-    }
     try {
       // Persist the fail-closed latch before the first payload write. A crash
       // anywhere after this point remains blocked across process restart until

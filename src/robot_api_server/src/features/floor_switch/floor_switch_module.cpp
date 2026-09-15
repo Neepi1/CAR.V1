@@ -217,7 +217,7 @@ public:
     return config_.negative_interlock_enabled;
   }
 
-  FloorRuntimeInterlockDecision interlock_decision() const
+  FloorRuntimeInterlockDecision interlock_decision(const std::string & operation = "") const
   {
     if (!config_.negative_interlock_enabled) {
       FloorRuntimeInterlockDecision decision;
@@ -226,7 +226,7 @@ public:
       return decision;
     }
     std::lock_guard<std::mutex> lock(interlock_mutex_);
-    return interlock_.decision();
+    return interlock_.decision_for_operation(operation);
   }
 
   bool operation_blocked(
@@ -234,7 +234,7 @@ public:
     std::string & detail,
     std::string * reason_code) const
   {
-    const auto decision = interlock_decision();
+    const auto decision = interlock_decision(operation);
     if (!decision.blocked) {
       detail.clear();
       if (reason_code != nullptr) {
@@ -259,7 +259,7 @@ public:
   std::optional<HttpResponse> interlock_response(
     const std::string & operation) const
   {
-    const auto decision = interlock_decision();
+    const auto decision = interlock_decision(operation);
     if (!decision.blocked) {
       return std::nullopt;
     }
@@ -672,18 +672,12 @@ private:
           "action server unavailable: " + config_.live_action) + "}"};
     }
 
-    auto motion_admission = ports_.acquire_motion_admission(motion_admission_epoch);
-    if (!motion_admission.admitted()) {
-      return motion_admission_failure_response(
-        "live_floor_switch_start", motion_admission);
-    }
 
     const auto transaction_id =
       "manual-floor-switch-" + utc_timestamp_compact() + "-" +
       std::to_string(sequence_.fetch_add(1U, std::memory_order_acq_rel) + 1U);
     const auto decision = transaction_.start(transaction_id, target);
     if (!decision.accepted) {
-      motion_admission.unlock();
       std::ostringstream response;
       response << "{\"ok\":false,\"code\":" << json_string(decision.code)
                << ",\"detail\":" << json_string(decision.detail)
@@ -722,7 +716,6 @@ private:
     try {
       goal_future = live_client_->async_send_goal(goal, options);
     } catch (const std::exception & exception) {
-      motion_admission.unlock();
       FloorSwitchHttpOutcome outcome;
       outcome.failure_code = FloorSwitchAction::Result::INTERNAL_ERROR;
       outcome.detail = std::string("failed to submit strict floor-switch action: ") +
@@ -733,7 +726,6 @@ private:
         "application/json",
         live_response_json(transaction_.latest_snapshot(), false)};
     }
-    motion_admission.unlock();
 
     shutdown_requested_.store(false, std::memory_order_release);
     {
@@ -1041,10 +1033,6 @@ private:
     request->expected_asset_digest = selected_map->asset_digest;
     request->resume_navigation = resume_navigation;
 
-    auto motion_admission = ports_.acquire_motion_admission(motion_admission_epoch);
-    if (!motion_admission.admitted()) {
-      return motion_admission_failure_response("floor_switch", motion_admission);
-    }
     DelayedSideEffectEvidence pending_side_effect(ports_);
     auto future = legacy_client_->async_send_request(request);
     if (future.wait_for(config_.service_timeout) != std::future_status::ready) {

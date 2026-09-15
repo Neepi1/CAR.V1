@@ -1,23 +1,26 @@
 #include "robot_api_server/features/localization/localization_module.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <future>
 #include <iomanip>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <utility>
 
 #include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
-#include "robot_interfaces/srv/trigger_localization.hpp"
+#include "robot_interfaces/srv/trigger_localization_tracked.hpp"
 #include "std_msgs/msg/string.hpp"
 #include "std_srvs/srv/empty.hpp"
 #include "std_srvs/srv/set_bool.hpp"
 #include "tf2_msgs/msg/tf_message.hpp"
 
 #include "robot_api_server/features/localization/tf_pose_utils.hpp"
+#include "robot_api_server/features/localization/trigger_evidence.hpp"
 
 namespace robot_api_server::features::localization
 {
@@ -59,22 +62,21 @@ class PendingSideEffectEvidence
 {
 public:
   explicit PendingSideEffectEvidence(const LocalizationModulePorts & ports)
-  : ports_(ports)
+  : resolved_callback_(ports.side_effect_resolved)
   {
-    ports_.side_effect_started();
+    ports.side_effect_started();
   }
 
   void resolve()
   {
-    if (!resolved_) {
-      ports_.side_effect_resolved();
-      resolved_ = true;
+    if (!resolved_.exchange(true)) {
+      resolved_callback_();
     }
   }
 
 private:
-  const LocalizationModulePorts & ports_;
-  bool resolved_{false};
+  const std::function<void()> resolved_callback_;
+  std::atomic<bool> resolved_{false};
 };
 
 }  // namespace
@@ -119,10 +121,16 @@ public:
       });
 
     localization_trigger_client_ =
-      node_.create_client<robot_interfaces::srv::TriggerLocalization>(
-      config_.trigger_service,
+      node_.create_client<robot_interfaces::srv::TriggerLocalizationTracked>(
+      config_.trigger_service + "/tracked",
       rmw_qos_profile_services_default,
       callback_group_);
+    trigger_evidence_ = std::make_shared<TriggerEvidenceRegistry>();
+    trigger_status_sub_ = node_.create_subscription<TriggerEvidence::Status>(
+      "/global_localization/trigger_status", rclcpp::QoS(128).reliable().transient_local(),
+      [registry = trigger_evidence_](const TriggerEvidence::Status::SharedPtr status) {
+        registry->observe(*status);
+      });
     bridge_correction_pause_client_ = node_.create_client<std_srvs::srv::SetBool>(
       config_.bridge_correction_pause_service,
       rmw_qos_profile_services_default,
@@ -368,7 +376,7 @@ public:
 
   std::string trigger_service_name() const
   {
-    return config_.trigger_service;
+    return config_.trigger_service + "/tracked";
   }
 
   std::string result_topic_name() const
@@ -385,106 +393,72 @@ public:
     const std::string & reason,
     std::string & detail,
     const double wait_timeout_sec,
-    std::uint64_t * accepted_sequence)
+    std::uint64_t * accepted_sequence,
+    TriggerEvidence::Status * outcome = nullptr)
   {
+    if (outcome != nullptr) {
+      outcome->state = TriggerEvidence::Status::FAILED;
+      outcome->outcome_known = true;
+      outcome->code = "LOCALIZATION_NOT_DISPATCHED";
+    }
     if (ports_.operation_blocked("localization_trigger", detail)) {
       return false;
     }
-    const auto trigger_started_at = std::chrono::steady_clock::now();
     if (accepted_sequence != nullptr) {
       *accepted_sequence = 0U;
     }
-    const auto bridge_before = bridge_status_snapshot();
-    const std::uint64_t previous_explicit_sequence =
-      bridge_before.available ? bridge_before.last_explicit_relocalization_sequence : 0U;
     const double timeout_sec = wait_timeout_sec > 0.0 ?
       wait_timeout_sec : config_.default_relocalization_wait_sec;
     const auto trigger_timeout = localization_trigger_service_timeout(timeout_sec);
     if (!localization_trigger_client_->wait_for_service(trigger_timeout)) {
-      detail = "service unavailable: " + config_.trigger_service;
+      detail = "service unavailable: " + config_.trigger_service + "/tracked";
+      if (outcome != nullptr) {
+        outcome->state = TriggerEvidence::Status::FAILED;
+        outcome->outcome_known = true;
+        outcome->code = "LOCALIZATION_SERVICE_UNAVAILABLE";
+      }
       return false;
     }
     if (ports_.operation_blocked("localization_trigger", detail)) {
       return false;
     }
 
-    const std::string force_accept_detail =
-      "global localization wrapper owns bridge force-accept for reason=" + reason;
-    PendingSideEffectEvidence pending_side_effect(ports_);
-    auto request = std::make_shared<robot_interfaces::srv::TriggerLocalization::Request>();
+    using Tracked = robot_interfaces::srv::TriggerLocalizationTracked;
+    auto request = std::make_shared<Tracked::Request>();
+    request->request_id = trigger_session_ + "-" + std::to_string(++trigger_sequence_);
     request->reason = reason;
-    auto future = localization_trigger_client_->async_send_request(request);
-    if (future.wait_for(trigger_timeout) != std::future_status::ready) {
-      detail = "timed out waiting for localization trigger";
-      return false;
-    }
-
-    const auto response = future.get();
-    if (!response->accepted) {
-      const bool predispatch_without_unknown_bridge_arm =
-        response->message.find("dispatch_state=not_dispatched") != std::string::npos &&
-        response->message.find("failure_code=BRIDGE_FORCE_ACCEPT_TIMEOUT") == std::string::npos &&
-        response->message.find("failure_code=BRIDGE_FORCE_ACCEPT_FAILED") == std::string::npos;
-      if (predispatch_without_unknown_bridge_arm) {
-        pending_side_effect.resolve();
+    auto evidence = std::make_shared<TriggerEvidence>(
+      request->request_id, ports_.side_effect_started, ports_.side_effect_resolved);
+    trigger_evidence_->insert(evidence);
+    std::string transport_detail;
+    try {
+      auto future = localization_trigger_client_->async_send_request(request,
+        [registry = trigger_evidence_](rclcpp::Client<Tracked>::SharedFuture result) {
+          try {
+            registry->observe(result.get()->status);
+          } catch (const std::exception &) {
+            // A transport error does not prove that the server did not execute.
+          }
+        });
+      if (future.wait_for(trigger_timeout) == std::future_status::ready) {
+        trigger_evidence_->observe(future.get()->status);
+      } else {
+        transport_detail = "; HTTP wait expired; retaining the request for late completion";
       }
-      detail = response->message;
-      return false;
+    } catch (const std::exception & exception) {
+      transport_detail = std::string("; transport outcome unknown: ") + exception.what();
     }
-
-    std::string result_detail;
-    LocalizationResultSnapshot accepted_snapshot;
-    if (!wait_for_localization_result_after(
-        trigger_started_at, timeout_sec, result_detail, &accepted_snapshot))
-    {
-      accepted_snapshot = localization_result_snapshot();
-      if (accepted_snapshot.available &&
-        accepted_snapshot.frame_id == config_.map_frame &&
-        accepted_snapshot.age_sec <= config_.recent_result_max_age_sec)
-      {
-        detail = force_accept_detail + "; " + localization_result_recent_fallback_detail(
-          response->message,
-          config_.result_topic,
-          accepted_snapshot);
-        const bool accepted = wait_for_localization_bridge_acceptance(
-          accepted_snapshot, detail);
-        const auto bridge_after = bridge_status_snapshot();
-        const bool explicit_sequence_advanced =
-          bridge_after.available &&
-          bridge_after.last_explicit_relocalization_sequence > previous_explicit_sequence;
-        const bool proven = accepted && explicit_sequence_advanced;
-        if (proven) {
-          pending_side_effect.resolve();
-        }
-        if (accepted && !explicit_sequence_advanced) {
-          detail += "; map->odom bridge explicit relocalization sequence did not advance";
-        }
-        if (proven && accepted_sequence != nullptr) {
-          *accepted_sequence = bridge_after.last_explicit_relocalization_sequence;
-        }
-        return proven;
-      }
-      detail = force_accept_detail + "; " + response->message + "; " + result_detail;
-      return false;
+    const auto status = evidence->snapshot();
+    if (outcome != nullptr) {
+      *outcome = status;
     }
-
-    detail = force_accept_detail + "; " + response->message + "; " + result_detail;
-    const bool accepted = wait_for_localization_bridge_acceptance(accepted_snapshot, detail);
-    const auto bridge_after = bridge_status_snapshot();
-    const bool explicit_sequence_advanced =
-      bridge_after.available &&
-      bridge_after.last_explicit_relocalization_sequence > previous_explicit_sequence;
-    const bool proven = accepted && explicit_sequence_advanced;
-    if (proven) {
-      pending_side_effect.resolve();
+    detail = "request_id=" + request->request_id + " code=" + status.code + "; " +
+      status.detail + transport_detail;
+    const bool succeeded = status.outcome_known && status.state == TriggerEvidence::Status::SUCCEEDED;
+    if (succeeded && accepted_sequence != nullptr) {
+      *accepted_sequence = status.accepted_explicit_sequence;
     }
-    if (accepted && !explicit_sequence_advanced) {
-      detail += "; map->odom bridge explicit relocalization sequence did not advance";
-    }
-    if (proven && accepted_sequence != nullptr) {
-      *accepted_sequence = bridge_after.last_explicit_relocalization_sequence;
-    }
-    return proven;
+    return succeeded;
   }
 
   bool request_bridge_correction_pause(
@@ -503,14 +477,22 @@ public:
     }
     auto request = std::make_shared<std_srvs::srv::SetBool::Request>();
     request->data = paused;
-    PendingSideEffectEvidence pending_side_effect(ports_);
-    auto future = bridge_correction_pause_client_->async_send_request(request);
+    auto pending_side_effect = std::make_shared<PendingSideEffectEvidence>(ports_);
+    auto future = bridge_correction_pause_client_->async_send_request(request,
+      [pending_side_effect](rclcpp::Client<std_srvs::srv::SetBool>::SharedFuture result) {
+        try {
+          (void)result.get();
+          pending_side_effect->resolve();
+        } catch (const std::exception &) {
+          // Keep uncertainty if no server outcome was received.
+        }
+      });
     if (future.wait_for(timeout) != std::future_status::ready) {
       detail = "timeout waiting for service: " + config_.bridge_correction_pause_service;
       return false;
     }
     const auto response = future.get();
-    pending_side_effect.resolve();
+    pending_side_effect->resolve();
     detail = response->message;
     return response->success;
   }
@@ -526,15 +508,23 @@ public:
       return false;
     }
     auto request = std::make_shared<std_srvs::srv::Empty::Request>();
-    PendingSideEffectEvidence pending_side_effect(ports_);
-    auto future = amcl_nomotion_update_client_->async_send_request(request);
+    auto pending_side_effect = std::make_shared<PendingSideEffectEvidence>(ports_);
+    auto future = amcl_nomotion_update_client_->async_send_request(request,
+      [pending_side_effect](rclcpp::Client<std_srvs::srv::Empty>::SharedFuture result) {
+        try {
+          (void)result.get();
+          pending_side_effect->resolve();
+        } catch (const std::exception &) {
+          // No response is not proof of no side effects.
+        }
+      });
     if (future.wait_for(timeout) != std::future_status::ready) {
       detail = "timeout waiting for AMCL no-motion update service for " + context + ": " +
         config_.amcl_nomotion_update_service;
       return false;
     }
     (void)future.get();
-    pending_side_effect.resolve();
+    pending_side_effect->resolve();
     detail = "AMCL no-motion update requested for " + context + " via " +
       config_.amcl_nomotion_update_service;
     return true;
@@ -581,7 +571,7 @@ public:
       const bool refine_accepted =
         bridge.amcl_post_isaac_refined_sequence == relocalization_sequence;
       const bool refine_fully_applied =
-        refine_accepted && bridge.safe_for_goal_start && !bridge.correction_active &&
+        refine_accepted && !bridge.correction_active &&
         bridge.current_sequence == bridge.target_sequence &&
         bridge.last_published_sequence >= bridge.current_sequence;
       if (refine_fully_applied) {
@@ -756,8 +746,9 @@ private:
       body, "amcl_refine_required", config_.manual_amcl_refine_required);
     std::string detail;
     std::uint64_t relocalization_sequence = 0U;
+    TriggerEvidence::Status trigger_outcome;
     bool ok = trigger_localization_and_wait_for_result(
-      reason, detail, wait_timeout, &relocalization_sequence);
+      reason, detail, wait_timeout, &relocalization_sequence, &trigger_outcome);
     bool amcl_refine_ok = false;
     std::string amcl_refine_detail = "not run";
     if (ok) {
@@ -774,6 +765,10 @@ private:
       amcl_refine_detail = "not run because Isaac relocalization was not accepted";
     }
 
+    // Localization completion is independent of the optional navigation postcheck.
+    // Keep the legacy combined HTTP outcome without discarding the localization result.
+    const bool localization_complete = ok;
+    const std::string localization_detail = detail;
     bool settle_ok = false;
     std::string settle_detail = "not requested";
     if (ok && wait_for_settle) {
@@ -793,6 +788,13 @@ private:
 
     std::ostringstream out;
     out << "{\"ok\":" << (ok ? "true" : "false")
+        << ",\"localization_complete\":" << (localization_complete ? "true" : "false")
+        << ",\"localization_detail\":" << json_string(localization_detail)
+        << ",\"code\":" << json_string(ok ? "LOCALIZATION_COMPLETE" :
+          (trigger_outcome.state == TriggerEvidence::Status::SUCCEEDED ?
+          "LOCALIZATION_POSTCHECK_FAILED" : trigger_outcome.code))
+        << ",\"request_id\":" << json_string(trigger_outcome.request_id)
+        << ",\"trigger_outcome_known\":" << (trigger_outcome.outcome_known ? "true" : "false")
         << ",\"message\":" << json_string(detail)
         << ",\"last_explicit_relocalization_sequence\":" << relocalization_sequence
         << ",\"manual_relocalization_amcl_refine_requested\":"
@@ -1094,7 +1096,12 @@ private:
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr bridge_status_sub_;
   rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr tf_sub_;
   rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr tf_static_sub_;
-  rclcpp::Client<robot_interfaces::srv::TriggerLocalization>::SharedPtr
+  const std::string trigger_session_{"api-localization-" + std::to_string(std::random_device{}()) +
+    "-" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count())};
+  std::atomic<std::uint64_t> trigger_sequence_{0};
+  std::shared_ptr<TriggerEvidenceRegistry> trigger_evidence_;
+  rclcpp::Subscription<TriggerEvidence::Status>::SharedPtr trigger_status_sub_;
+  rclcpp::Client<robot_interfaces::srv::TriggerLocalizationTracked>::SharedPtr
     localization_trigger_client_;
   rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr bridge_correction_pause_client_;
   rclcpp::Client<std_srvs::srv::Empty>::SharedPtr amcl_nomotion_update_client_;

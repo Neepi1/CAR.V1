@@ -17,6 +17,14 @@ PORT="${ROBOT_API_SERVER_PORT:-8080}"
 DOCKING_SENSOR_BACKEND="${NJRH_DOCKING_SENSOR_BACKEND:-orbbec_336l}"
 docking_backend_args=()
 
+# The common owner starts the manager after main-stack initialization. Reuse
+# the existing empty-command policy so an early App request cannot race it.
+# Standalone API launch retains its existing on-demand manager behavior.
+if [[ "${NJRH_COMMON_SERVICES_MANAGED:-false}" == "true" &&
+  "${NJRH_DOCKING_MANAGER_AUTOSTART:-true}" == "true" ]]; then
+  docking_backend_args+=(-p "docking_manager_start_command:=''")
+fi
+
 case "${DOCKING_SENSOR_BACKEND}" in
   gs2)
     docking_backend_args+=(
@@ -44,16 +52,42 @@ esac
 
 cd "${PROJECT_ROOT}"
 set +u
-source /opt/ros/humble/setup.bash
-
-if [[ ! -x "${PROJECT_ROOT}/install/robot_api_server/lib/robot_api_server/robot_api_server_node" ]]; then
-  colcon build --packages-select robot_map_asset_identity robot_interfaces robot_elevator_manager robot_api_server --symlink-install
+# common_env already prepares both layers for cold entries and exports them
+# to resident children. Only restore an actually missing layer here.
+if [[ "${ROS_VERSION:-}" != 2 || "${ROS_DISTRO:-}" != humble ||
+  ":${AMENT_PREFIX_PATH:-}:" != *":/opt/ros/humble:"* ||
+  ":${LD_LIBRARY_PATH:-}:" != *":/opt/ros/humble/lib:"* ]]; then
+  source /opt/ros/humble/setup.bash
 fi
 
-source "${PROJECT_ROOT}/install/setup.bash"
+API_BIN="${PROJECT_ROOT}/install/robot_api_server/lib/robot_api_server/robot_api_server_node"
+api_built=false
+if [[ ! -x "${API_BIN}" ]]; then
+  colcon build --packages-select robot_map_asset_identity robot_interfaces robot_elevator_manager robot_api_server --symlink-install
+  api_built=true
+fi
+
+api_overlay_ready=false
+if [[ "${NJRH_COMMON_ENV_SETUP_DONE:-}" == 1 ]]; then
+  api_overlay_ready=true
+  for package in robot_api_server robot_interfaces; do
+    package_ready=false
+    for prefix in "${PROJECT_ROOT}/install" "${PROJECT_ROOT}/install/${package}"; do
+      if [[ ":${AMENT_PREFIX_PATH:-}:" == *":${prefix}:"* &&
+        ":${LD_LIBRARY_PATH:-}:" == *":${prefix}/lib:"* ]]; then
+        package_ready=true
+        break
+      fi
+    done
+    [[ "${package_ready}" == true ]] || api_overlay_ready=false
+  done
+fi
+if [[ "${api_built}" == true || "${api_overlay_ready}" != true ]]; then
+  source "${PROJECT_ROOT}/install/local_setup.bash"
+fi
 set -u
 
-njrh_exec_affined robot_api_server ros2 run robot_api_server robot_api_server_node --ros-args \
+njrh_exec_affined robot_api_server "${API_BIN}" --ros-args \
   --params-file "${CONFIG_FILE}" \
   -p port:="${PORT}" \
   "${docking_backend_args[@]}"

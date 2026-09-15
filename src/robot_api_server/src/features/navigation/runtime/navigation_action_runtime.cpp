@@ -8,6 +8,8 @@
 
 #include "action_msgs/msg/goal_status.hpp"
 #include "action_msgs/srv/cancel_goal.hpp"
+#include "std_msgs/msg/string.hpp"
+#include "robot_api_server/features/navigation/runtime/navigation_recovery_wait.hpp"
 
 #include "robot_api_server/features/navigation/runtime/navigation_cancel_policy.hpp"
 
@@ -75,6 +77,12 @@ public:
       [this](const action_msgs::msg::GoalStatusArray::SharedPtr msg) {
         handle_status(msg);
       });
+    recovery_sub_ = node_.create_subscription<std_msgs::msg::String>(
+      "/navigation/ordinary_recovery_status", rclcpp::QoS(1).reliable(),
+      [this](const std_msgs::msg::String::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(goal_mutex_);
+        recovery_wait_.receive(msg->data, node_.now().nanoseconds(), steady_seconds());
+      });
   }
 
   Client::SharedPtr client() const
@@ -101,13 +109,28 @@ public:
     GoalHandle::SharedPtr goal_handle,
     std::string pose_id,
     std::string building_id,
-    std::string floor_id)
+    std::string floor_id,
+    std::int64_t goal_stamp_ns)
   {
     std::lock_guard<std::mutex> lock(goal_mutex_);
     active_goal_handle_ = std::move(goal_handle);
     pose_id_ = std::move(pose_id);
     building_id_ = std::move(building_id);
     floor_id_ = std::move(floor_id);
+    recovery_wait_.bind(goal_stamp_ns);
+  }
+
+  static double steady_seconds()
+  {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+
+  std::string recovery_phase(const GoalHandle::SharedPtr & handle) const
+  {
+    std::lock_guard<std::mutex> lock(goal_mutex_);
+    if (!handle || !active_goal_handle_ ||
+      handle->get_goal_id() != active_goal_handle_->get_goal_id()) {return {};}
+    return recovery_wait_.phase(node_.now().nanoseconds(), steady_seconds());
   }
 
   GoalHandle::SharedPtr active_goal() const
@@ -386,6 +409,7 @@ private:
   void clear_goal_locked()
   {
     active_goal_handle_.reset();
+    recovery_wait_.bind(0);
     pose_id_.clear();
     building_id_.clear();
     floor_id_.clear();
@@ -396,6 +420,8 @@ private:
   NavigationActionRuntimePorts ports_;
   Client::SharedPtr client_;
   rclcpp::Subscription<action_msgs::msg::GoalStatusArray>::SharedPtr status_sub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr recovery_sub_;
+  NavigationRecoveryWait recovery_wait_;
   mutable std::mutex action_mutex_;
   mutable std::mutex goal_mutex_;
   GoalHandle::SharedPtr active_goal_handle_;
@@ -444,11 +470,17 @@ void NavigationActionRuntime::track_goal(
   GoalHandle::SharedPtr goal_handle,
   std::string pose_id,
   std::string building_id,
-  std::string floor_id)
+  std::string floor_id,
+  std::int64_t goal_stamp_ns)
 {
   impl_->track_goal(
     std::move(goal_handle), std::move(pose_id), std::move(building_id),
-    std::move(floor_id));
+    std::move(floor_id), goal_stamp_ns);
+}
+
+std::string NavigationActionRuntime::recovery_phase(const GoalHandle::SharedPtr & goal) const
+{
+  return impl_->recovery_phase(goal);
 }
 
 NavigationActionRuntime::GoalHandle::SharedPtr

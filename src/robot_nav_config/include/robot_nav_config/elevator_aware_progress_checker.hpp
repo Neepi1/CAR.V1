@@ -11,6 +11,7 @@
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
 #include "robot_nav_config/elevator_aware_progress_policy.hpp"
 #include "robot_nav_config/elevator_scoped_progress_state.hpp"
+#include "robot_nav_config/navigation_recovery/recovery_state.hpp"
 #include "std_msgs/msg/u_int8.hpp"
 
 namespace robot_nav_config {
@@ -42,6 +43,7 @@ private:
   std::optional<ElevatorScopedProgressState> last_progress_state_;
   std::optional<bool> last_elevator_scoped_;
   std::unique_ptr<ElevatorAwareProgressPolicy> policy_;
+  std::shared_ptr<navigation_recovery::RecoveryState> ordinary_recovery_state_;
 };
 
 } // namespace robot_nav_config

@@ -28,7 +28,8 @@ bool elevator_entry_collision_bypass_authorized(
          context.operating_mode_owner == "robot_elevator_manager" &&
          context.operating_mode_mission_id ==
          "elevator_" + permit.transaction_id &&
-         context.operating_mode == "DOORWAY";
+         (context.operating_mode == "ELEVATOR_WAIT" ||
+         context.operating_mode == "DOORWAY");
 }
 
 }  // namespace robot_safety

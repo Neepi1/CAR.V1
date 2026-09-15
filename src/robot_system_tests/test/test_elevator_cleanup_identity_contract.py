@@ -3,6 +3,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 API_ROOT = ROOT / "src" / "robot_api_server"
+EXECUTION_ROOT = API_ROOT / "src" / "features" / "elevator" / "execution"
 
 
 def _function_body(source: str, start: str, end: str) -> str:
@@ -12,12 +13,12 @@ def _function_body(source: str, start: str, end: str) -> str:
 
 
 def test_cleanup_does_not_expire_transient_local_asset_snapshot():
-    runtime = (API_ROOT / "src" / "elevator_ros_runtime_port.cpp").read_text(
+    runtime = (EXECUTION_ROOT / "elevator_ros_runtime_port.cpp").read_text(
         encoding="utf-8"
     )
     cleanup = _function_body(
         runtime,
-        "RuntimeResult validate_live_cleanup_identity(",
+        "RuntimeResult validate_strict_cleanup_runtime_identity(",
         "\n  RuntimeResult validate_transaction(",
     )
 
@@ -36,13 +37,13 @@ def test_cleanup_does_not_expire_transient_local_asset_snapshot():
 
 
 def test_cleanup_keeps_live_health_and_bridge_fresh_and_exact():
-    policy = (API_ROOT / "src" / "elevator_runtime_policy.cpp").read_text(
+    policy = (EXECUTION_ROOT / "elevator_runtime_policy.cpp").read_text(
         encoding="utf-8"
     )
     assessment = _function_body(
         policy,
         "assess_elevator_cleanup_runtime_identity(",
-        "\nstd::optional<robot_elevator_manager::ElevatorRuntimePose>",
+        "\nstd::optional<ElevatorRuntimeFloorIdentity>",
     )
 
     assert "evidence.localization_health_received_at_sec" in assessment
@@ -67,3 +68,29 @@ def test_cleanup_keeps_live_health_and_bridge_fresh_and_exact():
         "assessment.localization_bridge_exact",
     ):
         assert required in proven
+
+
+def test_cleanup_only_entry_uses_tested_policy_and_preserves_caller_safety_checks():
+    runtime = (EXECUTION_ROOT / "elevator_ros_runtime_port.cpp").read_text(
+        encoding="utf-8"
+    )
+    entry = _function_body(
+        runtime,
+        "RuntimeResult validate_live_cleanup_identity(",
+        "\n  RuntimeResult validate_strict_cleanup_runtime_identity(",
+    )
+    assert "check_elevator_cleanup_runtime_readiness(" in entry
+    assert "options_.persistent_recovery_lock_enabled, context.disposition" in entry
+    assert "validate_strict_cleanup_runtime_identity(" in entry
+    assert "*runtime_superseded_out = false" in entry
+    # Supporting wiring check only. Actual callback policy is executed by C++
+    # tests; these markers guard accidental removal of the independent proofs.
+    finalization = _function_body(
+        runtime, "RuntimeResult finalize_recovery(", "\n  void request_cancel("
+    )
+    for required in (
+        "wait_for_restart_action_idle(", "wait_for_stop()",
+        "wait_for_recovery_resource_absence(", "wait_for_no_foreign_elevator_hold(",
+        "prove_no_delayed_side_effect_unknown()", "ReleaseMotionHoldIfExecutionIdle",
+    ):
+        assert required in finalization

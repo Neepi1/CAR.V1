@@ -40,6 +40,20 @@ def main() -> None:
     assert "HttpResponse ApplicationRouterModule::route" in source
     assert "endpoint is reserved but not wired" in source
     assert "endpoint not found:" in source
+    assert "const bool elevator_request" in source
+    assert "if (elevator_request)" in source
+
+    # Legacy signatures are ABI slots, not permission to reacquire the test lock.
+    for relative in (
+        "mapping/mapping_module.cpp", "navigation/navigation_module.cpp",
+        "docking/lifecycle/docking_http_module.cpp", "maps/maps_module.cpp",
+        "floor_switch/floor_switch_module.cpp", "teleop/teleop_module.cpp",
+        "safety/safety_feature_module.cpp", "localization/localization_feature_module.cpp",
+    ):
+        feature = (PACKAGE_ROOT / "src/features" / relative).read_text(encoding="utf-8")
+        assert ".acquire_motion_admission(" not in feature, relative
+        assert "->acquire_motion_admission(" not in feature, relative
+        assert "ports_.elevator_interlock()" not in feature, relative
 
     ordered_markers = (
         "ports_.elevator_interlock(request)",

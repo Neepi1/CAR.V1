@@ -6,6 +6,8 @@ source "${SCRIPT_DIR}/common_env.sh"
 source "${SCRIPT_DIR}/runtime_health_helpers.sh"
 
 canonical_helper_pids=()
+declare -A canonical_local_state_deadlines=()
+canonical_local_state_startup_tool="${SCRIPT_DIR}/local_state_startup.py"
 
 reuse_common_services_enabled() {
   [[ "${NJRH_REUSE_COMMON_SERVICES:-true}" == "true" ]]
@@ -92,7 +94,7 @@ fastlio_odom_bridge_process_running() {
 }
 
 ekf_local_state_process_running() {
-  canonical_cmdline_matches "robot_localization/ekf_node|ekf_node --ros-args.*__node:=robot_local_state"
+  python3 "${canonical_local_state_startup_tool}" ekf-running
 }
 
 local_state_required_processes_running() {
@@ -373,9 +375,13 @@ stop_existing_canonical_tf_publishers() {
   kill_canonical_pattern "map_to_odom_tf_bridge"
 }
 
-start_canonical_helper() {
+# Launch and readiness are separate so the common owner can overlap startup
+# without forking away its child-PID registry. Other callers keep the synchronous
+# start_canonical_helper interface and its existing reuse/cleanup semantics.
+launch_canonical_helper() {
   local helper_name="$1"
   shift
+  canonical_helper_launched_pid=""
   local helper_log="${NJRH_RUNTIME_LOG_DIR}/${helper_name}.log"
   local helper_pattern=""
   if helper_pattern="$(canonical_helper_process_pattern "${helper_name}")"; then
@@ -389,6 +395,15 @@ start_canonical_helper() {
     fi
   fi
   mkdir -p "${NJRH_RUNTIME_LOG_DIR}"
+  if [[ ( "${helper_name}" == local_state* || "${helper_name}" == robot_local_state* ) &&
+        -s "${helper_log}" ]]; then
+    local report_dir="${NJRH_LOCAL_STATE_STARTUP_REPORT_DIR:-/tmp/njrh_reports/local_state_startup}"
+    local archived_log
+    mkdir -p "${report_dir}" || return 1
+    archived_log="$(mktemp "${report_dir}/${helper_name}_$(date -u +%Y%m%dT%H%M%SZ)_XXXXXX.log")" || return 1
+    cp -- "${helper_log}" "${archived_log}" || return 1
+    echo "[runtime-overlay] previous ${helper_name} attempt preserved: ${archived_log}" >&2
+  fi
   if [[ -e "${helper_log}" && ! -w "${helper_log}" ]]; then
     rm -f "${helper_log}" 2>/dev/null || {
       echo "[runtime-overlay] helper log is not writable and could not be removed: ${helper_log}" >&2
@@ -400,9 +415,39 @@ start_canonical_helper() {
     return 1
   }
   echo "[runtime-overlay] starting ${helper_name}" >&2
-  "$@" >>"${helper_log}" 2>&1 &
+  local startup_deadline=""
+  if [[ "${helper_name}" == local_state* || "${helper_name}" == robot_local_state* ]] &&
+      [[ "${LOCAL_STATE_MODE:-${NAV_LOCAL_STATE_MODE:-${NJRH_NAV_LOCAL_STATE_MODE:-ekf}}}" == ekf ]]; then
+    startup_deadline="$(python3 "${canonical_local_state_startup_tool}" deadline "${LOCAL_STATE_STARTUP_TIMEOUT_SEC:-30}")" || return 1
+  fi
+  NJRH_LOCAL_STATE_STARTUP_DEADLINE_SEC="${startup_deadline}" "$@" >>"${helper_log}" 2>&1 &
   local helper_pid=$!
+  [[ -z "${startup_deadline}" ]] || canonical_local_state_deadlines["${helper_pid}"]="${startup_deadline}"
   canonical_helper_pids+=("${helper_pid}")
+  canonical_helper_launched_pid="${helper_pid}"
+}
+
+complete_canonical_helper_start() {
+  local helper_name="$1"
+  local helper_pid="$2"
+  local helper_log="${NJRH_RUNTIME_LOG_DIR}/${helper_name}.log"
+  if [[ -n "${canonical_local_state_deadlines[${helper_pid}]:-}" ]]; then
+    local probe
+    probe="$(runtime_readiness_probe_bin)" || return 1
+    if python3 "${canonical_local_state_startup_tool}" wait "${helper_pid}" \
+        "${canonical_local_state_deadlines[${helper_pid}]}" "${probe}" \
+        "${NJRH_LOCAL_STATE_START_READY_MODE:-fresh_tf}" "${helper_log}"; then
+      echo "[runtime-overlay] helper launched: ${helper_name} (pid=${helper_pid}, cleanup_owner=common)" >&2
+      disown "${helper_pid}" 2>/dev/null || true
+      forget_canonical_helper_pid "${helper_pid}"
+      return 0
+    fi
+    terminate_canonical_helper_pid "${helper_name}" "${helper_pid}"
+    # The child may print its IMU failure while exiting at the shared deadline.
+    tail -n 12 "${helper_log}" >&2 || true
+    forget_canonical_helper_pid "${helper_pid}"
+    return 1
+  fi
   sleep 1
   if ! kill -0 "${helper_pid}" 2>/dev/null; then
     echo "[runtime-overlay] helper failed to stay alive: ${helper_name}. Check ${helper_log}" >&2
@@ -427,6 +472,14 @@ start_canonical_helper() {
   disown "${helper_pid}" 2>/dev/null || true
   forget_canonical_helper_pid "${helper_pid}"
   echo "[runtime-overlay] helper launched: ${helper_name} (pid=${helper_pid}, cleanup_owner=common)" >&2
+}
+
+start_canonical_helper() {
+  local helper_name="$1"
+  launch_canonical_helper "$@" || return $?
+  # A reused helper was already checked and is not owned by this caller.
+  [[ -n "${canonical_helper_launched_pid}" ]] || return 0
+  complete_canonical_helper_start "${helper_name}" "${canonical_helper_launched_pid}"
 }
 
 cleanup_canonical_helpers() {

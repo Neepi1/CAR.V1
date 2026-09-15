@@ -390,7 +390,8 @@ public:
         "ElevatorFollowPath",
         "ElevatorReverseEntryStagingFollowPath",
         "ElevatorReverseDockingFollowPath",
-        "ElevatorCabinEntryDirectFollowPath"})
+        "ElevatorCabinEntryDirectFollowPath",
+        "ElevatorCabinPanelFollowPath"})
     {
       const auto service_name =
         options_.elevator_controller_session_service_prefix + "/" +
@@ -2348,14 +2349,19 @@ private:
     if (runtime_superseded_out != nullptr) {
       *runtime_superseded_out = false;
     }
-    if (
-      context.disposition != CleanupDisposition::kSourceOutside &&
-      context.disposition != CleanupDisposition::kTargetOutside)
-    {
-      return failed(
-        "ELEVATOR_CLEANUP_DISPOSITION_UNSAFE",
-        "only a proven outside-floor disposition can validate release identity");
-    }
+    return check_elevator_cleanup_runtime_readiness(
+      options_.persistent_recovery_lock_enabled, context.disposition,
+      [this, &context, allow_ready_runtime_supersession, runtime_superseded_out]() {
+        return validate_strict_cleanup_runtime_identity(
+          context, allow_ready_runtime_supersession, runtime_superseded_out);
+      });
+  }
+
+  RuntimeResult validate_strict_cleanup_runtime_identity(
+    const CleanupContext & context,
+    const bool allow_ready_runtime_supersession,
+    bool * const runtime_superseded_out)
+  {
     const auto runtime_context =
       read_runtime_map_context_file(options_.runtime_map_context_file);
     if (!runtime_context)
@@ -3833,7 +3839,8 @@ private:
     } else if (
       navigation_profile == ElevatorNavigationProfile::kElevatorCabinDirect)
     {
-      goal.behavior_tree = options_.elevator_cabin_entry_direct_behavior_tree;
+      goal.behavior_tree = elevator_cabin_behavior_tree_for_role(
+        options_.elevator_cabin_entry_direct_behavior_tree, request->target.role);
     } else if (navigation_profile ==
       ElevatorNavigationProfile::kElevatorReverseDocking)
     {

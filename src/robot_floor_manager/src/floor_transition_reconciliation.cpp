@@ -35,6 +35,22 @@ bool contains(const std::string & value, const std::string & token)
 
 }  // namespace
 
+FloorTransitionCleanupAction select_floor_transition_cleanup(
+  const bool begin_established,
+  const bool begin_outcome_unknown,
+  const bool target_effect_dispatched)
+{
+  // A timed-out request can still mutate its server later. Never restore the
+  // source based on a failed response or on BEGIN acknowledgement alone.
+  if (target_effect_dispatched) {
+    return FloorTransitionCleanupAction::kRetainSafety;
+  }
+  if (!begin_established && !begin_outcome_unknown) {
+    return FloorTransitionCleanupAction::kReleaseUnchangedSource;
+  }
+  return FloorTransitionCleanupAction::kRestoreSource;
+}
+
 ExplicitLocalizationFailureClassification classify_explicit_localization_failure(
   const std::string & trigger_error)
 {

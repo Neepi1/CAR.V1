@@ -1,5 +1,60 @@
 # Phase S3 Fast Resident Navigation Startup
 
+## 2026-09-09 Nav2 / Isaac process startup decoupling
+
+The first hardware restart exposed an outer-environment omission: `/etc/njrh/runtime.env`
+still explicitly set `NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION=false`,
+overriding the inner script's new default. The systemd runner default, both
+installer env-writing branches and the provisioning template now agree on
+`true`; existing machines also need that exact runtime.env key updated.
+`test_nav2_prestart_environment.py` executes the real outer launcher with fake
+Docker/filesystem boundaries and tests new/existing/reinstalled env generation.
+An intentional operator override remains respected. The correction does not
+start lifecycle activation early, retry Isaac, or change any other env setting.
+Hardware acceptance remains pending the next authorized whole-service restart.
+
+- Default `NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION=true`: start the
+  held Nav2 processes while Isaac initializes. Default
+  `NJRH_NAV2_LIFECYCLE_BACKGROUND_START=false`: do not activate costmaps before
+  initial localization. Existing lifecycle sequencing and TF ownership remain.
+- If the first localization attempt fails, retain the owned Nav2 and Isaac
+  processes. Publish `starting / waiting_for_localization`, not runtime-ready.
+  One status-only client observes `/localization/bridge_status`; it never calls
+  Isaac. A later explicit correction newer than the pre-trigger baseline lets
+  startup continue through the existing activation and ready-context commit.
+- If the baseline was unavailable, the first observed sequence becomes the
+  baseline; a subsequent explicit correction is required. Old results do not
+  become startup success. Stopping the runtime still cleans up the waiting client
+  and both owned process branches; actual process death remains a failure.
+- The held-launch receipt no longer expires at 60 seconds. It is a one-time
+  process-launch record, not a heartbeat; matching live wrapper/controller PIDs
+  remain required. No lifecycle-client refactor, lease, motion gate, navigation
+  parameter change, or automatic retry loop is introduced.
+
+`test_navigation_localization_startup.py` exercises the real shell startup flow
+with fake process/ROS boundaries: overlap, timeout retention, later acceptance,
+stop cleanup, stale/wrong-owner results, and held-launch receipt ownership.
+`test_nav2_lifecycle_sequence_behavior.py` covers the unchanged lifecycle helper.
+No live localization, goal, or restart is performed by these tests.
+
+Hardware acceptance is pending an authorized whole-service restart: record Nav2
+process start before the first localization result, lifecycle-ready time, and
+process uniqueness; then verify a no-result start can continue after an explicit
+localization without restarting either branch. This is process-preload overlap,
+not a claim that Nav2 is already active before localization or that Isaac's
+internal no-result problem is repaired. Subsequent sections describe historical
+startup tuning where not superseded here.
+
+## 2026-09-09 common scheduling update
+
+[Phase 1 startup overlap](startup_parallel_phase1.md) supersedes the historical
+Ranger-before-JT128 and docking-before-health/resident-launch ordering below.
+Canonical producer launch is parent-owned; bounded readiness checks overlap.
+The selected-map navigation branch starts after its common dependencies are
+joined, without first joining the docking observation check. Nav2/AMCL and
+Isaac transaction ordering are unchanged. Hardware restart/timing acceptance
+is pending; this is not a claim that Isaac cold-start readiness is repaired.
+
 Phase S3 shortens cold-boot resident navigation startup without changing TF
 ownership, pointcloud QoS, Nav2 plugins, FAST-LIO2 logic, or the Ranger speed
 chain.
@@ -26,13 +81,10 @@ The startup contract is:
    timestamp and publishes the canonical `map -> odom`. The bridge retains
    30 seconds of `odom -> base_link` TF history for the wrapper's 20-second
    result window; it never restamps the result or substitutes latest TF.
-5. The production path starts the held Nav2 process preload only after that
-   bridge-owned baseline is accepted. Lifecycle activation remains held until
-   the preload is complete.
-   `NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION=true` remains
-   available for A/B diagnostics, but it is not the default because field
-   startup showed lifecycle helpers and localization repair can race when Nav2
-   is prestarted and activated too early.
+5. The production path preloads held Nav2 processes concurrently with Isaac.
+   Lifecycle activation still follows the accepted bridge-owned baseline and
+   completion of process preload; it is not run concurrently with initial
+   localization by default.
 6. Startup does not repeat the floor-manager source-preflight service after it
    verifies the already committed exact `current/` asset context. The
    child-process

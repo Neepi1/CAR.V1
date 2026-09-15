@@ -246,18 +246,19 @@ MappingProcessSnapshot MappingProcessRuntime::snapshot_locked(const bool running
 MappingProcessSnapshot MappingProcessRuntime::tracked_snapshot()
 {
   std::lock_guard<std::mutex> lock(mutex_);
-  return snapshot_locked(tracked_process_running_locked());
+  return snapshot_locked(stopping_ ? active_ : tracked_process_running_locked());
 }
 
 MappingProcessSnapshot MappingProcessRuntime::recover_snapshot()
 {
   std::lock_guard<std::mutex> lock(mutex_);
-  return snapshot_locked(recover_process_locked());
+  return snapshot_locked(stopping_ ? active_ : recover_process_locked());
 }
 
 MappingProcessStartResult MappingProcessRuntime::start(
   const std::function<void()> & before_launch)
 {
+  std::lock_guard<std::mutex> operation_lock(operation_mutex_);
   std::lock_guard<std::mutex> lock(mutex_);
   if (tracked_process_running_locked()) {
     return {true, true, pid_, "2D mapping chain is already running"};
@@ -386,12 +387,13 @@ std::size_t MappingProcessRuntime::restore_lidar_rps_xps_state() const
   return restored;
 }
 
-std::size_t MappingProcessRuntime::terminate_process_groups_locked()
+std::size_t MappingProcessRuntime::terminate_process_groups_locked(const pid_t tracked_pid)
 {
+  // operation_mutex_ is held; mutex_ must remain available to HTTP snapshots.
   std::set<pid_t> groups = discover_mapping_process_groups();
-  if (pid_ > 0) {
-    const pid_t pgid = ::getpgid(pid_);
-    groups.insert(pgid > 0 ? pgid : pid_);
+  if (tracked_pid > 0) {
+    const pid_t pgid = ::getpgid(tracked_pid);
+    groups.insert(pgid > 0 ? pgid : tracked_pid);
   }
 
   const std::size_t requested_groups = groups.size();
@@ -416,6 +418,9 @@ std::size_t MappingProcessRuntime::terminate_process_groups_locked()
     }
 
     for (const int signal : {SIGTERM, SIGKILL}) {
+      if (groups.empty()) {
+        break;
+      }
       for (const auto pgid : groups) {
         signal_process_group(pgid, signal);
       }
@@ -433,14 +438,11 @@ std::size_t MappingProcessRuntime::terminate_process_groups_locked()
     }
   }
 
-  if (pid_ > 0) {
+  if (tracked_pid > 0) {
     int status = 0;
-    while (::waitpid(pid_, &status, WNOHANG) == pid_) {
+    while (::waitpid(tracked_pid, &status, WNOHANG) == tracked_pid) {
     }
   }
-  pid_ = -1;
-  active_ = false;
-  update_runtime_state(false, "stopped", "2D mapping runtime stopped");
   const std::size_t requested_residuals = terminate_residual_processes();
   restore_lidar_rps_xps_state();
   return requested_groups + requested_residuals;
@@ -448,8 +450,30 @@ std::size_t MappingProcessRuntime::terminate_process_groups_locked()
 
 std::size_t MappingProcessRuntime::stop()
 {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return terminate_process_groups_locked();
+  std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+  pid_t tracked_pid;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    tracked_pid = pid_;
+    stopping_ = true;
+    update_runtime_state(active_, "stopping", "waiting for 2D mapping processes to exit");
+  }
+  std::size_t stopped = 0;
+  try {
+    stopped = terminate_process_groups_locked(tracked_pid);
+  } catch (...) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stopping_ = false;
+    throw;
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pid_ = -1;
+    active_ = false;
+    stopping_ = false;
+    update_runtime_state(false, "stopped", "2D mapping runtime stopped");
+  }
+  return stopped;
 }
 
 }  // namespace robot_api_server::features::mapping::runtime

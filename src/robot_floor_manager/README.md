@@ -2,6 +2,13 @@
 
 `robot_floor_manager` owns only floor asset switching. It does not publish TF and does not alter FAST-LIO2, PGO, local perception, or Nav2 controller behavior.
 
+Failure cleanup now separates released transaction resources from localization
+validity: a failed switch can terminate as `FAILED` with an unready map, without
+turning that unready map into a retained transaction lock. Pending writes must
+still settle before a new conflicting switch. See
+[`floor_failure_terminal_cleanup.md`](../../docs/floor_failure_terminal_cleanup.md)
+for the corrected scope and verification boundary.
+
 ## Services
 
 - `/floor_manager/switch_floor` (`robot_interfaces/srv/SwitchFloor`)
@@ -194,22 +201,44 @@ requires later `MotionInterlockState` and `CorrectionPauseState` samples to
 prove the exact keys absent. If that proof fails, it establishes a newer
 motion hold and reports a recovery lock instead of a clean failure.
 
-Once bridge `BEGIN` is submitted, a timeout is likewise treated as an unknown
-runtime mutation. Cleanup sends a higher-sequence exact
+BEGIN invalidates the runtime context, but is not a target asset dispatch.
+The worker records `target_effect_dispatched_` immediately before sending a
+NavMap/filter load, localizer apply, explicit localization or costmap-clear
+request. The record is monotonic within one transaction: timeout, exception,
+cancellation and a failed response never reset it. It is not another lock.
+
+If no target request was dispatched, cleanup after an accepted or unknown
+BEGIN sends a higher-sequence exact
 `OP_ABORT_PREMUTATION`; if it arrives first, its transaction tombstone rejects
 the delayed lower-sequence BEGIN. If BEGIN arrived first, the bridge restores
 the source context only after proving the exact source asset, unchanged
 map-to-odom/localizer state, and the floor-manager pause. A later
 `LocalizationHealth` sample must then prove the same building/floor/map,
 epoch/digest, valid runtime context, ready localizer/bridge, and unique
-canonical TF. A known successful BEGIN is no longer sufficient by itself to
-retain a permanent lock. If exact ABORT is acknowledged, the newer source
+canonical TF. Its explicit sequence must match the restore response, not the
+possibly older preflight health cache. The proven fresh source sample supplies
+the generation/sequence persisted to disk. A known successful BEGIN is no
+longer sufficient by itself to retain a permanent lock. If exact pre-mutation
+ABORT is acknowledged, the newer source
 health sample is valid, the source runtime context is durably written back,
 and both exact transaction leases are proven absent, the failed transaction
 terminates as ordinary `FAILED` on the proven source floor. Any unproven
 ABORT, source identity, durable write, or lease release retains the motion
 hold, writes an unconfirmed failed context, and reports
 `recovery_required=true`.
+
+Once any target request may have been dispatched, ordinary `OP_ABORT` retains
+invalid context and safety protection; it never claims to restore the source.
+A delayed NavMap request cannot safely be undone just because its response was
+lost. No automatic post-dispatch rollback or live recovery-lock reset was added.
+
+Cleanup proves correction-pause release before it sends motion-hold release,
+and releases only this transaction's keys. A proven recovered failure reports
+the source identity and an explicit retryable-failure explanation, not target
+success; it does not resume a navigation goal. Tests exercise the production
+cleanup selector with the real bridge state machine and separately check the
+node's dispatch/release wiring. No ROS interface or normal target COMMIT
+requirement changed. See [audit repair record](../../docs/gate_audit_remediation_plan.md).
 
 The runtime context writer uses a same-directory durable rename and preserves
 the v1 compatibility fields while adding transaction ID, epoch/digest,
@@ -301,6 +330,31 @@ An `ACCEPTED`, `EXECUTING`, or `CANCELING` sample overrides it immediately;
 loss of the action graph clears both bootstrap and terminal idle evidence.
 This removes false `NAV_IDLE_UNPROVEN` failures without treating a missing
 Nav2 server or status writer as idle.
+
+### Unlocalized startup handoff (2026-09-09 deployment)
+
+When both `/bt_navigator/get_state` and `/controller_server/get_state` have
+unique expected owners and fresh explicit unconfigured/inactive responses,
+the node can prove Nav idle without an action-status publisher. An observed
+active goal still vetoes this path; graph absence alone never proves idle.
+The same safety hold and fresh stopped wheel/local odometry remain required.
+
+A cold-start switch first hands the exact immutable target to the resident
+startup owner. Only after old workers have settled does it perform BEGIN,
+load target maps/masks, reload Isaac assets, and explicitly localize. Target
+pending TF may start Nav2/AMCL without falsely granting ordinary navigation.
+Full target AMCL, post-clear costmaps and bridge COMMIT are still mandatory.
+The request/ack files carry transaction, nonce, digest/epoch and localization
+generation; they do not grant motion. Cancellation publishes a failed request
+before transaction cleanup to prevent new startup steps. Old startup writers
+cannot overwrite the selected target.
+
+Implementation and evidence: `docs/floor_switch_unready_startup.md`. The candidate
+was deployed, but restart acceptance is blocked by the common startup's missing
+fresh `/dock/target_observation`; automatic restarts were stopped. Hardware
+floor-switch acceptance remains pending. The change
+does **not** automatically clear an unknown RPC outcome or a failed transition
+after target mutation. Those cases retain the existing stop/recovery protection.
 
 The Nav2 graph probe is deliberately graph-only: it checks the three hidden
 `NavigateToPose` action services plus the status publisher and does not create

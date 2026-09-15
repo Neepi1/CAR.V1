@@ -4,8 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common_env.sh"
 source "${SCRIPT_DIR}/cpu_affinity.sh"
+source "${SCRIPT_DIR}/imu_pipeline_helpers.sh"
 
 MODE="${LOCAL_STATE_MODE:-ekf}"
+njrh_resolve_imu_pipeline_mode "${MODE}"
 NODE_BIN="${NJRH_PROJECT_ROOT}/install/robot_local_state/lib/robot_local_state/local_state_node"
 
 wait_for_child_exit() {
@@ -126,6 +128,11 @@ if [[ "${MODE}" == "passthrough" || "${MODE}" == "legacy" ]]; then
 fi
 
 EKF_PROFILE="${LOCAL_STATE_EKF_PROFILE:-${NJRH_LOCAL_STATE_EKF_PROFILE:-wheel_only}}"
+# One monotonic deadline, inherited from the common owner or created for a
+# standalone EKF launch. No independent IMU/endpoint countdowns or retry reset.
+if [[ -z "${NJRH_LOCAL_STATE_STARTUP_DEADLINE_SEC:-}" ]]; then
+  NJRH_LOCAL_STATE_STARTUP_DEADLINE_SEC="$(python3 "${SCRIPT_DIR}/local_state_startup.py" deadline "${LOCAL_STATE_STARTUP_TIMEOUT_SEC:-30}")"
+fi
 DEFAULT_WHEEL_ODOM_EKF_PARAMS_FILE="${NJRH_OVERLAY_ROOT}/config/local_state_wheel_odom_ekf.yaml"
 case "${EKF_PROFILE}" in
   wheel_spin_imu|spin_imu)
@@ -306,12 +313,13 @@ if [[ "${LOCAL_STATE_IMU_BIAS_FILTER_ENABLED}" == "true" ]]; then
   }
 fi
 
-if ! ros2 pkg prefix robot_localization >/dev/null 2>&1; then
+if ! ROBOT_LOCALIZATION_PREFIX="$(python3 -c \
+  'from ament_index_python.packages import get_package_prefix; print(get_package_prefix("robot_localization"))' \
+  2>/dev/null)"; then
   echo "[runtime-overlay] ROS package missing: robot_localization" >&2
   echo "[runtime-overlay] install ros-humble-robot-localization in the NJRH-car image/container." >&2
   exit 1
 fi
-ROBOT_LOCALIZATION_PREFIX="$(ros2 pkg prefix robot_localization)"
 EKF_NODE_BIN="${ROBOT_LOCALIZATION_PREFIX}/lib/robot_localization/ekf_node"
 [[ -x "${EKF_NODE_BIN}" ]] || {
   echo "[runtime-overlay] robot_localization EKF binary missing or not executable: ${EKF_NODE_BIN}" >&2
@@ -370,27 +378,37 @@ if ! kill -0 "${wheel_odom_pid}" 2>/dev/null; then
 fi
 
 if [[ "${LOCAL_STATE_IMU_BIAS_FILTER_ENABLED}" == "true" ]]; then
-  IMU_BIAS_NODE_BIN="${NJRH_PROJECT_ROOT}/install/robot_local_state/lib/robot_local_state/imu_gyro_bias_filter_node"
-  [[ -x "${IMU_BIAS_NODE_BIN}" ]] || {
-    echo "[runtime-overlay] compiled IMU gyro bias filter missing or not executable: ${IMU_BIAS_NODE_BIN}" >&2
-    exit 1
-  }
+  if njrh_imu_pipeline_composed; then
+    # The driver owns both IMU nodes. An EKF restart must not stop canonical
+    # /lidar_imu or reset the driver-owned filter; keep only the existing probe.
+    echo "[runtime-overlay] reusing driver-owned IMU pipeline filter; local-state does not own its PID" >&2
+  else
+    IMU_BIAS_NODE_BIN="${NJRH_PROJECT_ROOT}/install/robot_local_state/lib/robot_local_state/imu_gyro_bias_filter_node"
+    [[ -x "${IMU_BIAS_NODE_BIN}" ]] || {
+      echo "[runtime-overlay] compiled IMU gyro bias filter missing or not executable: ${IMU_BIAS_NODE_BIN}" >&2
+      exit 1
+    }
 
-  njrh_start_affined_background imu_bias_pid robot_local_state_imu_bias_filter "${IMU_BIAS_NODE_BIN}" --ros-args \
-    --params-file "${IMU_BIAS_FILTER_PARAMS_FILE}" \
-    -r __node:=imu_gyro_bias_filter
-  sleep 1
-  if ! kill -0 "${imu_bias_pid}" 2>/dev/null; then
-    echo "[runtime-overlay] IMU gyro bias filter failed to stay alive" >&2
-    exit 1
+    njrh_start_affined_background imu_bias_pid robot_local_state_imu_bias_filter "${IMU_BIAS_NODE_BIN}" --ros-args \
+      --params-file "${IMU_BIAS_FILTER_PARAMS_FILE}" \
+      -r __node:=imu_gyro_bias_filter
+    sleep 1
+    if ! kill -0 "${imu_bias_pid}" 2>/dev/null; then
+      echo "[runtime-overlay] IMU gyro bias filter failed to stay alive" >&2
+      exit 1
+    fi
   fi
   if [[ "${LOCAL_STATE_IMU_BIAS_FILTER_READY_CHECK:-true}" == "true" ]]; then
     CORRECTED_IMU_TOPIC="${LOCAL_STATE_CORRECTED_IMU_TOPIC:-/lidar_imu_bias_corrected}"
     IMU_BIAS_TOPIC="${LOCAL_STATE_IMU_BIAS_TOPIC:-/local_state/imu_bias}"
-    IMU_BIAS_READY_TIMEOUT_SEC="${LOCAL_STATE_IMU_BIAS_FILTER_READY_TIMEOUT_SEC:-8}"
-    runtime_readiness_probe imu-bias-filter \
+    IMU_BIAS_READY_TIMEOUT_SEC="$(python3 "${SCRIPT_DIR}/local_state_startup.py" remaining "${NJRH_LOCAL_STATE_STARTUP_DEADLINE_SEC}")" || {
+      echo "[runtime-overlay] LOCAL_STATE_START_FAILED stage=WAIT_IMU reason=startup_deadline_exhausted" >&2
+      exit 1
+    }
+    echo "[runtime-overlay] LOCAL_STATE_START_STAGE stage=WAIT_IMU remaining_sec=${IMU_BIAS_READY_TIMEOUT_SEC}" >&2
+    NJRH_RUNTIME_READINESS_PROBE_PROCESS_TIMEOUT_SEC="${IMU_BIAS_READY_TIMEOUT_SEC}" runtime_readiness_probe imu-bias-filter \
       "${CORRECTED_IMU_TOPIC}" "${IMU_BIAS_TOPIC}" "${IMU_BIAS_READY_TIMEOUT_SEC}" || {
-      echo "[runtime-overlay] IMU gyro bias filter outputs did not become ready" >&2
+      echo "[runtime-overlay] LOCAL_STATE_START_FAILED stage=WAIT_IMU reason=imu_outputs_not_ready" >&2
       exit 1
     }
   fi
@@ -404,6 +422,10 @@ elif [[ "${EKF_USES_IMU}" != "true" ]]; then
   echo "[runtime-overlay] LOCAL_STATE_EKF_PROFILE=${EKF_PROFILE}; EKF imu0 fusion disabled and IMU bias filter disabled by override" >&2
 fi
 
+python3 "${SCRIPT_DIR}/local_state_startup.py" remaining "${NJRH_LOCAL_STATE_STARTUP_DEADLINE_SEC}" >/dev/null || {
+  echo "[runtime-overlay] LOCAL_STATE_START_FAILED stage=START_EKF reason=startup_deadline_exhausted" >&2
+  exit 1
+}
 echo "[runtime-overlay] starting robot_local_state EKF profile=${EKF_PROFILE} params=${EKF_PARAMS_FILE}" >&2
 LOCAL_STATE_RMW_FASTRTPS_PUBLICATION_MODE="${LOCAL_STATE_RMW_FASTRTPS_PUBLICATION_MODE:-ASYNCHRONOUS}"
 case "${LOCAL_STATE_RMW_FASTRTPS_PUBLICATION_MODE}" in

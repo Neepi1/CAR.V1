@@ -1,5 +1,24 @@
 # Phase 1.13/1.14 PointCloud Acceleration Profile
 
+## Current production clarification
+
+This section supersedes conflicting production-path descriptions below.
+The current repository runtime profile is `ipc_worker` with `separate_process`
+ingress: `pointcloud_accel_axis_node` publishes the full-density/full-fields
+`/lidar_points` trunk and its scan worker publishes `/scan` for Nav2 obstacle
+marking/raytracing and collision monitoring. Local obstacle/clearing PointCloud2
+workers and compact branches are disabled by default; do not re-enable them
+from the historical profile diagrams or acceptance lists below. Refer to the
+[package README](../src/robot_hesai_jt128/README.md) and
+[runtime configuration](../scripts/jetson/runtime_overlay/config/pointcloud_accel_axis.yaml)
+for the current wiring. The remaining sections retain historical profile,
+compatibility and experimental context, not current deployment instructions.
+
+The [CPU fused-normalization stage](pointcloud_cpu_fused_normalization.md)
+prepares a bounded candidate without changing those outputs or scan settings.
+Its isolated algorithm measurements and tests are recorded there; they do not
+represent a full-runtime restart, whole-process saving or hardware acceptance.
+
 ## Scope
 
 The pointcloud acceleration profile is a reversible runtime wiring layer. It

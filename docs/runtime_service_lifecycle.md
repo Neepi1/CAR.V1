@@ -27,7 +27,13 @@ only after firmware feedback confirms the requested mode with
 status. `/cmd_vel_safe` remains a diagnostic mirror and is not a second control
 path.
 
-`robot_api_server` is supervised inside the common-service layer. If the API process exits, `run_robot_api_server_supervised.sh` restarts it after a short delay. Before each restart, the supervisor clears stale orphan API processes so only one `robot_api_server_node` can own port `8080` and the fixed HTTP worker pool. `njrh_container.sh start-runtime` and `start-common` now also require `GET /api/v1/status` on port `8080` to become healthy before reporting common services as ready. That host-side HTTP wait defaults to `NJRH_ROBOT_API_READY_TIMEOUT_SEC=120` with `NJRH_ROBOT_API_READY_POLL_SEC=1`; it does not create ROS readiness participants. The API process uses a fixed HTTP worker pool controlled by `max_http_connections` and returns `503` when overloaded instead of creating unbounded detached request threads.
+`robot_api_server` is supervised inside the common-service layer. If the API process exits, `run_robot_api_server_supervised.sh` signals the common owner and exits; it never restarts the API in isolation. The common owner stops the chain and systemd owns recovery. Startup clears stale orphan API processes so only one `robot_api_server_node` can own port `8080` and the fixed HTTP worker pool. `njrh_container.sh start-runtime` and `start-common` also require `GET /api/v1/status` on port `8080` to become healthy before reporting common services as ready. That host-side HTTP wait defaults to `NJRH_ROBOT_API_READY_TIMEOUT_SEC=120` with `NJRH_ROBOT_API_READY_POLL_SEC=1`; it does not create ROS readiness participants. The API process uses a fixed HTTP worker pool controlled by `max_http_connections` and returns `503` when overloaded instead of creating unbounded detached request threads.
+
+The common-service health loop uses one ROS-free native `runtime_process_check`
+invocation to count both API and supervisor identities. Observation failure is
+distinct from a confirmed missing/duplicate owner and cannot itself authorize a
+restart. AMCL status and FlatScan metadata reuse the resident C++ observer; see
+[management design](runtime_management_observer.md).
 
 The common-service health loop counts the API node by canonical
 `/proc/<pid>/exe` identity and counts its Bash supervisor by that executable
@@ -49,23 +55,24 @@ the next health check without a 120-second grace period.
 
 Local-state health uses a separate classification for the resident observer
 and for the observed runtime. A missing, invalid, clock-invalid, or stale
-`runtime_health_guard.py` JSON snapshot is an observer fault. A fresh odometry
-callback that contradicts temporarily missing ROS-graph endpoint/publisher
+`runtime_health_guard` JSON snapshot is an observer fault. A fresh odometry
+sample that contradicts temporarily missing ROS-graph endpoint/publisher
 metadata is also observer-side graph lag. These cases are logged with snapshot
 and odometry ages and reset the local-state failure budget, but they do not
 authorize estop latching, common-owner exit, or a complete-chain restart. A
-fresh snapshot that identifies an endpoint, publisher, message-delivery,
-odometry-stamp, or summary failure is only the first recovery candidate. When
-the EKF process is still alive, the common owner runs one bounded independent
+fresh C++ snapshot showing no fresh advancing odometry stamp for 3 seconds is
+only a recovery candidate. The common owner runs one bounded independent
 `/local_state/odometry` freshness probe before consuming the producer-failure
 budget. If that participant receives fresh canonical odometry, the snapshot is
 classified as observer-side DDS visibility loss and the producer-failure budget
-is reset. If the independent confirmation also fails, or the required process
-is missing, three consecutive confirmed candidates retain the existing
-fail-closed complete-chain recovery behavior.
+is reset, even if process inspection reported the required process missing.
+Only three distinct consecutive snapshots with failed independent confirmation
+retain the existing complete-chain recovery behavior. Repeated evidence and
+changed observer generations cannot accumulate false confirmations. Sampling
+is 1Hz; startup freshness and real-time safety watchdogs remain separate.
 
 Orbbec docking-camera health follows the same observer/evidence boundary. A
-missing or stale `runtime_health_guard.py` snapshot is not proof that the
+missing or stale `runtime_health_guard` snapshot is not proof that the
 camera stream failed, so it is diagnostic-only and resets the docking-sensor
 failure counter. A fresh snapshot with `docking_sensor_healthy=false` advances
 a bounded diagnostic counter, but camera health alone never authorizes a

@@ -1,0 +1,5 @@
+<library path="ranger_clearance_critic">
+  <class type="mppi::critics::RangerClearanceCritic" base_class_type="mppi::critics::CriticFunction">
+    <description>Finite rectangular planning-clearance preference, without changing the costmap footprint.</description>
+  </class>
+</library>

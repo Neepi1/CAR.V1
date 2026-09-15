@@ -16,7 +16,7 @@ if(${CUDA_FOUND})
 	set(CUDA_SEPARABLE_COMPILATION ON)
 	include_directories(${CUDA_INCLUDE_DIRS})
 	set(CUDA_PROPAGATE_HOST_FLAGS OFF)
-	set(CUDA_NVCC_FLAGS -arch=sm_61;-O3;-G;-g;-std=c++14)#鏍规嵁鍏蜂綋GPU鎬ц兘鏇存敼绠楀姏鍙傛暟
+	# Inherit native CUDA architecture / Release flags from the caller.
 	link_directories($ENV{CUDA_PATH}/lib/x64)
 else(${CUDA_FOUND})
 	MESSAGE(STATUS "cuda not found!")

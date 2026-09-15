@@ -1,5 +1,24 @@
 # Floor switch
 
+Floor failures are task history, not permanent API locks. Each typed observation
+replaces that source's previous evidence. Current activity still rejects every
+conflicting operation; current invalid localization still rejects navigation
+goals and live-pose capture. Exact source-independent mapping, localization,
+navigation-service startup and floor-selection operations can enter their own
+recovery paths without claiming that localization is ready. Entry, worker and
+commit checks use the same `decision_for_operation` policy. The current-state
+change is local/tested, not deployed. See
+[current-state admission](../../../../../docs/floor_failure_current_state_admission.md).
+The earlier, narrower offline-only deployment remains documented separately in
+[failure/asset admission](../../../../../docs/floor_failure_asset_admission.md).
+
+Source readiness is not a prerequisite for manual target loading. The runtime
+context is used only for the exact already-active optimization. Unknown, failed,
+starting or unlocalized sources proceed to the existing target transaction;
+invalid source health alone does not block that request. This does not change
+navigation lifecycle or the target completion contract. The real-API isolated
+regression is `test/features/floor_switch/floor_switch_unready_http_smoke.py`.
+
 Owns the complete API-side floor-switch vertical slice:
 
 - `floor_switch_feature_module` is the aggregate owner of configuration
@@ -16,8 +35,8 @@ Owns the complete API-side floor-switch vertical slice:
   module config. It performs no switch or runtime side effect.
 - `floor_switch_http_transaction` owns the thread-safe App-visible live
   transaction state.
-- `floor_runtime_interlock` reduces retained floor-manager and localization
-  health observations into one fail-closed decision.
+- `floor_runtime_interlock` reduces the latest floor-manager and localization
+  health observations into an operation-specific current-state decision.
 - `runtime_map_context_io` owns the persisted context format shared with
   navigation/localization startup.
 - `floor_switch_handoff_tracker` retains the elevator post-switch handoff

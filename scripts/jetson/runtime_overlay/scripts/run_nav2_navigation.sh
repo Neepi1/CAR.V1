@@ -32,7 +32,7 @@ case "${planner_profile}" in
     ;;
   ranger_lattice)
     planner_profile_file="${planner_profile_file:-${planner_profile_root}/ranger_mini3_lattice.yaml}"
-    nav_to_pose_bt_xml="${nav_to_pose_bt_xml:-${nav_bt_root}/navigate_to_pose_ranger_lattice.xml}"
+    nav_to_pose_bt_xml="${nav_to_pose_bt_xml:-${nav_bt_root}/navigate_to_pose_ranger_lattice_recovery.xml}"
     lattice_validator="${NJRH_PROJECT_ROOT}/src/robot_nav_config/tools/validate_ranger_mini3_lattice.py"
     [[ -f "${lattice_validator}" ]] || {
       echo "[runtime-overlay] missing Ranger lattice validator: ${lattice_validator}" >&2
@@ -110,6 +110,9 @@ wait_for_controller_server_affinity() {
   fi
 
   while (( SECONDS <= deadline )); do
+    if [[ -n "${NJRH_STARTUP_CPU_SESSION:-}" ]]; then
+      expected="$(njrh_effective_cpuset_for controller_server)"
+    fi
     pid="$(controller_server_pids | tail -n 1 || true)"
     if [[ -n "${pid}" && -r "/proc/${pid}/status" ]]; then
       allowed="$(read_proc_cpuset "${pid}")"
@@ -493,6 +496,10 @@ ensure_resident_overlay_helper_process() {
   local helper_name="$1"
   local label="$2"
   shift 2
+  if [[ "${NJRH_COMMON_SERVICES_MANAGED:-false}" == "true" ]]; then
+    echo "[runtime-overlay] resident ${label} is common-owned; Nav2 does not create a competing helper" >&2
+    return 0
+  fi
   local helper_pattern=""
   helper_pattern="$(helper_process_pattern "${helper_name}" 2>/dev/null || true)"
   if [[ -n "${helper_pattern}" ]] && helper_process_running "${helper_pattern}"; then

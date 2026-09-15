@@ -351,6 +351,29 @@ robot_elevator_manager::ElevatorRuntimeResult validate_elevator_prepared_source(
   const robot_elevator_manager::FrozenElevatorRelease & release,
   const ElevatorPreparedSourceEvidence & evidence);
 
+// Cleanup-only seam. Success here proves neither stopping nor resource release;
+// callers must independently prove both before releasing their owner hold.
+template<typename StrictReadinessProbe>
+robot_elevator_manager::ElevatorRuntimeResult check_elevator_cleanup_runtime_readiness(
+  const bool persistent_recovery_lock_enabled,
+  const robot_elevator_manager::ElevatorCleanupDisposition disposition,
+  StrictReadinessProbe && strict_readiness_probe)
+{
+  using robot_elevator_manager::ElevatorCleanupDisposition;
+  if (disposition != ElevatorCleanupDisposition::kSourceOutside &&
+    disposition != ElevatorCleanupDisposition::kTargetOutside)
+  {
+    return {false, "ELEVATOR_CLEANUP_DISPOSITION_UNSAFE",
+      "only a proven outside-floor disposition can validate release identity"};
+  }
+  if (!persistent_recovery_lock_enabled) {
+    return {true, "ELEVATOR_CLEANUP_RUNTIME_READINESS_NOT_REQUIRED",
+      "nonpersistent cleanup does not require a navigable map; stopping and "
+      "owner-resource release must still be independently proven"};
+  }
+  return std::forward<StrictReadinessProbe>(strict_readiness_probe)();
+}
+
 ElevatorCleanupRuntimeIdentityAssessment
 assess_elevator_cleanup_runtime_identity(
   const ElevatorCleanupRuntimeIdentityEvidence & evidence,
@@ -535,6 +558,12 @@ ElevatorNavigationProfile select_elevator_navigation_profile(
 // tree. Ordinary Nav2 has no elevator-controller execution session.
 std::optional<std::string> elevator_controller_id_for_profile(
   ElevatorNavigationProfile profile,
+  robot_elevator_manager::PoseRole target_role);
+
+// The panel-only speed profile is installed alongside the configured direct
+// cabin tree. Other cabin roles retain the configured tree unchanged.
+std::string elevator_cabin_behavior_tree_for_role(
+  const std::string & direct_behavior_tree,
   robot_elevator_manager::PoseRole target_role);
 
 // One immutable elevator effect is one navigation action attempt. Coordinates

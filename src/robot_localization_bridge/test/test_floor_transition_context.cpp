@@ -49,6 +49,40 @@ TEST(FloorTransitionContext, BeginRequiresExactFloorPauseBeforeInvalidatingConte
   EXPECT_EQ(accepted.state.begin_explicit_relocalization_sequence, 7U);
 }
 
+TEST(FloorTransitionContext, UnlocalizedSourceCanBeginButOnlyTargetEvidenceCanCommit)
+{
+  FloorTransitionContext context;
+  FloorTransitionIdentity unknown_source;
+  unknown_source.transaction_id = identity().transaction_id;
+  const auto started = context.begin(identity(), unknown_source, true, 0U, 1U);
+  ASSERT_TRUE(started.accepted);
+  EXPECT_TRUE(started.state.active.map_id.empty());
+  EXPECT_FALSE(started.state.runtime_context_valid);
+  EXPECT_FALSE(context.commit(identity(), {}, 2U).accepted);
+  const auto finished = context.commit(identity(), ready_commit(), 3U);
+  EXPECT_TRUE(finished.accepted);
+  EXPECT_EQ(finished.state.active.map_id, identity().map_id);
+  EXPECT_TRUE(finished.state.runtime_context_valid);
+}
+
+TEST(FloorTransitionContext, ConsecutiveTargetsDoNotRequireCallerSourceLocalization)
+{
+  FloorTransitionContext context;
+  ASSERT_TRUE(context.begin(identity(), {}, true, 0U, 1U).accepted);
+  ASSERT_TRUE(context.commit(identity(), ready_commit(), 2U).accepted);
+  auto next = identity();
+  next.transaction_id = "next-map-switch";
+  next.floor_id = "F3";
+  next.map_id = "map_f3";
+  next.asset_epoch = 24U;
+  ASSERT_TRUE(context.begin(next, {}, true, 8U, 1U).accepted);
+  EXPECT_FALSE(context.commit(next, ready_commit(), 2U).accepted);
+  auto fresh_target = ready_commit();
+  fresh_target.explicit_relocalization_sequence = 9U;
+  ASSERT_TRUE(context.commit(next, fresh_target, 3U).accepted);
+  EXPECT_EQ(context.snapshot().active.map_id, "map_f3");
+}
+
 TEST(FloorTransitionContext, BeginIsIdempotentOnlyForExactIdentity)
 {
   FloorTransitionContext context;
@@ -103,7 +137,7 @@ TEST(FloorTransitionContext, CommitRequiresNewExplicitSequenceAndSettledPublishe
   EXPECT_EQ(committed.state.accepted_explicit_relocalization_sequence, 8U);
 }
 
-TEST(FloorTransitionContext, AbortLocksInvalidContextAndCannotBeBypassed)
+TEST(FloorTransitionContext, AbortEndsOnlyItsTransactionAndAllowsAnExplicitNewSwitch)
 {
   FloorTransitionContext context;
   ASSERT_TRUE(context.seed_active_source(identity()).accepted);
@@ -112,7 +146,9 @@ TEST(FloorTransitionContext, AbortLocksInvalidContextAndCannotBeBypassed)
   const auto aborted = context.abort(identity(), 2U);
   EXPECT_TRUE(aborted.accepted);
   EXPECT_FALSE(aborted.state.runtime_context_valid);
-  EXPECT_TRUE(aborted.state.failed_locked);
+  EXPECT_FALSE(aborted.state.transition_active);
+  EXPECT_FALSE(aborted.state.failed_locked);
+  EXPECT_FALSE(aborted.state.recovery_required);
   EXPECT_FALSE(context.candidate_allowed(true, false));
 
   const auto duplicate = context.abort(identity(), 3U);
@@ -121,24 +157,55 @@ TEST(FloorTransitionContext, AbortLocksInvalidContextAndCannotBeBypassed)
 
   auto replacement = identity();
   replacement.transaction_id = "elevator-tx-18";
-  EXPECT_FALSE(
-    context.begin(replacement, identity(), true, 8U, 4U).accepted);
+  const auto restarted = context.begin(replacement, {}, true, 8U, 1U);
+  ASSERT_TRUE(restarted.accepted);
+  EXPECT_FALSE(restarted.state.runtime_context_valid);
+  EXPECT_FALSE(restarted.state.failed_locked);
+  EXPECT_EQ(restarted.state.pending.transaction_id, replacement.transaction_id);
+  EXPECT_FALSE(context.commit(replacement, ready_commit(), 2U).accepted);
+  auto fresh_target = ready_commit();
+  fresh_target.explicit_relocalization_sequence = 9U;
+  EXPECT_TRUE(context.commit(replacement, fresh_target, 3U).accepted);
 }
 
-TEST(FloorTransitionContext, BeginRejectsUnseededSourceWithoutChangingContext)
+TEST(FloorTransitionContext, BeginAllowsUnseededSourceWithoutInventingActiveIdentity)
 {
   FloorTransitionContext context;
 
-  const auto rejected = context.begin(
+  const auto started = context.begin(
     identity(), identity(), true, 7U, 1U);
 
-  EXPECT_FALSE(rejected.accepted);
-  EXPECT_EQ(
-    rejected.code,
-    FloorTransitionDecisionCode::kPreMutationUnproven);
-  EXPECT_TRUE(rejected.state.runtime_context_valid);
-  EXPECT_FALSE(rejected.state.transition_active);
-  EXPECT_TRUE(rejected.state.active.map_id.empty());
+  EXPECT_TRUE(started.accepted);
+  EXPECT_FALSE(started.state.runtime_context_valid);
+  EXPECT_TRUE(started.state.transition_active);
+  EXPECT_TRUE(started.state.active.map_id.empty());
+}
+
+TEST(FloorTransitionContext, EndedTransactionCannotOverwriteOrImpersonateItsReplacement)
+{
+  FloorTransitionContext context;
+  const auto old = identity();
+  ASSERT_TRUE(context.seed_active_source(old).accepted);
+  ASSERT_TRUE(context.begin(old, {}, true, 7U, 1U).accepted);
+  ASSERT_TRUE(context.abort(old, 2U).accepted);
+  EXPECT_FALSE(context.begin(old, {}, true, 8U, 100U).accepted);
+
+  auto replacement = old;
+  replacement.transaction_id = "replacement-after-failure";
+  EXPECT_FALSE(context.begin(replacement, {}, false, 8U, 1U).accepted);
+  ASSERT_TRUE(context.begin(replacement, {}, true, 8U, 2U).accepted);
+  EXPECT_FALSE(context.abort(old, 101U).accepted);
+  EXPECT_FALSE(context.commit(old, ready_commit(), 102U).accepted);
+  EXPECT_EQ(context.snapshot().pending.transaction_id, replacement.transaction_id);
+  EXPECT_FALSE(context.snapshot().runtime_context_valid);
+
+  auto fresh_target = ready_commit();
+  fresh_target.explicit_relocalization_sequence = 9U;
+  ASSERT_TRUE(context.commit(replacement, fresh_target, 3U).accepted);
+  // The same map does not make an old transaction's COMMIT an idempotent replay.
+  EXPECT_FALSE(context.commit(old, fresh_target, 103U).accepted);
+  EXPECT_EQ(context.snapshot().active.transaction_id, replacement.transaction_id);
+  EXPECT_TRUE(context.snapshot().runtime_context_valid);
 }
 
 FloorTransitionIdentity source_identity()
@@ -246,7 +313,25 @@ TEST(FloorTransitionContext, PreMutationAbortRefusesChangedSourceAssets)
   EXPECT_TRUE(rejected.state.transition_active);
 }
 
-TEST(FloorTransitionContext, ActiveSourceSeedCannotRebindOrClearRecoveryLock)
+TEST(FloorTransitionContext, PremutationCleanupCannotBeReopenedByAHigherSequenceBegin)
+{
+  auto context = seeded_source_context();
+  const auto old = identity();
+  FloorTransitionPreMutationAbortEvidence evidence;
+  evidence.source = source_identity();
+  evidence.source_assets_unchanged = true;
+  ASSERT_TRUE(context.abort_pre_mutation(old, evidence, 4U).accepted);
+  const auto delayed = context.begin(old, source_identity(), true, 6U, 100U);
+  EXPECT_FALSE(delayed.accepted);
+  EXPECT_TRUE(context.snapshot().runtime_context_valid);
+  EXPECT_FALSE(context.snapshot().transition_active);
+
+  auto replacement = old;
+  replacement.transaction_id = "new-after-premutation-cleanup";
+  EXPECT_TRUE(context.begin(replacement, {}, true, 6U, 1U).accepted);
+}
+
+TEST(FloorTransitionContext, ActiveSourceSeedCannotRebindOrInventValidityAfterAbort)
 {
   auto context = seeded_source_context();
   auto other = source_identity();
@@ -256,9 +341,9 @@ TEST(FloorTransitionContext, ActiveSourceSeedCannotRebindOrClearRecoveryLock)
   ASSERT_TRUE(
     context.begin(identity(), source_identity(), true, 6U, 3U).accepted);
   ASSERT_TRUE(context.abort(identity(), 4U).accepted);
-  EXPECT_TRUE(context.snapshot().failed_locked);
+  EXPECT_FALSE(context.snapshot().failed_locked);
   EXPECT_FALSE(context.seed_active_source(source_identity()).accepted);
-  EXPECT_TRUE(context.snapshot().failed_locked);
+  EXPECT_FALSE(context.snapshot().failed_locked);
   EXPECT_FALSE(context.snapshot().runtime_context_valid);
 }
 

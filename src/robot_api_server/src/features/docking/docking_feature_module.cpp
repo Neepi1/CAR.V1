@@ -670,7 +670,7 @@ public:
           job.building_id,
           job.floor_id,
           selected_map,
-          late_dependencies_.elevator->capture_motion_admission_epoch());
+          0U);
         detail = response.body;
         return response.status < 400;
       };

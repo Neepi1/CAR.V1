@@ -79,6 +79,9 @@ struct FloorTransitionEvidence
   bool caller_pause_released{false};
   bool runtime_context_invalid{false};
   bool runtime_context_valid{false};
+  // Failure ownership is independent of localization readiness. Set only
+  // after pending writes settle and this transaction's pauses/holds release.
+  bool failure_resources_released{false};
   bool bridge_ready{false};
   bool amcl_ready{false};
   bool global_costmap_fresh{false};

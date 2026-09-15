@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -20,7 +21,10 @@
 
 #include "action_msgs/msg/goal_status.hpp"
 #include "action_msgs/msg/goal_status_array.hpp"
+#include "action_msgs/srv/cancel_goal.hpp"
 #include "lifecycle_msgs/msg/state.hpp"
+#include "lifecycle_msgs/msg/transition.hpp"
+#include "lifecycle_msgs/srv/change_state.hpp"
 #include "lifecycle_msgs/srv/get_state.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "nav_msgs/msg/odometry.hpp"
@@ -277,6 +281,12 @@ public:
     runtime_map_context_file_ =
       declare_parameter<std::string>(
       "runtime_map_context_file", "/tmp/njrh_runtime_map_context.json");
+    startup_handoff_file_ = declare_parameter<std::string>(
+      "startup_handoff_file", "/tmp/njrh_floor_startup_handoff.json");
+    startup_handoff_ack_file_ = declare_parameter<std::string>(
+      "startup_handoff_ack_file", "/tmp/njrh_floor_startup_handoff_ack.json");
+    startup_handoff_timeout_sec_ = declare_parameter<double>("startup_handoff_timeout_sec", 90.0);
+    startup_ready_timeout_sec_ = declare_parameter<double>("startup_ready_timeout_sec", 120.0);
     evidence_timeout_sec_ =
       declare_parameter<double>("evidence_timeout_sec", 10.0);
     nav_idle_bootstrap_grace_sec_ = std::clamp(
@@ -292,6 +302,15 @@ public:
       declare_parameter<double>("stopped_angular_threshold_radps", 0.02);
 
     callback_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+    nav_cancel_client_ = create_client<action_msgs::srv::CancelGoal>(
+      navigate_to_pose_action_name_ + "/_action/cancel_goal", rmw_qos_profile_services_default,
+      callback_group_);
+    nav_lifecycle_probes_[0].node_name = "/bt_navigator";
+    nav_lifecycle_probes_[1].node_name = "/controller_server";
+    for (auto & probe : nav_lifecycle_probes_) {
+      // Default mutually-exclusive callback group serializes probe bookkeeping.
+      probe.client = create_client<lifecycle_msgs::srv::GetState>(probe.node_name + "/get_state");
+    }
 
     keepout_mask_state_service_ = lifecycle_state_service_for_load_map(keepout_mask_load_service_);
     speed_mask_state_service_ = lifecycle_state_service_for_load_map(speed_mask_load_service_);
@@ -420,6 +439,7 @@ public:
           }
         }
         const auto observed_at = steady_now_sec();
+        nav_goal_active_.store(active);
         std::lock_guard<std::mutex> lock(evidence_mutex_);
         evidence_tracker_.observe_nav_activity(active, observed_at);
         evidence_changed_.notify_all();
@@ -427,6 +447,9 @@ public:
     nav_graph_probe_timer_ = create_wall_timer(
       200ms,
       [this]() {
+        if (nav_lifecycle_probe_enabled_.load()) {
+          probe_nav_lifecycle();
+        }
         std::set<std::string> service_names;
         for (const auto & entry : get_service_names_and_types()) {
           service_names.insert(entry.first);
@@ -617,6 +640,9 @@ private:
       }
     }
     cancel_requested_.store(true);
+    // Stop future startup steps immediately; already dispatched RPCs still
+    // settle through their original clients and the existing safety cleanup.
+    finish_startup_handoff("failed", "floor-switch cancellation accepted", transaction_id);
     evidence_changed_.notify_all();
     return rclcpp_action::CancelResponse::ACCEPT;
   }
@@ -675,7 +701,8 @@ private:
     bool transaction_conflict = false;
     {
       std::lock_guard<std::mutex> lock(floor_state_mutex_);
-      transaction_conflict = floor_switch_action_active_ || switching_;
+      transaction_conflict = floor_switch_action_active_ || switching_ ||
+        deferred_failure_cleanup_.load();
       if (!transaction_conflict) {
         // Reset the probe while holding the same mutex used by cancellation.
         // A cancel arriving after this point cannot be erased by startup.
@@ -692,7 +719,7 @@ private:
       result->failure_code = static_cast<std::uint16_t>(code);
       result->message =
         std::string(robot_floor_manager::to_string(code)) +
-        ": another floor transaction or legacy selection is active";
+        ": another floor transaction, unresolved request, or owned-resource cleanup is active";
       result->runtime_context_valid = false;
       publish_transition_status(
         goal->transaction_id, "BLOCKED",
@@ -710,6 +737,7 @@ private:
       floor_switch_worker_ = std::thread(
         [this, goal_handle]() {
           execute_live_floor_switch(goal_handle);
+          reconcile_deferred_failure();
         });
     } catch (const std::exception & exception) {
       release_floor_switch_action(goal->transaction_id);
@@ -842,6 +870,14 @@ private:
         bridge_begin_established_ = false;
         bridge_begin_submitted_ = false;
         bridge_begin_outcome_unknown_ = false;
+        target_effect_dispatched_ = false;
+        target_requests_.clear();
+        startup_target_trigger_dispatched_ = false;
+        tracked_floor_transaction_ = request.transaction_id;
+        {
+          std::lock_guard<std::mutex> handoff_lock(startup_handoff_mutex_);
+          startup_handoff_.reset();
+        }
         motion_hold_command_submitted_.store(false);
         motion_hold_outcome_unknown_.store(false);
         correction_pause_command_submitted_.store(false);
@@ -853,6 +889,7 @@ private:
       }
 
       robot_floor_manager::FloorTransitionExecutor executor(*this);
+      nav_lifecycle_probe_enabled_.store(true);
       const auto execution = executor.run(
         request,
         *snapshot_result.snapshot,
@@ -864,9 +901,14 @@ private:
         {
           publish_live_progress(goal_handle, request, output);
         });
+      nav_lifecycle_probe_enabled_.store(false);
+      finish_startup_handoff(execution.success ? "committed" : "failed", execution.message,
+        request.transaction_id);
       finish_live_floor_switch(goal_handle, request, execution);
     } catch (const std::exception & exception) {
-      emergency_lock_after_exception(request, exception.what());
+      nav_lifecycle_probe_enabled_.store(false);
+      finish_startup_handoff("failed", exception.what(), request.transaction_id);
+      const bool cleanup_released = emergency_lock_after_exception(request, exception.what());
       auto result = std::make_shared<FloorSwitchAction::Result>();
       result->success = false;
       result->failure_code = static_cast<std::uint16_t>(
@@ -874,22 +916,30 @@ private:
       result->message =
         "INTERNAL_ERROR: live floor-switch exception: " +
         std::string(exception.what());
-      result->runtime_context_valid = !bridge_begin_established_;
-      result->recovery_required = bridge_begin_established_;
+      {
+        std::lock_guard<std::mutex> lock(evidence_mutex_);
+        result->runtime_context_valid = runtime_context_confirmed_;
+      }
+      result->recovery_required = !cleanup_released;
       publish_transition_status(
         request.transaction_id, "FAILED", "INTERNAL_ERROR",
         result->failure_code, result->message, &request);
       release_floor_switch_action(request.transaction_id);
       goal_handle->abort(result);
     } catch (...) {
-      emergency_lock_after_exception(request, "unknown exception");
+      nav_lifecycle_probe_enabled_.store(false);
+      finish_startup_handoff("failed", "unknown exception", request.transaction_id);
+      const bool cleanup_released = emergency_lock_after_exception(request, "unknown exception");
       auto result = std::make_shared<FloorSwitchAction::Result>();
       result->success = false;
       result->failure_code = static_cast<std::uint16_t>(
         robot_floor_manager::FloorSwitchFailureCode::kInternalError);
       result->message = "INTERNAL_ERROR: unknown live floor-switch exception";
-      result->runtime_context_valid = !bridge_begin_established_;
-      result->recovery_required = bridge_begin_established_;
+      {
+        std::lock_guard<std::mutex> lock(evidence_mutex_);
+        result->runtime_context_valid = runtime_context_confirmed_;
+      }
+      result->recovery_required = !cleanup_released;
       publish_transition_status(
         request.transaction_id, "FAILED", "INTERNAL_ERROR",
         result->failure_code, result->message, &request);
@@ -999,6 +1049,7 @@ private:
     if (
       failure.find("BRIDGE") != std::string::npos ||
       failure.find("CONTEXT") != std::string::npos ||
+      failure.find("STARTUP_") != std::string::npos ||
       failure.find("COSTMAP") != std::string::npos ||
       failure.find("PAUSE") != std::string::npos)
     {
@@ -1079,6 +1130,7 @@ private:
     }
     const auto disposition =
       robot_floor_manager::floor_transition_failure_disposition(execution);
+    deferred_failure_code_ = result->failure_code;
     publish_transition_status(
       request.transaction_id,
       disposition.state,
@@ -1119,7 +1171,8 @@ private:
     bool transaction_conflict = false;
     {
       std::lock_guard<std::mutex> lock(floor_state_mutex_);
-      transaction_conflict = floor_switch_action_active_ || switching_;
+      transaction_conflict = floor_switch_action_active_ || switching_ ||
+        deferred_failure_cleanup_.load();
       if (!transaction_conflict) {
         floor_switch_action_active_ = true;
         active_floor_switch_transaction_ = input.request.transaction_id;
@@ -1635,9 +1688,8 @@ private:
         "bridge floor-transition response did not prove the exact command sequence";
       return nullptr;
     }
-    // ABORT restores the previously active source identity. Its accepted epoch
-    // therefore need not equal the pending target epoch. BEGIN and COMMIT must
-    // still echo the exact target epoch.
+    // Only ABORT_PREMUTATION can restore the source identity. Ordinary ABORT
+    // retains an invalid context. BEGIN and COMMIT must echo the target epoch.
     if (
       bridge_response_requires_target_epoch(operation) &&
       response->accepted_asset_epoch != effect.expected_asset_epoch)
@@ -1650,6 +1702,7 @@ private:
 
   bool wait_for_source_runtime_context_after(
     const std::uint64_t generation_after_response,
+    const std::uint64_t restored_explicit_sequence,
     std::string & error)
   {
     const auto deadline = std::chrono::steady_clock::now() + evidence_timeout();
@@ -1660,12 +1713,21 @@ private:
       return false;
     }
     const auto proven =
-      [this, generation_after_response]() {
+      [this, generation_after_response, restored_explicit_sequence]() {
+        const auto observed_at = steady_now_sec();
         return
           localization_health_generation_ > generation_after_response &&
           last_localization_health_.has_value() &&
+          last_localization_health_received_steady_sec_ >= 0.0 &&
+          observed_at >= last_localization_health_received_steady_sec_ &&
+          observed_at - last_localization_health_received_steady_sec_ <=
+          evidence_max_age_sec_ &&
           same_runtime_identity(
             *last_localization_health_, *source_runtime_context_) &&
+          // BEGIN may follow a newer source fix than the cached preflight
+          // sample. Compare against the restore response, not that old sample.
+          last_localization_health_->explicit_relocalization_sequence ==
+          restored_explicit_sequence &&
           last_localization_health_->runtime_context_valid &&
           !last_localization_health_->transition_active &&
           last_localization_health_->localizer_ready &&
@@ -1674,6 +1736,9 @@ private:
       };
     while (!shutting_down_.load()) {
       if (proven()) {
+        // Persist the same source generation that was just proven, rather than
+        // the possibly older sample captured before pause acquisition/BEGIN.
+        source_runtime_context_ = last_localization_health_;
         return true;
       }
       if (evidence_changed_.wait_until(lock, deadline) ==
@@ -1689,21 +1754,18 @@ private:
 
   bool abort_bridge_and_prove_source(
     const robot_floor_manager::FloorTransitionEffect & effect,
-    const bool pre_mutation,
     std::string & error)
   {
     const auto response = call_bridge_transition(
       effect,
-      pre_mutation ?
-      robot_interfaces::srv::BeginFloorTransition::Request::OP_ABORT_PREMUTATION :
-      robot_interfaces::srv::BeginFloorTransition::Request::OP_ABORT,
+      robot_interfaces::srv::BeginFloorTransition::Request::OP_ABORT_PREMUTATION,
       error);
     if (!response) {
       return false;
     }
     if (!response->runtime_context_valid) {
       error =
-        "bridge ABORT response did not restore a valid source runtime context";
+        "bridge pre-mutation ABORT did not restore a valid source runtime context";
       return false;
     }
     std::uint64_t health_generation_after_response = 0U;
@@ -1712,7 +1774,8 @@ private:
       health_generation_after_response = localization_health_generation_;
     }
     if (!wait_for_source_runtime_context_after(
-        health_generation_after_response, error))
+        health_generation_after_response,
+        response->explicit_relocalization_sequence, error))
     {
       return false;
     }
@@ -1969,6 +2032,128 @@ private:
     return true;
   }
 
+  static bool localizer_apply_failed_before_mutation(const std::string & code)
+  {
+    return code.rfind("ASSET_", 0U) == 0U ||
+      code == "TRANSACTION_ID_INVALID" || code == "COMPONENT_CONFIG_INVALID" ||
+      code == "COMPONENT_MANAGER_UNAVAILABLE" || code == "COMPONENT_LIST_TIMEOUT" ||
+      code == "LOCALIZER_OPERATION_BUSY" || code == "LOCALIZER_COMPONENT_AMBIGUOUS" ||
+      code == "LOCALIZER_PARAMETER_CAPTURE_INVALID" || code == "LOCALIZER_PARAMETER_LIST_TIMEOUT" ||
+      code == "LOCALIZER_PARAMETER_GET_TIMEOUT" || code == "LOCALIZER_PNG_INVALID" ||
+      code == "NAV_MAP_YAML_INVALID" || code == "LOCALIZER_YAML_INVALID" ||
+      code == "LOCALIZER_IMAGE_MISMATCH";
+  }
+
+  template<typename Response>
+  static bool target_response_settled(const std::shared_ptr<Response> & response)
+  {
+    return response != nullptr;
+  }
+
+  static bool target_response_settled(
+    const std::shared_ptr<robot_interfaces::srv::TriggerLocalization::Response> & response)
+  {
+    if (!response) {return false;}
+    if (response->accepted) {return true;}
+    // The wrapper can return before its nested Isaac or force-accept request.
+    // In particular "not_dispatched" describes Isaac, not the prior bridge arm.
+    if (response->message.find("BRIDGE_FORCE_ACCEPT_TIMEOUT") != std::string::npos ||
+      response->message.find("BRIDGE_FORCE_ACCEPT_FAILED") != std::string::npos)
+    {return false;}
+    return response->message.find("dispatch_state=not_dispatched") != std::string::npos;
+  }
+
+  static bool target_response_settled(
+    const std::shared_ptr<robot_interfaces::srv::ApplyFloorAssets::Response> & response)
+  {
+    if (!response) {return false;}
+    if (response->success || localizer_apply_failed_before_mutation(response->code)) {return true;}
+    return response->rollback_succeeded && response->code.find("TIMEOUT") == std::string::npos &&
+      response->code.find("EXCEPTION") == std::string::npos &&
+      response->code.find("UNKNOWN") == std::string::npos;
+  }
+
+  // Keep the real response future alive across a timeout. "Was dispatched"
+  // determines whether source restoration is legal; it must not mean "still
+  // executing forever". A callback exception does not prove server completion.
+  template<typename Client, typename Request>
+  auto dispatch_target_request(
+    const std::shared_ptr<Client> & client,
+    const std::shared_ptr<Request> & request,
+    std::shared_ptr<std::atomic_bool> * settlement = nullptr)
+  {
+    auto settled = std::make_shared<std::atomic_bool>(false);
+    target_requests_.push_back({settled, client, {}});
+    if (settlement) {*settlement = settled;}
+    target_effect_dispatched_ = true;
+    auto future = client->async_send_request(request,
+      [](typename Client::SharedFuture) {});
+    const auto observed = future.future;
+    target_requests_.back().response_settled = [observed]() {
+        if (observed.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+          return false;
+        }
+        try {
+          return target_response_settled(observed.get());
+        } catch (const std::exception &) {
+          // Retain this exact unresolved request, not a historic failure bit.
+          return false;
+        }
+      };
+    return future;
+  }
+
+  bool target_requests_settled() const
+  {
+    return std::all_of(target_requests_.begin(), target_requests_.end(),
+      [](const auto & request) {
+        return request.settled->load() ||
+          (request.response_settled && request.response_settled());
+      });
+  }
+
+  bool startup_effects_settled()
+  {
+    std::lock_guard<std::mutex> lock(startup_handoff_mutex_);
+    if (!startup_handoff_) {return true;}
+    const auto ack = robot_floor_manager::read_floor_startup_handoff_ack(
+      startup_handoff_ack_file_, *startup_handoff_);
+    if (!ack || !ack->failure.empty()) {return false;}
+    // After adoption the startup owner only waits for target localization;
+    // before we trigger that localization it cannot dispatch target startup.
+    if (!startup_target_trigger_dispatched_ && ack->state == "adopted") {return true;}
+    return ack->state == "runtime_ready" &&
+      ack->explicit_relocalization_sequence == explicit_relocalization_sequence_ &&
+      ack->explicit_relocalization_sequence > startup_handoff_->explicit_sequence_baseline &&
+      ack->localizer_generation == localizer_generation_ && localizer_generation_ > 0U;
+  }
+
+  void reconcile_deferred_failure()
+  {
+    while (deferred_failure_cleanup_.load() && !shutting_down_.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      if (!target_requests_settled() || !startup_effects_settled() ||
+        shutting_down_.load()) {continue;}
+      const auto effect = deferred_failure_effect_;
+      const auto snapshot = deferred_failure_snapshot_;
+      try {
+        const auto cleanup = perform(effect, snapshot);
+        if (cleanup.success && cleanup.evidence.failure_resources_released) {
+          publish_transition_status(effect.transaction_id, "FAILED", "FAILED", deferred_failure_code_,
+            effect.detail + "; late requests settled and owned resources released");
+          return;
+        }
+      } catch (const std::exception & error) {
+        RCLCPP_WARN(get_logger(), "floor failure resource cleanup not yet proven: %s", error.what());
+      }
+      // The action result is already returned. Retry only its exact cleanup,
+      // without holding a ROS callback or restarting the failed floor switch.
+      for (int interval = 0; interval < 8 && !shutting_down_.load(); ++interval) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      }
+    }
+  }
+
   bool load_map_with_client(
     const rclcpp::Client<nav2_msgs::srv::LoadMap>::SharedPtr & client,
     const std::string & service_name,
@@ -1981,7 +2166,7 @@ private:
     }
     auto request = std::make_shared<nav2_msgs::srv::LoadMap::Request>();
     request->map_url = map_yaml.string();
-    auto future = client->async_send_request(request);
+    auto future = dispatch_target_request(client, request);
     if (future.wait_for(service_timeout()) != std::future_status::ready) {
       error = "timed out loading " + label + ": " + map_yaml.string();
       return false;
@@ -2008,6 +2193,12 @@ private:
   {
     if (!call_filter_mask_load_) {
       error = "live filter-mask reload is disabled by configuration";
+      return false;
+    }
+    if (has_startup_handoff() &&
+      (!prepare_mask_lifecycle(keepout_mask_state_service_, error) ||
+      (speed_filter_enabled_ && !prepare_mask_lifecycle(speed_mask_state_service_, error))))
+    {
       return false;
     }
     if (!filter_mask_servers_are_active()) {
@@ -2051,7 +2242,8 @@ private:
     request->nav_map_yaml = assets.nav_map_yaml.string();
     request->localizer_map_png = assets.localizer_map_png.string();
     request->localizer_params_yaml = assets.localizer_params_yaml.string();
-    auto future = localizer_apply_client_->async_send_request(request);
+    std::shared_ptr<std::atomic_bool> request_settled;
+    auto future = dispatch_target_request(localizer_apply_client_, request, &request_settled);
     const auto total_timeout = localizer_apply_timeout();
     const auto deadline = std::chrono::steady_clock::now() + total_timeout;
     std::string rpc_error;
@@ -2104,6 +2296,11 @@ private:
       }
 
       if (outcome.terminal) {
+        // Exact typed terminal state is completion evidence even when the RPC
+        // response was lost; it is not merely a timeout or a local cancellation.
+        if (outcome.success || localizer_apply_failed_before_mutation(outcome.code)) {
+          request_settled->store(true);
+        }
         if (!outcome.success) {
           error = "global localization rejected floor assets from exact typed state";
           if (!outcome.code.empty()) {
@@ -2179,7 +2376,8 @@ private:
       ++attempt;
       auto request = std::make_shared<robot_interfaces::srv::TriggerLocalization::Request>();
       request->reason = "floor_switch:" + assets.building_id + "/" + assets.floor_id;
-      auto future = localization_trigger_client_->async_send_request(request);
+      startup_target_trigger_dispatched_ = true;
+      auto future = dispatch_target_request(localization_trigger_client_, request);
 
       bool response_ready = false;
       while (!shutting_down_.load() && !cancel_requested_.load()) {
@@ -2226,6 +2424,11 @@ private:
       }
 
       error = "global localization trigger rejected: " + response->message;
+      if (!target_response_settled(response)) {
+        // Do not start a second trigger while a nested Isaac/bridge request
+        // belonging to the first one still has an unproven outcome.
+        return false;
+      }
       const auto classification =
         robot_floor_manager::classify_explicit_localization_failure(error);
       if (!classification.retryable) {
@@ -2274,7 +2477,7 @@ private:
       return false;
     }
     const auto request = std::make_shared<nav2_msgs::srv::ClearEntireCostmap::Request>();
-    const auto future = client->async_send_request(request);
+    const auto future = dispatch_target_request(client, request);
     if (future.wait_for(service_timeout()) != std::future_status::ready) {
       error = "timed out clearing costmap service: " + service_name;
       return false;
@@ -2368,6 +2571,7 @@ private:
     evidence.bridge_ready = source.bridge_ready;
     evidence.amcl_ready = source.amcl_ready;
     evidence.runtime_context_invalid = false;
+    evidence.runtime_context_valid = true;
     evidence.safe_for_goal_start = true;
     return evidence;
   }
@@ -2395,6 +2599,231 @@ private:
     return result;
   }
 
+  bool nav_lifecycle_owner_unique(const std::string & expected_node)
+  {
+    try {
+      const auto names = get_node_names();
+      if (std::count(names.begin(), names.end(), expected_node) != 1) {return false;}
+      const auto service = expected_node + "/get_state";
+      std::size_t owners = 0U;
+      for (const auto & name : names) {
+        const auto separator = name.find_last_of('/');
+        const auto node_name = name.substr(separator + 1U);
+        const auto node_namespace = separator == 0U ? "/" : name.substr(0U, separator);
+        const auto services = get_service_names_and_types_by_node(node_name, node_namespace);
+        const auto found = services.find(service);
+        if (found == services.end()) {continue;}
+        if (name != expected_node || found->second !=
+          std::vector<std::string>{"lifecycle_msgs/srv/GetState"}) {return false;}
+        ++owners;
+      }
+      return owners == 1U;
+    } catch (const std::exception &) {
+      return false;
+    }
+  }
+
+  void probe_nav_lifecycle()
+  {
+    for (std::size_t index = 0; index < nav_lifecycle_probes_.size(); ++index) {
+      auto & probe = nav_lifecycle_probes_[index];
+      const auto endpoint = index == 0U ? robot_floor_manager::NavLifecycleEndpoint::kBtNavigator :
+        robot_floor_manager::NavLifecycleEndpoint::kControllerServer;
+      const auto observed = steady_now_sec();
+      if (probe.in_flight && observed - probe.requested_at > 0.75) {
+        probe.client->remove_pending_request(probe.pending_id);
+        probe.in_flight = false;
+        ++probe.generation;
+      }
+      if (probe.in_flight) {continue;}
+      if (!nav_lifecycle_owner_unique(probe.node_name) ||
+        !probe.client->service_is_ready())
+      {
+        std::lock_guard<std::mutex> lock(evidence_mutex_);
+        evidence_tracker_.observe_nav_lifecycle_state(endpoint, 0U, observed);
+        continue;
+      }
+      probe.in_flight = true;
+      probe.requested_at = observed;
+      const auto generation = ++probe.generation;
+      try {
+        auto pending = probe.client->async_send_request(
+          std::make_shared<lifecycle_msgs::srv::GetState::Request>(),
+          [this, index, endpoint, generation](rclcpp::Client<lifecycle_msgs::srv::GetState>::SharedFuture future) {
+            auto & current = nav_lifecycle_probes_[index];
+            if (current.generation != generation) {return;}
+            current.in_flight = false;
+            std::uint8_t state = 0U;
+            try {
+              if (steady_now_sec() - current.requested_at <= 0.75 &&
+                nav_lifecycle_owner_unique(current.node_name)) {
+                state = future.get()->current_state.id;
+              }
+            } catch (const std::exception &) {}
+            std::lock_guard<std::mutex> lock(evidence_mutex_);
+            evidence_tracker_.observe_nav_lifecycle_state(endpoint, state, steady_now_sec());
+            evidence_changed_.notify_all();
+          });
+        probe.pending_id = pending.request_id;
+      } catch (const std::exception &) {
+        probe.in_flight = false;
+        std::lock_guard<std::mutex> lock(evidence_mutex_);
+        evidence_tracker_.observe_nav_lifecycle_state(endpoint, 0U, observed);
+      }
+    }
+  }
+
+  bool wait_startup_handoff(const std::string & state, double timeout, std::string & error)
+  {
+    robot_floor_manager::RuntimeMapContextRecord expected;
+    {
+      std::lock_guard<std::mutex> lock(startup_handoff_mutex_);
+      if (!startup_handoff_) {error = "startup handoff request missing"; return false;}
+      expected = *startup_handoff_;
+    }
+    const auto deadline = steady_now_sec() + std::max(0.1, timeout);
+    while (!shutting_down_.load() && !cancel_requested_.load() && steady_now_sec() < deadline) {
+      const auto ack = robot_floor_manager::read_floor_startup_handoff_ack(
+        startup_handoff_ack_file_, expected);
+      if (ack) {
+        if (ack->state == "failed" || !ack->failure.empty()) {
+          error = "target startup preparation failed: " + ack->failure + ": " + ack->detail;
+          return false;
+        }
+        if (ack->state == state) {
+          if (state == "runtime_ready" &&
+            (ack->explicit_relocalization_sequence != explicit_relocalization_sequence_ ||
+            ack->localizer_generation != localizer_generation_))
+          {
+            error = "startup ready acknowledgement used a different localization generation";
+            return false;
+          }
+          return true;
+        }
+      }
+      std::unique_lock<std::mutex> lock(evidence_mutex_);
+      evidence_changed_.wait_for(lock, 100ms);
+    }
+    error = "startup did not acknowledge exact target state=" + state +
+      " before timeout/cancel; motion remains held";
+    return false;
+  }
+
+  bool begin_startup_handoff(
+    const robot_floor_manager::FloorTransitionEffect & effect, const FloorAssets & assets,
+    std::string & error)
+  {
+    robot_floor_manager::RuntimeMapContextRecord record;
+    record.startup_handoff = true;
+    record.state = "requested";
+    record.transaction_id = effect.transaction_id;
+    record.building_id = effect.building_id;
+    record.floor_id = effect.floor_id;
+    record.map_id = effect.map_id;
+    record.asset_epoch = effect.expected_asset_epoch;
+    record.asset_digest = effect.expected_asset_digest;
+    record.request_nonce = "floor_" + std::to_string(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+    record.updated_at_sec = now().seconds();
+    record.speed_filter_enabled = speed_filter_enabled_;
+    record.asset_root = assets.root.string();
+    record.nav_map_yaml = assets.nav_map_yaml.string();
+    record.localizer_map_png = assets.localizer_map_png.string();
+    record.localizer_params_yaml = assets.localizer_params_yaml.string();
+    record.keepout_mask_yaml = assets.keepout_mask_yaml.string();
+    record.speed_mask_yaml = assets.speed_mask_yaml.string();
+    {
+      std::lock_guard<std::mutex> lock(evidence_mutex_);
+      if (last_localization_health_) {
+        record.explicit_sequence_baseline = last_localization_health_->explicit_relocalization_sequence;
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lock(startup_handoff_mutex_);
+      if (cancel_requested_.load()) {error = "cancelled before startup handoff"; return false;}
+      startup_handoff_ = record;
+      if (!robot_floor_manager::AtomicRuntimeMapContextWriter{}.write(
+          startup_handoff_file_, record, error)) {return false;}
+    }
+    return wait_startup_handoff("adopted", startup_handoff_timeout_sec_, error);
+  }
+
+  bool has_startup_handoff()
+  {
+    std::lock_guard<std::mutex> lock(startup_handoff_mutex_);
+    return startup_handoff_.has_value();
+  }
+
+  bool finish_startup_handoff(
+    const std::string & state, const std::string & detail,
+    const std::string & expected_transaction = "")
+  {
+    std::lock_guard<std::mutex> lock(startup_handoff_mutex_);
+    if (!startup_handoff_) {return true;}
+    if (!expected_transaction.empty() && startup_handoff_->transaction_id != expected_transaction) {
+      return true;
+    }
+    if (state == "committed" && cancel_requested_.load()) {return false;}
+    startup_handoff_->state = state;
+    startup_handoff_->message = detail;
+    startup_handoff_->updated_at_sec = now().seconds();
+    std::string error;
+    if (!robot_floor_manager::AtomicRuntimeMapContextWriter{}.write(
+        startup_handoff_file_, *startup_handoff_, error))
+    {
+      RCLCPP_ERROR(get_logger(), "failed to publish startup handoff terminal: %s", error.c_str());
+      return false;
+    }
+    return true;
+  }
+
+  bool prove_stopped_idle_hold(robot_floor_manager::FloorTransitionEvidence & evidence)
+  {
+    return wait_for_evidence(
+      [this]() {
+        return evidence_tracker_.preconditions(
+          steady_now_sec(), evidence_max_age_sec_, stopped_stable_duration_sec_,
+          stopped_linear_threshold_mps_, stopped_angular_threshold_radps_,
+          nav_idle_bootstrap_grace_sec_);
+      },
+      [](const auto & value) {return value.motion_hold_active && value.nav_idle && value.stopped;},
+      evidence);
+  }
+
+  bool prepare_mask_lifecycle(const std::string & state_service, std::string & error)
+  {
+    auto state_client = create_client<lifecycle_msgs::srv::GetState>(
+      state_service, rmw_qos_profile_services_default, callback_group_);
+    const auto change_service = state_service.substr(0, state_service.size() - std::string("get_state").size()) + "change_state";
+    auto change_client = create_client<lifecycle_msgs::srv::ChangeState>(
+      change_service, rmw_qos_profile_services_default, callback_group_);
+    for (int step = 0; step < 3; ++step) {
+      if (!wait_for_service(state_client, state_service, error)) {return false;}
+      auto state_future = state_client->async_send_request(std::make_shared<lifecycle_msgs::srv::GetState::Request>());
+      if (state_future.wait_for(service_timeout()) != std::future_status::ready) {
+        error = "mask GetState timeout: " + state_service; return false;
+      }
+      const auto state = state_future.get()->current_state.id;
+      if (state == lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) {return true;}
+      auto request = std::make_shared<lifecycle_msgs::srv::ChangeState::Request>();
+      if (state == lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED) {
+        request->transition.id = lifecycle_msgs::msg::Transition::TRANSITION_CONFIGURE;
+      } else if (state == lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE) {
+        request->transition.id = lifecycle_msgs::msg::Transition::TRANSITION_ACTIVATE;
+      } else {
+        error = "mask lifecycle is not stable: " + state_service; return false;
+      }
+      if (!wait_for_service(change_client, change_service, error)) {return false;}
+      // A configure/activate may still execute after a client timeout.
+      auto changed = dispatch_target_request(change_client, request);
+      if (changed.wait_for(service_timeout()) != std::future_status::ready || !changed.get()->success) {
+        error = "mask lifecycle change not acknowledged: " + change_service; return false;
+      }
+    }
+    error = "mask lifecycle did not become active: " + state_service;
+    return false;
+  }
+
   robot_floor_manager::FloorTransitionEffectResult perform(
     const robot_floor_manager::FloorTransitionEffect & effect,
     const robot_floor_manager::FloorAssetSnapshot & snapshot) override
@@ -2420,6 +2849,18 @@ private:
         // out or cancellation arrives. Record ownership before waiting so
         // pre-BEGIN cleanup releases exactly this transaction's key.
         motion_hold_acquired_.store(true);
+        if (nav_goal_active_.load()) {
+          if (!wait_for_service(nav_cancel_client_, navigate_to_pose_action_name_ + "/_action/cancel_goal", error)) {
+            return effect_failure("NAV_IDLE_UNPROVEN", error);
+          }
+          auto canceled_goal = nav_cancel_client_->async_send_request(
+            std::make_shared<action_msgs::srv::CancelGoal::Request>());
+          if (canceled_goal.wait_for(service_timeout()) != std::future_status::ready) {
+            return effect_failure("NAV_IDLE_UNPROVEN", "navigation cancellation is still unproven");
+          }
+          // Cancellation acknowledgement is not idle proof; status below must become terminal.
+          (void)canceled_goal.get();
+        }
         robot_floor_manager::FloorTransitionEvidence evidence;
         const bool proven = wait_for_evidence(
           [this]() {
@@ -2458,6 +2899,19 @@ private:
             "fresh wheel and local odometry did not remain stopped",
             evidence);
         }
+        bool inactive = false;
+        {
+          std::lock_guard<std::mutex> lock(evidence_mutex_);
+          inactive = evidence_tracker_.nav_runtime_inactive(steady_now_sec(), evidence_max_age_sec_);
+        }
+        if (inactive && !begin_startup_handoff(effect, assets, error)) {
+          return effect_failure("STARTUP_HANDOFF_UNPROVEN", error, evidence);
+        }
+        if (inactive && !prove_stopped_idle_hold(evidence)) {
+          return effect_failure("NAV_IDLE_UNPROVEN",
+            "fresh hold, idle and dual-odom stop proof lost during startup handoff", evidence);
+        }
+        nav_lifecycle_probe_enabled_.store(false);
         return effect_success(
           "motion hold, Nav2 idle, and dual-odom stop proven",
           evidence);
@@ -2498,15 +2952,8 @@ private:
 
       case robot_floor_manager::FloorTransitionEffectKind::kInvalidateRuntimeContext:
       {
-        {
-          std::lock_guard<std::mutex> lock(evidence_mutex_);
-          if (!source_runtime_context_.has_value()) {
-            return effect_failure(
-              "SOURCE_RUNTIME_CONTEXT_UNPROVEN",
-              "bridge BEGIN requires a fresh exact source identity with "
-              "localizer, map->odom, and canonical TF readiness");
-          }
-        }
+        // A verified source is optional rollback evidence, never a prerequisite
+        // for initializing an exact target from an unlocalized startup.
         auto response = call_bridge_transition(
           effect,
           robot_interfaces::srv::BeginFloorTransition::Request::OP_BEGIN,
@@ -2755,6 +3202,21 @@ private:
       case robot_floor_manager::FloorTransitionEffectKind::kVerifyBridgeReady:
       {
         robot_floor_manager::FloorTransitionEvidence evidence;
+        if (has_startup_handoff()) {
+          // Pending target TF is usable for initializing Nav2/AMCL, but is not
+          // permission to move or to commit. Waiting for AMCL first deadlocks
+          // against the startup owner which must create it after this TF.
+          if (!wait_for_evidence(
+              [this]() {return evidence_tracker_.target_localization(
+                  steady_now_sec(), evidence_max_age_sec_, localizer_generation_);},
+              [](const auto & value) {return value.bridge_ready &&
+                  value.runtime_context_invalid && value.explicit_relocalization_sequence != 0U;},
+              evidence) || !wait_startup_handoff("runtime_ready", startup_ready_timeout_sec_, error))
+          {
+            return effect_failure("STARTUP_TARGET_READY_UNPROVEN",
+              error.empty() ? "pending target transform was not proven" : error, evidence);
+          }
+        }
         if (!wait_for_evidence(
             [this]() {
               return evidence_tracker_.target_localization(
@@ -2883,6 +3345,18 @@ private:
 
       case robot_floor_manager::FloorTransitionEffectKind::kComplete:
       {
+        if (has_startup_handoff()) {
+          robot_floor_manager::FloorTransitionEvidence stopped_evidence;
+          if (!prove_stopped_idle_hold(stopped_evidence)) {
+            return effect_failure("NAV_IDLE_UNPROVEN",
+              "target runtime started but fresh idle/stop/hold proof is missing", stopped_evidence);
+          }
+          // Terminal handoff publication is part of success, before allowing motion.
+          if (!finish_startup_handoff("committed", "target runtime context committed", effect.transaction_id)) {
+            return effect_failure("RUNTIME_CONTEXT_WRITE_FAILED",
+              "startup handoff commit could not be durably published; hold retained");
+          }
+        }
         if (!set_motion_hold(
             effect.transaction_id,
             robot_interfaces::srv::SetMotionHold::Request::OP_RELEASE,
@@ -2915,6 +3389,10 @@ private:
 
       case robot_floor_manager::FloorTransitionEffectKind::kHoldAndLock:
       {
+        deferred_failure_effect_ = effect;
+        deferred_failure_snapshot_ = snapshot;
+        deferred_failure_cleanup_.store(true);
+        finish_startup_handoff("failed", effect.detail, effect.transaction_id);
         std::string cleanup_detail;
         const auto append_detail =
           [&cleanup_detail](const std::string & detail) {
@@ -2932,13 +3410,18 @@ private:
               pause_error);
             append_detail(pause_error);
 
+            // Do not open a motion window while pause release is unproven.
+            if (!pause_released) {
+              return false;
+            }
+
             std::string hold_error;
             const bool hold_released = set_motion_hold(
               effect.transaction_id,
               robot_interfaces::srv::SetMotionHold::Request::OP_RELEASE,
               hold_error);
             append_detail(hold_error);
-            return pause_released && hold_released;
+            return hold_released;
           };
         const auto retain_safety_resources =
           [this, &effect, &append_detail]() {
@@ -2960,13 +3443,19 @@ private:
 
         const bool begin_established = bridge_begin_established_;
         const bool begin_outcome_unknown = bridge_begin_outcome_unknown_;
-        if (!begin_established && !begin_outcome_unknown) {
+        const auto cleanup_action = robot_floor_manager::select_floor_transition_cleanup(
+          begin_established, begin_outcome_unknown, target_effect_dispatched_);
+        if (cleanup_action ==
+          robot_floor_manager::FloorTransitionCleanupAction::kReleaseUnchangedSource)
+        {
           // Always issue higher-sequence exact RELEASE commands. An earlier
           // ACQUIRE may have been accepted even when its response timed out,
           // so local "acquired" booleans are not cleanup evidence.
-          if (release_pre_mutation_resources()) {
+          if (startup_effects_settled() && release_pre_mutation_resources()) {
+            deferred_failure_cleanup_.store(false);
             auto evidence = target_evidence(effect);
             evidence.runtime_context_invalid = false;
+            evidence.failure_resources_released = true;
             return effect_success(
               "pre-mutation exact leases released and proven absent by fresh state",
               evidence);
@@ -2979,7 +3468,7 @@ private:
           if (retained.first) {
             std::string context_error;
             if (!write_runtime_context(
-                effect, "floor_switch_failed_locked", false,
+                effect, "floor_switch_cleanup_pending", false,
                 "pre-mutation cleanup was not proven; safety hold retained",
                 context_error))
             {
@@ -2992,8 +3481,7 @@ private:
               std::string{"; correction pause retention is unproven"}),
               evidence);
           }
-          return effect_failure(
-            "PREMUTATION_CLEANUP_UNPROVEN",
+          return effect_success(
             cleanup_detail.empty() ?
             "exact lease release and safety-hold retention were both unproven" :
             cleanup_detail,
@@ -3001,45 +3489,116 @@ private:
         }
 
         std::string abort_error;
-        const bool source_restored =
-          abort_bridge_and_prove_source(
-          effect, !begin_established, abort_error);
+        bool source_restored = false;
+        bool bridge_aborted = false;
+        if (cleanup_action ==
+          robot_floor_manager::FloorTransitionCleanupAction::kRestoreSource)
+        {
+          source_restored = abort_bridge_and_prove_source(effect, abort_error);
+        } else {
+          // ABORT ends the bridge transaction, but does not prove localization
+          // or that outstanding target RPCs have finished.
+          const auto response = call_bridge_transition(
+            effect,
+            robot_interfaces::srv::BeginFloorTransition::Request::OP_ABORT,
+            abort_error);
+          if (response && response->runtime_context_valid) {
+            abort_error = "ordinary ABORT unexpectedly reported a valid runtime context";
+          }
+          bridge_aborted = response && !response->runtime_context_valid;
+          append_detail("target effect dispatched or outcome unknown; source restore skipped");
+        }
         append_detail(abort_error);
 
-        // Once exact ABORT and a later source-identity LocalizationHealth
+        // Once exact pre-mutation ABORT and a later source-identity LocalizationHealth
         // sample prove that the source runtime is valid again, persist that
         // source identity and release this transaction's resources. This is
         // a recoverable failed transaction, not a permanent vehicle lock.
         if (source_restored) {
-          bridge_begin_established_ = false;
-          bridge_begin_submitted_ = false;
-          bridge_begin_outcome_unknown_ = false;
-          {
-            std::lock_guard<std::mutex> lock(evidence_mutex_);
-            runtime_context_confirmed_ = true;
-          }
           std::string source_context_error;
           const bool source_context_written = write_source_runtime_context(
             effect,
-            "floor switch failed; exact source runtime restored by bridge ABORT",
+            "floor switch failed before target dispatch; exact source runtime restored",
             source_context_error);
           append_detail(source_context_error);
           if (source_context_written && release_pre_mutation_resources()) {
+            deferred_failure_cleanup_.store(false);
+            bridge_begin_established_ = false;
+            bridge_begin_submitted_ = false;
+            bridge_begin_outcome_unknown_ = false;
             auto evidence = source_evidence();
+            {
+              std::lock_guard<std::mutex> lock(floor_state_mutex_);
+              selected_building_id_ = evidence.active_building_id;
+              selected_floor_id_ = evidence.active_floor_id;
+              selected_map_id_ = evidence.active_map_id;
+            }
+            {
+              std::lock_guard<std::mutex> lock(evidence_mutex_);
+              runtime_context_confirmed_ = true;
+              published_asset_epoch_ = evidence.asset_epoch;
+              published_asset_digest_ = evidence.asset_digest;
+              localizer_ready_ = source_runtime_context_->localizer_ready;
+              bridge_ready_ = evidence.bridge_ready;
+              amcl_ready_ = evidence.amcl_ready;
+            }
             evidence.motion_hold_active = false;
             evidence.floor_pause_owned = false;
             evidence.correction_pause_effective = false;
             evidence.runtime_context_invalid = false;
+            evidence.failure_resources_released = true;
             return effect_success(
-              "bridge BEGIN was exactly aborted; durable source context and "
-              "exact lease absence were proven",
+              "floor switch failed before target dispatch; source restored and "
+              "transaction resources released; retry is allowed",
               evidence);
           }
         }
 
-        // Either BEGIN is known to have invalidated the source context, or its
-        // result/cleanup cannot be proven. Finish only in a retained safety
-        // lock; a higher sequence prevents any delayed RELEASE from undoing it.
+        // A completed unsuccessful mutation is not an in-flight mutation.
+        // End only this transaction's occupancy while leaving localization
+        // invalid. Normal navigation must still obtain a valid map/pose itself.
+        if (target_requests_settled() && startup_effects_settled()) {
+          if (!bridge_aborted) {
+            std::string terminal_error;
+            const auto response = call_bridge_transition(effect,
+              robot_interfaces::srv::BeginFloorTransition::Request::OP_ABORT,
+              terminal_error);
+            bridge_aborted = response && !response->runtime_context_valid;
+            append_detail(terminal_error);
+          }
+          std::string context_error;
+          if (bridge_aborted && write_runtime_context(effect, "floor_switch_failed", false,
+              "floor switch failed; transaction ended, localization must be re-established",
+              context_error) && release_pre_mutation_resources())
+          {
+            {
+              std::lock_guard<std::mutex> lock(evidence_mutex_);
+              runtime_context_confirmed_ = false;
+              bridge_ready_ = false;
+              amcl_ready_ = false;
+            }
+            bridge_begin_established_ = false;
+            bridge_begin_submitted_ = false;
+            bridge_begin_outcome_unknown_ = false;
+            deferred_failure_cleanup_.store(false);
+            auto evidence = target_evidence(effect);
+            evidence.motion_hold_active = false;
+            evidence.floor_pause_owned = false;
+            evidence.correction_pause_effective = false;
+            evidence.runtime_context_valid = false;
+            evidence.runtime_context_invalid = true;
+            evidence.failure_resources_released = true;
+            return effect_success(
+              "floor switch failed; all target requests settled, bridge transaction ended "
+              "and owned resources released; localization remains invalid", evidence);
+          }
+          append_detail(context_error);
+        } else {
+          append_detail("target request is still pending; exact cleanup will resume after its response");
+        }
+
+        // Only a real unresolved request or unacknowledged cleanup retains the
+        // transaction's safety protection; the already-failed action returns.
         const auto retained = retain_safety_resources();
         {
           std::lock_guard<std::mutex> lock(evidence_mutex_);
@@ -3047,10 +3606,12 @@ private:
         }
         std::string context_error;
         if (!write_runtime_context(
-            effect, "floor_switch_failed_locked", false,
+            effect, "floor_switch_cleanup_pending", false,
             source_restored ?
             "bridge source context restored but floor recovery lock retained" :
-            "bridge BEGIN/ABORT outcome is unproven; floor recovery lock retained",
+            (target_effect_dispatched_ ?
+            "target request or exact cleanup still pending" :
+            "source recovery unproven; floor recovery lock retained"),
             context_error))
         {
           append_detail(context_error);
@@ -3058,18 +3619,9 @@ private:
         auto evidence = target_evidence(effect);
         evidence.motion_hold_active = retained.first;
         evidence.runtime_context_invalid = true;
-        if (!retained.first) {
-          return effect_failure(
-            "FAILURE_CLEANUP_UNPROVEN",
-            cleanup_detail.empty() ?
-            "higher-sequence floor-manager safety hold was not proven" :
-            cleanup_detail,
-            evidence);
-        }
         return effect_success(
-          source_restored ?
-          "bridge ABORT and source context proven; recovery safety lock retained" :
-          "bridge cleanup remains unproven; recovery safety lock retained" +
+          "failed floor switch returned; its pending requests or owned-resource cleanup "
+          "will be reconciled without restarting the transaction" +
           (retained.second ? std::string{} :
           std::string{"; correction pause retention is unproven"}),
           evidence);
@@ -3082,11 +3634,14 @@ private:
       "INTERNAL_ERROR", "unsupported floor-transition effect");
   }
 
-  void emergency_lock_after_exception(
+  bool emergency_lock_after_exception(
     const robot_floor_manager::FloorTransitionRequest & request,
     const std::string & reason) noexcept
   {
     try {
+      // A new preflight can throw before this worker owns any runtime effect.
+      // Never clean a previous transaction using the new request's identity.
+      if (tracked_floor_transaction_ != request.transaction_id) {return true;}
       robot_floor_manager::FloorTransitionEffect effect;
       effect.kind =
         robot_floor_manager::FloorTransitionEffectKind::kHoldAndLock;
@@ -3112,11 +3667,13 @@ private:
           "floor-switch exception cleanup remains unproven: %s",
           cleanup.detail.c_str());
       }
+      return cleanup.success && cleanup.evidence.failure_resources_released;
     } catch (...) {
       RCLCPP_ERROR(
         get_logger(),
         "floor-switch exception cleanup threw; manual recovery is required");
     }
+    return false;
   }
 
   void on_switch_floor(
@@ -3125,7 +3682,7 @@ private:
   {
     {
       std::lock_guard<std::mutex> lock(floor_state_mutex_);
-      if (switching_ || floor_switch_action_active_) {
+      if (switching_ || floor_switch_action_active_ || deferred_failure_cleanup_.load()) {
         response->success = false;
         response->code = "TRANSACTION_CONFLICT";
         response->message = "floor switch or selection already in progress";
@@ -3258,6 +3815,39 @@ private:
   bool bridge_begin_established_{false};
   bool bridge_begin_submitted_{false};
   bool bridge_begin_outcome_unknown_{false};
+  bool target_effect_dispatched_{false};
+  bool startup_target_trigger_dispatched_{false};
+  struct PendingTargetRequest
+  {
+    std::shared_ptr<std::atomic_bool> settled;
+    std::shared_ptr<void> client;
+    std::function<bool()> response_settled;
+  };
+  std::vector<PendingTargetRequest> target_requests_;
+  std::string tracked_floor_transaction_;
+  std::atomic_bool deferred_failure_cleanup_{false};
+  std::uint16_t deferred_failure_code_{99U};
+  robot_floor_manager::FloorTransitionEffect deferred_failure_effect_;
+  robot_floor_manager::FloorAssetSnapshot deferred_failure_snapshot_;
+  std::mutex startup_handoff_mutex_;
+  std::optional<robot_floor_manager::RuntimeMapContextRecord> startup_handoff_;
+  std::string startup_handoff_file_;
+  std::string startup_handoff_ack_file_;
+  double startup_handoff_timeout_sec_{90.0};
+  double startup_ready_timeout_sec_{120.0};
+  std::atomic_bool nav_lifecycle_probe_enabled_{false};
+  std::atomic_bool nav_goal_active_{false};
+  struct NavLifecycleProbe
+  {
+    std::string node_name;
+    rclcpp::Client<lifecycle_msgs::srv::GetState>::SharedPtr client;
+    bool in_flight{false};
+    double requested_at{0.0};
+    std::int64_t pending_id{0};
+    std::uint64_t generation{0U};
+  };
+  std::array<NavLifecycleProbe, 2> nav_lifecycle_probes_;
+  rclcpp::Client<action_msgs::srv::CancelGoal>::SharedPtr nav_cancel_client_;
   std::atomic_bool motion_hold_command_submitted_{false};
   std::atomic_bool motion_hold_outcome_unknown_{false};
   std::atomic_bool motion_hold_acquired_{false};

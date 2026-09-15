@@ -121,20 +121,11 @@ patterns=(
   "continuous_flatscan_forwarder.py"
   "isaac_continuous_flatscan_forwarder"
   "map_to_odom_tf_bridge"
-  "map_server"
-  "lifecycle_manager_map"
+  "__node:=map_server([[:space:]]|$)"
+  "__node:=lifecycle_manager_map([[:space:]]|$)"
   "/opt/ros/humble/lib/nav2_util/lifecycle_bringup map_server"
 )
 if [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" == "legacy" ]]; then
-  patterns+=(
-    "jt128_nav_sensing.launch.py"
-    "pointcloud_to_laserscan_node"
-    "pointcloud_to_laserscan"
-    "robot_hesai_jt128/scan_republisher_node"
-    "scan_republisher_node"
-    "nav_cloud_preprocessor"
-  )
-else
   patterns+=(
     "jt128_nav_sensing.launch.py"
     "pointcloud_to_laserscan_node"
@@ -169,7 +160,9 @@ cleanup_localization_stack_patterns() {
   kill_localization_stack_patterns KILL
 }
 
-stop_existing_canonical_tf_publishers
+if [[ "${NJRH_COMMON_SERVICES_MANAGED:-false}" != "true" ]]; then
+  stop_existing_canonical_tf_publishers
+fi
 
 localization_pid=""
 map_lifecycle_bringup_pid=""
@@ -260,6 +253,14 @@ start_map_server_lifecycle_with_nav2_util() {
       "${sequence_args[@]}" \
       map_server &
   map_lifecycle_bringup_pid=$!
+  # Keep this child in the occupancy owner's shell even when its wait is
+  # deferred, so startup failure/cancellation still cleans up the same job.
+  [[ "${1:-wait}" != "background" ]] || return 0
+  wait_for_map_server_lifecycle_with_nav2_util
+}
+
+wait_for_map_server_lifecycle_with_nav2_util() {
+  [[ -n "${map_lifecycle_bringup_pid}" ]] || return 0
   if wait "${map_lifecycle_bringup_pid}"; then
     map_lifecycle_bringup_pid=""
     echo "[runtime-overlay] localization map_server repo lifecycle sequence: map_server active" >&2
@@ -426,22 +427,41 @@ ensure_resident_local_state_for_localization() {
   echo "[runtime-overlay] resident local_state ${NAV_LOCAL_STATE_MODE} process exists for occupancy localization; startup odom/TF probes are disabled" >&2
 }
 
-require_common_ranger_chassis_for_localization || exit 1
-require_common_static_tf_for_localization || exit 1
-require_common_pointcloud_for_localization || exit 1
-ensure_localization_pointcloud_ready
-if [[ "${NAV_LOCAL_STATE_MODE}" == "fastlio" ]]; then
-  ensure_resident_fastlio_for_local_state || exit 1
+# MapServer and Isaac can initialize before common-owned sensor readiness.
+start_occupancy_launch() {
+  ros2 launch "${LAUNCH_FILE}" "${launch_args[@]}" &
+  localization_pid=$!
+}
+parallel_initialization=false
+if [[ "${NJRH_COMMON_SERVICES_MANAGED:-false}" == "true" && "${NJRH_POINTCLOUD_ACCEL_PROFILE}" != "legacy" && "${NAV_LOCAL_STATE_MODE}" == "ekf" ]]; then
+  parallel_initialization=true
+  start_occupancy_launch
+  start_map_server_lifecycle_with_nav2_util background || exit 1
 fi
-ensure_resident_local_state_for_localization || exit 1
+
+if [[ "${parallel_initialization}" != "true" ]]; then
+  require_common_ranger_chassis_for_localization || exit 1
+  require_common_static_tf_for_localization || exit 1
+  require_common_pointcloud_for_localization || exit 1
+  ensure_localization_pointcloud_ready
+  if [[ "${NAV_LOCAL_STATE_MODE}" == "fastlio" ]]; then
+    ensure_resident_fastlio_for_local_state || exit 1
+  fi
+  ensure_resident_local_state_for_localization || exit 1
+fi
 start_canonical_helper "robot_localization_bridge" bash "${SCRIPT_DIR}/run_localization_bridge.sh"
 start_overlay_helper "global_localization_localization" bash "${SCRIPT_DIR}/run_global_localization.sh"
+if [[ "${parallel_initialization}" == "true" ]]; then
+  # These observers can initialize without an active map. The resident runtime
+  # still joins exact map/Isaac/input readiness before dispatching localization.
+  wait_for_map_server_lifecycle_with_nav2_util || exit 1
+fi
 echo "[runtime-overlay] Isaac localization mode=triggered; AMCL owns continuous localization candidates when NJRH_AMCL_LOCALIZATION_MODE=shadow|gated" >&2
 
-ros2 launch "${LAUNCH_FILE}" "${launch_args[@]}" &
-localization_pid=$!
-
-start_map_server_lifecycle_with_nav2_util || exit 1
+if [[ "${parallel_initialization}" != "true" ]]; then
+  start_occupancy_launch
+  start_map_server_lifecycle_with_nav2_util || exit 1
+fi
 
 wait "${localization_pid}" || localization_exit_code=$?
 exit "${localization_exit_code}"

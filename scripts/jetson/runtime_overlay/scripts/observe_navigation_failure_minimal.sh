@@ -2,6 +2,7 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export NJRH_NAV_OBSERVER_MODULE_DIR="${SCRIPT_DIR}"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-$(cd "${SCRIPT_DIR}/../../../.." && pwd)}"
 export NJRH_PROJECT_ROOT="${NJRH_PROJECT_ROOT:-${WORKSPACE_ROOT}}"
 source "${SCRIPT_DIR}/common_env.sh"
@@ -34,13 +35,15 @@ Read-only, low-impact observer:
   - does not subscribe to /tf, PointCloud2, or LaserScan
   - records status/action/string/Twist messages, filtered /rosout, and controller detail summaries
   - controller detail mode records /speed_limit, Path summaries, and local costmap occupancy summaries
+  - v3 records stamped Nav2 feedback, available collision state, log source stamps and low-rate process counters
+  - missing MPPI internal rejection reasons are explicitly reported; no visualization is enabled
 
 Options:
   --duration-sec N              Capture duration in seconds. Default: 120.
   --sample-period-sec N         Summary sample period. Default: 1.0.
   --label LABEL                 Report label. Default: nav_failure_minimal.
   --api-url URL                 robot_api_server URL. Default: http://127.0.0.1:8080.
-  --output-dir DIR              Report directory. Default: reports/navigation_failure_minimal/<timestamp>_<label>_<duration>s.
+  --output-dir DIR              New report directory (must not exist). Default: unique /tmp/njrh_reports/navigation_obstacle_<timestamp>_<label>_*.
   --no-rosout                   Do not subscribe to /rosout.
   --no-cmd-vel                  Do not subscribe to command-chain Twist topics.
   --include-perception-status   Also record lightweight status strings from perception/lidar status topics.
@@ -147,9 +150,16 @@ fi
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 LABEL="$(sanitize_label "${LABEL}")"
 if [[ -z "${OUTPUT_DIR}" ]]; then
-  OUTPUT_DIR="${NJRH_PROJECT_ROOT}/reports/navigation_failure_minimal/${TIMESTAMP}_${LABEL}_${DURATION_SEC}s"
+  mkdir -p /tmp/njrh_reports || exit 1
+  OUTPUT_DIR="$(mktemp -d "/tmp/njrh_reports/navigation_obstacle_${TIMESTAMP}_${LABEL}_XXXXXX")" || exit 1
+else
+  # Never mix goals from different runs or overwrite numbered grid snapshots.
+  mkdir -p "$(dirname "${OUTPUT_DIR}")" || exit 1
+  if ! mkdir "${OUTPUT_DIR}"; then
+    echo "${PREFIX} FAIL report directory already exists or cannot be created: ${OUTPUT_DIR}" >&2
+    exit 2
+  fi
 fi
-mkdir -p "${OUTPUT_DIR}"
 
 # The runtime API normally keeps its token only in the server process environment.
 # Reuse it for read-only status polling when this observer is run as container root.
@@ -170,7 +180,7 @@ echo "${PREFIX} duration_sec=${DURATION_SEC} sample_period_sec=${SAMPLE_PERIOD_S
 echo "${PREFIX} controller_detail=${INCLUDE_CONTROLLER_DETAIL} ackermann_min_radius_m=${ACKERMANN_MIN_TURNING_RADIUS_M}"
 echo "${PREFIX} store_costmap_snapshots=${STORE_COSTMAP_SNAPSHOTS} costmap_snapshot_period_sec=${COSTMAP_SNAPSHOT_PERIOD_SEC}"
 echo "${PREFIX} read-only: no goals, no params, no services, no /tf, no PointCloud2, no LaserScan"
-echo "${PREFIX} start the App navigation goal now if you have not already"
+echo "${PREFIX} wait for READY before starting one App navigation goal"
 
 python3 - \
   "${DURATION_SEC}" \
@@ -185,25 +195,37 @@ python3 - \
   "${STORE_COSTMAP_SNAPSHOTS}" \
   "${COSTMAP_SNAPSHOT_PERIOD_SEC}" <<'PY'
 import gzip
+import hashlib
 import json
 import math
 import os
 import re
+import signal
 import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+sys.path.insert(0, os.environ["NJRH_NAV_OBSERVER_MODULE_DIR"])
+from navigation_observer_evidence import NavigationEvidence
 
 import rclpy
 from action_msgs.msg import GoalStatusArray
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import PolygonStamped, Twist
 from rcl_interfaces.msg import Log
 from nav2_msgs.msg import SpeedLimit
+from nav2_msgs.action import FollowPath, NavigateToPose
+try:
+    from nav2_msgs.msg import CollisionMonitorState
+except ImportError:
+    CollisionMonitorState = None
 from nav_msgs.msg import OccupancyGrid, Odometry, Path as NavPath
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-from std_msgs.msg import String
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.signals import SignalHandlerOptions
+from std_msgs.msg import Bool, String, UInt8
 
 
 duration_sec = float(sys.argv[1])
@@ -313,9 +335,16 @@ def twist_nonzero(msg):
 
 def command_shape(msg):
     vx = float(msg.linear.x)
+    vy = float(msg.linear.y)
     wz = float(msg.angular.z)
     abs_vx = abs(vx)
     abs_wz = abs(wz)
+    if abs(vy) > 1.0e-4:
+        return {
+            "shape": "lateral" if abs_vx <= 1.0e-4 and abs_wz <= 1.0e-4 else "mixed_lateral",
+            "turning_radius_m": None,
+            "ackermann_radius_ok": None,
+        }
     if abs_vx <= 1.0e-4 and abs_wz <= 1.0e-4:
         return {
             "shape": "zero",
@@ -415,10 +444,46 @@ def parse_json_maybe(text):
         return None
 
 
+def save_runtime_snapshot():
+    """File/process evidence only: no ROS parameter clients or runtime writes."""
+    names = ("controller_server", "planner_server", "bt_navigator", "velocity_smoother",
+             "collision_monitor", "robot_safety_node", "robot_api_server_node", "ranger_base_node")
+    result = {"captured_at": now_iso(), "processes": {name: [] for name in names}}
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            executable = os.readlink(proc / "exe")
+            name = Path(executable).name
+            if name not in names:
+                continue
+            entry = {"pid": int(proc.name), "executable": executable}
+            # Never persist process environments or API command lines/tokens.
+            if name in ("controller_server", "velocity_smoother", "collision_monitor"):
+                args = (proc / "cmdline").read_bytes().decode(errors="replace").split("\0")
+                entry["parameter_files"] = []
+                for index, arg in enumerate(args[:-1]):
+                    if arg == "--params-file":
+                        path = Path(args[index + 1])
+                        content = path.read_bytes()
+                        target = f"{name}_{proc.name}_params_{index}.yaml"
+                        (output_dir / target).write_bytes(content)
+                        entry["parameter_files"].append({"source": str(path), "file": target,
+                                                        "sha256": hashlib.sha256(content).hexdigest()})
+            result["processes"][name].append(entry)
+        except (OSError, ValueError) as exc:
+            result.setdefault("read_errors", []).append({"pid": proc.name, "error": str(exc)})
+    (output_dir / "runtime_snapshot.json").write_text(json.dumps(result, indent=2) + "\n")
+
+
 class MinimalNavigationObserver(Node):
     def __init__(self):
-        super().__init__("minimal_navigation_failure_observer")
+        super().__init__("minimal_navigation_failure_observer", enable_rosout=False,
+                         start_parameter_services=False)
         self.started_wall = time.time()
+        self.started_monotonic = time.monotonic()
+        self.deadline_monotonic = self.started_monotonic + duration_sec
+        self.stop_reason = "duration_complete"
         self.deadline_wall = self.started_wall + duration_sec
         self.samples_path = output_dir / "samples.jsonl"
         self.api_path = output_dir / "api_poll.jsonl"
@@ -429,6 +494,7 @@ class MinimalNavigationObserver(Node):
         self.api_file = self.api_path.open("a", encoding="utf-8")
         self.events_file = self.events_path.open("a", encoding="utf-8")
         self.cmd_frames_file = self.cmd_frames_path.open("a", encoding="utf-8")
+        self.path_frames_file = gzip.open(output_dir / "path_frames.jsonl.gz", "at", encoding="utf-8")
         self.rosout_file = self.rosout_path.open("a", encoding="utf-8")
         self.costmap_snapshot_dir = output_dir / "costmap_snapshots"
         self.costmap_index_file = None
@@ -442,13 +508,22 @@ class MinimalNavigationObserver(Node):
         self.action_status_keys = {}
         self.string_status = {}
         self.string_status_last = {}
+        self.scalar_status = {}
+        self.latest_footprint = None
+        self.last_footprint_monotonic = -math.inf
+        self.path_fingerprints = {}
+        self.path_last_saved = {}
         self.twist_stats = {}
         self.latest_api_status = None
         self.latest_api_navigation = None
         self.api_errors = []
+        self.api_worker = ThreadPoolExecutor(max_workers=1)
+        self.api_future = None
         self.rosout_hits = 0
         self.rosout_tail = []
         self.event_counts = {}
+        self.evidence = NavigationEvidence(output_dir)
+        self.collision_state_subscriptions = {}
         self.speed_limit_stats = {
             "count": 0,
             "last_msg_at": None,
@@ -472,6 +547,8 @@ class MinimalNavigationObserver(Node):
         self.cmd_shape_stats = {}
 
         small_qos = QoSProfile(depth=10)
+        retained_state_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                                       durability=DurabilityPolicy.TRANSIENT_LOCAL)
         rosout_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=100,
@@ -490,10 +567,17 @@ class MinimalNavigationObserver(Node):
                 small_qos,
             )
 
+        # Feedback subscription only; no ActionClient or goal request is created.
+        for action, action_type in (("navigate_to_pose", NavigateToPose), ("follow_path", FollowPath)):
+            self.create_subscription(
+                action_type.Impl.FeedbackMessage, f"/{action}/_action/feedback",
+                lambda msg, action=action: self.evidence.feedback(action, msg),
+                QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT))
+
         string_topics = [
             "/localization/bridge_status",
             "/safety/status",
-            "/ranger_mini3_mode_controller/status",
+            "/ranger_base/status",
         ]
         if include_perception_status:
             string_topics.extend(
@@ -508,8 +592,22 @@ class MinimalNavigationObserver(Node):
                 String,
                 topic,
                 lambda msg, topic=topic: self.on_string(topic, msg),
-                small_qos,
+                retained_state_qos if topic == "/safety/status" else small_qos,
             )
+
+        for topic in (
+            "/ranger_mini3/nav_terminal_reverse_enable",
+            "/ranger_mini3/nav_terminal_lateral_enable",
+            "/safety/motion_allowed",
+            "/safety/estop",
+        ):
+            self.create_subscription(Bool, topic,
+                                     lambda msg, topic=topic: self.on_scalar(topic, msg),
+                                     retained_state_qos if topic == "/safety/motion_allowed" else small_qos)
+        self.create_subscription(
+            UInt8, "/ranger_mini3/nav_elevator_scoped_progress_state",
+            lambda msg: self.on_scalar("/ranger_mini3/nav_elevator_scoped_progress_state", msg),
+            small_qos)
 
         if include_cmd_vel:
             for topic in (
@@ -518,6 +616,8 @@ class MinimalNavigationObserver(Node):
                 "/cmd_vel_collision_checked",
                 "/cmd_vel_safe",
                 "/cmd_vel",
+                "/cmd_vel_api",
+                "/cmd_vel_docking",
             ):
                 self.twist_stats[topic] = {
                     "count": 0,
@@ -553,6 +653,7 @@ class MinimalNavigationObserver(Node):
                 "/received_global_plan",
                 "/plan",
                 "/plan_smoothed",
+                "/ranger_mini3/ordinary_local_repair_path",
             ):
                 self.path_stats[topic] = {
                     "count": 0,
@@ -574,6 +675,9 @@ class MinimalNavigationObserver(Node):
             )
             if store_costmap_snapshots:
                 self.create_subscription(
+                    PolygonStamped, "/local_costmap/published_footprint", self.on_footprint,
+                    QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
+                self.create_subscription(
                     Odometry,
                     "/local_state/odometry",
                     self.on_odometry,
@@ -585,13 +689,49 @@ class MinimalNavigationObserver(Node):
 
         self.create_timer(max(0.2, sample_period_sec), self.on_sample_timer)
         self.create_timer(1.0, self.on_api_timer)
+        self.create_timer(10.0, self.refresh_evidence_graph)
+
+    def refresh_evidence_graph(self):
+        """One existing participant; sparse cached graph reads, never ROS RPC."""
+        selected = {}
+        errors = []
+        try:
+            graph = dict(self.get_topic_names_and_types())
+            names = {"/navigate_to_pose/_action/feedback", "/follow_path/_action/feedback",
+                     "/collision_monitor_state", "/cmd_vel_nav_raw", "/cmd_vel_nav",
+                     "/cmd_vel_collision_checked", "/cmd_vel", "/local_state/odometry",
+                     "/local_costmap/costmap", "/local_costmap/published_footprint",
+                     "/ranger_mini3/ordinary_local_repair_path", "/transformed_global_plan"}
+            candidates = sorted(name for name, types in graph.items()
+                                if "nav2_msgs/msg/CollisionMonitorState" in types)
+            names.update(candidates[:4])
+            # Inventory only: NEVER subscribe to the full MPPI MarkerArray.
+            names.update(sorted(name for name in graph if "critic" in name.lower() or name == "/trajectories")[:8])
+            for name in sorted(names):
+                selected[name] = {"types": graph.get(name, []),
+                                  "publisher_count": self.count_publishers(name)}
+            for name in candidates[:4]:
+                if CollisionMonitorState is None:
+                    errors.append("CollisionMonitorState Python type unavailable")
+                    break
+                if name not in self.collision_state_subscriptions and selected[name]["publisher_count"] > 0:
+                    self.collision_state_subscriptions[name] = self.create_subscription(
+                        CollisionMonitorState, name,
+                        lambda msg, name=name: self.evidence.collision(name, msg),
+                        QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT))
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+        self.evidence.graph(selected, errors)
 
     def close_files(self):
+        self.api_worker.shutdown(wait=True)
+        self.evidence.close()
         for handle in (
             self.samples_file,
             self.api_file,
             self.events_file,
             self.cmd_frames_file,
+            self.path_frames_file,
             self.rosout_file,
             self.costmap_index_file,
         ):
@@ -607,11 +747,36 @@ class MinimalNavigationObserver(Node):
         self.event_counts[kind] = self.event_counts.get(kind, 0) + 1
         row = {
             "captured_at": now_iso(),
+            "elapsed_monotonic_sec": time.monotonic() - self.started_monotonic,
             "kind": kind,
             "payload": payload,
         }
         self.events_file.write(json.dumps(row, ensure_ascii=True, sort_keys=True) + "\n")
         self.events_file.flush()
+
+    def on_scalar(self, topic, msg):
+        previous = self.scalar_status.get(topic)
+        self.scalar_status[topic] = {
+            "captured_at": now_iso(), "received_monotonic": time.monotonic(), "data": msg.data,
+        }
+        if previous is None or previous["data"] != msg.data:
+            self.emit_event("scalar_state_changed", {"topic": topic, "data": msg.data})
+
+    def scalar_snapshot(self):
+        now = time.monotonic()
+        return {topic: {**value, "receive_age_sec": now - value["received_monotonic"]}
+                for topic, value in self.scalar_status.items()}
+
+    def on_footprint(self, msg):
+        now = time.monotonic()
+        if now - self.last_footprint_monotonic < 0.5:
+            return
+        self.last_footprint_monotonic = now
+        self.latest_footprint = {
+            "captured_at": now_iso(), "frame_id": msg.header.frame_id,
+            "stamp_sec": msg.header.stamp.sec, "stamp_nanosec": msg.header.stamp.nanosec,
+            "points_xyz": [[float(p.x), float(p.y), float(p.z)] for p in msg.polygon.points],
+        }
 
     def on_action_status(self, topic, msg):
         statuses = []
@@ -670,12 +835,15 @@ class MinimalNavigationObserver(Node):
             shape_stats["last_turning_radius_m"] = radius
         cmd_row = {
             "captured_at": now_iso(),
+            "elapsed_monotonic_sec": time.monotonic() - self.started_monotonic,
             "topic": topic,
             "twist": twist_dict(msg),
             "shape": shape,
             "mode": mode_snapshot(
-                self.string_status.get("/ranger_mini3_mode_controller/status") or {}
+                self.string_status.get("/ranger_base/status") or {}
             ),
+            "permits_and_progress": self.scalar_snapshot(),
+            "collision_state": self.evidence.collision_snapshot(),
         }
         self.cmd_frames_file.write(json.dumps(cmd_row, ensure_ascii=True, sort_keys=True) + "\n")
         if stats["count"] % 20 == 0:
@@ -723,6 +891,7 @@ class MinimalNavigationObserver(Node):
         stats["latest"] = latest
         if store_costmap_snapshots:
             self.latest_path_geometry[topic] = {
+                "captured_at": now_iso(),
                 "frame_id": msg.header.frame_id,
                 "stamp_sec": int(msg.header.stamp.sec),
                 "stamp_nanosec": int(msg.header.stamp.nanosec),
@@ -730,7 +899,27 @@ class MinimalNavigationObserver(Node):
                     [float(item.pose.position.x), float(item.pose.position.y)]
                     for item in msg.poses
                 ],
+                "poses_xyyaw": [
+                    [float(item.pose.position.x), float(item.pose.position.y),
+                     quaternion_yaw(item.pose.orientation)] for item in msg.poses
+                ],
             }
+            geometry = self.latest_path_geometry[topic]
+            fingerprint = hashlib.sha256(json.dumps(
+                [geometry["frame_id"], geometry["poses_xyyaw"]], separators=(",", ":")
+            ).encode()).hexdigest()
+            now = time.monotonic()
+            changed = self.path_fingerprints.get(topic) != fingerprint
+            # Reference/repaired paths are sparse; transformed MPPI paths can be 15 Hz.
+            if changed and (topic in ("/plan", "/ranger_mini3/ordinary_local_repair_path")
+                            or now - self.path_last_saved.get(topic, -math.inf) >= 0.5):
+                self.path_frames_file.write(json.dumps({
+                    "topic": topic, "sha256": fingerprint, **geometry,
+                    "elapsed_monotonic_sec": now - self.started_monotonic,
+                }) + "\n")
+                self.path_frames_file.flush()
+                self.path_fingerprints[topic] = fingerprint
+                self.path_last_saved[topic] = now
         if count == 0:
             self.emit_event("path_empty", {"topic": topic})
 
@@ -750,6 +939,7 @@ class MinimalNavigationObserver(Node):
             "linear_y": float(twist.linear.y),
             "angular_z": float(twist.angular.z),
         }
+        self.evidence.remember_odom(self.latest_odometry)
 
     @staticmethod
     def costmap_preview_pixel(value):
@@ -825,7 +1015,11 @@ class MinimalNavigationObserver(Node):
             },
             "statistics": latest_stats,
             "odometry": self.latest_odometry,
+            "published_footprint": self.latest_footprint,
+            "permits_and_progress": self.scalar_snapshot(),
             "paths": self.latest_path_geometry,
+            "navigation_feedback": self.evidence.latest_feedback,
+            "collision_state": self.evidence.collision_snapshot(),
             "action_status": self.action_status,
             "api_goal": (
                 (self.latest_api_navigation or {}).get("navigation_goal")
@@ -979,6 +1173,14 @@ class MinimalNavigationObserver(Node):
         name = msg.name or ""
         if not ROSOUT_FILTER.search(name) and not ROSOUT_FILTER.search(text):
             return
+        self.evidence.log(msg, {
+            "commands": {topic: {"last_msg_at": stats.get("last_msg_at"), "last": stats.get("last")}
+                         for topic, stats in self.twist_stats.items()},
+            "permits_and_progress": self.scalar_snapshot(),
+            "odometry": self.latest_odometry,
+            "collision_state": self.evidence.collision_snapshot(),
+            "navigation_feedback": self.evidence.latest_feedback,
+        })
         level = ROSOUT_LEVELS.get(int(msg.level), str(int(msg.level)))
         line = f"{now_iso()} [{level}] {name}: {text}"
         self.rosout_file.write(line + "\n")
@@ -1000,8 +1202,14 @@ class MinimalNavigationObserver(Node):
             return None, f"{type(exc).__name__}: {exc}"
 
     def on_api_timer(self):
-        status, status_error = self.fetch_json("/api/v1/status")
-        navigation, navigation_error = self.fetch_json("/api/v1/navigation/state")
+        # One bounded HTTP batch in flight; HTTP timeouts cannot block ROS callbacks.
+        if self.api_future is None:
+            self.api_future = self.api_worker.submit(self.fetch_api_batch)
+            return
+        if not self.api_future.done():
+            return
+        captured_at, (status, status_error), (navigation, navigation_error) = self.api_future.result()
+        self.api_future = self.api_worker.submit(self.fetch_api_batch)
         if status is not None:
             self.latest_api_status = status
         if navigation is not None:
@@ -1015,7 +1223,7 @@ class MinimalNavigationObserver(Node):
             self.api_errors.append({"captured_at": now_iso(), "errors": errors})
             self.api_errors = self.api_errors[-20:]
         row = {
-            "captured_at": now_iso(),
+            "captured_at": captured_at,
             "status": status,
             "navigation_state": navigation,
             "errors": errors,
@@ -1023,12 +1231,23 @@ class MinimalNavigationObserver(Node):
         self.api_file.write(json.dumps(row, ensure_ascii=True, sort_keys=True) + "\n")
         self.api_file.flush()
 
+    def fetch_api_batch(self):
+        status = self.fetch_json("/api/v1/status")
+        navigation = self.fetch_json("/api/v1/navigation/state")
+        return now_iso(), status, navigation
+
     def on_sample_timer(self):
+        self.evidence.process_sample()
         bridge = self.string_status.get("/localization/bridge_status", {})
         bridge_json = bridge.get("json") if isinstance(bridge, dict) else None
         sample = {
             "captured_at": now_iso(),
-            "elapsed_sec": round(time.time() - self.started_wall, 3),
+            "elapsed_sec": round(time.monotonic() - self.started_monotonic, 3),
+            "permits_and_progress": self.scalar_snapshot(),
+            "odometry": self.latest_odometry,
+            "navigation_feedback": self.evidence.latest_feedback,
+            "collision_state": self.evidence.collision_snapshot(),
+            "published_footprint": self.latest_footprint,
             "action_status": self.action_status,
             "bridge_summary": {
                 key: bridge_json.get(key)
@@ -1036,7 +1255,7 @@ class MinimalNavigationObserver(Node):
             } if isinstance(bridge_json, dict) else None,
             "safety_status": (self.string_status.get("/safety/status") or {}).get("data"),
             "mode_controller_status": (
-                self.string_status.get("/ranger_mini3_mode_controller/status") or {}
+                self.string_status.get("/ranger_base/status") or {}
             ).get("data"),
             "twist_stats": self.twist_stats,
             "cmd_shape_stats": self.cmd_shape_stats,
@@ -1111,6 +1330,11 @@ class MinimalNavigationObserver(Node):
             classification.append("local_costmap_center_occupied_seen")
 
         summary = {
+            "recorder_version": 3,
+            "evidence_availability": self.evidence.coverage(),
+            "stop_reason": self.stop_reason,
+            "elapsed_sec": time.monotonic() - self.started_monotonic,
+            "permits_and_progress": self.scalar_snapshot(),
             "report_dir": str(output_dir),
             "duration_sec": duration_sec,
             "sample_period_sec": sample_period_sec,
@@ -1140,7 +1364,7 @@ class MinimalNavigationObserver(Node):
             "bridge_summary": bridge_summary,
             "safety_status": (self.string_status.get("/safety/status") or {}).get("data"),
             "mode_controller_status": (
-                self.string_status.get("/ranger_mini3_mode_controller/status") or {}
+                self.string_status.get("/ranger_base/status") or {}
             ).get("data"),
             "twist_stats": self.twist_stats,
             "cmd_shape_stats": self.cmd_shape_stats,
@@ -1152,6 +1376,7 @@ class MinimalNavigationObserver(Node):
             "rosout_tail": self.rosout_tail,
             "api_errors_tail": self.api_errors,
         }
+        self.evidence.save_coverage()
         (output_dir / "summary.json").write_text(
             json.dumps(summary, indent=2, ensure_ascii=True, sort_keys=True) + "\n",
             encoding="utf-8",
@@ -1166,11 +1391,24 @@ class MinimalNavigationObserver(Node):
             "",
             f"- report_dir: `{summary['report_dir']}`",
             f"- duration_sec: `{summary['duration_sec']}`",
+            f"- stop_reason: `{summary['stop_reason']}`",
+            "- Classification is a capture-wide hint, not proof of this goal's root cause; inspect timestamps and goal IDs.",
+            "- Missing permit/path messages mean unobserved, NOT false/disabled/no replanning.",
+            "- center_0_5m/center_1_0m are map-axis square windows, NOT the robot outline or collision verdict.",
+            "- Legacy lethal counters combine OccupancyGrid values 99 and 100; inspect exact grids to distinguish inscribed inflation from lethal obstacles.",
             "- impact: one temporary rclpy participant; no publish/action/service/param; no `/tf`, PointCloud2, or LaserScan subscriptions",
             f"- full_costmap_snapshots: `{summary['impact_contract']['stores_full_costmap']}` "
             f"count=`{summary.get('costmap_snapshot_count')}` "
             f"period_sec=`{summary['impact_contract'].get('costmap_snapshot_period_sec')}`",
             f"- classification: `{', '.join(summary['classification']) if summary['classification'] else 'no_failure_classification_yet'}`",
+            "",
+            "## Evidence Availability",
+            f"- collision_state: `{summary['evidence_availability']['collision_state']['status']}`",
+            f"- action_feedback_counts: `{summary['evidence_availability']['action_feedback_counts']}`",
+            "- MPPI candidate rejection reasons and optimizer computation duration: **NOT COLLECTED**.",
+            "- This capture cannot fully replay the optimizer. Missing diagnostics are NOT proof of clear obstacles or a healthy controller.",
+            "- Map-pose/odometry pairing uses nearest original stamps (<=100 ms), not exact TF; retain the recorded mismatch and frames.",
+            "- Process CPU/main-thread runqueue counters are scheduling clues, not MPPI cycle timing.",
             "",
             "## Final API Goal",
         ]
@@ -1275,8 +1513,15 @@ class MinimalNavigationObserver(Node):
                 "",
                 "## Files",
                 "- `summary.json`: machine-readable summary",
+                "- `runtime_snapshot.json` and `*_params_*.yaml`: process counts and startup parameter file evidence (not a live parameter RPC)",
+                "- `evidence_availability.json`: explicit observed/missing evidence and installed package versions",
+                "- `diagnostic_graph.jsonl`: sparse publisher inventory (no service requests)",
+                "- `diagnostic_events.jsonl`: collision state changes when published; original-stamped controller warnings and command context",
+                "- `action_feedback.jsonl`: goal UUID, stamped map pose, nearest buffered odometry, FollowPath distance/speed (max 5 Hz per action)",
+                "- `process_samples.jsonl`: at most 1 Hz controller process CPU/main-thread scheduling counters; NOT MPPI computation duration",
                 "- `samples.jsonl`: one aggregate sample per period",
                 "- `cmd_frames.jsonl`: per-message Twist shape, turning radius, and motion-mode snapshot",
+                "- `path_frames.jsonl.gz`: changed full path geometry with frames, stamps and yaw (snapshot mode)",
                 "- `api_poll.jsonl`: `/api/v1/status` and `/api/v1/navigation/state` poll",
                 "- `events.jsonl`: action/status changes and first nonzero command events",
                 "- `rosout_filtered.log`: filtered Nav2/controller/localization/safety log lines",
@@ -1288,13 +1533,44 @@ class MinimalNavigationObserver(Node):
         return "\n".join(lines) + "\n"
 
 
-rclpy.init()
+# Own signals: do not let SIGINT destroy the ROS context while take_message is
+# converting a callback. This caused the historical Ctrl+C conversion traceback.
+stop_requested = False
+
+
+def request_stop(signum, _frame):
+    global stop_requested
+    stop_requested = True
+
+
+signal.signal(signal.SIGINT, request_stop)
+signal.signal(signal.SIGTERM, request_stop)
+save_runtime_snapshot()
+rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
 node = MinimalNavigationObserver()
+observer_error = None
+print("[nav-failure-minimal] warming up DDS for 6 seconds; no robot action", flush=True)
+ready_printed = False
 try:
-    while rclpy.ok() and time.time() < node.deadline_wall:
+    while rclpy.ok() and not stop_requested and time.monotonic() < node.deadline_monotonic:
         rclpy.spin_once(node, timeout_sec=0.1)
+        if not ready_printed and time.monotonic() - node.started_monotonic >= 6.0:
+            ready_printed = True
+            node.refresh_evidence_graph()
+            availability = node.evidence.coverage()
+            print("[nav-failure-minimal] EVIDENCE_LIMITS collision_state="
+                  + availability["collision_state"]["status"]
+                  + "; MPPI rejection reasons/compute duration NOT COLLECTED; see evidence_availability.json",
+                  flush=True)
+            print("[nav-failure-minimal] READY capture window open; start ONE App goal now", flush=True)
+    if stop_requested:
+        node.stop_reason = "operator_interrupt"
 except KeyboardInterrupt:
-    pass
+    node.stop_reason = "operator_interrupt"
+except Exception as exc:
+    observer_error = exc
+    node.stop_reason = f"observer_error: {type(exc).__name__}: {exc}"
+    node.emit_event("observer_error", {"error": node.stop_reason})
 finally:
     try:
         node.on_sample_timer()
@@ -1311,6 +1587,9 @@ finally:
             except Exception as exc:
                 if "rcl_shutdown already called" not in str(exc):
                     raise
+if observer_error is not None:
+    print(f"[nav-failure-minimal] partial report saved; {node.stop_reason}", file=sys.stderr)
+    sys.exit(1)
 PY
 
 status=$?

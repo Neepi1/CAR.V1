@@ -1,4 +1,5 @@
 #include "robot_api_server/features/navigation/mission/navigation_goal_executor.hpp"
+#include "robot_api_server/features/navigation/runtime/navigation_recovery_wait.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -249,10 +250,8 @@ void NavigationGoalExecutor::run(
     auto next_handoff_check = result_wait_started;
     auto last_near_goal_progress = result_wait_started;
     std::optional<double> best_near_goal_distance;
-    const auto deadline =
-      std::chrono::steady_clock::now() +
-      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-        std::chrono::duration<double>(config_.navigation_goal_result_timeout_sec));
+    NavigationExecutionBudget budget(config_.navigation_goal_result_timeout_sec, result_wait_started);
+    std::string last_recovery_phase;
     port_.publish_navigation_terminal_speed_limit_for_goal(target);
     port_.update_navigation_terminal_reverse_permit_for_goal(
       target,
@@ -287,7 +286,21 @@ void NavigationGoalExecutor::run(
           false);
         return;
       }
-      if (port_.maybe_navigation_near_goal_stalled_handoff(
+      const auto recovery_phase = action_runtime_.recovery_phase(goal_handle);
+      const bool recovery_wait = NavigationRecoveryWait::pauses_execution(recovery_phase);
+      if (recovery_wait) {
+        best_near_goal_distance.reset();
+        last_near_goal_progress = next_handoff_check = std::chrono::steady_clock::now();
+      }
+      if (recovery_phase != last_recovery_phase) {
+        mission_runtime_.update_running(job_id, [&](NavigationGoalJob & job) {
+          job.phase = recovery_wait ? "nav2_" + recovery_phase : "waiting_for_nav2_result";
+          job.detail = recovery_wait ? "original Nav2 task retained: " + recovery_phase :
+            "waiting for Nav2 result";
+        });
+        last_recovery_phase = recovery_phase;
+      }
+      if (!recovery_wait && port_.maybe_navigation_near_goal_stalled_handoff(
           job_id,
           target,
           goal_handle,
@@ -301,7 +314,7 @@ void NavigationGoalExecutor::run(
         near_goal_stalled_handoff = true;
         break;
       }
-      if (std::chrono::steady_clock::now() >= deadline) {
+      if (budget.expired(std::chrono::steady_clock::now(), recovery_wait)) {
         std::string cancel_detail;
         port_.cancel_active_navigation_goal(cancel_detail);
         port_.clear_navigation_terminal_speed_limit();

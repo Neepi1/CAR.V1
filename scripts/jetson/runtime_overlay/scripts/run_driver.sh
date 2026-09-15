@@ -7,6 +7,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 unset NJRH_COMMON_ENV_SETUP_DONE NJRH_COMMON_ENV_PARENT_READY
 source "${SCRIPT_DIR}/common_env.sh"
 source "${SCRIPT_DIR}/cpu_affinity.sh"
+source "${SCRIPT_DIR}/imu_pipeline_helpers.sh"
+njrh_resolve_imu_pipeline_mode
 source "${SCRIPT_DIR}/local_perception_profile.sh"
 source "${SCRIPT_DIR}/pointcloud_accel_profile.sh"
 source "${SCRIPT_DIR}/large_cloud_fastdds_transport.sh"
@@ -36,6 +38,7 @@ fi
 HESAI_ACCEL_DRIVER_CONFIG="${NJRH_HESAI_ACCEL_DRIVER_CONFIG:-${NJRH_OVERLAY_ROOT}/config/hesai_accel_driver.yaml}"
 export DRIVER_PROFILE="${DRIVER_PROFILE:-mapping}"
 export NJRH_HESAI_UPSTREAM_DRIVER_PROFILE="${NJRH_HESAI_UPSTREAM_DRIVER_PROFILE:-navigation}"
+export NJRH_HESAI_USE_GPU="${NJRH_HESAI_USE_GPU:-true}"
 export LIDAR_FRAME="${LIDAR_FRAME:-lidar_link}"
 export IMU_FRAME="${IMU_FRAME:-imu_link}"
 export POINTS_TOPIC="${NJRH_JT128_POINTS_TOPIC:-/lidar_points}"
@@ -81,12 +84,14 @@ fi
 
 RUNTIME_CONFIG_FILE="$(mktemp /tmp/njrh_driver_config_XXXX.yaml)"
 sed -E \
+  -e "s|^([[:space:]]*use_gpu:[[:space:]]*).*|\\1${NJRH_HESAI_USE_GPU}|" \
   -e "s|^([[:space:]]*ros_frame_id:[[:space:]]*).*|\\1hesai_lidar|" \
   -e "s|^([[:space:]]*ros_send_point_cloud_topic:[[:space:]]*).*|\\1${VENDOR_POINTS_TOPIC}|" \
   -e "s|^([[:space:]]*ros_send_imu_topic:[[:space:]]*).*|\\1${VENDOR_IMU_TOPIC}|" \
   -e "s|^([[:space:]]*)use_timestamp_type:.*|\\1use_timestamp_type: 1                 # 0 use lidar point cloud timestamp; 1 use host receive timestamp|" \
   "${CONFIG_FILE}" > "${RUNTIME_CONFIG_FILE}"
 export CONFIG_FILE="${RUNTIME_CONFIG_FILE}"
+echo "[runtime-overlay] JT128 use_gpu=${NJRH_HESAI_USE_GPU}; point/IMU transport and CPU affinity unchanged" >&2
 
 driver_pid=""
 pointcloud_pipeline_pid=""
@@ -142,7 +147,7 @@ jt128_pointcloud_downsample_running() {
 }
 
 jt128_imu_remap_running() {
-  pgrep -f "imu_axis_remap" >/dev/null 2>&1
+  njrh_expected_imu_ingress_running
 }
 
 canonical_jt128_ingress_running() {
@@ -160,18 +165,54 @@ any_jt128_ingress_process_running() {
     jt128_accel_driver_process_running ||
     jt128_pointcloud_remap_running ||
     jt128_pointcloud_downsample_running ||
-    jt128_imu_remap_running
+    njrh_any_imu_ingress_running
 }
 
 stop_jt128_ingress_processes() {
-  for pattern in "[h]esai_ros_driver_node" "[r]os2 run hesai_ros_driver" "[h]esai_accel_driver_node" "[j]t128_accel_driver_node" "[i]mu_axis_remap" "[p]ointcloud_perception_pipeline.launch.py" "[c]omponent_container_mt.*pointcloud_perception_pipeline" "[p]ointcloud_axis_remap" "[p]ointcloud_accel_axis" "[p]ointcloud_fastlio_remap" "[p]ointcloud_downsample"; do
+  for pattern in "[h]esai_ros_driver_node" "[r]os2 run hesai_ros_driver" "[h]esai_accel_driver_node" "[j]t128_accel_driver_node" "[i]mu_axis_remap" "${NJRH_IMU_PIPELINE_PROCESS_PATTERN}" "[p]ointcloud_perception_pipeline.launch.py" "[c]omponent_container_mt.*pointcloud_perception_pipeline" "[p]ointcloud_axis_remap" "[p]ointcloud_accel_axis" "[p]ointcloud_fastlio_remap" "[p]ointcloud_downsample"; do
     pkill -INT -f "$pattern" 2>/dev/null || true
   done
   sleep 1
-  for pattern in "[h]esai_ros_driver_node" "[r]os2 run hesai_ros_driver" "[h]esai_accel_driver_node" "[j]t128_accel_driver_node" "[i]mu_axis_remap" "[p]ointcloud_perception_pipeline.launch.py" "[c]omponent_container_mt.*pointcloud_perception_pipeline" "[p]ointcloud_axis_remap" "[p]ointcloud_accel_axis" "[p]ointcloud_fastlio_remap" "[p]ointcloud_downsample"; do
+  for pattern in "[h]esai_ros_driver_node" "[r]os2 run hesai_ros_driver" "[h]esai_accel_driver_node" "[j]t128_accel_driver_node" "[i]mu_axis_remap" "${NJRH_IMU_PIPELINE_PROCESS_PATTERN}" "[p]ointcloud_perception_pipeline.launch.py" "[c]omponent_container_mt.*pointcloud_perception_pipeline" "[p]ointcloud_axis_remap" "[p]ointcloud_accel_axis" "[p]ointcloud_fastlio_remap" "[p]ointcloud_downsample"; do
     pkill -TERM -f "$pattern" 2>/dev/null || true
   done
   sleep 1
+}
+
+start_canonical_imu_ingress() {
+  [[ -f "${IMU_REMAP_CONFIG}" ]] || {
+    echo "[runtime-overlay] canonical imu remap config missing: ${IMU_REMAP_CONFIG}" >&2
+    return 1
+  }
+  if njrh_imu_pipeline_composed; then
+    local host_bin="${NJRH_IMU_PIPELINE_CPP_BIN:-${NJRH_PROJECT_ROOT}/install/robot_bringup/lib/robot_bringup/imu_pipeline_node}"
+    local filter_params="${LOCAL_STATE_IMU_BIAS_FILTER_PARAMS_FILE:-${NJRH_OVERLAY_ROOT}/config/local_state_imu_bias_filter.yaml}"
+    [[ -x "${host_bin}" && -f "${filter_params}" ]] || {
+      echo "[runtime-overlay] IMU pipeline host or filter params missing: ${host_bin} ${filter_params}; build robot_bringup or select NJRH_IMU_PIPELINE_MODE=standalone" >&2
+      return 1
+    }
+    # A prior standalone local-state owner may still be alive during a
+    # driver-only topology switch. Retire only its old filter executable;
+    # neither the EKF nor the new host matches this exact executable pattern.
+    if pgrep -f "${NJRH_IMU_STANDALONE_FILTER_PATTERN}" >/dev/null 2>&1; then
+      echo "[runtime-overlay] replacing standalone IMU bias filter with driver-owned host" >&2
+      pkill -INT -f "${NJRH_IMU_STANDALONE_FILTER_PATTERN}" 2>/dev/null || true
+      sleep 1
+      pkill -KILL -f "${NJRH_IMU_STANDALONE_FILTER_PATTERN}" 2>/dev/null || true
+    fi
+    echo "[runtime-overlay] starting driver-owned IMU remap/filter host: ${host_bin}" >&2
+    njrh_start_affined_background imu_remap_pid imu_axis_remap "${host_bin}" \
+      --remap-params "${IMU_REMAP_CONFIG}" --filter-params "${filter_params}"
+  else
+    [[ -x "${IMU_REMAP_CPP_BIN}" ]] || {
+      echo "[runtime-overlay] compiled imu remap missing or not executable: ${IMU_REMAP_CPP_BIN}" >&2
+      echo "[runtime-overlay] build robot_hesai_jt128; Python remap fallback has been removed." >&2
+      return 1
+    }
+    echo "[runtime-overlay] using compiled imu remap: ${IMU_REMAP_CPP_BIN}" >&2
+    njrh_start_affined_background imu_remap_pid imu_axis_remap \
+      "${IMU_REMAP_CPP_BIN}" --ros-args --params-file "${IMU_REMAP_CONFIG}"
+  fi
 }
 
 if [[ "${NJRH_JT128_ENABLE_POINTCLOUD_DOWNSAMPLE}" != "true" ]] && jt128_pointcloud_downsample_running; then
@@ -217,10 +258,6 @@ if [[ "${NJRH_POINTCLOUD_INGRESS_PROFILE}" == "driver_integrated" ]]; then
     echo "[runtime-overlay] canonical imu remap config missing: ${IMU_REMAP_CONFIG}" >&2
     exit 1
   }
-  [[ -x "${IMU_REMAP_CPP_BIN}" ]] || {
-    echo "[runtime-overlay] compiled imu remap missing or not executable: ${IMU_REMAP_CPP_BIN}" >&2
-    exit 1
-  }
   echo "[runtime-overlay] starting driver_integrated JT128 ingress: ${HESAI_ACCEL_DRIVER_CPP_BIN}" >&2
   echo "[runtime-overlay] production pointcloud path bypasses /jt128/vendor/points_raw DDS; rollback keeps hesai_ros_driver_node -> /jt128/vendor/points_raw -> pointcloud_accel_axis_node" >&2
   njrh_run_large_cloud_affined hesai_ros_driver \
@@ -229,10 +266,7 @@ if [[ "${NJRH_POINTCLOUD_INGRESS_PROFILE}" == "driver_integrated" ]]; then
       -p "config_path:=${RUNTIME_CONFIG_FILE}" &
   driver_pid=$!
   sleep 2
-  echo "[runtime-overlay] starting canonical imu remap for driver_integrated ingress: ${IMU_REMAP_CPP_BIN}" >&2
-  njrh_run_affined imu_axis_remap \
-    "${IMU_REMAP_CPP_BIN}" --ros-args --params-file "${IMU_REMAP_CONFIG}" &
-  imu_remap_pid=$!
+  start_canonical_imu_ingress
   wait "${driver_pid}"
   exit $?
 fi
@@ -314,15 +348,7 @@ else
   echo "[runtime-overlay] diagnostic pointcloud_downsample disabled; pointcloud ingress publishes only canonical /lidar_points" >&2
 fi
 
-[[ -x "${IMU_REMAP_CPP_BIN}" ]] || {
-  echo "[runtime-overlay] compiled imu remap missing or not executable: ${IMU_REMAP_CPP_BIN}" >&2
-  echo "[runtime-overlay] build robot_hesai_jt128; Python remap fallback has been removed." >&2
-  exit 1
-}
-echo "[runtime-overlay] using compiled imu remap: ${IMU_REMAP_CPP_BIN}" >&2
-njrh_run_affined imu_axis_remap \
-  "${IMU_REMAP_CPP_BIN}" --ros-args --params-file "${IMU_REMAP_CONFIG}" &
-imu_remap_pid=$!
+start_canonical_imu_ingress
 
 export DRIVER_PROFILE="${UPSTREAM_DRIVER_PROFILE}"
 # The upstream Hesai publisher and the separate pointcloud accelerator exchange

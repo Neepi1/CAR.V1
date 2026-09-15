@@ -18,6 +18,7 @@ pids_by_pattern() {
         $0 ~ pattern &&
         $1 != cleanup_shell_pid &&
         $1 != cleanup_parent_pid &&
+        $2 !~ /(^|\/)(pgrep|pkill|awk|mawk|gawk)$/ &&
         $0 !~ /awk -v pattern/ &&
         $0 !~ /pids_by_pattern/ &&
         $0 !~ /stop_exact_process_set/ &&
@@ -50,12 +51,14 @@ stop_exact_process_set() {
   [[ "${#pids[@]}" -gt 0 ]] || return 0
   echo "[njrh-systemd] stopping ${label} pids=${pids[*]}" >&2
   kill -INT "${pids[@]}" 2>/dev/null || true
-  wait_pids_gone 2 "${pids[@]}" && return 0
+  # A shutdown handler may create a child while the old PID exits. Re-scan
+  # the owned process class instead of treating the old snapshot as proof.
+  wait_pids_gone 2 "${pids[@]}" || true
 
   mapfile -t pids < <(pids_by_pattern "${pattern}")
   [[ "${#pids[@]}" -gt 0 ]] || return 0
   kill -TERM "${pids[@]}" 2>/dev/null || true
-  wait_pids_gone 3 "${pids[@]}" && return 0
+  wait_pids_gone 3 "${pids[@]}" || true
 
   mapfile -t pids < <(pids_by_pattern "${pattern}")
   [[ "${#pids[@]}" -gt 0 ]] || return 0
@@ -66,6 +69,7 @@ stop_exact_process_set() {
   mapfile -t pids < <(pids_by_pattern "${pattern}")
   if [[ "${#pids[@]}" -gt 0 ]]; then
     echo "[njrh-systemd] failed to stop ${label}; remaining pids=${pids[*]}" >&2
+    ps -p "$(IFS=,; echo "${pids[*]}")" -o pid=,ppid=,stat=,args= >&2 || true
     return 1
   fi
   return 0
@@ -94,10 +98,16 @@ stop_exact_process_set \
 stop_exact_process_set \
   "runtime nodes" \
   "${NJRH_RUNTIME_NODE_PATTERN}" || cleanup_failed=1
+# Runtime shutdown invokes AMCL --stop, which can create lifecycle CLI
+# children after the initial diagnostics sweep. Reap those before --check.
+stop_exact_process_set \
+  "shutdown ros2 diagnostics cli" \
+  "${NJRH_RUNTIME_ROS2_CLI_PATTERN}" || cleanup_failed=1
 
 mapfile -t remaining < <(remaining_runtime_pids)
 if [[ "${#remaining[@]}" -gt 0 ]]; then
   echo "[njrh-systemd] runtime cleanup left residual pids=${remaining[*]}" >&2
+  ps -p "$(IFS=,; echo "${remaining[*]}")" -o pid=,ppid=,stat=,args= >&2 || true
   cleanup_failed=1
 fi
 

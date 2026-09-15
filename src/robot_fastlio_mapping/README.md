@@ -2,6 +2,21 @@
 
 Wrapper-only package for FAST-LIO2 frontend integration.
 
+With the `navigation_5cpu` runtime profile, mapping also stays within CPU0–4:
+FAST-LIO and its launcher use CPU1-4 (excluding CPU0); SLAM Toolbox/PGO and
+the mapping owner retain CPU0,1,4. The odometry
+bridge uses CPU2; existing pointcloud/scan workers retain CPU1,4. Mapping's
+existing LiDAR RPS/XPS setting uses CPU4 rather than CPU5. No estimator settings,
+sensor fidelity or TF ownership change. Mapping-specific roles
+do not borrow CPU5–7 through the navigation cold-start boost. See
+[mapping CPU allocation](../../docs/mapping_five_cpu_profile.md).
+
+The separately authorized OpenMP build uses four matching threads on Jetson
+(`MP_EN`, `MP_PROC_NUM=4`) through the existing upstream matching loop. See
+[OpenMP build and verification](../../docs/fastlio_openmp_threads.md).
+CPU1-4 affinity does not itself activate that loop; a newly built executable is
+loaded at the next mapping start, not injected into an active mapping session.
+
 ## Parameters
 
 - `navigation_mode`: when true, wrapper must keep non-canonical TF isolated

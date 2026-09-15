@@ -44,11 +44,16 @@ SLAM2D_LIDAR_RPS_XPS_STATE_DIR="${NJRH_SLAM2D_LIDAR_RPS_XPS_STATE_DIR:-/tmp/njrh
 SLAM2D_COMPOSITE_PREFLIGHT_ENABLED="${NJRH_SLAM2D_COMPOSITE_PREFLIGHT_ENABLED:-true}"
 MAPPING_STARTUP_STARTED_SECONDS="${SECONDS}"
 
-# Mode scripts can be launched by a long-lived API process that still carries
-# older concrete CPU-set environment values. Re-derive this mapping path from
-# the mapping-mode defaults here, with explicit per-mode override knobs.
-export NJRH_CPUSET_FASTLIO_DESKEW="${NJRH_SLAM2D_FASTLIO_CPUSET:-${NJRH_CPUSET_MAPPING_BACKEND:-7}}"
-export NJRH_CPUSET_SLAM_TOOLBOX_MAPPING="${NJRH_SLAM2D_SLAM_TOOLBOX_CPUSET:-3,7}"
+# The five-core profile has already resolved mapping masks after inherited/site
+# values. Do not overwrite them with legacy CPU7/3,7 per-mode defaults.
+if [[ "${NJRH_NAVIGATION_CPU_PROFILE:-site_default}" == navigation_5cpu ]]; then
+  SLAM2D_LIDAR_RPS_XPS_CPUSET="${NJRH_CPUSET_MAPPING_LIDAR_RPS_XPS}"
+  # Constrain the mapping owner too, so unprefixed launchers/helpers inherit it.
+  njrh_apply_affinity_to_current_process mapping_frontend
+else
+  export NJRH_CPUSET_FASTLIO_DESKEW="${NJRH_SLAM2D_FASTLIO_CPUSET:-${NJRH_CPUSET_MAPPING_BACKEND:-7}}"
+  export NJRH_CPUSET_SLAM_TOOLBOX_MAPPING="${NJRH_SLAM2D_SLAM_TOOLBOX_CPUSET:-3,7}"
+fi
 
 log_mapping_startup_stage() {
   local stage="$1"
@@ -500,6 +505,7 @@ require_resident_common_mapping_prereqs() {
 
   if [[ "${SLAM2D_COMPOSITE_PREFLIGHT_ENABLED}" != "true" ]]; then
     echo "[runtime-overlay] using explicit legacy mapping preflight" >&2
+    restore_navigation_scan_owner "${SLAM2D_SCAN_TOPIC}" || return 1
     require_resident_common_mapping_prereqs_legacy
     return $?
   fi
@@ -517,7 +523,8 @@ require_resident_common_mapping_prereqs() {
     "${SLAM2D_SCAN_MAX_AGE_SEC}" \
     "${LOCAL_ODOM_MAX_AGE_SEC}" \
     0.25 \
-    "${LOCAL_ODOM_MAX_WHEEL_DIFF_M}" || {
+    "${LOCAL_ODOM_MAX_WHEEL_DIFF_M}" \
+    "${RESIDENT_SCAN_CONTROL_SERVICE}" "${RESIDENT_SCAN_STATUS_TOPIC}" || {
     echo "[runtime-overlay] refusing to start slam_toolbox mapping because composite preflight failed" >&2
     return 1
   }
@@ -531,11 +538,6 @@ cleanup() {
   fi
   stop_mapping_pipeline_processes
   if [[ "${resident_scan_released}" == "true" ]]; then
-    if wait_for_scan_publisher_count "${SLAM2D_SCAN_TOPIC}" 0; then
-      :
-    else
-      echo "[runtime-overlay] warning: mapping /scan publisher did not leave the graph before navigation restore" >&2
-    fi
     if restore_navigation_scan_owner "${SLAM2D_SCAN_TOPIC}"; then
       resident_scan_released="false"
       echo "[runtime-overlay] canonical /scan ownership returned to ${RESIDENT_SCAN_OWNER_NODE}" >&2
@@ -569,14 +571,9 @@ trap on_signal INT TERM
 configure_mapping_fastdds_transport || exit 1
 stop_mapping_pipeline_processes
 log_mapping_startup_stage "mapping_pipeline_stopped"
-# Self-heal an interrupted previous handoff before validating the resident
-# navigation source.  This is idempotent and still requires exact graph proof.
-restore_navigation_scan_owner "${SLAM2D_SCAN_TOPIC}" || exit 1
+# Composite preflight retains one participant for conditional restore, exact
+# ownership and existing inputs. Cold graph zero no longer triggers a write.
 require_resident_common_mapping_prereqs || exit 1
-wait_for_scan_owner "${SLAM2D_SCAN_TOPIC}" "${RESIDENT_SCAN_OWNER_NODE}" 1 || {
-  echo "[runtime-overlay] refusing mapping handoff: canonical resident /scan ownership is not unique" >&2
-  exit 1
-}
 log_mapping_startup_stage "mapping_preflight_ready"
 apply_slam2d_lidar_rps_xps
 
@@ -591,8 +588,7 @@ for required_file in \
   "${SLAM_LAUNCH_FILE}" \
   "${PREPROCESSOR_PARAMS_FILE}" \
   "${SCAN_PARAMS_FILE}" \
-  "${SLAM_PARAMS_FILE}" \
-  "${FASTLIO_PAIR_PROBE}"
+  "${SLAM_PARAMS_FILE}"
 do
   [[ -f "${required_file}" ]] || {
     echo "[runtime-overlay] missing slam_toolbox runtime file: ${required_file}" >&2
@@ -653,12 +649,6 @@ else
   fi
 fi
 
-wait_for_fresh_header_topic_message "${POINTS_TOPIC}" "${FASTLIO_POINTS_READY_TIMEOUT}" "${FASTLIO_POINTS_MAX_AGE_SEC}" 0.25 || {
-  echo "[runtime-overlay] timed out waiting for FAST-LIO2 deskewed pointcloud: ${POINTS_TOPIC}" >&2
-  echo "[runtime-overlay] check mapping-owned FAST-LIO2 and canonical /lidar_points + /lidar_imu input streams." >&2
-  exit 1
-}
-
 slam_odom_frame="odom"
 slam_tf_topic="/tf"
 if [[ "${SLAM2D_ODOM_SOURCE}" == "fastlio" ]]; then
@@ -667,18 +657,8 @@ if [[ "${SLAM2D_ODOM_SOURCE}" == "fastlio" ]]; then
     echo "[runtime-overlay] missing compiled FAST-LIO mapping odom bridge: ${bridge_bin}" >&2
     exit 1
   }
-  wait_for_topic_message "${FASTLIO_ODOM_TOPIC}" "${FASTLIO_ODOM_READY_TIMEOUT}" || {
-    echo "[runtime-overlay] timed out waiting for FAST-LIO2 odometry: ${FASTLIO_ODOM_TOPIC}" >&2
-    echo "[runtime-overlay] check ${fastlio_log}; slam_toolbox mapping is configured to use FAST-LIO odom." >&2
-    exit 1
-  }
-  python3 "${FASTLIO_PAIR_PROBE}" \
-    "${POINTS_TOPIC}" "${FASTLIO_ODOM_TOPIC}" \
-    --timeout-sec "${FASTLIO_PAIR_READY_TIMEOUT}" || {
-    echo "[runtime-overlay] refusing cross-instance FAST-LIO mapping cloud/odom wiring" >&2
-    exit 1
-  }
-  log_mapping_startup_stage "fastlio_ready"
+  # Input subscription can be discovered while FAST-LIO initializes; the bridge
+  # naturally waits for its first odometry sample and publishes only private TF.
   echo "[runtime-overlay] using FAST-LIO2 mapping odom from ${FASTLIO_ODOM_TOPIC} on private TF ${SLAM2D_PRIVATE_TF_TOPIC}" >&2
   njrh_start_affined_background fastlio_odom_bridge_pid \
     fastlio_odom_bridge "${bridge_bin}" \
@@ -696,21 +676,32 @@ if [[ "${SLAM2D_ODOM_SOURCE}" == "fastlio" ]]; then
     -p input_qos_depth:=1 \
     -p output_reliable:=true \
     -p output_qos_depth:=20
-  wait_for_topic_message "/mapping/fastlio_odometry" 10 || {
-    echo "[runtime-overlay] FAST-LIO mapping odom bridge did not publish /mapping/fastlio_odometry" >&2
-    exit 1
-  }
-  log_mapping_startup_stage "odom_bridge_ready"
+  log_mapping_startup_stage "odom_bridge_started"
   slam_odom_frame="${SLAM2D_FASTLIO_ODOM_FRAME}"
   slam_tf_topic="${SLAM2D_PRIVATE_TF_TOPIC}"
+fi
+
+wait_for_fresh_header_topic_message "${POINTS_TOPIC}" "${FASTLIO_POINTS_READY_TIMEOUT}" "${FASTLIO_POINTS_MAX_AGE_SEC}" 0.25 || {
+  echo "[runtime-overlay] timed out waiting for FAST-LIO2 deskewed pointcloud: ${POINTS_TOPIC}" >&2
+  exit 1
+}
+if [[ "${SLAM2D_ODOM_SOURCE}" == "fastlio" ]]; then
+  runtime_readiness_probe mapping-fastlio-ready \
+    "${POINTS_TOPIC}" "${FASTLIO_ODOM_TOPIC}" /mapping/fastlio_odometry \
+    "${FASTLIO_ODOM_READY_TIMEOUT}" "${FASTLIO_POINTS_MAX_AGE_SEC}" || {
+    echo "[runtime-overlay] refusing mapping: FAST-LIO cloud/odom pair or bridge not ready" >&2
+    exit 1
+  }
+  log_mapping_startup_stage "fastlio_ready"
+  log_mapping_startup_stage "odom_bridge_ready"
 fi
 
 # Atomically surrender canonical /scan only after the corrected cloud and its
 # odometry/TF chain are ready.  reset() in the resident service removes its
 # publisher from the graph while /lidar_points and FAST-LIO2 continue running.
-set_resident_scan_output false
+# Set before the request so cleanup also restores after an uncertain reply.
 resident_scan_released="true"
-wait_for_scan_publisher_count "${SLAM2D_SCAN_TOPIC}" 0 || {
+release_navigation_scan_owner "${SLAM2D_SCAN_TOPIC}" || {
   echo "[runtime-overlay] refusing mapping scan startup: resident /scan publisher did not leave the graph" >&2
   exit 1
 }
@@ -720,9 +711,13 @@ log_mapping_startup_stage "resident_scan_released"
 # participant created after the endpoint may temporarily receive a unique
 # endpoint with UNKNOWN node metadata; the pre-armed observer sees the endpoint
 # discovery and its ROS node identity in one continuous graph session.
-start_scan_owner_observer \
-  "${SLAM2D_SCAN_TOPIC}" "pointcloud_to_laserscan" 1 \
-  "${SLAM2D_SCAN_OWNER_READY_TIMEOUT}"
+mapping_scan_timeout="$(awk -v owner="${SLAM2D_SCAN_OWNER_READY_TIMEOUT}" \
+  -v fresh="${SLAM2D_SCAN_READY_TIMEOUT}" -v tf="${SLAM2D_STAMPED_TF_READY_TIMEOUT}" \
+  'BEGIN {budget=owner; if (fresh>budget) budget=fresh; if (tf>budget) budget=tf; print budget}')"
+start_mapping_scan_observer \
+  "${SLAM2D_SCAN_TOPIC}" "${slam_tf_topic}" "${slam_odom_frame}" \
+  "${mapping_scan_timeout}" "${SLAM2D_STAMPED_TF_REQUIRED_GOOD}" \
+  pointcloud_to_laserscan "${SLAM2D_SCAN_MAX_AGE_SEC}"
 
 ros2 launch "${SLAM_LAUNCH_FILE}" \
   preprocessor_params:="${PREPROCESSOR_PARAMS_FILE}" \
@@ -735,26 +730,12 @@ ros2 launch "${SLAM_LAUNCH_FILE}" \
   tf_topic:="${slam_tf_topic}" &
 projected_map_pid=$!
 wait_for_scan_owner_observer || {
-  echo "[runtime-overlay] refusing mapping runtime: corrected-cloud /scan owner is not unique" >&2
-  exit 1
-}
-wait_for_fresh_header_topic_message "${SLAM2D_SCAN_TOPIC}" "${SLAM2D_SCAN_READY_TIMEOUT}" "${SLAM2D_SCAN_MAX_AGE_SEC}" 0.25 || {
-  echo "[runtime-overlay] corrected-cloud mapping scan is stale on ${SLAM2D_SCAN_TOPIC}" >&2
+  echo "[runtime-overlay] refusing mapping runtime: corrected /scan owner, freshness or original-stamp TF not ready" >&2
   exit 1
 }
 log_mapping_startup_stage "mapping_scan_owner_ready"
 
-# Prove the original FAST-LIO2 stamp is transformable; no relay or restamping
-# node exists in this mapping path.
-runtime_readiness_probe stamped-scan-tf \
-  "${SLAM2D_SCAN_TOPIC}" \
-  "${slam_tf_topic}" \
-  "${slam_odom_frame}" \
-  "${SLAM2D_STAMPED_TF_READY_TIMEOUT}" \
-  "${SLAM2D_STAMPED_TF_REQUIRED_GOOD}" || {
-  echo "[runtime-overlay] refusing mapping runtime: corrected /scan is not transformable through ${slam_tf_topic} to ${slam_odom_frame} at its original timestamp" >&2
-  exit 1
-}
+# The shared observer already proved the ORIGINAL stamp, with no restamping.
 log_mapping_startup_stage "stamped_scan_tf_ready"
 log_mapping_startup_stage "slam_toolbox_started"
 wait "${projected_map_pid}" || projected_map_exit_code=$?

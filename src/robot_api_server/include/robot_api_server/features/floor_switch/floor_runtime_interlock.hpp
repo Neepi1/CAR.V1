@@ -11,7 +11,7 @@ struct FloorRuntimeInterlockDecision
   bool blocked{false};
   std::string code{"FLOOR_RUNTIME_LEGACY_UNSCOPED"};
   std::string detail{
-    "no explicit floor-transition failure or active transaction has been observed"};
+    "no current floor-transition or localization evidence has been observed"};
   std::string transaction_id;
 };
 
@@ -31,6 +31,10 @@ public:
     const std::string & detail);
 
   FloorRuntimeInterlockDecision decision() const;
+  FloorRuntimeInterlockDecision decision_for_map_switch() const;
+  // Current evidence only. Source-independent recovery can bypass an invalid
+  // source context, never an active transition; this does not grant motion.
+  FloorRuntimeInterlockDecision decision_for_operation(const std::string & operation) const;
 
 private:
   FloorRuntimeInterlockDecision floor_status_decision_;

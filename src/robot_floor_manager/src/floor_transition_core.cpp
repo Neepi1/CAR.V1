@@ -120,14 +120,12 @@ FloorTransitionOutput FloorTransitionCore::dispatch(
   }
   if (state_ == FloorTransitionState::kFailureCleanup) {
     if (event.kind == FloorTransitionEventKind::kEffectSucceeded) {
-      // Runtime cleanup is authoritative for both pre- and post-BEGIN
-      // failures. A successful cleanup may clear recovery only when exact
-      // bridge ABORT, a fresh source-identity health sample, durable source
-      // context restoration, and exact lease release were all proven by the
-      // runtime port. Otherwise it reports runtime_context_invalid=true and
-      // the stop remains retained.
-      recovery_required_ = event.evidence.runtime_context_invalid;
-      runtime_context_valid_ = !recovery_required_;
+      // A failed transaction can finish without a localized map. Only the
+      // runtime port can prove settled writes and released owner resources;
+      // localization validity is neither that proof nor a global task lock.
+      runtime_context_valid_ = !event.evidence.runtime_context_invalid;
+      recovery_required_ = !runtime_context_valid_ &&
+        !event.evidence.failure_resources_released;
       state_ = recovery_required_ ?
         FloorTransitionState::kFailedLocked :
         FloorTransitionState::kFailed;
@@ -140,7 +138,9 @@ FloorTransitionOutput FloorTransitionCore::dispatch(
       output.recovery_required = recovery_required_;
       output.message = recovery_required_ ?
         "failure cleanup acknowledged; recovery lock retained" :
-        "failure cleanup acknowledged; source runtime context is ready";
+        (runtime_context_valid_ ?
+        "failure cleanup acknowledged; source runtime context is ready" :
+        "failed transaction released; map localization remains unready");
       return output;
     }
     if (event.evidence.runtime_context_invalid) {

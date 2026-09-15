@@ -527,6 +527,12 @@ def test_runtime_env_freezes_accepted_navigation_profile():
     assert values["NJRH_ALLOW_BASE_IMAGE_FALLBACK"] == "false"
 
 
+def test_runtime_env_enables_nav2_process_preload():
+    provision = load_module()
+    assert provision.runtime_env_values(sample_manifest())[
+        "NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION"] == "true"
+
+
 def test_auto_enrolled_device_identity_is_reused_and_rejects_camera_replacement(
     monkeypatch, tmp_path
 ):

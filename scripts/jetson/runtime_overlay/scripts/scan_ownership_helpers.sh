@@ -8,6 +8,7 @@
 
 RESIDENT_SCAN_OWNER_NODE="${NJRH_RESIDENT_SCAN_OWNER_NODE:-pointcloud_accel_axis_node}"
 RESIDENT_SCAN_CONTROL_SERVICE="${NJRH_RESIDENT_SCAN_CONTROL_SERVICE:-/pointcloud_accel_axis_node/set_scan_output_enabled}"
+RESIDENT_SCAN_STATUS_TOPIC="${NJRH_RESIDENT_SCAN_STATUS_TOPIC:-/lidar/pointcloud_accel_status}"
 SCAN_OWNERSHIP_TIMEOUT_SEC="${NJRH_SCAN_OWNERSHIP_TIMEOUT_SEC:-12}"
 SCAN_OWNER_OBSERVER_PID=""
 SCAN_OWNER_OBSERVER_LOG=""
@@ -124,37 +125,20 @@ resident_scan_output_matches_requested_state() {
 
 restore_navigation_scan_owner() {
   local topic="${1:-/scan}"
-  # Fast idempotent check first. During a completed mapping teardown the graph
-  # is already proven empty, so do not spend the full ownership timeout waiting
-  # for an owner that intentionally does not exist.
-  if wait_for_scan_owner \
-      "${topic}" "${RESIDENT_SCAN_OWNER_NODE}" 1 1; then
-    return 0
-  fi
+  runtime_readiness_probe scan-handoff ensure "${topic}" "${RESIDENT_SCAN_OWNER_NODE}" \
+    "${RESIDENT_SCAN_CONTROL_SERVICE}" "${RESIDENT_SCAN_STATUS_TOPIC}" "${SCAN_OWNERSHIP_TIMEOUT_SEC}"
+}
 
-  if wait_for_scan_publisher_count "${topic}" 0 1; then
-    set_resident_scan_output true || return 1
-    wait_for_scan_owner "${topic}" "${RESIDENT_SCAN_OWNER_NODE}" 1 || {
-      echo "[runtime-overlay] canonical navigation scan owner was not restored on ${topic}" >&2
-      return 1
-    }
-    return 0
-  fi
+release_navigation_scan_owner() {
+  local topic="${1:-/scan}"
+  runtime_readiness_probe scan-handoff release "${topic}" "${RESIDENT_SCAN_OWNER_NODE}" \
+    "${RESIDENT_SCAN_CONTROL_SERVICE}" "${RESIDENT_SCAN_STATUS_TOPIC}" "${SCAN_OWNERSHIP_TIMEOUT_SEC}"
+}
 
-  # A discovered endpoint can temporarily have UNKNOWN node metadata under
-  # Fast DDS load. Keep one continuous full-timeout proof before deciding that
-  # a different publisher owns the canonical topic.
-  if wait_for_scan_owner \
-      "${topic}" "${RESIDENT_SCAN_OWNER_NODE}" 1 "${SCAN_OWNERSHIP_TIMEOUT_SEC}"; then
-    return 0
-  fi
-  if ! wait_for_scan_publisher_count "${topic}" 0 1; then
-    echo "[runtime-overlay] refusing navigation scan restore: another publisher still owns ${topic}" >&2
-    return 1
-  fi
-  set_resident_scan_output true || return 1
-  wait_for_scan_owner "${topic}" "${RESIDENT_SCAN_OWNER_NODE}" 1 || {
-    echo "[runtime-overlay] canonical navigation scan owner was not restored on ${topic}" >&2
-    return 1
-  }
+start_mapping_scan_observer() {
+  stop_scan_owner_observer
+  SCAN_OWNER_OBSERVER_LOG="/tmp/njrh_scan_owner_observer_${BASHPID:-$$}.log"
+  runtime_readiness_probe mapping-scan-ready "$@" >"${SCAN_OWNER_OBSERVER_LOG}" 2>&1 &
+  SCAN_OWNER_OBSERVER_PID=$!
+  echo "[runtime-overlay] pre-armed mapping scan owner/freshness/stamped-TF observer pid=${SCAN_OWNER_OBSERVER_PID}" >&2
 }

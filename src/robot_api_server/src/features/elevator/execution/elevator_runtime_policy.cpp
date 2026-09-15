@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 
 namespace robot_api_server
 {
@@ -455,9 +456,22 @@ std::optional<std::string> elevator_controller_id_for_profile(
     case ElevatorNavigationProfile::kElevatorReverseDocking:
       return std::string{"ElevatorReverseDockingFollowPath"};
     case ElevatorNavigationProfile::kElevatorCabinDirect:
-      return std::string{"ElevatorCabinEntryDirectFollowPath"};
+      return target_role == PoseRole::kCabinPanel ?
+             std::string{"ElevatorCabinPanelFollowPath"} :
+             std::string{"ElevatorCabinEntryDirectFollowPath"};
   }
   return std::nullopt;
+}
+
+std::string elevator_cabin_behavior_tree_for_role(
+  const std::string & direct_behavior_tree,
+  const PoseRole target_role)
+{
+  if (target_role != PoseRole::kCabinPanel) {
+    return direct_behavior_tree;
+  }
+  return (std::filesystem::path(direct_behavior_tree).parent_path() /
+         "navigate_elevator_cabin_panel.xml").string();
 }
 
 std::optional<std::string> make_elevator_controller_session_id(

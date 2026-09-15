@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.8)
 project(robot_api_server)
 
+# An unspecified single-config build otherwise compiles this resident gateway
+# without optimization. Keep symbols for field diagnosis and respect explicit
+# Debug/Release/toolchain and multi-config selections.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+endif()
+
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
@@ -248,6 +255,9 @@ install(DIRECTORY config launch
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME api_default_build_type
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/test_default_build_type.py)
 
   ament_add_gtest(
     test_application_router_module
@@ -879,6 +889,14 @@ if(BUILD_TESTING)
   target_compile_features(test_navigation_process_runtime PRIVATE cxx_std_17)
   target_include_directories(test_navigation_process_runtime PRIVATE include)
 
+  ament_add_gtest(test_mapping_stop_concurrency
+    test/features/mapping/runtime/test_mapping_stop_concurrency.cpp
+    src/features/mapping/runtime/mapping_process_runtime.cpp
+    src/infrastructure/http/http_common.cpp
+  )
+  target_compile_features(test_mapping_stop_concurrency PRIVATE cxx_std_17)
+  target_include_directories(test_mapping_stop_concurrency PRIVATE include)
+
   ament_add_gtest(
     test_mapping_runtime
     test/features/mapping/runtime/test_mapping_runtime.cpp
@@ -904,6 +922,33 @@ if(BUILD_TESTING)
     src/features/maps/catalog_activation/runtime_map_lookup.cpp
     src/infrastructure/process/runtime_process_utils.cpp
   )
+  ament_add_gtest(
+    test_mapping_save_job
+    test/features/mapping/test_mapping_save_job.cpp
+    src/features/maps/catalog_activation/map_asset_filesystem.cpp
+    src/infrastructure/http/http_common.cpp
+  )
+  target_compile_features(test_mapping_save_job PRIVATE cxx_std_17)
+  target_include_directories(test_mapping_save_job PRIVATE include)
+  ament_add_gtest(
+    test_mapping_save_routing
+    test/features/mapping/test_mapping_save_routing.cpp
+    src/application/routing/application_router_module.cpp
+    src/application/runtime_mode/runtime_mode_coordinator.cpp
+    src/features/mapping/map_asset_writer.cpp
+    src/features/mapping/mapping_module.cpp
+    src/features/mapping/runtime/mapping_process_runtime.cpp
+    src/features/mapping/runtime/mapping_start_job.cpp
+    src/features/maps/catalog_activation/api_time_utils.cpp
+    src/features/maps/catalog_activation/map_asset_filesystem.cpp
+    src/features/maps/catalog_activation/map_catalog.cpp
+    src/features/maps/catalog_activation/runtime_map_lookup.cpp
+  )
+  target_compile_features(test_mapping_save_routing PRIVATE cxx_std_17)
+  target_include_directories(test_mapping_save_routing PRIVATE include)
+  target_link_libraries(test_mapping_save_routing robot_api_server_keepout yaml-cpp)
+  ament_target_dependencies(test_mapping_save_routing nav_msgs rclcpp
+    robot_elevator_manager robot_map_asset_identity std_srvs)
   target_compile_features(test_mapping_module PRIVATE cxx_std_17)
   target_include_directories(test_mapping_module PRIVATE include)
   target_link_libraries(test_mapping_module robot_api_server_keepout yaml-cpp)
@@ -1138,7 +1183,13 @@ if(BUILD_TESTING)
     src/infrastructure/http/http_common.cpp
   )
   target_compile_features(test_navigation_goal_execution_module PRIVATE cxx_std_17)
+  target_link_libraries(test_navigation_goal_execution_module yaml-cpp)
   target_include_directories(test_navigation_goal_execution_module PRIVATE include)
+  ament_add_gtest(test_navigation_recovery_wait
+    test/features/navigation/runtime/test_navigation_recovery_wait.cpp)
+  target_include_directories(test_navigation_recovery_wait PRIVATE include)
+  target_compile_features(test_navigation_recovery_wait PRIVATE cxx_std_17)
+  target_link_libraries(test_navigation_recovery_wait yaml-cpp)
   ament_target_dependencies(
     test_navigation_goal_execution_module
     action_msgs
@@ -1431,6 +1482,25 @@ if(BUILD_TESTING)
     src/features/localization/localization_configuration_module.cpp
     src/features/localization/tf_pose_utils.cpp
   )
+  ament_add_gtest(test_trigger_evidence
+    test/features/localization/test_trigger_evidence.cpp)
+  target_compile_features(test_trigger_evidence PRIVATE cxx_std_17)
+  target_include_directories(test_trigger_evidence PRIVATE include)
+  ament_target_dependencies(test_trigger_evidence robot_interfaces)
+  ament_add_gtest(test_localization_trigger_transport
+    test/features/localization/test_localization_trigger_transport.cpp
+    src/features/localization/localization_module.cpp
+    src/features/localization/localization_result_model.cpp
+    src/features/localization/amcl_runtime_status.cpp
+    src/features/localization/tf_pose_utils.cpp
+    src/infrastructure/http/http_common.cpp)
+  target_compile_features(test_localization_trigger_transport PRIVATE cxx_std_17)
+  target_include_directories(test_localization_trigger_transport PRIVATE include)
+  ament_target_dependencies(test_localization_trigger_transport
+    rclcpp robot_interfaces geometry_msgs std_msgs std_srvs tf2_msgs)
+  set_tests_properties(test_localization_trigger_transport PROPERTIES
+    ENVIRONMENT "ROS_DOMAIN_ID=217;ROS_LOCALHOST_ONLY=1;FASTRTPS_DEFAULT_PROFILES_FILE=;FASTDDS_DEFAULT_PROFILES_FILE="
+    RUN_SERIAL TRUE TIMEOUT 30)
   target_compile_features(test_localization_configuration_module PRIVATE cxx_std_17)
   target_include_directories(test_localization_configuration_module PRIVATE include)
   ament_target_dependencies(

@@ -1,5 +1,43 @@
 # robot_api_server
 
+Unspecified single-config builds default to `RelWithDebInfo` (optimized, with
+debug symbols). Explicit `Debug`/`Release` and multi-config builds retain their
+chosen behavior. This does not change callback rates, HTTP fields, navigation,
+elevator, docking, localization or safety policies. See
+[build optimization and verification](../../docs/robot_api_optimized_build.md).
+
+2026-09-10 deployment: the current-state floor interlock replaces the historical
+sticky failure implementation. This scoped update does not deploy the remaining
+floor/elevator cleanup candidates or remove undock's invalid-map check. Earlier
+sticky-lock descriptions below are superseded for this module by
+[the exact deployment record](../../docs/floor_interlock_deployment_20260910.md).
+
+Relocalization submissions use request-scoped completion evidence and retain late
+ROS replies after HTTP timeout. Only matching, proven outcomes release admission;
+an unrelated AMCL rejection is not a terminal trigger result. See
+[confirmation protocol](../../docs/relocalization_trigger_confirmation.md).
+
+The workspace [floor-failure asset admission fix](../../docs/floor_failure_asset_admission.md)
+allows offline elevator-configuration and explicit-coordinate pose edits after
+a terminal floor failure, without granting motion or clearing runtime failure.
+Active switches still serialize these edits. The precise two-object update is
+deployed; the restarted production API executable matches the tested candidate.
+
+Manual `/api/v1/floor-switch/start` does not require a ready/confirmed source
+map or a previous explicit localization. Such evidence is used only to prove an
+exact already-active no-op. Source-invalid health alone is not a map-switch
+rejection; other operations retain their existing policy. Target verification,
+Action completion and navigation start/stop behavior are unchanged. See
+[`map_switch_source_independence.md`](../../docs/map_switch_source_independence.md).
+
+Persistent ordinary-navigation recovery is an **offline candidate**. The API
+binds `/navigation/ordinary_recovery_status` to the exact tracked action and
+original goal stamp; only fresh `waiting`/`recovering` intervals are excluded
+from the ordinary execution timeout. Waiting resets the near-goal stall watch,
+but cancellation, missing-status timeout and final arrival verification remain
+effective. Production activation and physical acceptance are still pending.
+See [recovery contract](../robot_nav_config/docs/ordinary_navigation_recovery.md).
+
 `robot_api_server` is the production-facing HTTP gateway for Android and other non-ROS clients.
 
 It does not own mapping, localization, navigation, or chassis control logic. It only exposes a narrow HTTP API and forwards requests into existing ROS 2 topics and services.

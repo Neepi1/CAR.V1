@@ -36,6 +36,7 @@
 #include "tf2_msgs/msg/tf_message.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
+#include "mapping_scan_handoff.hpp"
 
 namespace
 {
@@ -943,6 +944,66 @@ bool wait_for_stable_local_state(const rclcpp::Node::SharedPtr & node,
   return false;
 }
 
+bool wait_for_scan_handoff(const rclcpp::Node::SharedPtr & node,
+  const std::string & mode, const std::string & topic, const std::string & owner,
+  const std::string & service, const std::string & status_topic, double timeout_sec)
+{
+  if (mode != "ensure" && mode != "release") { return false; }
+  mapping_startup::ScanHandoff handoff(node, topic, owner, service, status_topic, mode == "ensure");
+  const auto deadline = Clock::now() + std::chrono::duration<double>(timeout_sec);
+  while (rclcpp::ok() && Clock::now() < deadline) {
+    spin_slice(node);
+    const auto result = handoff.tick();
+    if (result == mapping_startup::ScanHandoff::Result::Ready) {
+      std::cerr << "[runtime-overlay] scan handoff ready: mode=" << mode << " topic=" << topic << "\n";
+      return true;
+    }
+    if (result == mapping_startup::ScanHandoff::Result::Rejected) { break; }
+  }
+  std::cerr << "[runtime-overlay] scan handoff not proven: mode=" << mode << " topic=" << topic << "\n";
+  return false;
+}
+
+bool wait_for_mapping_fastlio(const rclcpp::Node::SharedPtr & node,
+  const std::string & points, const std::string & odom, const std::string & bridge,
+  double timeout_sec, double max_age_sec)
+{
+  // Cloud freshness is checked by the existing caller. This client only
+  // observes endpoint identity and small odometry messages, never PointCloud2.
+  int64_t odom_stamp = 0, bridge_stamp = 0;
+  auto input = node->create_subscription<nav_msgs::msg::Odometry>(odom,
+    rclcpp::QoS(1).best_effort(), [&](nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+      odom_stamp = rclcpp::Time(msg->header.stamp).nanoseconds();
+    });
+  auto output = node->create_subscription<nav_msgs::msg::Odometry>(bridge,
+    rclcpp::QoS(1).best_effort(), [&](nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+      bridge_stamp = rclcpp::Time(msg->header.stamp).nanoseconds();
+    });
+  const auto deadline = Clock::now() + std::chrono::duration<double>(timeout_sec);
+  while (rclcpp::ok() && Clock::now() < deadline) {
+    spin_slice(node);
+    const auto clouds = node->get_publishers_info_by_topic(points);
+    const auto odoms = node->get_publishers_info_by_topic(odom);
+    const auto fresh = [&](int64_t stamp) {
+      const double age = (node->now().nanoseconds() - stamp) * 1e-9;
+      return stamp > 0 && age >= -0.25 && age <= max_age_sec;
+    };
+    if (clouds.size() != 1 || odoms.size() != 1) { continue; }
+    const auto & name = clouds.front().node_name();
+    if (name.empty() || name.find("unknown") != std::string::npos ||
+      name.find("UNKNOWN") != std::string::npos) { continue; }
+    if (name == odoms.front().node_name() &&
+      clouds.front().node_namespace() == odoms.front().node_namespace() &&
+      fresh(odom_stamp) && fresh(bridge_stamp))
+    {
+      std::cerr << "[runtime-overlay] mapping FAST-LIO pair and bridge ready: owner=" << name << "\n";
+      return true;
+    }
+  }
+  std::cerr << "[runtime-overlay] mapping FAST-LIO pair/odom/bridge not ready\n";
+  return false;
+}
+
 bool wait_for_mapping_preflight(const rclcpp::Node::SharedPtr & node,
                                 const std::string & scan_topic,
                                 const std::string & scan_owner_node,
@@ -955,7 +1016,9 @@ bool wait_for_mapping_preflight(const rclcpp::Node::SharedPtr & node,
                                 double scan_max_age_sec,
                                 double odom_max_age_sec,
                                 double max_future_sec,
-                                double max_odom_diff_m)
+                                double max_odom_diff_m,
+                                const std::string & restore_service = "",
+                                const std::string & status_topic = "")
 {
   constexpr const char * kBaseFrame = "base_link";
   constexpr const char * kLidarLevelFrame = "lidar_level_link";
@@ -970,6 +1033,12 @@ bool wait_for_mapping_preflight(const rclcpp::Node::SharedPtr & node,
   auto tf_buffer = std::make_shared<tf2_ros::Buffer>(node->get_clock());
   auto tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer, node, false);
   (void)tf_listener;
+
+  std::unique_ptr<mapping_startup::ScanHandoff> handoff;
+  if (!restore_service.empty()) {
+    handoff = std::make_unique<mapping_startup::ScanHandoff>(
+      node, scan_topic, scan_owner_node, restore_service, status_topic, true);
+  }
 
   bool scan_received = false;
   bool local_odom_received = false;
@@ -1035,12 +1104,13 @@ bool wait_for_mapping_preflight(const rclcpp::Node::SharedPtr & node,
       }
     }
 
-    scan_owner_ready = false;
-    for (const auto & info : node->get_publishers_info_by_topic(scan_topic)) {
-      if (node_name_matches(info.node_name(), scan_owner_node)) {
-        scan_owner_ready = true;
-        break;
-      }
+    const auto scan_publishers = node->get_publishers_info_by_topic(scan_topic);
+    scan_owner_ready = scan_publishers.size() == 1 &&
+      node_name_matches(scan_publishers.front().node_name(), scan_owner_node);
+    if (handoff) {
+      const auto result = handoff->tick();
+      if (result == mapping_startup::ScanHandoff::Result::Rejected) { return false; }
+      scan_owner_ready = result == mapping_startup::ScanHandoff::Result::Ready;
     }
 
     bool has_local_state_node = false;
@@ -1158,7 +1228,9 @@ bool wait_for_stamped_scan_tf(const rclcpp::Node::SharedPtr & node,
                               const std::string & tf_topic,
                               const std::string & target_frame,
                               double timeout_sec,
-                              int required_consecutive_good)
+                              int required_consecutive_good,
+                              const std::string & expected_owner = "",
+                              double max_age_sec = 0.0)
 {
   struct ScanObservation
   {
@@ -1235,8 +1307,21 @@ bool wait_for_stamped_scan_tf(const rclcpp::Node::SharedPtr & node,
 
   while (rclcpp::ok() && Clock::now() < deadline) {
     spin_slice(node);
+    if (!expected_owner.empty()) {
+      const auto owners = node->get_publishers_info_by_topic(scan_topic);
+      if (owners.size() != 1 || !node_name_matches(owners.front().node_name(), expected_owner)) {
+        last_error = "scan owner is not yet uniquely proven";
+        continue;
+      }
+    }
     int consecutive_good = 0;
     for (const auto & observation : observations) {
+      const auto age_sec = (node->now().nanoseconds() - observation.stamp_ns) * 1e-9;
+      if (max_age_sec > 0.0 && (age_sec > max_age_sec || age_sec < -0.25)) {
+        consecutive_good = 0;
+        last_error = "scan timestamp is not fresh";
+        continue;
+      }
       std::string transform_error;
       const tf2::TimePoint stamp{
         std::chrono::nanoseconds(observation.stamp_ns)};
@@ -1402,9 +1487,25 @@ bool wait_for_lifecycle_active(const rclcpp::Node::SharedPtr & node,
     }
     auto request = std::make_shared<lifecycle_msgs::srv::GetState::Request>();
     auto future = client->async_send_request(request);
-    const auto result = rclcpp::spin_until_future_complete(node, future, 800ms);
+    auto result = rclcpp::FutureReturnCode::TIMEOUT;
+    // 800 ms is a responsive spin slice, not a deadline for this request.
+    // Keep late replies until the original overall budget expires; otherwise
+    // a consistently slower active server is queried repeatedly but never seen.
+    while (rclcpp::ok() && Clock::now() < deadline) {
+      const auto remaining = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        deadline - Clock::now());
+      if (remaining <= std::chrono::nanoseconds::zero()) {
+        break;
+      }
+      result = rclcpp::spin_until_future_complete(
+        node, future, std::min(remaining, std::chrono::nanoseconds(800ms)));
+      if (result != rclcpp::FutureReturnCode::TIMEOUT) {
+        break;
+      }
+    }
     if (result != rclcpp::FutureReturnCode::SUCCESS) {
-      continue;
+      client->remove_pending_request(future);
+      break;
     }
     const auto response = future.get();
     last_state = response->current_state.label + " [" +
@@ -1464,6 +1565,151 @@ bool wait_for_occupancy_grid(const rclcpp::Node::SharedPtr & node, const std::st
               << " last=" << last_msg.info.width << "x" << last_msg.info.height << "\n";
   } else {
     std::cerr << "[runtime-overlay] timed out waiting for " << topic << " OccupancyGrid\n";
+  }
+  return false;
+}
+
+bool wait_for_amcl_inputs(
+  const rclcpp::Node::SharedPtr & node, const std::string & scan_topic,
+  const std::string & fallback_scan_frame, const std::string & known_scan_frame,
+  const std::string & pending_csv, double map_timeout_sec, double scan_timeout_sec,
+  double tf_timeout_sec, Clock::time_point started)
+{
+  const std::map<std::string, double> limits{
+    {"MAP", map_timeout_sec}, {"SCAN", scan_timeout_sec},
+    {"MAP_TF", tf_timeout_sec}, {"ODOM_TF", tf_timeout_sec}, {"SENSOR_TF", tf_timeout_sec}};
+  for (const auto & limit : limits) {
+    if (!std::isfinite(limit.second) || limit.second <= 0.0) {
+      throw std::runtime_error("amcl-inputs timeouts must be finite and positive");
+    }
+  }
+  std::set<std::string> pending;
+  std::istringstream phases(pending_csv);
+  std::string phase;
+  while (std::getline(phases, phase, ',')) {
+    if (limits.count(phase) == 0 || !pending.insert(phase).second) {
+      throw std::runtime_error("invalid or repeated amcl-inputs pending phase");
+    }
+  }
+  if (pending.empty() || pending_csv.back() == ',') {
+    throw std::runtime_error("amcl-inputs requires nonempty pending phases");
+  }
+  auto valid_protocol_frame = [](const std::string & frame) {
+      return !frame.empty() && std::none_of(frame.begin(), frame.end(), [](unsigned char c) {
+          return std::iscntrl(c) != 0;
+        });
+    };
+  if (!valid_protocol_frame(fallback_scan_frame) ||
+    (known_scan_frame != "-" && !valid_protocol_frame(known_scan_frame)))
+  {
+    throw std::runtime_error("invalid amcl-inputs frame: empty or protocol control character");
+  }
+
+  auto elapsed = [&]() {return std::chrono::duration<double>(Clock::now() - started).count();};
+  auto ready = [&](const std::string & completed) {
+      if (pending.count(completed) == 0 || elapsed() >= limits.at(completed)) {
+        return;
+      }
+      pending.erase(completed);
+      // Flush each independently observed success so the existing shell cache
+      // can retain it even if another condition or the outer budget times out.
+      std::cout << "AMCL_INPUT_READY=" << completed << std::endl;
+      std::cerr << "[runtime-overlay] AMCL input ready phase=" << completed
+                << " elapsed_sec=" << elapsed() << "\n";
+    };
+
+  // A resumed SENSOR_TF check can use the already observed scan frame. When
+  // SCAN itself is pending, use that newly received message's actual frame.
+  std::string scan_frame =
+    pending.count("SCAN") == 0 && known_scan_frame != "-" ? known_scan_frame : "";
+  const bool need_scan = pending.count("SCAN") != 0 ||
+    (pending.count("SENSOR_TF") != 0 && scan_frame.empty());
+  bool scan_received = false;
+  rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_subscription;
+  if (pending.count("MAP") != 0) {
+    map_subscription = node->create_subscription<nav_msgs::msg::OccupancyGrid>(
+      "/map", qos_profile(RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+      RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL),
+      [&](const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+        // Same criterion as the former occupancy-grid /map <timeout> 1 1.
+        if (msg->info.width >= 1 && msg->info.height >= 1) {
+          ready("MAP");
+        }
+      });
+  }
+  std::vector<rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr> scan_subscriptions;
+  if (need_scan) {
+    for (const auto & qos : default_qos_profiles()) {
+      scan_subscriptions.push_back(node->create_subscription<sensor_msgs::msg::LaserScan>(
+        scan_topic, qos, [&](const sensor_msgs::msg::LaserScan::SharedPtr msg) {
+          if (scan_received || elapsed() >= scan_timeout_sec) {
+            return;
+          }
+          const auto & frame = msg->header.frame_id.empty() ?
+            fallback_scan_frame : msg->header.frame_id;
+          if (!valid_protocol_frame(frame)) {
+            throw std::runtime_error("invalid received AMCL scan frame protocol character");
+          }
+          scan_frame = frame;
+          scan_received = true;
+          // Emit the frame first: interrupted output cannot checkpoint SCAN
+          // without the frame needed by its later SENSOR_TF continuation.
+          std::cout << "AMCL_INPUT_FRAME=" << scan_frame << std::endl;
+          ready("SCAN");
+        }));
+    }
+  }
+
+  std::shared_ptr<tf2_ros::Buffer> buffer;
+  std::shared_ptr<tf2_ros::TransformListener> listener;
+  if (pending.count("MAP_TF") || pending.count("ODOM_TF") || pending.count("SENSOR_TF")) {
+    buffer = std::make_shared<tf2_ros::Buffer>(node->get_clock());
+    listener = std::make_shared<tf2_ros::TransformListener>(*buffer, node, false);
+  }
+  // Keep one executor as well as one participant/buffer throughout discovery.
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(node);
+  std::map<std::string, std::string> last_tf_errors;
+  auto check_tf = [&](const std::string & name, const std::string & target,
+      const std::string & source) {
+      if (pending.count(name) == 0 || source.empty() || elapsed() >= limits.at(name)) {
+        return;
+      }
+      try {
+        // Preserve the existing tf command's natural readiness semantics.
+        buffer->lookupTransform(target, source, tf2::TimePointZero);
+        ready(name);
+      } catch (const tf2::TransformException & exc) {
+        last_tf_errors[name] = exc.what();
+      }
+    };
+  while (rclcpp::ok()) {
+    executor.spin_some();
+    check_tf("MAP_TF", "map", "odom");
+    check_tf("ODOM_TF", "odom", "base_link");
+    check_tf("SENSOR_TF", "base_link", scan_frame);
+    if (pending.empty()) {
+      std::cerr << "[runtime-overlay] AMCL pending inputs ready elapsed_sec=" << elapsed() << "\n";
+      return true;
+    }
+    for (const auto & name : pending) {
+      if (elapsed() >= limits.at(name)) {
+        std::cerr << "[runtime-overlay] timed out waiting for AMCL input phase=" << name
+                  << " elapsed_sec=" << elapsed();
+        const auto error = last_tf_errors.find(name);
+        if (error != last_tf_errors.end()) {
+          std::cerr << " detail=" << error->second;
+        }
+        std::cerr << "\n";
+        return false;
+      }
+    }
+    if (need_scan && !scan_received && elapsed() >= scan_timeout_sec) {
+      std::cerr << "[runtime-overlay] timed out waiting for AMCL scan frame elapsed_sec="
+                << elapsed() << "\n";
+      return false;
+    }
+    std::this_thread::sleep_for(50ms);
   }
   return false;
 }
@@ -1658,13 +1904,18 @@ void print_usage()
     << "  mapping-preflight <scan_topic> <scan_owner_node> <local_odom_topic> "
        "<reference_odom_topic> <local_state_mode> <tf_timeout_sec> <scan_timeout_sec> "
        "<odom_timeout_sec> <scan_max_age_sec> <odom_max_age_sec> <max_future_sec> "
-       "<max_odom_diff_m>\n"
+       "<max_odom_diff_m> [restore_service status_topic]\n"
+    << "  scan-handoff <ensure|release> <scan_topic> <owner> <service> <status_topic> <timeout_sec>\n"
+    << "  mapping-fastlio-ready <points_topic> <odom_topic> <bridge_topic> <timeout_sec> <max_age_sec>\n"
+    << "  mapping-scan-ready <scan_topic> <tf_topic> <target_frame> <timeout_sec> <required_good> <owner> <max_age_sec>\n"
     << "  stamped-scan-tf <scan_topic> <tf_topic> <target_frame> <timeout_sec> "
        "<required_consecutive_good>\n"
     << "  transformable-scan <timeout_sec> <required_good>\n"
     << "  local-state-endpoint <timeout_sec> <mode>\n"
     << "  lifecycle-active <node_name> <timeout_sec>\n"
     << "  occupancy-grid <topic> <timeout_sec> <min_width> <min_height>\n"
+    << "  amcl-inputs <scan_topic> <fallback_scan_frame> <known_scan_frame_or_dash> "
+       "<pending_csv> <map_timeout_sec> <scan_timeout_sec> <tf_timeout_sec>\n"
     << "  map-topic-matches-yaml <map_yaml> <timeout_sec>\n"
     << "  localization-prestart <timeout_sec>\n"
     << "  localization-stack <map_yaml> <flatscan_topic> <timeout_sec>\n"
@@ -1681,9 +1932,12 @@ int main(int argc, char ** argv)
   }
 
   const std::string command = argv[1];
+  const auto command_started = Clock::now();
   try {
     rclcpp::init(argc, argv);
-    auto node = std::make_shared<rclcpp::Node>("runtime_readiness_probe");
+    auto node = std::make_shared<rclcpp::Node>(
+      "runtime_readiness_probe", rclcpp::NodeOptions().start_parameter_services(false)
+      .start_parameter_event_publisher(false).enable_rosout(false));
     bool ok = false;
 
     if (command == "service" && argc == 4) {
@@ -1733,7 +1987,13 @@ int main(int argc, char ** argv)
         parse_double(argv[4], "odom_max_age_sec"),
         parse_double(argv[5], "odom_max_future_sec"),
         parse_double(argv[6], "tf_max_age_sec"));
-    } else if (command == "mapping-preflight" && argc == 14) {
+    } else if (command == "scan-handoff" && argc == 8) {
+      ok = wait_for_scan_handoff(node, argv[2], argv[3], argv[4], argv[5], argv[6],
+        parse_double(argv[7], "timeout_sec"));
+    } else if (command == "mapping-fastlio-ready" && argc == 7) {
+      ok = wait_for_mapping_fastlio(node, argv[2], argv[3], argv[4],
+        parse_double(argv[5], "timeout_sec"), parse_double(argv[6], "max_age_sec"));
+    } else if (command == "mapping-preflight" && (argc == 14 || argc == 16)) {
       std::string mode = argv[6];
       std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
           return static_cast<char>(std::tolower(c));
@@ -1751,7 +2011,12 @@ int main(int argc, char ** argv)
         parse_double(argv[10], "scan_max_age_sec"),
         parse_double(argv[11], "odom_max_age_sec"),
         parse_double(argv[12], "max_future_sec"),
-        parse_double(argv[13], "max_odom_diff_m"));
+        parse_double(argv[13], "max_odom_diff_m"),
+        argc == 16 ? argv[14] : "", argc == 16 ? argv[15] : "");
+    } else if (command == "mapping-scan-ready" && argc == 9) {
+      ok = wait_for_stamped_scan_tf(node, argv[2], argv[3], argv[4],
+        parse_double(argv[5], "timeout_sec"), parse_int(argv[6], "required_good"),
+        argv[7], parse_double(argv[8], "max_age_sec"));
     } else if (command == "stamped-scan-tf" && argc == 7) {
       ok = wait_for_stamped_scan_tf(
         node, argv[2], argv[3], argv[4], parse_double(argv[5], "timeout_sec"),
@@ -1772,6 +2037,12 @@ int main(int argc, char ** argv)
       ok = wait_for_occupancy_grid(
         node, argv[2], parse_double(argv[3], "timeout_sec"),
         parse_int(argv[4], "min_width"), parse_int(argv[5], "min_height"));
+    } else if (command == "amcl-inputs" && argc == 9) {
+      ok = wait_for_amcl_inputs(
+        node, argv[2], argv[3], argv[4], argv[5],
+        parse_double(argv[6], "map_timeout_sec"),
+        parse_double(argv[7], "scan_timeout_sec"),
+        parse_double(argv[8], "tf_timeout_sec"), command_started);
     } else if (command == "map-topic-matches-yaml" && argc == 4) {
       ok = wait_for_map_topic_matches_yaml(node, argv[2], parse_double(argv[3],
         "timeout_sec"));

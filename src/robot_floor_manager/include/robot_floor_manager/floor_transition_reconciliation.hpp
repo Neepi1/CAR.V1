@@ -5,6 +5,20 @@
 namespace robot_floor_manager
 {
 
+enum class FloorTransitionCleanupAction
+{
+  kReleaseUnchangedSource,
+  kRestoreSource,
+  kRetainSafety,
+};
+
+// Chooses cleanup, not permission to move. Restoration still needs the bridge's
+// exact source proof, durable context and acknowledged owner-scoped releases.
+FloorTransitionCleanupAction select_floor_transition_cleanup(
+  bool begin_established,
+  bool begin_outcome_unknown,
+  bool target_effect_dispatched);
+
 struct ExplicitLocalizationReconciliation
 {
   bool success{false};

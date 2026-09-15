@@ -17,6 +17,7 @@
 
 #include "robot_api_server/features/mapping/map_asset_writer.hpp"
 #include "robot_api_server/features/mapping/runtime/mapping_start_job.hpp"
+#include "robot_api_server/features/mapping/runtime/mapping_save_job.hpp"
 #include "robot_api_server/features/maps/catalog_activation/api_time_utils.hpp"
 #include "robot_api_server/features/maps/catalog_activation/file_utils.hpp"
 #include "robot_api_server/features/maps/catalog_activation/map_asset_filesystem.hpp"
@@ -128,6 +129,7 @@ public:
     map_asset_mutation_mutex_(map_asset_mutation_mutex),
     config_(std::move(config)),
     ports_(std::move(ports)),
+    save_job_(config_.runtime_maps_dir / "save_jobs"),
     process_runtime_(
       config_.process,
       [this](
@@ -165,6 +167,28 @@ public:
     const HttpRequest & request,
     const ElevatorMotionAdmissionFence::Epoch motion_admission_epoch)
   {
+    if (request.method == "GET" && request.path == "/api/v1/mapping/2d/save/status") {
+      auto result = save_job_.find(query_value(request, "request_id").value_or(""));
+      if (json_string_value(result.body, "state") == "recovery_required" &&
+        json_bool_value(result.body, "map_saved", false))
+      {
+        const auto saved = json_object_value(result.body, "result").value_or("{}");
+        try {
+          const auto manifest = map_catalog_.find_map_by_id(
+            json_string_value(saved, "map_id").value_or(""));
+          if (!manifest || json_string_value(saved, "asset_digest") != manifest->asset_digest) {
+            throw std::runtime_error("saved map identity no longer matches the receipt");
+          }
+          verify_map_asset_identity(*manifest, config_.maps_root);
+        } catch (const std::exception & error) {
+          const std::string marker = "\"map_saved\":true";
+          result.body.replace(result.body.find(marker), marker.size(), "\"map_saved\":false");
+          result.body.pop_back();
+          result.body += ",\"asset_verification_error\":" + json_string(error.what()) + "}";
+        }
+      }
+      return result;
+    }
     if (request.method == "GET" && request.path == "/api/v1/mapping/2d/map") {
       return handle_mapping_2d_map_png(request);
     }
@@ -181,6 +205,13 @@ public:
       (request.path == "/api/v1/mapping/2d/save" ||
       request.path == "/api/v1/mapping/save"))
     {
+      if (json_bool_value(request.body, "async", false)) {
+        return submit_mapping_save(request.body);
+      }
+      std::lock_guard<std::mutex> lock(start_mutex_);
+      if (save_job_.running() || start_job_.running()) {
+        return HttpResponse{409, "application/json", error_json("mapping start/save is still running")};
+      }
       return handle_save_mapping_2d(request.body, motion_admission_epoch);
     }
     return std::nullopt;
@@ -263,6 +294,7 @@ public:
     }
     (void)start_job_.request_cancel("2D mapping start cancellation requested");
     join_mapping_start_worker();
+    save_job_.join();
     {
       std::lock_guard<std::mutex> lock(live_subscription_mutex_);
       live_map_page_subscription_active_ = false;
@@ -493,11 +525,47 @@ private:
     return latest_live_map_;
   }
 
+  HttpResponse submit_mapping_save(const std::string & body)
+  {
+    std::lock_guard<std::mutex> lock(start_mutex_);
+    const auto id = json_string_value(body, "request_id").value_or("");
+    if (!runtime::MappingSaveJob::valid_id(id)) {
+      return {400, "application/json", error_json("valid request_id is required")};
+    }
+    const auto building = json_string_value(body, "building_id").value_or("");
+    const auto floor = json_string_value(body, "floor_id").value_or("");
+    const auto name = json_string_value(body, "map_name").value_or("");
+    if (!safe_asset_id(building) || !safe_asset_id(floor) || !valid_display_map_name(name)) {
+      return {400, "application/json", error_json("valid building_id, floor_id and map_name are required")};
+    }
+    const auto key = json_string(building) + ":" + json_string(floor) + ":" + json_string(name);
+    if (save_job_.find(id).status == 200) {
+      return save_job_.submit(id, key, {}); // Same identity returns the original result.
+    }
+    if (shutdown_requested_.load() || start_job_.running() || save_job_.running()) {
+      return {409, "application/json", error_json("mapping start/save is still running")};
+    }
+    double age = 0.0;
+    std::shared_ptr<const nav_msgs::msg::OccupancyGrid> frozen;
+    try {
+      frozen = std::make_shared<nav_msgs::msg::OccupancyGrid>(latest_mapping_map_for_save(age));
+    } catch (const std::exception & error) {
+      return {404, "application/json", error_json(error.what())};
+    }
+    return save_job_.submit(id, key, [this, body, frozen, age](const auto & saved) {
+        return handle_save_mapping_2d(body, 0U, frozen, age, saved);
+      });
+  }
+
   HttpResponse handle_save_mapping_2d(
     const std::string & body,
-    const ElevatorMotionAdmissionFence::Epoch motion_admission_epoch)
+    const ElevatorMotionAdmissionFence::Epoch /* legacy_epoch */,
+    std::shared_ptr<const nav_msgs::msg::OccupancyGrid> frozen = {},
+    const double frozen_age = 0.0,
+    const runtime::MappingSaveJob::Saved & saved = {})
   {
-    std::lock_guard<std::mutex> asset_guard(map_asset_mutation_mutex_);
+    const auto begin = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> asset_guard(map_asset_mutation_mutex_);
     if (const auto blocked = ports_.floor_runtime_interlock_response("mapping_save")) {
       return *blocked;
     }
@@ -524,7 +592,8 @@ private:
     nav_msgs::msg::OccupancyGrid map;
     const bool mapping_was_active = process_runtime_.tracked_snapshot().active;
     try {
-      map = latest_mapping_map_for_save(map_age_sec);
+      map = frozen ? *frozen : latest_mapping_map_for_save(map_age_sec);
+      if (frozen) {map_age_sec = frozen_age;}
     } catch (const std::exception & exception) {
       return {404, "application/json", error_json(exception.what())};
     }
@@ -541,10 +610,6 @@ private:
         "mapping_save_commit"))
     {
       return *blocked;
-    }
-    auto motion_admission = ports_.acquire_motion_admission(motion_admission_epoch);
-    if (!motion_admission.admitted()) {
-      return motion_admission_failure_response("mapping_save", motion_admission);
     }
 
     set_mapping_runtime_state(true, "saving", "saving live 2D mapping assets");
@@ -601,19 +666,12 @@ private:
       return {500, "application/json", error_json(exception.what())};
     }
 
-    const std::size_t stopped_groups = process_runtime_.stop();
-    set_mapping_live_map_cache_active(false);
-    clear_live_map_cache();
-    set_mapping_runtime_state(false, "stopped", "2D map saved and mapping chain stopped");
-
     std::ostringstream response;
     response << std::fixed << std::setprecision(3);
     response << "{\"ok\":true,"
-             << "\"mapping_active\":false,"
+             << "\"map_saved\":true,"
              << "\"mapping_was_active\":"
              << (mapping_was_active ? "true" : "false") << ","
-             << "\"stopped\":" << (stopped_groups > 0U ? "true" : "false") << ","
-             << "\"stopped_groups\":" << stopped_groups << ","
              << "\"map_age_sec\":" << map_age_sec << ","
              << "\"map_id\":" << json_string(manifest.map_id) << ","
              << "\"display_name\":" << json_string(manifest.display_name) << ","
@@ -646,7 +704,37 @@ private:
              << json_string(manifest.localizer_params_yaml.string()) << ","
              << "\"asset_report_json\":"
              << json_string(manifest.asset_report_json.string()) << "}}";
-    return {200, "application/json", response.str()};
+    asset_guard.unlock();
+    const auto assets_done = std::chrono::steady_clock::now();
+    const std::string asset_result = response.str();
+    if (saved) {saved(asset_result);}
+    RCLCPP_INFO(node_.get_logger(), "mapping_save map_id=%s phase=assets_committed elapsed_ms=%lld",
+      manifest.map_id.c_str(), static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(assets_done - begin).count()));
+    std::size_t stopped_groups = 0U;
+    {
+      std::lock_guard<std::mutex> launch_lock(transition_launch_mutex_);
+      stopped_groups = process_runtime_.stop();
+    }
+    const bool mapping_stopped = !process_runtime_.recover_snapshot().running;
+    if (mapping_stopped) {
+      set_mapping_live_map_cache_active(false);
+      clear_live_map_cache();
+    }
+    set_mapping_runtime_state(!mapping_stopped, mapping_stopped ? "stopped" : "failed",
+      mapping_stopped ? "2D map saved and mapping chain stopped" :
+      "2D map saved, but mapping shutdown is not confirmed", mapping_stopped);
+    RCLCPP_INFO(node_.get_logger(), "mapping_save map_id=%s phase=shutdown_finished elapsed_ms=%lld stopped=%d",
+      manifest.map_id.c_str(), static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - assets_done).count()), mapping_stopped);
+    auto result = asset_result;
+    result.pop_back();
+    result += ",\"mapping_active\":" + std::string(mapping_stopped ? "false" : "true") +
+      ",\"mapping_stopped\":" + (mapping_stopped ? "true" : "false") +
+      ",\"stopped\":" + (mapping_stopped ? "true" : "false") +
+      ",\"stopped_groups\":" + std::to_string(stopped_groups) + "}";
+    return {200, "application/json", result};
   }
 
   bool mapping_scan_has_exact_navigation_owner() const
@@ -858,8 +946,12 @@ private:
   }
 
   HttpResponse handle_start_mapping_2d(
-    const ElevatorMotionAdmissionFence::Epoch motion_admission_epoch)
+    const ElevatorMotionAdmissionFence::Epoch /* legacy_epoch */)
   {
+    std::lock_guard<std::mutex> start_lock(start_mutex_);
+    if (save_job_.running()) {
+      return {409, "application/json", error_json("mapping save is still running")};
+    }
     std::lock_guard<std::mutex> asset_guard(map_asset_mutation_mutex_);
     if (const auto blocked = ports_.floor_runtime_interlock_response("mapping_start")) {
       return *blocked;
@@ -897,7 +989,6 @@ private:
         ",\"map_endpoint\":\"/api/v1/mapping/2d/map\"}"};
     }
 
-    std::lock_guard<std::mutex> start_lock(start_mutex_);
     if (start_job_.running()) {
       return {
         202,
@@ -907,10 +998,6 @@ private:
     }
     join_mapping_start_worker();
 
-    auto motion_admission = ports_.acquire_motion_admission(motion_admission_epoch);
-    if (!motion_admission.admitted()) {
-      return motion_admission_failure_response("mapping_start", motion_admission);
-    }
     std::string conflict_owner;
     if (!runtime_mode_.try_begin_transition("mapping_start", conflict_owner)) {
       return {
@@ -937,7 +1024,6 @@ private:
         error_json("2D mapping start transition is already active")};
     }
     const std::uint64_t job_id = *accepted_job;
-    motion_admission.unlock();
 
     if (navigation_was_active) {
       runtime_mode_.set_navigation(
@@ -971,6 +1057,11 @@ private:
 
   HttpResponse handle_stop_mapping_2d()
   {
+    std::lock_guard<std::mutex> start_lock(start_mutex_);
+    if (save_job_.running()) {
+      return {202, "application/json",
+        "{\"ok\":true,\"accepted\":true,\"state\":\"save_in_progress\"}"};
+    }
     std::size_t requested_groups = 0U;
     bool start_transition_cancel_requested = false;
     {
@@ -1126,6 +1217,7 @@ private:
   std::mutex & map_asset_mutation_mutex_;
   MappingModuleConfig config_;
   MappingModulePorts ports_;
+  runtime::MappingSaveJob save_job_;
   MappingProcessRuntime process_runtime_;
   MappingStartJobTracker start_job_;
   std::mutex start_mutex_;

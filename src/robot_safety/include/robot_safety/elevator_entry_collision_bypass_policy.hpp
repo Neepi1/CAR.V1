@@ -22,8 +22,9 @@ struct ElevatorEntryCollisionBypassContext
 
 // This is deliberately narrower than an ordinary source selector. A fresh
 // permit must name the exact active elevator transaction, and robot_safety
-// must independently prove the mode owner, mission, hold, and DOORWAY mode
-// contract. The elevator-test execution lease is intentionally not involved.
+// must independently prove the mode owner, mission, and clear hold. Post-call
+// staging uses ELEVATOR_WAIT; cabin entry/exit uses DOORWAY. Neither mode alone
+// authorizes bypass. The elevator-test execution lease is not involved.
 bool elevator_entry_collision_bypass_authorized(
   const ElevatorEntryCollisionBypassPermit & permit,
   const ElevatorEntryCollisionBypassContext & context,

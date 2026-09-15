@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace robot_localization_bridge
 {
@@ -116,6 +117,9 @@ private:
 
   FloorTransitionContextSnapshot state_;
   std::unordered_map<std::string, std::uint64_t> last_command_sequences_;
+  // An ended transaction can never acquire the context again, even with a
+  // higher sequence. A new, explicitly paused transaction is required.
+  std::unordered_set<std::string> terminated_transactions_;
 };
 
 const char * to_string(FloorTransitionDecisionCode code) noexcept;

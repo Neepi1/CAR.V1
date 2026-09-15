@@ -1183,13 +1183,22 @@ def main() -> int:
                 failed.failure_code = 99
                 failed.detail = "manual recovery required"
                 publish_repeated(probe, status_pub, failed)
-                publish_repeated(probe, health_pub, healthy)
+                invalid.transition_active = False
+                invalid.runtime_context_valid = False
+                invalid.detail = "ABORTED_CONTEXT_INVALID"
+                publish_repeated(probe, health_pub, invalid)
                 assert_floor_block(
                     args.port,
                     "POST",
-                    "/api/v1/safety/resume",
-                    "FLOOR_TRANSITION_FAILED_LOCKED",
+                    "/api/v1/navigation/goal",
+                    "FLOOR_RUNTIME_CONTEXT_INVALID",
                 )
+                publish_repeated(probe, health_pub, healthy)
+                status, response = request_json(
+                    args.port, "POST", "/api/v1/navigation/goal", {}
+                )
+                assert status == 400, response
+                assert response.get("code") != "FLOOR_TRANSITION_BLOCKED", response
 
                 print(
                     json.dumps(
@@ -1198,7 +1207,8 @@ def main() -> int:
                             "blocked_endpoint_count": len(blocked_endpoints),
                             "safety_stop_allowed": True,
                             "preflight_blocked_not_latched": True,
-                            "failed_lock_sticky": True,
+                            "terminal_failure_not_a_latch": True,
+                            "current_invalid_context_still_blocks_motion": True,
                             "cross_floor_docking_rejected": True,
                             "inactive_map_docking_rejected": True,
                             "active_map_delete_rejected": True,

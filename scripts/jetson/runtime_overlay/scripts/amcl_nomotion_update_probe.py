@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 import sys
 from typing import Any, Dict
 
@@ -48,7 +49,8 @@ def main() -> int:
 
     try:
         rclpy.init()
-        node = rclpy.create_node("amcl_nomotion_update_probe")
+        node = rclpy.create_node(
+            "amcl_nomotion_update_probe", enable_rosout=False, start_parameter_services=False)
 
         def now_sec() -> float:
             return node.get_clock().now().nanoseconds * 1.0e-9
@@ -78,6 +80,9 @@ def main() -> int:
         result["service_available"] = True
 
         result["request_start_time"] = now_sec()
+        if os.environ.get("NJRH_STARTUP_OWNER_PID") or os.environ.get("NJRH_FLOOR_STARTUP_HANDOFF_NONCE"):
+            from floor_startup_handoff import require_startup_side_effect_permission
+            require_startup_side_effect_permission()
         future = client.call_async(Empty.Request())
         deadline = result["request_start_time"] + max(0.0, args.timeout_sec)
         service_error = ""

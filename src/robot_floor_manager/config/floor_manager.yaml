@@ -32,6 +32,12 @@ robot_floor_manager:
     global_costmap_clear_service: /global_costmap/clear_entirely_global_costmap
     local_costmap_clear_service: /local_costmap/clear_entirely_local_costmap
     runtime_map_context_file: /tmp/njrh_runtime_map_context.json
+    # Cold-start coordination only; neither file authorizes motion.
+    startup_handoff_file: /tmp/njrh_floor_startup_handoff.json
+    startup_handoff_ack_file: /tmp/njrh_floor_startup_handoff_ack.json
+    # Stage ceilings, not an extension of the caller's overall cancellation budget.
+    startup_handoff_timeout_sec: 90.0
+    startup_ready_timeout_sec: 120.0
     service_timeout_sec: 10.0
     # Isaac component capture/unload/load is a composite operation. A delayed
     # RPC is reconciled against the exact transaction-scoped typed asset state.

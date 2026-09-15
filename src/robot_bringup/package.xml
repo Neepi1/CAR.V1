@@ -11,12 +11,15 @@
   <depend>lifecycle_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>rclcpp</depend>
+  <depend>rapidjson</depend>
   <depend>robot_interfaces</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
   <depend>tf2</depend>
   <depend>tf2_msgs</depend>
   <depend>tf2_ros</depend>
+  <test_depend>python3-pytest</test_depend>
 
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
@@ -36,8 +39,8 @@
   <exec_depend>robot_description</exec_depend>
   <exec_depend>robot_global_localization</exec_depend>
   <exec_depend>robot_floor_manager</exec_depend>
-  <exec_depend>robot_hesai_jt128</exec_depend>
-  <exec_depend>robot_local_state</exec_depend>
+  <depend>robot_hesai_jt128</depend>
+  <depend>robot_local_state</depend>
   <exec_depend>robot_localization_bridge</exec_depend>
   <exec_depend>robot_nav_config</exec_depend>
   <exec_depend>robot_safety</exec_depend>

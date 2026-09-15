@@ -111,7 +111,6 @@ void GoalScopedRotationShimController::configure(
   nav2_util::declare_parameter_if_not_declared(
     node, plugin_name_ + ".terminal_handoff_reverse_permit_topic",
     rclcpp::ParameterValue(std::string("/ranger_mini3/nav_terminal_reverse_enable")));
-
   node->get_parameter(plugin_name_ + ".rotate_to_heading_once", rotate_to_heading_once_);
   node->get_parameter(plugin_name_ + ".goal_change_xy_threshold", goal_change_xy_threshold_);
   node->get_parameter(plugin_name_ + ".goal_change_yaw_threshold", goal_change_yaw_threshold_);
@@ -201,7 +200,6 @@ void GoalScopedRotationShimController::configure(
   node->get_parameter(
     plugin_name_ + ".terminal_handoff_reverse_permit_topic",
     terminal_reverse_permit_topic_);
-
   goal_change_xy_threshold_ = std::max(0.0, goal_change_xy_threshold_);
   goal_change_yaw_threshold_ = std::max(0.0, goal_change_yaw_threshold_);
   same_goal_rearm_after_idle_sec_ = std::max(0.0, same_goal_rearm_after_idle_sec_);
@@ -272,6 +270,30 @@ void GoalScopedRotationShimController::configure(
     terminal_reverse_permit_pub_ =
       node->create_publisher<std_msgs::msg::Bool>(terminal_reverse_permit_topic_, permit_qos);
   }
+  ordinary_local_repair_runtime_ =
+    std::make_unique<OrdinaryLocalPathRepairRuntime>();
+  ordinary_local_repair_runtime_->configure(
+    node, plugin_name_, tf_, terminal_costmap_ros_,
+    terminal_handoff_parameters_.max_distance_m);
+  // A recovery request only prepares a path-specific state reset. It never
+  // changes controller lifecycle, publishes velocity or grants motion.
+  ordinary_recovery_state_ = navigation_recovery::for_node(node->get_node_base_interface().get());
+  using Prepare = robot_nav_config::srv::PrepareOrdinaryNavigationRecovery;
+  ordinary_recovery_service_ = node->create_service<Prepare>(
+    "~/prepare_ordinary_navigation_recovery",
+    [state = ordinary_recovery_state_, clock = node->get_clock()](
+      const Prepare::Request::SharedPtr request, Prepare::Response::SharedPtr response) {
+      const auto observation = state->inspect(request->path,
+        rclcpp::Time(request->attempt_started).nanoseconds(), clock->now().nanoseconds());
+      response->matched = observation.matched;
+      response->recoverable = observation.recoverable;
+      response->waiting = observation.waiting;
+      response->progress_epoch = observation.progress_epoch;
+      if (request->inspect_only) {return;}
+      response->prepared = state->prepare(request->path,
+        rclcpp::Time(request->attempt_started).nanoseconds(), response->reason,
+        rclcpp::Time(request->task_started).nanoseconds());
+    });
 
   RCLCPP_INFO(
     logger_,
@@ -302,11 +324,15 @@ void GoalScopedRotationShimController::configure(
 void GoalScopedRotationShimController::activate()
 {
   nav2_rotation_shim_controller::RotationShimController::activate();
+  ordinary_recovery_state_->set_active(true);
   if (terminal_lateral_permit_pub_ && !terminal_lateral_permit_pub_->is_activated()) {
     terminal_lateral_permit_pub_->on_activate();
   }
   if (terminal_reverse_permit_pub_ && !terminal_reverse_permit_pub_->is_activated()) {
     terminal_reverse_permit_pub_->on_activate();
+  }
+  if (ordinary_local_repair_runtime_) {
+    ordinary_local_repair_runtime_->activate();
   }
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -321,7 +347,12 @@ void GoalScopedRotationShimController::activate()
 
 void GoalScopedRotationShimController::deactivate()
 {
+  ordinary_recovery_state_->set_active(false);
+  recovery_alignment_active_ = false;
   publish_terminal_permits(false, false);
+  if (ordinary_local_repair_runtime_) {
+    ordinary_local_repair_runtime_->deactivate();
+  }
   if (terminal_lateral_permit_pub_ && terminal_lateral_permit_pub_->is_activated()) {
     terminal_lateral_permit_pub_->on_deactivate();
   }
@@ -333,6 +364,16 @@ void GoalScopedRotationShimController::deactivate()
     terminal_handoff_controller_.reset();
   }
   nav2_rotation_shim_controller::RotationShimController::deactivate();
+}
+
+void GoalScopedRotationShimController::cleanup()
+{
+  if (ordinary_recovery_state_) {
+    ordinary_recovery_state_->set_active(false);
+  }
+  ordinary_recovery_service_.reset();
+  ordinary_recovery_state_.reset();
+  nav2_rotation_shim_controller::RotationShimController::cleanup();
 }
 
 GoalSignature GoalScopedRotationShimController::goal_signature(
@@ -349,6 +390,12 @@ GoalSignature GoalScopedRotationShimController::goal_signature(
 
 void GoalScopedRotationShimController::setPlan(const nav_msgs::msg::Path & path)
 {
+  bool preserve_startup = false;
+  const bool recovery_rearm = ordinary_recovery_state_ &&
+    ordinary_recovery_state_->observe_plan(path, &preserve_startup);
+  if (ordinary_local_repair_runtime_) {
+    ordinary_local_repair_runtime_->set_plan(path);
+  }
   if (path.poses.empty()) {
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -360,8 +407,26 @@ void GoalScopedRotationShimController::setPlan(const nav_msgs::msg::Path & path)
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
+  recovery_alignment_active_ = recovery_rearm;
+  recovery_alignment_logged_ = false;
+  if (preserve_startup) {
+    goal_scope_.mark_startup_alignment_consumed();
+    terminal_handoff_controller_.reset();
+    in_rotation_ = false;
+    last_angular_vel_ = 0.0;
+  }
+  if (recovery_rearm) {
+    goal_scope_.reset();
+    startup_alignment_guard_.reset();
+    terminal_handoff_controller_.reset();
+    in_rotation_ = false;
+    last_angular_vel_ = 0.0;
+    RCLCPP_WARN(logger_,
+      "[ordinary-recovery] consumed exact replanned path; startup alignment rearmed; poses=%zu",
+      path.poses.size());
+  }
   const auto now_steady = std::chrono::steady_clock::now();
-  const bool idle_rearm = rotate_to_heading_once_ && goal_scope_.have_goal() &&
+  const bool idle_rearm = !preserve_startup && rotate_to_heading_once_ && goal_scope_.have_goal() &&
     have_last_compute_time_ && same_goal_rearm_after_idle_sec_ > 0.0 &&
     std::chrono::duration<double>(now_steady - last_compute_time_).count() >=
     same_goal_rearm_after_idle_sec_;
@@ -474,6 +539,9 @@ geometry_msgs::msg::TwistStamped GoalScopedRotationShimController::computeVeloci
   const geometry_msgs::msg::Twist & velocity,
   nav2_core::GoalChecker * goal_checker)
 {
+  if (ordinary_recovery_state_) {
+    ordinary_recovery_state_->observe_control();
+  }
   bool startup_alignment_pending = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -495,11 +563,24 @@ geometry_msgs::msg::TwistStamped GoalScopedRotationShimController::computeVeloci
         angular_dist_threshold_,
         angular_disengage_threshold_);
       rotation_started = startup_alignment_guard_.rotation_started();
+      if (recovery_alignment_active_ && !recovery_alignment_logged_ && measurement.error) {
+        RCLCPP_WARN(logger_, "[ordinary-recovery] startup initial_yaw_error=%.6f decision=%s",
+          *measurement.error,
+          decision == StartupAlignmentDecision::kRotate ? "rotate" : "already_aligned");
+        recovery_alignment_logged_ = true;
+      }
 
       if (decision == StartupAlignmentDecision::kComplete) {
         path_updated_ = false;
         in_rotation_ = false;
         goal_scope_.mark_startup_alignment_consumed();
+        if (recovery_alignment_active_) {
+          RCLCPP_WARN(logger_,
+            "[ordinary-recovery] startup complete final_yaw_error=%.6f path_too_short=%s",
+            measurement.error.value_or(std::numeric_limits<double>::quiet_NaN()),
+            measurement.path_too_short ? "true" : "false");
+          recovery_alignment_active_ = false;
+        }
       } else {
         path_updated_ = true;
         in_rotation_ = rotation_started;
@@ -523,6 +604,26 @@ geometry_msgs::msg::TwistStamped GoalScopedRotationShimController::computeVeloci
       last_angular_vel_ = command.twist.angular.z;
       return command;
     }
+  }
+
+  OrdinaryLocalPathRepairUpdate local_repair_update;
+  if (ordinary_local_repair_runtime_) {
+    local_repair_update = ordinary_local_repair_runtime_->update(pose);
+  }
+  if (local_repair_update.replacement_path.has_value()) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    current_path_ = *local_repair_update.replacement_path;
+    primary_controller_->setPlan(*local_repair_update.replacement_path);
+    position_goal_checker_->reset();
+    path_updated_ = false;
+    in_rotation_ = false;
+  }
+  if (local_repair_update.hold_position) {
+    geometry_msgs::msg::TwistStamped command;
+    command.header = pose.header;
+    last_angular_vel_ = 0.0;
+    publish_terminal_permits(false, false);
+    return command;
   }
 
   const auto pose_error = terminal_pose_error(pose);
@@ -574,9 +675,12 @@ geometry_msgs::msg::TwistStamped GoalScopedRotationShimController::computeVeloci
 
   publish_terminal_permits(false, false);
 
-  auto command =
-    nav2_rotation_shim_controller::RotationShimController::computeVelocityCommands(
-    pose, velocity, goal_checker);
+  const auto compute_primary = [&]() {
+      return nav2_rotation_shim_controller::RotationShimController::computeVelocityCommands(
+        pose, velocity, goal_checker);
+    };
+  auto command = ordinary_local_repair_runtime_ ?
+    ordinary_local_repair_runtime_->compute_command(pose, compute_primary) : compute_primary();
 
   constexpr double kPureRotationLinearEpsilon = 1.0e-6;
   if (terminal_rotation_braking_enabled_ &&
@@ -599,6 +703,7 @@ geometry_msgs::msg::TwistStamped GoalScopedRotationShimController::computeVeloci
 
   return command;
 }
+
 
 std::optional<TerminalPoseError> GoalScopedRotationShimController::terminal_pose_error(
   const geometry_msgs::msg::PoseStamped & pose)

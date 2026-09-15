@@ -1,5 +1,10 @@
 # Phase R3 Explicit Relocalization Fast Smoothing
 
+> Historical implementation. Superseded by
+> [explicit immediate application](explicit_relocalization_immediate.md): all
+> explicit Isaac corrections apply immediately; ordinary AMCL still smooths.
+> The legacy fast parameters below no longer select runtime behavior.
+
 Phase R3 keeps `robot_localization_bridge` as the only `map -> odom` TF owner
 and narrows the bridge smoothing policy by correction source.
 
@@ -43,12 +48,8 @@ but makes large explicit relocalization converge in seconds instead of minutes.
 When `smoothing_policy=explicit_relocalization_fast`, the active smoothing rates
 are correction-specific and may be higher than the configured default rates.
 
-## Rollback
+## Activation
 
-Set:
-
-```yaml
-explicit_relocalization_fast_smoothing_enabled: false
-```
-
-and restart `robot_localization_bridge`.
+Only an explicitly authorized full `njrh-runtime.service` restart may activate
+a candidate. Never restart this node independently. The historical fast-enable
+flag is not a rollback switch for the new immediate application policy.

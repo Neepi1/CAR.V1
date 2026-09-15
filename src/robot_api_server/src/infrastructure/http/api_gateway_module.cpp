@@ -163,6 +163,7 @@ std::optional<HttpResponse> ApiGatewayModule::handle_metadata(
     "\"POST /api/v1/mapping/2d/start\","
     "\"POST /api/v1/mapping/2d/stop\","
     "\"POST /api/v1/mapping/2d/save\","
+    "\"GET /api/v1/mapping/2d/save/status\","
     "\"POST /api/v1/mapping/stop\","
     "\"POST /api/v1/mapping/save\","
     "\"POST /api/v1/maps/delete\","

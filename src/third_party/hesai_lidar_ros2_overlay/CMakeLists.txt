@@ -14,10 +14,14 @@ configure_file(
 )
 
 set(WITH_PTCS_USE ON CACHE BOOL "Use Ptcs")
-# set(FIND_CUDA ON CACHE BOOL "Find CUDA")
+option(FIND_CUDA "Build the Hesai CUDA point parser" ON)
 
 if(FIND_CUDA)
-    find_package(CUDA )
+    find_package(CUDA REQUIRED)
+    # Production Jetson Orin; other CUDA targets can override this cache value.
+    set(CMAKE_CUDA_ARCHITECTURES "87" CACHE STRING "CUDA target architectures")
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 endif()
 if(${CUDA_FOUND})
     project(CommonModules LANGUAGES CXX CUDA)
@@ -25,7 +29,7 @@ if(${CUDA_FOUND})
 	set(CUDA_SEPARABLE_COMPILATION ON)
 	include_directories(${CUDA_INCLUDE_DIRS})
 	set(CUDA_PROPAGATE_HOST_FLAGS OFF)
-	set(CUDA_NVCC_FLAGS -arch=sm_61;-O3;-G;-g;)#鏍规嵁鍏蜂綋GPU鎬ц兘鏇存敼绠楀姏鍙傛暟
+	# Native CUDA targets use CMAKE_CUDA_ARCHITECTURES and Release flags.
 	link_directories($ENV{CUDA_PATH}/lib/x64)
 
   add_definitions(-DUSE_CUDA)

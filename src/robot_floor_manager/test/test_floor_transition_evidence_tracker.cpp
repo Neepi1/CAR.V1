@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,7 @@ TEST(FloorTransitionEvidenceTracker, LatchesNavTerminalWhileLiveEvidenceExpires)
 
   EXPECT_TRUE(proven.motion_hold_active);
   EXPECT_TRUE(proven.nav_idle);
+  EXPECT_FALSE(tracker.nav_runtime_inactive(100.5, 0.75));
   EXPECT_TRUE(proven.stopped);
 
   const auto stale = tracker.preconditions(
@@ -72,6 +74,7 @@ TEST(FloorTransitionEvidenceTracker, ProvesColdStartIdleAfterStableActionServerW
   evidence = tracker.preconditions(
     101.1, 0.75, 0.25, 0.02, 0.02, 2.0);
   EXPECT_TRUE(evidence.nav_idle);
+  EXPECT_FALSE(tracker.nav_runtime_inactive(101.1, 0.75));
 
   // Any later active status overrides the cold-start proof immediately.
   tracker.observe_nav_activity(true, 101.2);
@@ -89,6 +92,136 @@ TEST(FloorTransitionEvidenceTracker, ProvesColdStartIdleAfterStableActionServerW
   evidence = tracker.preconditions(
     101.4, 0.75, 0.25, 0.02, 0.02, 2.0);
   EXPECT_FALSE(evidence.nav_idle);
+}
+
+TEST(FloorTransitionEvidenceTracker, ProvesIdleWithBothExplicitStoppedLifecycleResponses)
+{
+  FloorTransitionEvidenceTracker tracker;
+  tracker.begin(target(), 100.0);
+  tracker.observe_motion_interlock(
+    true, {"robot_floor_manager:floor-live-1"}, 100.1);
+  tracker.observe_wheel_odom(0.0, 0.0, 0.0, 100.1);
+  tracker.observe_local_odom(0.0, 0.0, 0.0, 100.1);
+  tracker.observe_wheel_odom(0.0, 0.0, 0.0, 100.5);
+  tracker.observe_local_odom(0.0, 0.0, 0.0, 100.5);
+  // An intentionally inactive navigator need not advertise an active action
+  // graph. Actual GetState replies, not missing endpoints, prove it stopped.
+  tracker.observe_nav_graph_ready(false, 100.1);
+  tracker.observe_nav_lifecycle_state(NavLifecycleEndpoint::kBtNavigator, 1U, 100.2);
+  tracker.observe_nav_lifecycle_state(NavLifecycleEndpoint::kControllerServer, 2U, 100.3);
+
+  const auto proven = tracker.preconditions(100.5, 0.75, 0.25, 0.02, 0.02);
+  EXPECT_TRUE(proven.motion_hold_active);
+  EXPECT_TRUE(proven.stopped);
+  EXPECT_TRUE(proven.nav_idle);
+  EXPECT_TRUE(tracker.nav_runtime_inactive(100.5, 0.75));
+}
+
+TEST(FloorTransitionEvidenceTracker, LifecycleIdleExpiresEvenWhenOtherEvidenceAllowsLongerAge)
+{
+  FloorTransitionEvidenceTracker tracker;
+  tracker.begin(target(), 100.0);
+  tracker.observe_nav_lifecycle_state(NavLifecycleEndpoint::kBtNavigator, 2U, 100.0);
+  tracker.observe_nav_lifecycle_state(NavLifecycleEndpoint::kControllerServer, 1U, 100.0);
+
+  EXPECT_TRUE(tracker.preconditions(100.75, 5.0, 0.25, 0.02, 0.02).nav_idle);
+  EXPECT_FALSE(tracker.preconditions(100.751, 5.0, 0.25, 0.02, 0.02).nav_idle);
+
+  // One endpoint's new reply cannot renew the other endpoint's evidence.
+  tracker.observe_nav_lifecycle_state(NavLifecycleEndpoint::kBtNavigator, 2U, 100.8);
+  EXPECT_FALSE(tracker.preconditions(100.8, 5.0, 0.25, 0.02, 0.02).nav_idle);
+  tracker.observe_nav_lifecycle_state(NavLifecycleEndpoint::kControllerServer, 1U, 100.8);
+  EXPECT_TRUE(tracker.preconditions(100.8, 5.0, 0.25, 0.02, 0.02).nav_idle);
+
+  // A tighter caller budget remains authoritative as well.
+  EXPECT_FALSE(tracker.preconditions(101.0, 0.1, 0.25, 0.02, 0.02).nav_idle);
+}
+
+TEST(FloorTransitionEvidenceTracker, ActiveGoalContradictsLifecycleIdleEvenAfterGraphLoss)
+{
+  FloorTransitionEvidenceTracker tracker;
+  tracker.begin(target(), 100.0);
+  tracker.observe_nav_graph_ready(true, 99.0);
+  tracker.observe_nav_activity(true, 100.1);
+  tracker.observe_nav_lifecycle_state(NavLifecycleEndpoint::kBtNavigator, 2U, 100.2);
+  tracker.observe_nav_lifecycle_state(NavLifecycleEndpoint::kControllerServer, 2U, 100.2);
+  EXPECT_FALSE(tracker.preconditions(100.2, 0.75, 0.25, 0.02, 0.02).nav_idle);
+  EXPECT_FALSE(tracker.nav_runtime_inactive(100.2, 0.75));
+
+  // A disappeared graph is not a terminal action acknowledgement. It cannot
+  // erase the conflicting active-goal evidence and unlock the lifecycle path.
+  tracker.observe_nav_graph_ready(false, 100.3);
+  EXPECT_FALSE(tracker.preconditions(100.3, 0.75, 0.25, 0.02, 0.02).nav_idle);
+  tracker.observe_nav_activity(false, 100.4);
+  EXPECT_TRUE(tracker.preconditions(100.4, 0.75, 0.25, 0.02, 0.02).nav_idle);
+  EXPECT_TRUE(tracker.nav_runtime_inactive(100.4, 0.75));
+}
+
+TEST(FloorTransitionEvidenceTracker, MissingOrNonStoppedLifecycleResponsesNeverProveInactive)
+{
+  for (const auto endpoint : {
+      NavLifecycleEndpoint::kBtNavigator, NavLifecycleEndpoint::kControllerServer})
+  {
+    FloorTransitionEvidenceTracker tracker;
+    tracker.begin(target(), 100.0);
+    // Waiting arbitrarily long for missing discovery/response is not proof.
+    EXPECT_FALSE(tracker.preconditions(200.0, 0.75, 0.25, 0.02, 0.02).nav_idle);
+    tracker.observe_nav_lifecycle_state(endpoint, 2U, 200.0);
+    EXPECT_FALSE(tracker.nav_runtime_inactive(200.0, 0.75));
+
+    tracker.observe_nav_lifecycle_state(NavLifecycleEndpoint::kBtNavigator, 1U, 200.0);
+    tracker.observe_nav_lifecycle_state(NavLifecycleEndpoint::kControllerServer, 2U, 200.0);
+    ASSERT_TRUE(tracker.nav_runtime_inactive(200.0, 0.75));
+    // Unknown/timeout, active, finalized and transitional states all revoke
+    // the endpoint's previous stopped proof immediately.
+    for (const std::uint8_t state : {0U, 3U, 4U, 10U, 11U, 12U, 13U, 14U, 15U, 99U}) {
+      tracker.observe_nav_lifecycle_state(endpoint, state, 200.1);
+      EXPECT_FALSE(tracker.preconditions(200.1, 0.75, 0.25, 0.02, 0.02).nav_idle)
+        << "state=" << static_cast<unsigned>(state);
+      tracker.observe_nav_lifecycle_state(endpoint, 2U, 200.2);
+      EXPECT_TRUE(tracker.nav_runtime_inactive(200.2, 0.75));
+    }
+  }
+}
+
+TEST(FloorTransitionEvidenceTracker, LifecycleProofRejectsInvalidOrFutureTimestamps)
+{
+  for (const double received : {
+      -1.0, 101.0, std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity()})
+  {
+    for (const auto endpoint : {
+        NavLifecycleEndpoint::kBtNavigator, NavLifecycleEndpoint::kControllerServer})
+    {
+      FloorTransitionEvidenceTracker tracker;
+      tracker.begin(target(), 100.0);
+      tracker.observe_nav_lifecycle_state(NavLifecycleEndpoint::kBtNavigator, 2U, 100.0);
+      tracker.observe_nav_lifecycle_state(NavLifecycleEndpoint::kControllerServer, 2U, 100.0);
+      tracker.observe_nav_lifecycle_state(endpoint, 2U, received);
+      EXPECT_FALSE(tracker.nav_runtime_inactive(100.1, 0.75));
+    }
+  }
+  FloorTransitionEvidenceTracker tracker;
+  tracker.begin(target(), 100.0);
+  tracker.observe_nav_lifecycle_state(NavLifecycleEndpoint::kBtNavigator, 2U, 100.0);
+  tracker.observe_nav_lifecycle_state(NavLifecycleEndpoint::kControllerServer, 2U, 100.0);
+  EXPECT_FALSE(tracker.nav_runtime_inactive(std::numeric_limits<double>::quiet_NaN(), 0.75));
+  EXPECT_FALSE(tracker.nav_runtime_inactive(100.1, std::numeric_limits<double>::quiet_NaN()));
+  EXPECT_FALSE(tracker.nav_runtime_inactive(100.1, -0.1));
+}
+
+TEST(FloorTransitionEvidenceTracker, LifecycleProbeIsNotMandatoryForLiveActionIdleProof)
+{
+  FloorTransitionEvidenceTracker tracker;
+  tracker.begin(target(), 100.0);
+  tracker.observe_nav_graph_ready(true, 99.0);
+  tracker.observe_nav_activity(false, 100.1);
+  tracker.observe_nav_lifecycle_state(NavLifecycleEndpoint::kBtNavigator, 3U, 100.1);
+  tracker.observe_nav_lifecycle_state(NavLifecycleEndpoint::kControllerServer, 0U, 100.1);
+  // Active lifecycle does not mean an action goal is active. Preserve the
+  // original event-driven action-idle proof without selecting a cold handoff.
+  EXPECT_TRUE(tracker.preconditions(100.1, 0.75, 0.25, 0.02, 0.02).nav_idle);
+  EXPECT_FALSE(tracker.nav_runtime_inactive(100.1, 0.75));
 }
 
 TEST(FloorTransitionEvidenceTracker, ProvesPauseHandoffOnlyWhenFloorLeaseIsExclusive)

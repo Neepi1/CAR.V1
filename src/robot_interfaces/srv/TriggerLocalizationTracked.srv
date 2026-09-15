@@ -1,0 +1,5 @@
+# Additive API. Existing TriggerLocalization clients remain wire-compatible.
+string request_id
+string reason
+---
+robot_interfaces/LocalizationTriggerStatus status

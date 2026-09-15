@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 import os
+import shlex
+import sys
 from pathlib import Path
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction, RegisterEventHandler
+from launch.event_handlers import OnProcessStart, OnProcessIO, OnProcessExit
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import ComposableNodeContainer, Node
 from launch_ros.descriptions import ComposableNode
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from isaac_startup_state import IsaacStartupState
 
 
 def cpu_affinity_prefix(service_name):
@@ -18,6 +24,15 @@ def cpu_affinity_prefix(service_name):
     cpuset = os.environ.get(f"NJRH_CPUSET_{key}", "")
     if not cpuset:
         return None
+    session = os.environ.get("NJRH_STARTUP_CPU_SESSION", "")
+    if (session and os.environ.get("NJRH_NAVIGATION_CPU_PROFILE") == "navigation_5cpu"
+            and key in ("NAV2_MAP_SERVER", "NAV2_LIFECYCLE_MANAGER", "OCCUPANCY_GRID_LOCALIZER")):
+        overlay = Path(os.environ.get("NJRH_OVERLAY_ROOT", Path(__file__).resolve().parents[1]))
+        return shlex.join([
+            "python3", (overlay / "scripts/startup_cpu_affinity.py").as_posix(),
+            "exec", "--session", session, "--steady-cpus", cpuset,
+            "--role", key.lower(), "--",
+        ])
     return f"taskset -c {cpuset}"
 
 
@@ -100,10 +115,36 @@ def generate_launch_description():
         composable_node_descriptions=[occupancy_grid_localizer],
         output="screen",
         prefix=cpu_affinity_prefix("occupancy_grid_localizer"),
-        arguments=["--ros-args", "--log-level", log_level],
+        # The pinned Nitros completion marker is INFO on this logger only.
+        arguments=["--ros-args", "--log-level", log_level,
+                   "--log-level", "occupancy_grid_localizer:=info"],
         respawn=True,
         respawn_delay=0.5,
     )
+
+    def register_startup_evidence(context):
+        evidence = IsaacStartupState(
+            os.environ.get("NJRH_ISAAC_STARTUP_STATE_FILE", ""),
+            map_yaml.perform(context), localizer_map_yaml.perform(context))
+
+        def started(event, _context):
+            evidence.started(event.pid)
+
+        def exited(event, _context):
+            evidence.exited(event.pid)
+
+        def stdout(event):
+            evidence.output(event.pid, "stdout", event.text)
+
+        def stderr(event):
+            evidence.output(event.pid, "stderr", event.text)
+
+        return [
+            RegisterEventHandler(OnProcessStart(target_action=localizer_container, on_start=started)),
+            RegisterEventHandler(OnProcessIO(target_action=localizer_container,
+                                           on_stdout=stdout, on_stderr=stderr)),
+            RegisterEventHandler(OnProcessExit(target_action=localizer_container, on_exit=exited)),
+        ]
 
     return LaunchDescription([
         DeclareLaunchArgument("map_yaml", default_value=str(map_yaml_default)),
@@ -115,6 +156,7 @@ def generate_launch_description():
         DeclareLaunchArgument("map_lifecycle_manager_enabled", default_value="true"),
         DeclareLaunchArgument("map_frame", default_value="map"),
         DeclareLaunchArgument("log_level", default_value="info"),
+        OpaqueFunction(function=register_startup_evidence),
         map_server,
         lifecycle_manager,
         localizer_container,

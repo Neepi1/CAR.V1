@@ -53,6 +53,29 @@ translate forward, reverse, or laterally to a pose from which the turn and
 onward route are both clear; it then turns and proceeds. It does not erase the
 blocking cell or retry an unsafe spin.
 
+## Cabin panel speed isolation
+
+The `cabin_panel_approach` request (target role `cabin_panel`) selects
+`navigate_elevator_cabin_panel.xml` and `ElevatorCabinPanelFollowPath`. This is
+another instance of the existing controller, not another control algorithm.
+Its lateral cap is **0.20 m/s**; all other parameters exactly match
+`ElevatorCabinEntryDirectFollowPath`, including 0.40 m/s forward/reverse,
+0.50 rad/s yaw, 0.06 m / 0.05 rad arrival tolerances and the existing obstacle
+policy. The unchanged direct planner still owns the path.
+
+Entry, return-center and egress keep the existing direct controller and
+0.40 m/s lateral cap. Ordinary navigation and docking are not changed.
+Controller-session BEGIN/END and the selected BT use the same panel-specific
+ID. The panel tree must be installed beside the configured
+`elevator_cabin_entry_direct_behavior_tree`, including when a custom BT
+directory is configured. No new readiness check or arm call is introduced.
+
+The cap is not a constant commanded speed: acceleration, braking and near-goal
+convergence still apply. Targeted policy/configuration tests verify selection
+and isolation. After a separately authorized full-chain restart, a supervised
+elevator test is still needed to verify the panel segment's actual speed and
+arrival; no robot movement is part of the source/deployment verification.
+
 ## Motion and safety contract
 
 The scoped planner accepts only a finite start/goal pair within 2.5 m. Door and

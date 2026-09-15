@@ -17,6 +17,30 @@ def _yaml_block(text: str, key: str) -> str:
     return "\n".join(block)
 
 
+def test_only_cabin_panel_lateral_speed_is_reduced():
+    nav = (ROOT / "src/robot_nav_config/config/nav2.yaml").read_text(encoding="utf-8")
+    direct = _yaml_block(nav, "ElevatorCabinEntryDirectFollowPath")
+    panel = _yaml_block(nav, "ElevatorCabinPanelFollowPath")
+    assert panel.replace("ElevatorCabinPanelFollowPath", "ElevatorCabinEntryDirectFollowPath").replace(
+        "lateral_max_speed_mps: 0.20", "lateral_max_speed_mps: 0.40"
+    ) == direct
+    assert "lateral_max_speed_mps: 0.20" in panel
+    assert "lateral_max_speed_mps: 0.40" in direct
+    trees = ROOT / "src/robot_nav_config/behavior_trees"
+    direct_tree = (trees / "navigate_elevator_cabin_entry_direct.xml").read_text()
+    panel_tree = (trees / "navigate_elevator_cabin_panel.xml").read_text()
+    assert panel_tree.replace("navigate_elevator_cabin_panel", "navigate_elevator_cabin_entry_direct").replace(
+        "ElevatorCabinPanelFollowPath", "ElevatorCabinEntryDirectFollowPath"
+    ) == direct_tree
+    runtime = (ROOT / "src/robot_api_server/src/features/elevator/execution/elevator_ros_runtime_port.cpp").read_text(
+        encoding="utf-8"
+    )
+    clients = runtime[runtime.index("for (const auto * controller_id : {") :]
+    clients = clients[:clients.index("nav_client_ =")]
+    assert '"ElevatorCabinPanelFollowPath"' in clients
+    assert "goal.behavior_tree = elevator_cabin_behavior_tree_for_role(" in runtime
+
+
 def test_elevator_scoped_plugins_are_transaction_selected_only():
     source_nav = (
         ROOT / "src" / "robot_nav_config" / "config" / "nav2.yaml"
@@ -41,7 +65,7 @@ def test_elevator_scoped_plugins_are_transaction_selected_only():
         '"ElevatorFollowPath", "ElevatorHallFollowPath", '
         '"ElevatorReverseEntryStagingFollowPath", '
         '"ElevatorReverseDockingFollowPath", '
-        '"ElevatorCabinEntryDirectFollowPath"]'
+        '"ElevatorCabinEntryDirectFollowPath", "ElevatorCabinPanelFollowPath"]'
     ) in source_nav
     assert 'plugin: "robot_nav_config::ElevatorScopedPlanner"' in source_nav
     assert 'plugin: "robot_nav_config::ElevatorScopedController"' in source_nav
@@ -212,6 +236,7 @@ def test_runtime_adapter_owns_the_scoped_behavior_tree_selection():
         / "src"
         / "robot_api_server"
         / "src"
+        / "features" / "elevator" / "execution"
         / "elevator_ros_runtime_port.cpp"
     ).read_text(encoding="utf-8")
     assert "resolve_elevator_navigation_request" in runtime
@@ -262,17 +287,21 @@ def test_runtime_adapter_owns_the_scoped_behavior_tree_selection():
             'navigate_elevator_reverse_docking.xml"'
         ) in text
 
-    node = (
+    module = (
         ROOT
         / "src"
         / "robot_api_server"
         / "src"
-        / "robot_api_server_node.cpp"
+        / "features" / "elevator" / "elevator_module.cpp"
     ).read_text(encoding="utf-8")
-    assert "options.current_map_pose_probe" in node
-    assert "pose.age_sec > robot_pose_freshness_sec_" in node
-    assert "return ElevatorMapPose{" in node
-    assert "pose.x, pose.y, pose.yaw, pose.stamp_sec, pose.age_sec" in node
+    feature = (
+        ROOT / "src" / "robot_api_server" / "src" / "features" / "elevator"
+        / "elevator_feature_module.cpp"
+    ).read_text(encoding="utf-8")
+    assert "options.current_map_pose_probe = ports_.current_map_pose_probe" in module
+    assert "pose.age_sec > dependencies_.robot_pose_freshness_sec" in feature
+    assert "return ElevatorMapPose{" in feature
+    assert "pose.x, pose.y, pose.yaw, pose.stamp_sec, pose.age_sec" in " ".join(feature.split())
 
 
 def test_scoped_limits_preserve_the_elevator_motion_envelope_only():
@@ -283,10 +312,11 @@ def test_scoped_limits_preserve_the_elevator_motion_envelope_only():
     assert "      max_distance_m: 2.5" in scoped
     assert "      goal_xy_tolerance_m: 0.06" in scoped
     assert "      goal_yaw_tolerance_rad: 0.05" in scoped
-    assert scoped.count("      yaw_max_speed_radps: 0.50") == 5
+    assert scoped.count("      yaw_max_speed_radps: 0.50") == 6
     assert scoped.count("      lateral_max_speed_mps: 0.40") == 5
-    assert scoped.count("      forward_max_speed_mps: 0.40") == 5
-    assert scoped.count("      reverse_max_speed_mps: 0.40") == 5
+    assert scoped.count("      lateral_max_speed_mps: 0.20") == 1
+    assert scoped.count("      forward_max_speed_mps: 0.40") == 6
+    assert scoped.count("      reverse_max_speed_mps: 0.40") == 6
     assert "      blocked_timeout_sec: 3.0" in scoped
     assert "      route_revision_enabled: true" in scoped
     assert "      route_revision_interval_sec: 0.5" in scoped
@@ -365,7 +395,7 @@ def test_scoped_progress_counts_fine_motion_without_weakening_ordinary_navigatio
     assert source_nav.count(
         "      progress_state_topic: "
         "/ranger_mini3/nav_elevator_scoped_progress_state"
-    ) == 5
+    ) == 6
 
 
 def test_scoped_clearance_uses_filled_footprint_without_mutating_inflation():
@@ -565,6 +595,7 @@ def test_all_cabin_transit_intents_use_one_unchecked_direct_nav2_chain():
         / "src"
         / "robot_api_server"
         / "src"
+        / "features" / "elevator" / "execution"
         / "elevator_ros_runtime_port.cpp"
     ).read_text(encoding="utf-8")
     safety_runtime = (
@@ -575,6 +606,7 @@ def test_all_cabin_transit_intents_use_one_unchecked_direct_nav2_chain():
         / "src"
         / "robot_api_server"
         / "src"
+        / "features" / "elevator" / "execution"
         / "elevator_runtime_policy.cpp"
     ).read_text(encoding="utf-8")
     direct_bt = (

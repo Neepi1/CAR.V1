@@ -4,7 +4,8 @@ This directory is one complete API-facing mapping module, split internally by
 lifecycle responsibility:
 
 - `mapping_feature_module` is the aggregate owner of `MappingModule` and its
-  floor/maps/elevator/navigation/teleop handoff ports. It preserves the same
+  floor/maps/navigation/teleop handoff ports (the unused elevator slot remains
+  ABI-compatible). It preserves the same
   cancellation, zero-command and runtime-context effects while removing that
   wiring from the API root.
 - `mapping_module` is the deep public boundary. It owns mapping HTTP dispatch,
@@ -24,6 +25,14 @@ lifecycle responsibility:
   temporary LiDAR RPS/XPS state.
 - `runtime/mapping_start_job` owns the thread-safe public state of the one active
   asynchronous mapping-start transaction.
+- `runtime/mapping_save_job` owns an explicitly requested asynchronous save,
+  frozen-grid lifetime, idempotent request ID, durable result and shutdown status.
+  See `docs/mapping_save_async.md` at the workspace root for the App protocol.
+
+Mapping no longer acquires the elevator test fence. Asset mutation remains
+serialized, but the asset mutex is released before process shutdown. Start,
+save and stop are serialized only inside mapping to prevent an old save from
+stopping a new session. Status queries do not join workers or take this mutex.
 
 The aggregate supplies only explicit cross-domain ports. The module
 retains the established commercial sequence: cancel navigation, stop navigation

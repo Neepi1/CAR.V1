@@ -1,17 +1,22 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <future>
+#include <iomanip>
 #include <limits>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
+#include <unistd.h>
 
 #include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
@@ -21,8 +26,10 @@
 #include "robot_global_localization/post_reload_readiness_gate.hpp"
 #include "robot_global_localization/ros_component_manager_port.hpp"
 #include "robot_interfaces/msg/localizer_asset_state.hpp"
+#include "robot_interfaces/msg/localization_trigger_status.hpp"
 #include "robot_interfaces/srv/apply_floor_assets.hpp"
 #include "robot_interfaces/srv/trigger_localization.hpp"
+#include "robot_interfaces/srv/trigger_localization_tracked.hpp"
 #include "std_msgs/msg/string.hpp"
 #include "std_srvs/srv/empty.hpp"
 #include "std_srvs/srv/trigger.hpp"
@@ -150,6 +157,14 @@ public:
       get_parameter("pose_topic").as_string(), rclcpp::QoS(10));
     health_pub_ = create_publisher<std_msgs::msg::String>(
       get_parameter("health_topic").as_string(), rclcpp::QoS(10));
+    flatscan_input_status_pub_ = create_publisher<std_msgs::msg::String>(
+      "/global_localization/flatscan_input_status", rclcpp::QoS(1).reliable());
+    {
+      std::ifstream boot_file("/proc/sys/kernel/random/boot_id");
+      std::getline(boot_file, input_status_boot_id_);
+      input_status_generation_ = std::to_string(getpid()) + "-" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    }
     auto asset_state_qos = rclcpp::QoS(rclcpp::KeepLast(1));
     asset_state_qos.reliable();
     asset_state_qos.transient_local();
@@ -218,6 +233,15 @@ public:
       std::placeholders::_2),
       rmw_qos_profile_services_default,
       callback_group_);
+    trigger_status_pub_ = create_publisher<robot_interfaces::msg::LocalizationTriggerStatus>(
+      "/global_localization/trigger_status", rclcpp::QoS(128).reliable().transient_local());
+    tracked_trigger_srv_ = create_service<robot_interfaces::srv::TriggerLocalizationTracked>(
+      "/global_localization/trigger/tracked",
+      std::bind(&GlobalLocalizationNode::on_tracked_trigger, this, std::placeholders::_1,
+      std::placeholders::_2), rmw_qos_profile_services_default, callback_group_);
+    trigger_reconcile_timer_ = create_wall_timer(
+      std::chrono::seconds(1), std::bind(&GlobalLocalizationNode::reconcile_triggers, this),
+      callback_group_);
     apply_floor_srv_ = create_service<robot_interfaces::srv::ApplyFloorAssets>(
       "/global_localization/apply_floor_assets",
       std::bind(&GlobalLocalizationNode::on_apply_floor, this, std::placeholders::_1,
@@ -254,6 +278,7 @@ private:
     bool available{false};
     std::uint64_t seq{0U};
     double received_sec{0.0};
+    double received_monotonic_sec{0.0};
     double header_stamp_sec{0.0};
     double fov_deg{0.0};
     std::size_t point_count{0U};
@@ -290,18 +315,226 @@ private:
     std::string raw;
   };
 
+  using TriggerStatus = robot_interfaces::msg::LocalizationTriggerStatus;
+  struct TriggerAttempt
+  {
+    TriggerStatus status;
+    std::string reason;
+    bool arm_attempted{false};
+    bool arm_confirmed{false};
+    bool dispatch_attempted{false};
+    bool initial_captured{false};
+    BridgeStatusSnapshot initial;
+    double started_sec{0.0};
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture arm_future;
+    rclcpp::Client<std_srvs::srv::Empty>::SharedFuture dispatch_future;
+  };
+
+  bool unresolved_trigger_exists()
+  {
+    std::lock_guard<std::mutex> lock(trigger_attempts_mutex_);
+    for (const auto & entry : trigger_attempts_) {
+      if (entry.second.status.state == TriggerStatus::UNKNOWN) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool attempt_identity_matches(const TriggerAttempt & attempt)
+  {
+    std::lock_guard<std::mutex> lock(asset_state_mutex_);
+    return attempt.status.localizer_generation == last_asset_state_.localizer_generation &&
+           attempt.status.map_id == last_asset_state_.active_map_id &&
+           attempt.status.building_id == last_asset_state_.active_building_id &&
+           attempt.status.floor_id == last_asset_state_.active_floor_id &&
+           attempt.status.asset_epoch == last_asset_state_.active_asset_epoch &&
+           attempt.status.asset_digest == last_asset_state_.active_asset_digest;
+  }
+
+  bool reconcile_trigger(TriggerAttempt & attempt)
+  {
+    if (attempt.arm_future.valid() &&
+      attempt.arm_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+    {
+      try {
+        const bool arm_confirmed = attempt.arm_future.get()->success;
+        if (!attempt.dispatch_attempted) {
+          attempt.arm_confirmed = arm_confirmed;
+          attempt.status.state = TriggerStatus::FAILED;
+          attempt.status.outcome_known = true;
+          attempt.status.code = arm_confirmed ?
+            "LOCALIZATION_NOT_DISPATCHED" : "LOCALIZATION_ARM_REJECTED";
+          return true;
+        }
+      } catch (const std::exception &) {
+        return false;
+      }
+    }
+    if (!attempt.initial_captured || !attempt_identity_matches(attempt)) {
+      return false;
+    }
+    if (!attempt.dispatch_future.valid() ||
+      attempt.dispatch_future.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+    {
+      return false;
+    }
+    try {
+      (void)attempt.dispatch_future.get();
+    } catch (const std::exception &) {
+      return false;
+    }
+    const auto latest = bridge_status_snapshot();
+    if (!latest.available || latest.received_sec < attempt.started_sec ||
+      now().seconds() - latest.received_sec > 1.0 ||
+      latest.last_explicit_relocalization_sequence !=
+      attempt.initial.last_explicit_relocalization_sequence + 1U ||
+      latest.last_explicit_relocalization_source != "isaac_triggered" ||
+      !map_to_odom_ready(latest) || latest.correction_active ||
+      !bridge_explicit_relocalization_target_settled(latest))
+    {
+      return false;
+    }
+    attempt.status.state = TriggerStatus::SUCCEEDED;
+    attempt.status.outcome_known = true;
+    attempt.status.code = "LOCALIZATION_APPLIED";
+    attempt.status.accepted_explicit_sequence = latest.last_explicit_relocalization_sequence;
+    return true;
+  }
+
+  void reconcile_triggers()
+  {
+    // No polling thread, service dispatch or re-arming: inspect already received evidence only.
+    std::unique_lock<std::mutex> operation(localizer_operation_mutex_, std::try_to_lock);
+    if (!operation.owns_lock()) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(trigger_attempts_mutex_);
+    for (auto & entry : trigger_attempts_) {
+      auto & attempt = entry.second;
+      if (attempt.status.state != TriggerStatus::UNKNOWN) {
+        continue;
+      }
+      if (reconcile_trigger(attempt)) {
+        attempt.status.detail = attempt.status.state == TriggerStatus::SUCCEEDED ?
+          "late completion proven for the same map generation and explicit sequence" :
+          (attempt.arm_confirmed ?
+          "late arm response confirmed; dispatch_state=not_dispatched bridge_force_accept_armed=true" :
+          "late arm response confirms rejection without an Isaac dispatch");
+        last_trigger_status_ = attempt.status.code + ": " + attempt.status.detail;
+        RCLCPP_INFO(get_logger(), "trigger outcome reconciled request_id=%s sequence=%llu",
+          attempt.status.request_id.c_str(),
+          static_cast<unsigned long long>(attempt.status.accepted_explicit_sequence));
+      }
+      trigger_status_pub_->publish(attempt.status);
+    }
+  }
+
+  void on_tracked_trigger(
+    const std::shared_ptr<robot_interfaces::srv::TriggerLocalizationTracked::Request> request,
+    std::shared_ptr<robot_interfaces::srv::TriggerLocalizationTracked::Response> response)
+  {
+    TriggerAttempt attempt;
+    attempt.status.request_id = request->request_id;
+    attempt.reason = request->reason;
+    if (request->request_id.empty() || request->request_id.size() > 160U) {
+      attempt.status.state = TriggerStatus::FAILED;
+      attempt.status.outcome_known = true;
+      attempt.status.code = "LOCALIZATION_REQUEST_ID_INVALID";
+      response->status = attempt.status;
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(trigger_attempts_mutex_);
+      const auto existing = trigger_attempts_.find(request->request_id);
+      if (existing != trigger_attempts_.end()) {
+        response->status = existing->second.status;
+        return;
+      }
+      // Preserve every unresolved request; bound only terminal history.
+      if (trigger_attempts_.size() >= 128U) {
+        const auto terminal = std::find_if(trigger_attempts_.begin(), trigger_attempts_.end(),
+          [](const auto & entry) {return entry.second.status.outcome_known;});
+        if (terminal != trigger_attempts_.end()) {
+          trigger_attempts_.erase(terminal);
+        } else {
+          attempt.status.state = TriggerStatus::FAILED;
+          attempt.status.outcome_known = true;
+          attempt.status.code = "LOCALIZATION_HISTORY_FULL";
+          response->status = attempt.status;
+          return;
+        }
+      }
+      attempt.status.state = TriggerStatus::RUNNING;
+      trigger_attempts_.emplace(request->request_id, attempt);
+    }
+    auto legacy_request = std::make_shared<robot_interfaces::srv::TriggerLocalization::Request>();
+    auto legacy_response = std::make_shared<robot_interfaces::srv::TriggerLocalization::Response>();
+    legacy_request->reason = request->reason;
+    // Keep ownership through publication of the outcome, including UNKNOWN.
+    std::unique_lock<std::mutex> operation(localizer_operation_mutex_, std::try_to_lock);
+    try {
+      if (!operation.owns_lock() || unresolved_trigger_exists()) {
+        legacy_response->message = "failure_code=LOCALIZER_OPERATION_BUSY dispatch_state=not_dispatched";
+      } else {
+        execute_trigger(legacy_request, legacy_response, &attempt);
+      }
+    } catch (const std::exception & exception) {
+      legacy_response->accepted = false;
+      legacy_response->message = std::string("failure_code=LOCALIZATION_EXCEPTION ") + exception.what();
+    }
+    attempt.status.detail = legacy_response->message;
+    attempt.status.state = TriggerStatus::UNKNOWN;
+    attempt.status.code = "LOCALIZATION_OUTCOME_UNKNOWN";
+    if (!attempt.arm_attempted || (attempt.arm_confirmed && !attempt.dispatch_attempted)) {
+      // A confirmed preparation with no Isaac call has no computation in flight.
+      // This is NOT a claim that the bridge arm was cancelled. Unknown arm replies
+      // and attempted dispatches retain the existing UNKNOWN reconciliation.
+      attempt.status.state = TriggerStatus::FAILED;
+      attempt.status.outcome_known = true;
+      attempt.status.code = "LOCALIZATION_NOT_DISPATCHED";
+    } else {
+      // A failed response is not proof that a timed-out arm or dispatch has stopped.
+      (void)reconcile_trigger(attempt);
+    }
+    {
+      std::lock_guard<std::mutex> lock(trigger_attempts_mutex_);
+      trigger_attempts_[request->request_id] = attempt;
+    }
+    trigger_status_pub_->publish(attempt.status);
+    RCLCPP_INFO(get_logger(), "trigger outcome request_id=%s state=%u known=%s code=%s detail=%s",
+      request->request_id.c_str(), static_cast<unsigned>(attempt.status.state),
+      bool_string(attempt.status.outcome_known).c_str(), attempt.status.code.c_str(),
+      attempt.status.detail.c_str());
+    response->status = attempt.status;
+  }
+
   void on_trigger(
     const std::shared_ptr<robot_interfaces::srv::TriggerLocalization::Request> request,
     std::shared_ptr<robot_interfaces::srv::TriggerLocalization::Response> response)
   {
-    std::unique_lock<std::mutex> localizer_operation_lock(
-      localizer_operation_mutex_, std::try_to_lock);
-    if (!localizer_operation_lock.owns_lock()) {
+    std::unique_lock<std::mutex> operation(localizer_operation_mutex_, std::try_to_lock);
+    if (!operation.owns_lock() || unresolved_trigger_exists()) {
       response->accepted = false;
-      response->message =
-        "failure_code=LOCALIZER_OPERATION_BUSY dispatch_state=not_dispatched "
-        "floor asset reload or another trigger is active";
+      response->message = "failure_code=LOCALIZER_OPERATION_BUSY dispatch_state=not_dispatched";
       return;
+    }
+    execute_trigger(request, response, nullptr);
+  }
+
+  void execute_trigger(
+    const std::shared_ptr<robot_interfaces::srv::TriggerLocalization::Request> request,
+    std::shared_ptr<robot_interfaces::srv::TriggerLocalization::Response> response,
+    TriggerAttempt * attempt)
+  {
+    if (attempt != nullptr) {
+      std::lock_guard<std::mutex> lock(asset_state_mutex_);
+      attempt->status.building_id = last_asset_state_.active_building_id;
+      attempt->status.floor_id = last_asset_state_.active_floor_id;
+      attempt->status.map_id = last_asset_state_.active_map_id;
+      attempt->status.asset_epoch = last_asset_state_.active_asset_epoch;
+      attempt->status.asset_digest = last_asset_state_.active_asset_digest;
+      attempt->status.localizer_generation = last_asset_state_.localizer_generation;
     }
 
     std::string post_reload_readiness_detail;
@@ -341,7 +574,7 @@ private:
     const auto pre_arm_input = localizer_input_snapshot();
     std::string force_accept_detail;
     const bool force_accept_armed =
-      arm_bridge_force_accept(request->reason, service_call_timeout_sec, force_accept_detail);
+      arm_bridge_force_accept(request->reason, service_call_timeout_sec, force_accept_detail, attempt);
     const double force_accept_ready_sec = now().seconds();
 
     if (!force_accept_armed) {
@@ -355,17 +588,34 @@ private:
     if (!wait_for_localizer_input_after_arm(
         pre_arm_input, force_accept_ready_sec, post_arm_input_detail))
     {
-      input_detail += "; " + post_arm_input_detail + "; continuing with the latest fresh input";
-    } else {
-      input_detail += "; " + post_arm_input_detail;
+      response->accepted = false;
+      response->message =
+        "failure_code=LOCALIZER_INPUT_NOT_FRESH dispatch_state=not_dispatched "
+        "phase=post_arm bridge_force_accept_armed=true; " + post_arm_input_detail;
+      last_trigger_status_ = response->message;
+      return;
     }
+    input_detail += "; " + post_arm_input_detail;
 
     const auto trigger_started_sec = now().seconds();
     const auto initial_result = localization_result_snapshot();
     const auto initial_bridge = bridge_status_snapshot();
+    if (attempt != nullptr) {
+      attempt->initial = initial_bridge;
+      attempt->initial_captured = true;
+      attempt->started_sec = trigger_started_sec;
+      attempt->status.baseline_explicit_sequence = initial_bridge.last_explicit_relocalization_sequence;
+    }
 
     auto empty_request = std::make_shared<std_srvs::srv::Empty::Request>();
-    auto future = grid_search_trigger_client_->async_send_request(empty_request);
+    if (attempt != nullptr) {
+      // Set before sending: an exception cannot prove that no request escaped.
+      attempt->dispatch_attempted = true;
+    }
+    auto future = grid_search_trigger_client_->async_send_request(empty_request).future.share();
+    if (attempt != nullptr) {
+      attempt->dispatch_future = future;
+    }
     last_trigger_status_ = "grid_search_trigger_pending: " + request->reason;
 
     std::string direct_service_detail;
@@ -472,7 +722,7 @@ private:
 
     std::unique_lock<std::mutex> localizer_operation_lock(
       localizer_operation_mutex_, std::try_to_lock);
-    if (!localizer_operation_lock.owns_lock()) {
+    if (!localizer_operation_lock.owns_lock() || unresolved_trigger_exists()) {
       response->success = false;
       response->code = "LOCALIZER_OPERATION_BUSY";
       response->message =
@@ -626,7 +876,7 @@ private:
 
     std::unique_lock<std::mutex> localizer_operation_lock(
       localizer_operation_mutex_, std::try_to_lock);
-    if (!localizer_operation_lock.owns_lock()) {
+    if (!localizer_operation_lock.owns_lock() || unresolved_trigger_exists()) {
       return;
     }
 
@@ -706,6 +956,7 @@ private:
 
   void on_timer()
   {
+    publish_flatscan_input_status();
     const bool trigger_ready = grid_search_trigger_client_->service_is_ready();
     const std::string active_floor_id = active_floor_id_snapshot();
     if (mock_mode_) {
@@ -727,6 +978,28 @@ private:
     health.data = status + " floor=" + active_floor_id +
       " trigger_status=" + last_trigger_status_;
     health_pub_->publish(health);
+  }
+
+  void publish_flatscan_input_status()
+  {
+    const auto input = localizer_input_snapshot();
+    const double emitted = steady_now_seconds();
+    // Reuse the existing receive callback; never create a second FlatScan subscription.
+    std::ostringstream out;
+    out << std::setprecision(17)
+        << "{\"schema\":\"njrh.flatscan_input.v1\",\"boot_id\":\"" << input_status_boot_id_
+        << "\",\"generation\":\"" << input_status_generation_
+        << "\",\"sequence\":" << ++input_status_sequence_
+        << ",\"input_supported\":" << ((!mock_mode_ && localizer_input_freshness_enabled_ &&
+          localizer_input_topic_ == "/flatscan") ? "true" : "false")
+        << ",\"available\":" << (input.available ? "true" : "false")
+        << ",\"input_sequence\":" << input.seq
+        << ",\"received_monotonic_sec\":" << input.received_monotonic_sec
+        << ",\"emitted_monotonic_sec\":" << emitted
+        << ",\"header_stamp_sec\":" << input.header_stamp_sec << "}";
+    std_msgs::msg::String status;
+    status.data = out.str();
+    flatscan_input_status_pub_->publish(status);
   }
 
   void on_localization_result(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
@@ -808,6 +1081,7 @@ private:
     localizer_input_.available = true;
     localizer_input_.seq++;
     localizer_input_.received_sec = now().seconds();
+    localizer_input_.received_monotonic_sec = steady_now_seconds();
     localizer_input_.header_stamp_sec =
       static_cast<double>(msg->header.stamp.sec) +
       static_cast<double>(msg->header.stamp.nanosec) * 1.0e-9;
@@ -1053,18 +1327,23 @@ private:
     const auto deadline = steady_deadline(timeout_sec);
     std::string subscription_detail;
 
-    while (std::chrono::steady_clock::now() <= deadline) {
+    while (rclcpp::ok() && std::chrono::steady_clock::now() <= deadline) {
       if (ensure_localizer_input_subscription(subscription_detail)) {
         const auto snapshot = localizer_input_snapshot();
         if (snapshot.available) {
-          const double age_sec = now().seconds() - snapshot.received_sec;
+          const double observed_sec = now().seconds();
+          const double age_sec = observed_sec - snapshot.received_sec;
+          const double header_age_sec = observed_sec - snapshot.header_stamp_sec;
           if (
             age_sec >= 0.0 && age_sec <= max_age_sec &&
+            snapshot.header_stamp_sec > 0.0 &&
+            header_age_sec >= 0.0 && header_age_sec <= max_age_sec &&
             snapshot.fov_deg >= localizer_input_min_fov_deg_)
           {
             detail = "localizer input fresh topic=" + localizer_input_topic_ +
                      " type=" + snapshot.topic_type +
                      " age_sec=" + std::to_string(age_sec) +
+                     " header_age_sec=" + std::to_string(header_age_sec) +
                      " fov_deg=" + std::to_string(snapshot.fov_deg) +
                      " points=" + std::to_string(snapshot.point_count);
             return true;
@@ -1086,6 +1365,8 @@ private:
              " fov_deg=" + std::to_string(snapshot.fov_deg) +
              " last_age_sec=" +
              (snapshot.available ? std::to_string(now().seconds() - snapshot.received_sec) : "-1") +
+             " last_header_age_sec=" +
+             (snapshot.available ? std::to_string(now().seconds() - snapshot.header_stamp_sec) : "-1") +
              " subscription_detail=" + subscription_detail;
     RCLCPP_WARN(get_logger(), "%s", detail.c_str());
     return false;
@@ -1111,8 +1392,9 @@ private:
       1, localizer_input_required_consecutive_good_);
     int consecutive_good = 0;
     std::uint64_t last_examined_seq = baseline.seq;
+    double last_good_header_stamp_sec = baseline.header_stamp_sec;
 
-    while (std::chrono::steady_clock::now() <= deadline) {
+    while (rclcpp::ok() && std::chrono::steady_clock::now() <= deadline) {
       if (ensure_localizer_input_subscription(subscription_detail)) {
         const auto snapshot = localizer_input_snapshot();
         if (snapshot.seq == last_examined_seq) {
@@ -1120,20 +1402,27 @@ private:
           continue;
         }
         last_examined_seq = snapshot.seq;
-        const double age_sec = now().seconds() - snapshot.received_sec;
+        const double observed_sec = now().seconds();
+        const double age_sec = observed_sec - snapshot.received_sec;
+        const double header_age_sec = observed_sec - snapshot.header_stamp_sec;
         const bool sample_good =
           snapshot.available &&
           snapshot.seq > baseline.seq &&
           snapshot.received_sec >= armed_sec &&
           snapshot.header_stamp_sec >= min_header_stamp_sec &&
+          snapshot.header_stamp_sec > last_good_header_stamp_sec &&
+          snapshot.header_stamp_sec > 0.0 &&
+          header_age_sec >= 0.0 && header_age_sec <= max_age_sec &&
           snapshot.fov_deg >= localizer_input_min_fov_deg_ &&
           age_sec >= 0.0 && age_sec <= max_age_sec;
         if (sample_good) {
+          last_good_header_stamp_sec = snapshot.header_stamp_sec;
           ++consecutive_good;
           if (consecutive_good >= required_consecutive_good) {
             detail = "post-arm localizer input ready topic=" + localizer_input_topic_ +
                      " seq=" + std::to_string(snapshot.seq) +
                      " age_sec=" + std::to_string(age_sec) +
+                     " header_age_sec=" + std::to_string(header_age_sec) +
                      " fov_deg=" + std::to_string(snapshot.fov_deg) +
                      " points=" + std::to_string(snapshot.point_count) +
                      " consecutive_good=" + std::to_string(consecutive_good);
@@ -1154,6 +1443,8 @@ private:
              " min_header_stamp_sec=" + std::to_string(min_header_stamp_sec) +
              " last_header_stamp_sec=" + std::to_string(snapshot.header_stamp_sec) +
              " last_received_sec=" + std::to_string(snapshot.received_sec) +
+             " last_header_age_sec=" +
+             (snapshot.available ? std::to_string(now().seconds() - snapshot.header_stamp_sec) : "-1") +
              " fov_deg=" + std::to_string(snapshot.fov_deg) +
              " min_fov_deg=" + std::to_string(localizer_input_min_fov_deg_) +
              " consecutive_good=" + std::to_string(consecutive_good) +
@@ -1195,7 +1486,8 @@ private:
   bool arm_bridge_force_accept(
     const std::string & reason,
     const double timeout_sec,
-    std::string & detail)
+    std::string & detail,
+    TriggerAttempt * attempt = nullptr)
   {
     const auto timeout = std::chrono::duration<double>(std::min(timeout_sec, 2.0));
     if (!bridge_force_accept_client_->wait_for_service(timeout)) {
@@ -1205,7 +1497,13 @@ private:
       return false;
     }
     auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
-    auto future = bridge_force_accept_client_->async_send_request(request);
+    if (attempt != nullptr) {
+      attempt->arm_attempted = true;
+    }
+    auto future = bridge_force_accept_client_->async_send_request(request).future.share();
+    if (attempt != nullptr) {
+      attempt->arm_future = future;
+    }
     if (future.wait_for(timeout) != std::future_status::ready) {
       detail =
         "failure_code=BRIDGE_FORCE_ACCEPT_TIMEOUT dispatch_state=not_dispatched "
@@ -1223,6 +1521,9 @@ private:
       }
       detail = "bridge force-accept armed explicit_trigger=true reason=" + reason +
                ": " + response->message;
+      if (attempt != nullptr) {
+        attempt->arm_confirmed = true;
+      }
       return true;
     } catch (const std::exception & exc) {
       detail =
@@ -1285,7 +1586,7 @@ private:
     bool saw_nonfresh_bridge_accept = false;
     bool saw_prearm_result = false;
     bool saw_transient_triggered_stale_reject = false;
-    std::uint64_t last_amcl_observe_only_reject_count = initial.rejected_result_count;
+    std::uint64_t last_diagnostic_reject_count = initial.rejected_result_count;
     std::uint64_t last_transient_triggered_stale_reject_count = initial.rejected_result_count;
     std::uint64_t last_pretrigger_ignored_count =
       initial.force_accept_ignored_pretrigger_result_count;
@@ -1301,7 +1602,6 @@ private:
         {
           if (
             map_to_odom_ready(latest) &&
-            latest.safe_for_goal_start &&
             !latest.correction_active &&
             latest.current_sequence == latest.target_sequence &&
             bridge_explicit_relocalization_target_settled(latest))
@@ -1369,19 +1669,18 @@ private:
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
           }
-          if (bridge_reject_is_expected_amcl_observe_only(latest.last_reject_reason)) {
-            if (latest.rejected_result_count > last_amcl_observe_only_reject_count) {
-              last_amcl_observe_only_reject_count = latest.rejected_result_count;
-              detail = "bridge ignoring AMCL observe-only reject while waiting for fresh "
-                       "triggered localization_result: " + latest.last_reject_reason;
-              RCLCPP_INFO(get_logger(), "%s", detail.c_str());
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            continue;
+          // This counter spans all sources; it is not an outcome for this request.
+          // A later accepted candidate can also clear the diagnostic reason.
+          if (latest.rejected_result_count > last_diagnostic_reject_count) {
+            last_diagnostic_reject_count = latest.rejected_result_count;
+            RCLCPP_INFO(
+              get_logger(),
+              "candidate rejection observed while awaiting explicit sequence after %llu; "
+              "not a trigger terminal: count=%llu reason=%s",
+              static_cast<unsigned long long>(initial.last_explicit_relocalization_sequence),
+              static_cast<unsigned long long>(latest.rejected_result_count),
+              latest.last_reject_reason.c_str());
           }
-          detail = "failure_code=BRIDGE_REJECTED_RESULT dispatch_state=dispatched last_reject_reason=" +
-                   latest.last_reject_reason;
-          return false;
         }
         if (
           !explicit_accept_required &&
@@ -1390,7 +1689,6 @@ private:
         {
           if (
             map_to_odom_ready(latest) &&
-            latest.safe_for_goal_start &&
             !latest.correction_active &&
             latest.current_sequence == latest.target_sequence)
           {
@@ -1451,11 +1749,9 @@ private:
     const BridgeStatusSnapshot & initial,
     const BridgeStatusSnapshot & latest) const
   {
-    return latest.last_explicit_relocalization_sequence >
-           initial.last_explicit_relocalization_sequence ||
-           (
-      latest.accepted_result_count > initial.accepted_result_count &&
-      latest.last_accept_reason == "EXPLICIT_TRIGGERED_RELOCALIZATION");
+    return latest.last_explicit_relocalization_sequence ==
+           initial.last_explicit_relocalization_sequence + 1U &&
+           latest.last_explicit_relocalization_source == "isaac_triggered";
   }
 
   static std::string bool_string(const bool value)
@@ -1486,6 +1782,8 @@ private:
 
   bool map_to_odom_ready(const BridgeStatusSnapshot & latest)
   {
+    // Navigation admission (safe_for_goal_start) is a consumer decision, not
+    // localization completion: a floor transaction commits after this result.
     return latest.available &&
            latest.has_map_to_odom &&
            latest.owner == "robot_localization_bridge" &&
@@ -1535,6 +1833,9 @@ private:
   rclcpp::CallbackGroup::SharedPtr callback_group_;
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr health_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr flatscan_input_status_pub_;
+  std::string input_status_boot_id_, input_status_generation_;
+  std::atomic<std::uint64_t> input_status_sequence_{0U};
   rclcpp::Publisher<robot_interfaces::msg::LocalizerAssetState>::SharedPtr
     asset_state_pub_;
   rclcpp::Client<std_srvs::srv::Empty>::SharedPtr grid_search_trigger_client_;
@@ -1545,6 +1846,11 @@ private:
     localization_result_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr bridge_status_sub_;
   rclcpp::Service<robot_interfaces::srv::TriggerLocalization>::SharedPtr trigger_srv_;
+  rclcpp::Service<robot_interfaces::srv::TriggerLocalizationTracked>::SharedPtr tracked_trigger_srv_;
+  rclcpp::Publisher<TriggerStatus>::SharedPtr trigger_status_pub_;
+  rclcpp::TimerBase::SharedPtr trigger_reconcile_timer_;
+  std::mutex trigger_attempts_mutex_;
+  std::map<std::string, TriggerAttempt> trigger_attempts_;
   rclcpp::Service<robot_interfaces::srv::ApplyFloorAssets>::SharedPtr apply_floor_srv_;
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::TimerBase::SharedPtr runtime_context_bootstrap_timer_;

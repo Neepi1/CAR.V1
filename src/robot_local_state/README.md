@@ -1,6 +1,23 @@
 # robot_local_state
 
+The runtime EKF launcher and its common-service waiter share a single monotonic
+startup deadline (default 30 seconds); the original IMU-output check remains
+before EKF creation. Exact executable/owned-child checks exclude command-line
+lookalikes, and startup failure preserves the original helper log. No fusion,
+sensor or TF policy changes. See [startup repair](../../docs/local_state_startup_budget.md).
+
+The bias filter also exports `imu_gyro_bias_filter_core` for the driver-owned
+IMU host; EKF remains a separate process. In this mode local-state cleanup does
+not reset the filter or stop `/lidar_imu`. See
+[IMU communication/ownership](../../docs/imu_intra_process_pipeline.md).
+
 Local odometry wrapper and the only canonical owner of `odom -> base_link`.
+
+The IMU bias filter reuses unchanged rotation/covariance arithmetic while still
+querying TF for every input requiring a transform. Bias learning, publication
+rates, stamps, and failure behavior are unchanged. See
+[IMU arithmetic reuse](docs/imu_arithmetic_reuse.md) for equivalence tests and
+the separate hardware CPU/accuracy acceptance scope.
 
 Production runtime currently defaults to
 `LOCAL_STATE_MODE=ekf LOCAL_STATE_EKF_PROFILE=wheel_spin_imu`. In that mode the

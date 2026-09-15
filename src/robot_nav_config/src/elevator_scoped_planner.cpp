@@ -241,6 +241,8 @@ nav_msgs::msg::Path ElevatorScopedPlanner::createPlan(
     path.poses = {start, goal};
     path.poses.front().header = path.header;
     path.poses.back().header = path.header;
+    // Match the controller's latest-TF map goal in Nav2's outer goal checker.
+    path.poses.back().header.stamp = builtin_interfaces::msg::Time{};
     RCLCPP_WARN(
       logger_,
       "Elevator entry direct Nav2 path selected: distance=%.3fm clearance=transaction-bypassed",

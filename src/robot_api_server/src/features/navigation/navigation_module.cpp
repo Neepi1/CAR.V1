@@ -592,11 +592,6 @@ public:
     }
     mission_runtime_.join();
 
-    auto motion_admission = elevator_module_.acquire_motion_admission(motion_admission_epoch);
-    if (!motion_admission.admitted()) {
-      return elevator_module_.motion_admission_failure_response(
-        "navigation_goal", motion_admission);
-    }
     if (force_pre_navigation_relocalization) {
       const auto detail =
         "LOCALIZATION_RECOVERY_REQUIRED: force_relocalize is no longer executed inside normal navigation goals; "
@@ -661,7 +656,6 @@ public:
       "queued controlled undock in navigation background job" :
       dock.auto_undock_reason;
     start.started_at = utc_timestamp_iso8601();
-    motion_admission.unlock();
 
     ports_.set_navigation_runtime_state(
       true,
@@ -1357,11 +1351,6 @@ public:
     {
       return *blocked;
     }
-    auto motion_admission = elevator_module_.acquire_motion_admission(motion_admission_epoch);
-    if (!motion_admission.admitted()) {
-      return elevator_module_.motion_admission_failure_response(
-        "navigation_runtime_launch", motion_admission);
-    }
     process_runtime_.terminate_managed_process();
     if (selected_map) {
       try {
@@ -1397,7 +1386,6 @@ public:
     }
     ports_.set_navigation_runtime_state(
       true, "starting", "navigation runtime start accepted", true);
-    motion_admission.unlock();
 
     std::ostringstream response;
     response << "{\"ok\":true,"

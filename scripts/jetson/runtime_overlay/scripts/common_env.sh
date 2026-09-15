@@ -249,7 +249,13 @@ runtime_readiness_probe_output_reports_success() {
     mapping-preflight)
       [[ "${output}" == *"[runtime-overlay] mapping preflight ready:"* ]]
       ;;
-    stamped-scan-tf)
+    scan-handoff)
+      [[ "${output}" == *"[runtime-overlay] scan handoff ready:"* ]]
+      ;;
+    mapping-fastlio-ready)
+      [[ "${output}" == *"[runtime-overlay] mapping FAST-LIO pair and bridge ready:"* ]]
+      ;;
+    stamped-scan-tf|mapping-scan-ready)
       [[ "${output}" == *"[runtime-overlay] original-stamp scan TF ready:"* ]]
       ;;
     transformable-scan)
@@ -309,7 +315,10 @@ runtime_readiness_probe() {
           -v odom_timeout="${9:-0}" \
           'BEGIN {timeout=tf_timeout; if (scan_timeout > timeout) timeout=scan_timeout; if (odom_timeout > timeout) timeout=odom_timeout; printf "%.3f", timeout}')"
         ;;
-      stamped-scan-tf)
+      scan-handoff)
+        requested_timeout="${7:-}"
+        ;;
+      stamped-scan-tf|mapping-scan-ready|mapping-fastlio-ready)
         requested_timeout="${5:-}"
         ;;
       global-costmap)

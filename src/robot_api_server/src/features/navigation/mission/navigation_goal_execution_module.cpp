@@ -1,4 +1,5 @@
 #include "robot_api_server/features/navigation/mission/navigation_goal_execution_module.hpp"
+#include "robot_api_server/features/navigation/runtime/navigation_recovery_wait.hpp"
 
 #include <cmath>
 #include <future>
@@ -666,7 +667,8 @@ NavigationRepositionResult NavigationGoalExecutionModule::run_post_nav2_final_ve
       job.final_verify_retry_goal_sent = true;
       job.detail = "same Nav2 goal resent after final pose verify " + retry_reason;
     });
-  action_runtime_.track_goal(goal_handle, target.id, "", "");
+  action_runtime_.track_goal(goal_handle, target.id, "", "",
+    rclcpp::Time(goal.pose.header.stamp).nanoseconds());
 
   terminal_runtime_.update_reverse_permit_for_goal(
     target,
@@ -678,10 +680,7 @@ NavigationRepositionResult NavigationGoalExecutionModule::run_post_nav2_final_ve
   auto next_handoff_check = result_wait_started;
   auto last_near_goal_progress = result_wait_started;
   std::optional<double> best_near_goal_distance;
-  const auto deadline =
-    std::chrono::steady_clock::now() +
-    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-    std::chrono::duration<double>(config_.goal_result_timeout_sec));
+  NavigationExecutionBudget budget(config_.goal_result_timeout_sec, result_wait_started);
   terminal_runtime_.publish_speed_limit_for_goal(target);
   while (result_future.wait_for(100ms) != std::future_status::ready) {
     terminal_runtime_.publish_speed_limit_for_goal(target);
@@ -704,7 +703,13 @@ NavigationRepositionResult NavigationGoalExecutionModule::run_post_nav2_final_ve
       return result;
     }
     std::string handoff_detail;
-    if (maybe_navigation_near_goal_stalled_handoff(
+    const bool recovery_wait = NavigationRecoveryWait::pauses_execution(
+      action_runtime_.recovery_phase(goal_handle));
+    if (recovery_wait) {
+      best_near_goal_distance.reset();
+      last_near_goal_progress = next_handoff_check = std::chrono::steady_clock::now();
+    }
+    if (!recovery_wait && maybe_navigation_near_goal_stalled_handoff(
         job_id,
         target,
         goal_handle,
@@ -726,7 +731,7 @@ NavigationRepositionResult NavigationGoalExecutionModule::run_post_nav2_final_ve
         handoff_detail;
       return result;
     }
-    if (std::chrono::steady_clock::now() >= deadline) {
+    if (budget.expired(std::chrono::steady_clock::now(), recovery_wait)) {
       std::string action_cancel_detail;
       cancel_active_navigation_goal(action_cancel_detail);
       terminal_runtime_.clear_reverse_permit(
@@ -1166,7 +1171,8 @@ bool NavigationGoalExecutionModule::send_initial_navigation_goal_to_nav2(
     return false;
   }
 
-  action_runtime_.track_goal(goal_handle, pose_id, building_id, floor_id);
+  action_runtime_.track_goal(goal_handle, pose_id, building_id, floor_id,
+    rclcpp::Time(goal.pose.header.stamp).nanoseconds());
   return true;
 }
 

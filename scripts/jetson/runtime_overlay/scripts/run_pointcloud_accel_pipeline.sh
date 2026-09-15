@@ -30,6 +30,9 @@ FLATSCAN_STARTUP_RATE_RETRY_SEC="${NJRH_FLATSCAN_STARTUP_RATE_RETRY_SEC:-1.0}"
 FLATSCAN_STARTUP_RATE_SAMPLE_SEC="${NJRH_FLATSCAN_STARTUP_RATE_SAMPLE_SEC:-4}"
 FLATSCAN_SUPERVISE_PERIOD_SEC="${NJRH_FLATSCAN_SUPERVISE_PERIOD_SEC:-10.0}"
 FLATSCAN_STATUS_FILE="${NJRH_FLATSCAN_HELPER_STATUS_FILE:-${NJRH_RUNTIME_LOG_DIR}/flatscan_helper_status.env}"
+FLATSCAN_MONITOR_FILE="${NJRH_RUNTIME_HEALTH_FILE:-/tmp/njrh_runtime_health.json}"
+FLATSCAN_MONITOR_MAX_AGE_SEC="${NJRH_RUNTIME_HEALTH_MAX_AGE_SEC:-2.0}"
+FLATSCAN_MONITOR_CHECK_BIN="${NJRH_RUNTIME_FLATSCAN_CHECK_BIN:-${PROJECT_ROOT}/install/robot_bringup/lib/robot_bringup/runtime_flatscan_check}"
 
 driver_pid=""
 local_perception_pid=""
@@ -40,6 +43,11 @@ flatscan_helper_graph_miss_count=0
 flatscan_helper_health_state="starting"
 flatscan_helper_healthy_since_epoch=0
 flatscan_helper_restart_cooldown_until_epoch=0
+flatscan_observer_state="starting"
+flatscan_observer_source=""
+flatscan_observer_kind=""
+flatscan_observer_sequence=0
+flatscan_status_directory_ready=false
 
 truthy() {
   case "${1:-}" in
@@ -83,7 +91,14 @@ profile_process_running() {
 }
 
 write_flatscan_helper_status() {
-  mkdir -p "$(dirname "${FLATSCAN_STATUS_FILE}")"
+  if [[ "${flatscan_status_directory_ready}" != true ]]; then
+    mkdir -p "$(dirname "${FLATSCAN_STATUS_FILE}")"
+    flatscan_status_directory_ready=true
+  fi
+  local temporary="${FLATSCAN_STATUS_FILE}.tmp.$$"
+  local updated_at
+  local TZ=UTC
+  printf -v updated_at '%(%Y-%m-%dT%H:%M:%SZ)T' -1
   {
     echo "# Runtime status for the /scan -> /flatscan compatibility helper."
     printf 'FLATSCAN_HELPER_MODE=%q\n' "${flatscan_helper_mode}"
@@ -96,14 +111,18 @@ write_flatscan_helper_status() {
     printf 'FLATSCAN_HELPER_MISSING_CONFIRMATIONS=%q\n' "${FLATSCAN_HELPER_MISSING_CONFIRMATIONS}"
     printf 'FLATSCAN_HELPER_REQUIRED=%q\n' "${FLATSCAN_HELPER_REQUIRED}"
     printf 'FLATSCAN_HELPER_RESTART=%q\n' "${FLATSCAN_HELPER_RESTART}"
-    printf 'FLATSCAN_HELPER_UPDATED_AT=%q\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  } >"${FLATSCAN_STATUS_FILE}"
+    printf 'FLATSCAN_HELPER_OBSERVER_STATE=%q\n' "${flatscan_observer_state}"
+    printf 'FLATSCAN_HELPER_OBSERVER_SOURCE=%q\n' "${flatscan_observer_source}"
+    printf 'FLATSCAN_HELPER_OBSERVER_SEQUENCE=%q\n' "${flatscan_observer_sequence}"
+    printf 'FLATSCAN_HELPER_UPDATED_AT=%q\n' "${updated_at}"
+  } >"${temporary}"
+  mv -f -- "${temporary}" "${FLATSCAN_STATUS_FILE}"
 }
 
 topic_publisher_count() {
   local topic="$1"
   local output
-  output="$(timeout --kill-after=1 "${FLATSCAN_GRAPH_PROBE_TIMEOUT_SEC}" \
+  output="$(run_flatscan_supervision_probe timeout --kill-after=1 "${FLATSCAN_GRAPH_PROBE_TIMEOUT_SEC}" \
     ros2 topic info -v "${topic}" 2>/dev/null || true)"
   awk -F: '/Publisher count/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' <<<"${output}"
 }
@@ -120,11 +139,21 @@ flatscan_publisher_exists() {
   [[ "${publishers:-0}" -gt 0 ]]
 }
 
+run_flatscan_supervision_probe() {
+  # Bootstrap and bounded fault confirmation may share the driver's owner.
+  # Preserve the existing site-default placement and all timeout/ROS arguments.
+  if [[ "${NJRH_NAVIGATION_CPU_PROFILE:-site_default}" == "navigation_5cpu" ]]; then
+    njrh_run_affined nav_supervision "$@"
+  else
+    "$@"
+  fi
+}
+
 flatscan_hz_ok() {
   local sample_timeout_sec="${1:-${FLATSCAN_MESSAGE_CONFIRM_TIMEOUT_SEC}}"
   local output
   local hz
-  output="$(timeout --kill-after=1 "${sample_timeout_sec}" \
+  output="$(run_flatscan_supervision_probe timeout --kill-after=1 "${sample_timeout_sec}" \
     ros2 topic hz /flatscan --window 3 2>/dev/null || true)"
   hz="$(awk '/average rate:/ {value=$3} END {if (value != "") print value}' <<<"${output}")"
   if [[ -z "${hz}" ]]; then
@@ -194,6 +223,75 @@ confirm_flatscan_stream_after_graph_misses() {
     return 0
   fi
   return 1
+}
+
+note_flatscan_observer_unavailable() {
+  flatscan_observer_state="${1:-observer_unavailable}"
+  flatscan_helper_graph_miss_count=0
+  flatscan_helper_healthy_since_epoch=0
+  flatscan_helper_health_state="observer_unavailable"
+  write_flatscan_helper_status
+}
+
+observe_flatscan_helper() {
+  local output rc=0 status source kind seq
+  if [[ ! -x "${FLATSCAN_MONITOR_CHECK_BIN}" ]]; then
+    note_flatscan_observer_unavailable checker_missing
+    return 0
+  fi
+  output="$(run_flatscan_supervision_probe "${FLATSCAN_MONITOR_CHECK_BIN}" \
+    "${FLATSCAN_MONITOR_FILE}" "${FLATSCAN_MONITOR_MAX_AGE_SEC}" \
+    "${FLATSCAN_MESSAGE_CONFIRM_TIMEOUT_SEC}" 2>/dev/null)" || rc=$?
+  if [[ "${rc}" != 0 && "${rc}" != 50 ]]; then
+    note_flatscan_observer_unavailable
+    return 0
+  fi
+  read -r status source kind seq <<<"${output}"
+  source="${source#source_id=}"
+  kind="${kind#evidence_kind=}"
+  seq="${seq#evidence_sequence=}"
+  if [[ ! "${source}" =~ ^[a-zA-Z0-9._-]+:[a-zA-Z0-9._-]+$ ||
+        ! "${seq}" =~ ^[1-9][0-9]{0,15}$ ||
+        ( "${kind}" != input && "${kind}" != graph ) ]]; then
+    note_flatscan_observer_unavailable malformed_check_result
+    return 0
+  fi
+  if [[ "${source}" != "${flatscan_observer_source}" || "${kind}" != "${flatscan_observer_kind}" ]]; then
+    flatscan_helper_graph_miss_count=0
+    flatscan_helper_healthy_since_epoch=0
+    flatscan_observer_sequence=0
+    flatscan_observer_source="${source}"
+    flatscan_observer_kind="${kind}"
+  fi
+  if ((seq <= flatscan_observer_sequence)); then
+    # Re-reading an unchanged snapshot must not advance failures or reset a restart budget.
+    flatscan_observer_state="evidence_not_advanced"
+    flatscan_helper_healthy_since_epoch=0
+    write_flatscan_helper_status
+    return 0
+  fi
+  flatscan_observer_sequence="${seq}"
+  flatscan_observer_state="${status#status=}"
+  if [[ "${rc}" == 0 ]]; then
+    note_flatscan_healthy
+    return 0
+  fi
+  note_flatscan_graph_miss
+  if [[ "${flatscan_helper_graph_miss_count}" -lt "${FLATSCAN_HELPER_MISSING_CONFIRMATIONS}" ]]; then
+    return 0
+  fi
+  # Observation alone cannot authorize a restart. Preserve the bounded independent
+  # message confirmation and upstream check used by the original supervisor.
+  if confirm_flatscan_stream_after_graph_misses; then
+    :
+  elif scan_publisher_exists; then
+    restart_flatscan_helper_if_allowed "CASE_FLATSCAN_HELPER_DEAD: independently confirmed no /flatscan flow while /scan publisher exists and helper pid=${flatscan_pid} is alive"
+  else
+    flatscan_helper_graph_miss_count=0
+    flatscan_helper_health_state="upstream_scan_suspect"
+    write_flatscan_helper_status
+    echo "[pointcloud-accel] WARN FlatScan fault candidate unconfirmed upstream; keeping helper alive" >&2
+  fi
 }
 
 wait_for_pid_exit() {
@@ -352,22 +450,8 @@ supervise_flatscan_helper() {
           flatscan_helper_healthy_since_epoch=0
           write_flatscan_helper_status
           restart_flatscan_helper_if_allowed "laser_scan_to_flatscan exited"
-        elif ! flatscan_publisher_exists; then
-          note_flatscan_graph_miss
-          if [[ "${flatscan_helper_graph_miss_count}" -ge "${FLATSCAN_HELPER_MISSING_CONFIRMATIONS}" ]]; then
-            if confirm_flatscan_stream_after_graph_misses; then
-              :
-            elif scan_publisher_exists; then
-              restart_flatscan_helper_if_allowed "CASE_FLATSCAN_HELPER_DEAD: standalone /scan exists but /flatscan publisher is missing while laser_scan_to_flatscan pid=${flatscan_pid} is still alive"
-            else
-              flatscan_helper_graph_miss_count=0
-              flatscan_helper_health_state="upstream_scan_suspect"
-              write_flatscan_helper_status
-              echo "[pointcloud-accel] WARN standalone scan chain temporarily lacks /flatscan while /scan publisher is not ready; keeping laser_scan_to_flatscan pid=${flatscan_pid} alive and retrying" >&2
-            fi
-          fi
         else
-          note_flatscan_healthy
+          observe_flatscan_helper
         fi
         ;;
     esac

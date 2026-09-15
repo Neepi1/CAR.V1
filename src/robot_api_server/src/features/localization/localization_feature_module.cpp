@@ -85,19 +85,6 @@ public:
         {
           return *blocked;
         }
-        auto * elevator = dependencies_.elevator();
-        if (elevator == nullptr) {
-          return HttpResponse{
-          503,
-          "application/json",
-          error_json("elevator module is not initialized")};
-        }
-        auto admission = elevator->acquire_motion_admission(
-          motion_admission_epoch);
-        if (!admission.admitted()) {
-          return elevator->motion_admission_failure_response(
-            operation, admission);
-        }
         return work();
       };
     ports.wait_for_settle = [this](

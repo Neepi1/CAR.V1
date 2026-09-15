@@ -5,6 +5,9 @@ if [[ -z "${NJRH_OVERLAY_ROOT:-}" ]]; then
   return 1 2>/dev/null || exit 1
 fi
 
+source "${NJRH_OVERLAY_ROOT}/scripts/cpu_affinity_profiles.sh"
+njrh_restore_navigation_cpu_baseline
+
 NJRH_CPU_AFFINITY_CONFIG="${NJRH_CPU_AFFINITY_CONFIG:-${NJRH_OVERLAY_ROOT}/config/cpu_affinity.env}"
 if [[ -f "${NJRH_CPU_AFFINITY_CONFIG}" ]]; then
   # shellcheck source=../config/cpu_affinity.env
@@ -19,6 +22,9 @@ fi
 if declare -F njrh_resolve_nav2_controller_cpuset_profile >/dev/null 2>&1; then
   njrh_resolve_nav2_controller_cpuset_profile
 fi
+# Apply after the site override AND the controller resolver, so inherited
+# CPU5/6/7 values cannot escape the optional five-core navigation profile.
+njrh_apply_navigation_cpu_profile || return $?
 
 njrh_affinity_truthy() {
   case "${1:-}" in
@@ -47,6 +53,75 @@ njrh_cpuset_for() {
   printf '%s\n' "${!var_name:-}"
 }
 
+# The environment retains steady-state masks. Only an explicitly owned cold
+# startup session changes launch placement, including processes started later.
+njrh_startup_cpu_session_enabled() {
+  [[ -n "${NJRH_STARTUP_CPU_SESSION:-}" &&
+     "${NJRH_NAVIGATION_CPU_PROFILE:-site_default}" == navigation_5cpu ]] || return 1
+  njrh_affinity_enabled || return 1
+  local key candidate
+  key="$(njrh_affinity_var_name "$1")"
+  for candidate in "${NJRH_NAVIGATION_CPU_KEYS[@]}"; do
+    [[ "${key}" == "NJRH_CPUSET_${candidate}" ]] && return 0
+  done
+  return 1
+}
+
+njrh_affinity_prefix() {
+  local -n result="$1"
+  local service_name="$2" cpuset
+  result=()
+  cpuset="$(njrh_cpuset_for "${service_name}")"
+  njrh_affinity_enabled && [[ -n "${cpuset}" ]] || return 0
+  if njrh_startup_cpu_session_enabled "${service_name}"; then
+    result=(python3 "${NJRH_OVERLAY_ROOT}/scripts/startup_cpu_affinity.py"
+      exec --session "${NJRH_STARTUP_CPU_SESSION}" --steady-cpus "${cpuset}"
+      --role "${service_name}")
+    # API business children (mapping/arm) are not owned by cold navigation.
+    [[ "${service_name}" != robot_api_server ]] || result+=(--no-descendants)
+    result+=(--)
+  else
+    result=(taskset -c "${cpuset}")
+  fi
+}
+
+njrh_effective_cpuset_for() {
+  local cpuset
+  cpuset="$(njrh_cpuset_for "$1")"
+  if njrh_startup_cpu_session_enabled "$1"; then
+    python3 "${NJRH_OVERLAY_ROOT}/scripts/startup_cpu_affinity.py" mask \
+      --session "${NJRH_STARTUP_CPU_SESSION}" --steady-cpus "${cpuset}"
+  else
+    printf '%s\n' "${cpuset}"
+  fi
+}
+
+njrh_begin_startup_cpu_boost() {
+  [[ "${NJRH_NAVIGATION_CPU_PROFILE:-site_default}" == navigation_5cpu ]] || return 0
+  njrh_affinity_truthy "${NJRH_STARTUP_CPU_BOOST_ENABLED:-true}" || return 0
+  njrh_affinity_enabled || return 0
+  local owner_pid="${BASHPID:-$$}" session
+  if session="$(python3 "${NJRH_OVERLAY_ROOT}/scripts/startup_cpu_affinity.py" begin \
+      --owner-pid "${owner_pid}" --session-dir /tmp/njrh_reports/startup_cpu_affinity)"; then
+    export NJRH_STARTUP_CPU_SESSION="${session}"
+    if ! njrh_apply_affinity_to_current_process navigation_runtime_owner; then
+      njrh_finish_startup_cpu_boost placement_failed
+    fi
+  else
+    echo "[runtime-overlay] startup CPU boost unavailable; retaining steady placement" >&2
+  fi
+}
+
+njrh_finish_startup_cpu_boost() {
+  [[ -n "${NJRH_STARTUP_CPU_SESSION:-}" ]] || return 0
+  if ! python3 "${NJRH_OVERLAY_ROOT}/scripts/startup_cpu_affinity.py" finish \
+      --session "${NJRH_STARTUP_CPU_SESSION}" --reason "$1"; then
+    echo "[runtime-overlay] startup CPU restore incomplete; inspect startup CPU session report" >&2
+  fi
+  # Placement errors are diagnostics, not a new navigation readiness gate.
+  return 0
+}
+
 njrh_apply_affinity_to_current_process() {
   local service_name="$1"
   local cpuset
@@ -61,6 +136,14 @@ njrh_apply_affinity_to_current_process() {
     return 1
   fi
   pid="${BASHPID:-$$}"
+  if njrh_startup_cpu_session_enabled "${service_name}"; then
+    local extra=()
+    [[ "${service_name}" != robot_api_server ]] || extra=(--no-descendants)
+    python3 "${NJRH_OVERLAY_ROOT}/scripts/startup_cpu_affinity.py" register \
+      --session "${NJRH_STARTUP_CPU_SESSION}" --pid "${pid}" \
+      --steady-cpus "${cpuset}" --role "${service_name}" "${extra[@]}"
+    return $?
+  fi
   if ! taskset -pc "${cpuset}" "${pid}" >/dev/null 2>&1; then
     echo "[runtime-overlay] ERROR: failed to apply ${service_name} pid=${pid} -> CPU ${cpuset}" >&2
     return 1
@@ -76,41 +159,27 @@ njrh_apply_affinity_to_current_process() {
 njrh_run_affined() {
   local service_name="$1"
   shift
-  local cpuset
-  cpuset="$(njrh_cpuset_for "${service_name}")"
-  if njrh_affinity_enabled && [[ -n "${cpuset}" ]]; then
-    echo "[runtime-overlay] cpu affinity: ${service_name} -> CPU ${cpuset}" >&2
-    taskset -c "${cpuset}" "$@"
-    return $?
-  fi
-  "$@"
+  local affinity=()
+  njrh_affinity_prefix affinity "${service_name}"
+  "${affinity[@]}" "$@"
 }
 
 njrh_start_affined_background() {
   local pid_var="$1"
   local service_name="$2"
   shift 2
-  local cpuset
-  cpuset="$(njrh_cpuset_for "${service_name}")"
-  if njrh_affinity_enabled && [[ -n "${cpuset}" ]]; then
-    echo "[runtime-overlay] cpu affinity: ${service_name} -> CPU ${cpuset}" >&2
-    taskset -c "${cpuset}" "$@" &
-  else
-    "$@" &
-  fi
+  local affinity=()
+  njrh_affinity_prefix affinity "${service_name}"
+  "${affinity[@]}" "$@" &
   printf -v "${pid_var}" '%s' "$!"
 }
 
 njrh_exec_affined() {
   local service_name="$1"
   shift
-  local cpuset
-  cpuset="$(njrh_cpuset_for "${service_name}")"
-  if njrh_affinity_enabled && [[ -n "${cpuset}" ]]; then
-    echo "[runtime-overlay] cpu affinity: ${service_name} -> CPU ${cpuset}" >&2
-    exec taskset -c "${cpuset}" "$@"
-  fi
-  exec "$@"
+  local affinity=()
+  njrh_affinity_prefix affinity "${service_name}"
+  exec "${affinity[@]}" "$@"
 }
 
 njrh_apply_affinity_to_pids() {
@@ -124,6 +193,12 @@ njrh_apply_affinity_to_pids() {
   local pid
   for pid in "$@"; do
     if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+      if njrh_startup_cpu_session_enabled "${service_name}"; then
+        python3 "${NJRH_OVERLAY_ROOT}/scripts/startup_cpu_affinity.py" register \
+          --session "${NJRH_STARTUP_CPU_SESSION}" --pid "${pid}" \
+          --steady-cpus "${cpuset}" --role "${service_name}"
+        continue
+      fi
       local task_path
       local task_id
       local task_count=0

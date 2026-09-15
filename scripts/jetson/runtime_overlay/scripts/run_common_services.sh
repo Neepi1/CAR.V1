@@ -11,10 +11,19 @@ log_common_startup_stage() {
 }
 
 log_common_startup_stage "script_start"
+# A new full-chain owner never joins a caller's previous startup scope.
+unset NJRH_STARTUP_CPU_SESSION
 source "${SCRIPT_DIR}/canonical_tf_helpers.sh"
+source "${SCRIPT_DIR}/common_startup_helpers.sh"
 source "${SCRIPT_DIR}/nav_runtime_helpers.sh"
 source "${SCRIPT_DIR}/floor_asset_helpers.sh"
 source "${SCRIPT_DIR}/cpu_affinity.sh"
+source "${SCRIPT_DIR}/imu_pipeline_helpers.sh"
+# Give unprefixed helpers the same initial mask as the five-core navigation
+# children. The existing site-default startup placement is unchanged.
+if [[ "${NJRH_NAVIGATION_CPU_PROFILE:-site_default}" == navigation_5cpu ]]; then
+  njrh_apply_affinity_to_current_process navigation_runtime_owner
+fi
 source "${SCRIPT_DIR}/pointcloud_accel_profile.sh"
 log_common_startup_stage "helpers_loaded"
 njrh_load_pointcloud_accel_profile
@@ -22,6 +31,14 @@ njrh_load_pointcloud_ingress_profile
 log_common_startup_stage "profiles_loaded"
 
 common_pids=()
+export NJRH_COMMON_SERVICES_MANAGED=true
+api_http_ready=0
+docking_startup_done=0
+common_last_started_pid=""
+resident_navigation_autostart_pid=""
+# A unique path avoids accepting an earlier boot's scheduling receipt.
+mkdir -p "${NJRH_RUNTIME_LOG_DIR}"
+NJRH_NAVIGATION_STARTUP_RECEIPT="$(mktemp "${NJRH_RUNTIME_LOG_DIR}/navigation_startup.XXXXXX")"
 runtime_health_guard_started=0
 ranger_chassis_common_health_failures=0
 docking_sensor_common_health_failures=0
@@ -29,6 +46,7 @@ docking_health_observer_failures=0
 robot_local_state_common_health_failures=0
 runtime_health_observer_failures=0
 NAV_LOCAL_STATE_MODE="${NJRH_NAV_LOCAL_STATE_MODE:-ekf}"
+njrh_resolve_imu_pipeline_mode "${NAV_LOCAL_STATE_MODE}"
 DOCKING_SENSOR_BACKEND="${NJRH_DOCKING_SENSOR_BACKEND:-orbbec_336l}"
 # FAST-LIO2 is mapping-owned by default. Daily navigation uses wheel+IMU EKF
 # local odom, so common services must not keep the lidar-inertial frontend
@@ -98,6 +116,7 @@ start_common_process() {
   local pattern="$2"
   shift 2
   local log_file="${NJRH_RUNTIME_LOG_DIR}/${name}.log"
+  common_last_started_pid=""
 
   if reuse_common_services_enabled && pgrep -f "${pattern}" >/dev/null 2>&1; then
     echo "[runtime-overlay] reusing existing ${name}; pattern=${pattern}" >&2
@@ -107,8 +126,20 @@ start_common_process() {
   mkdir -p "${NJRH_RUNTIME_LOG_DIR}"
   rotate_runtime_log "${log_file}"
   echo "[runtime-overlay] starting ${name}" >&2
-  "$@" >>"${log_file}" 2>&1 &
+  local startup_affinity=()
+  # Place sensor initialization as well as its eventual ROS nodes. Otherwise
+  # repeated environment loading competes with Nav2 on the owner's compute pool.
+  # No startup ordering, waits, process ownership or site-default changes.
+  if [[ "${NJRH_NAVIGATION_CPU_PROFILE:-site_default}" == "navigation_5cpu" &&
+        ( "${name}" == "jt128_driver" || "${name}" == "pointcloud_accel_pipeline" ) ]] &&
+      njrh_affinity_enabled; then
+    # Non-legacy pointcloud startup also initializes run_driver.sh. Only its
+    # bootstrap inherits this mask; run_driver explicitly places each worker.
+    njrh_affinity_prefix startup_affinity lidar_startup
+  fi
+  "${startup_affinity[@]}" "$@" >>"${log_file}" 2>&1 &
   local pid=$!
+  common_last_started_pid="${pid}"
   common_pids+=("${pid}")
   sleep "${NJRH_COMMON_PROCESS_START_SETTLE_SEC:-0.2}"
   if ! kill -0 "${pid}" 2>/dev/null; then
@@ -118,16 +149,42 @@ start_common_process() {
   echo "[runtime-overlay] common service ready: ${name} (pid=${pid})" >&2
 }
 
+start_orbbec_336l_depth_common() {
+  local log_file="${NJRH_RUNTIME_LOG_DIR}/orbbec_336l_depth.log"
+  common_last_started_pid=""
+  mkdir -p "${NJRH_RUNTIME_LOG_DIR}"
+  rotate_runtime_log "${log_file}"
+  echo "[runtime-overlay] starting orbbec_336l_depth" >&2
+  # Always enter the wrapper. Only its flock, never an argv substring, owns 336L.
+  bash "${SCRIPT_DIR}/run_orbbec_336l_depth.sh" >>"${log_file}" 2>&1 &
+  local pid=$!
+  sleep "${NJRH_COMMON_PROCESS_START_SETTLE_SEC:-0.2}"
+  if kill -0 "${pid}" 2>/dev/null; then
+    common_last_started_pid="${pid}"
+    common_pids+=("${pid}")
+    echo "[runtime-overlay] common service ready: orbbec_336l_depth (pid=${pid})" >&2
+    return 0
+  fi
+  local status=0
+  wait "${pid}" || status=$?
+  if [[ "${status}" == "73" ]]; then
+    echo "[runtime-overlay] orbbec_336l_depth owner lock already held; no duplicate driver started" >&2
+    return 0
+  fi
+  echo "[runtime-overlay] common service failed to stay alive: orbbec_336l_depth (exit=${status}). Check ${log_file}" >&2
+  return 1
+}
+
 canonical_jt128_ingress_running() {
   local pointcloud_pipeline_pattern="pointcloud_perception_pipeline.launch.py|component_container_mt.*pointcloud_perception_pipeline|pointcloud_perception_pipeline"
   local pointcloud_standalone_pattern="pointcloud_axis_remap|pointcloud_accel_axis"
   if [[ "${NJRH_POINTCLOUD_INGRESS_PROFILE:-separate_process}" == "driver_integrated" ]]; then
     pgrep -f "hesai_accel_driver_node" >/dev/null 2>&1 &&
-      pgrep -f "imu_axis_remap" >/dev/null 2>&1
+      njrh_expected_imu_ingress_running
   else
     pgrep -f "hesai_ros_driver_node" >/dev/null 2>&1 &&
       { pgrep -f "${pointcloud_pipeline_pattern}" >/dev/null 2>&1 || pgrep -f "${pointcloud_standalone_pattern}" >/dev/null 2>&1; } &&
-      pgrep -f "imu_axis_remap" >/dev/null 2>&1
+      njrh_expected_imu_ingress_running
   fi
 }
 
@@ -140,58 +197,48 @@ process_count_for_pattern() {
   { pgrep -f "$1" 2>/dev/null || true; } | wc -l | tr -d '[:space:]'
 }
 
-process_count_for_executable() {
-  local expected_path="$1"
-  local expected_real
-  local executable_link
-  local actual_real
-  local count=0
-  expected_real="$(readlink -f -- "${expected_path}" 2>/dev/null || true)"
-  if [[ -z "${expected_real}" ]]; then
-    printf '0\n'
-    return 0
+query_robot_api_process_ownership() {
+  local binary="${NJRH_RUNTIME_PROCESS_CHECK_BIN:-${PROJECT_ROOT}/install/robot_bringup/lib/robot_bringup/runtime_process_check}"
+  local bash_executable output rc extra
+  api_process_check_status=observer_unavailable
+  api_supervisor_count=unknown
+  api_node_count=unknown
+  if [[ ! -x "${binary}" ]]; then
+    echo "[runtime-overlay] API ownership observer unavailable: missing native checker ${binary}" >&2
+    return 40
   fi
-  for executable_link in /proc/[0-9]*/exe; do
-    actual_real="$(readlink -f -- "${executable_link}" 2>/dev/null || true)"
-    if [[ "${actual_real}" == "${expected_real}" ]]; then
-      count=$((count + 1))
-    fi
-  done
-  printf '%s\n' "${count}"
-}
-
-process_count_for_executable_with_exact_argument() {
-  local expected_executable="$1"
-  local expected_argument="$2"
-  local expected_real
-  local executable_link
-  local actual_real
-  local cmdline_file
-  local argument
-  local count=0
-  local matched
-  expected_real="$(readlink -f -- "${expected_executable}" 2>/dev/null || true)"
-  if [[ -z "${expected_real}" ]]; then
-    printf '0\n'
-    return 0
+  bash_executable="$(command -v bash)" || return 40
+  # One native scan returns both counts. Never fall back to per-PID shell scans.
+  if output="$("${binary}" \
+    --supervisor-exe "${bash_executable}" \
+    --supervisor-arg "${SCRIPT_DIR}/run_robot_api_server_supervised.sh" \
+    --api-exe "${PROJECT_ROOT}/install/robot_api_server/lib/robot_api_server/robot_api_server_node")"; then
+    rc=0
+  else
+    rc=$?
   fi
-  for executable_link in /proc/[0-9]*/exe; do
-    actual_real="$(readlink -f -- "${executable_link}" 2>/dev/null || true)"
-    [[ "${actual_real}" == "${expected_real}" ]] || continue
-    cmdline_file="${executable_link%/exe}/cmdline"
-    [[ -r "${cmdline_file}" ]] || continue
-    matched=0
-    while IFS= read -r -d '' argument; do
-      if [[ "${argument}" == "${expected_argument}" ]]; then
-        matched=1
-        break
-      fi
-    done < "${cmdline_file}"
-    if [[ "${matched}" -eq 1 ]]; then
-      count=$((count + 1))
+  local status supervisor_count node_count
+  # Accept a single bounded numeric record, not shell code or partial output.
+  if [[ "${output}" != *$'\n'* ]] &&
+      read -r status supervisor_count node_count extra <<<"${output}" &&
+      [[ -z "${extra}" && "${supervisor_count}" =~ ^(0|[1-9][0-9]{0,9})$ &&
+        "${node_count}" =~ ^(0|[1-9][0-9]{0,9})$ ]]; then
+    if { [[ "${rc}" == 0 && "${status}" == unique &&
+             "${supervisor_count}" == 1 && "${node_count}" == 1 ]]; } ||
+       { [[ "${rc}" == 50 && "${status}" == ownership_fault &&
+             ( "${supervisor_count}" != 1 || "${node_count}" != 1 ) ]]; }; then
+      api_process_check_status="${status}"
+      api_supervisor_count="${supervisor_count}"
+      api_node_count="${node_count}"
+      return "${rc}"
     fi
-  done
-  printf '%s\n' "${count}"
+  fi
+  case "${rc}:${output}" in
+    '40:observer_unavailable - -') return 40 ;;
+    '42:observer_transient - -') api_process_check_status=observer_transient; return 42 ;;
+  esac
+  api_process_check_status=observer_error
+  return 41
 }
 
 pointcloud_accel_pipeline_aux_unique() {
@@ -219,7 +266,7 @@ start_runtime_health_guard_common() {
   local health_file
   health_file="$(runtime_health_file)"
   rm -f "${health_file}" 2>/dev/null || true
-  start_common_process "runtime_health_guard" "runtime_health_guard.py|run_runtime_health_guard.sh" \
+  start_common_process "runtime_health_guard" "runtime_health_guard|run_runtime_health_guard.sh" \
     bash "${SCRIPT_DIR}/run_runtime_health_guard.sh"
   runtime_health_guard_started=1
 }
@@ -313,13 +360,13 @@ verify_robot_local_state_common_health_or_exit() {
   fi
 
   case "${diagnostic_rc}" in
-    40|41|42|43|44)
+    40|41|42|43|44|45|46)
       runtime_health_observer_failures=$((runtime_health_observer_failures + 1))
       robot_local_state_common_health_failures=0
       echo "[runtime-overlay] runtime health observer degraded (${runtime_health_observer_failures}); does not authorize complete-chain recovery; diagnostic=${diagnostic}" >&2
       return 0
       ;;
-    50|51|52|53|54|55)
+    50|51|52|53|54|55|56)
       runtime_health_observer_failures=0
       ;;
     *)
@@ -330,9 +377,30 @@ verify_robot_local_state_common_health_or_exit() {
       ;;
   esac
 
+  # A retry may read the same atomic snapshot. It is not independent evidence.
+  local evidence_generation=""
+  local evidence_sequence=""
+  if [[ ! "${diagnostic}" =~ evidence_id=([a-zA-Z0-9._-]+):([0-9]{1,16})([[:space:]]|$) ]]; then
+    robot_local_state_common_health_failures=0
+    echo "[runtime-overlay] runtime health observer lacks sequenced fault evidence; does not authorize complete-chain recovery" >&2
+    return 0
+  fi
+  evidence_generation="${BASH_REMATCH[1]}"
+  evidence_sequence="$((10#${BASH_REMATCH[2]}))"
+  if [[ "${evidence_generation}" != "${robot_local_state_fault_generation:-}" ]]; then
+    robot_local_state_common_health_failures=0
+    robot_local_state_fault_generation="${evidence_generation}"
+    robot_local_state_fault_sequence=0
+  fi
+  if (( evidence_sequence <= ${robot_local_state_fault_sequence:-0} )); then
+    return 0
+  fi
+  robot_local_state_fault_sequence="${evidence_sequence}"
+
   if ! local_state_required_processes_running; then
     required_processes="missing"
-  elif direct_local_state_odom_ready_for_health_confirmation; then
+  fi
+  if direct_local_state_odom_ready_for_health_confirmation; then
     runtime_health_observer_failures=$((runtime_health_observer_failures + 1))
     robot_local_state_common_health_failures=0
     echo "[runtime-overlay] runtime health observer contradicted by independent fresh local odom (${runtime_health_observer_failures}); does not authorize complete-chain recovery; diagnostic=${diagnostic}" >&2
@@ -348,23 +416,17 @@ verify_robot_local_state_common_health_or_exit() {
 }
 
 verify_robot_api_server_common_health_or_exit() {
-  local bash_executable
-  local supervisor_count
-  local node_count
-  bash_executable="$(command -v bash)"
-  supervisor_count="$(
-    process_count_for_executable_with_exact_argument \
-      "${bash_executable}" \
-      "${SCRIPT_DIR}/run_robot_api_server_supervised.sh"
-  )"
-  node_count="$(
-    process_count_for_executable \
-      "${PROJECT_ROOT}/install/robot_api_server/lib/robot_api_server/robot_api_server_node"
-  )"
-  if [[ "${supervisor_count:-0}" -eq 1 && "${node_count:-0}" -eq 1 ]]; then
+  local rc
+  if query_robot_api_process_ownership; then
+    return 0
+  else
+    rc=$?
+  fi
+  if [[ "${rc}" != 50 ]]; then
+    echo "[runtime-overlay] API ownership ${api_process_check_status}; does not authorize complete-chain recovery" >&2
     return 0
   fi
-  echo "[runtime-overlay] robot_api_server ownership lost or non-unique (supervisor=${supervisor_count:-0}, node=${node_count:-0}); exiting common owner so systemd restarts the complete runtime chain" >&2
+  echo "[runtime-overlay] robot_api_server ownership lost or non-unique (supervisor=${api_supervisor_count}, node=${api_node_count}); exiting common owner so systemd restarts the complete runtime chain" >&2
   return 1
 }
 
@@ -372,32 +434,22 @@ wait_for_robot_api_server_common_ready() {
   local timeout_sec="${NJRH_ROBOT_API_PROCESS_READY_TIMEOUT_SEC:-120}"
   local poll_sec="${NJRH_ROBOT_API_PROCESS_READY_POLL_SEC:-1}"
   local deadline
-  local bash_executable
-  local supervisor_count=0
-  local node_count=0
+  api_process_check_status=observer_unavailable
+  api_supervisor_count=unknown
+  api_node_count=unknown
   if [[ ! "${timeout_sec}" =~ ^[0-9]+$ || "${timeout_sec}" -le 0 ]]; then
     timeout_sec=120
   fi
   deadline=$((SECONDS + timeout_sec))
-  bash_executable="$(command -v bash)"
   echo "[runtime-overlay] waiting up to ${timeout_sec}s for exact robot_api_server supervisor and node ownership" >&2
   while [[ "${SECONDS}" -lt "${deadline}" ]]; do
-    supervisor_count="$(
-      process_count_for_executable_with_exact_argument \
-        "${bash_executable}" \
-        "${SCRIPT_DIR}/run_robot_api_server_supervised.sh"
-    )"
-    node_count="$(
-      process_count_for_executable \
-        "${PROJECT_ROOT}/install/robot_api_server/lib/robot_api_server/robot_api_server_node"
-    )"
-    if [[ "${supervisor_count:-0}" -eq 1 && "${node_count:-0}" -eq 1 ]]; then
+    if query_robot_api_process_ownership; then
       echo "[runtime-overlay] exact robot_api_server ownership ready (supervisor=1, node=1)" >&2
       return 0
     fi
     sleep "${poll_sec}"
   done
-  echo "[runtime-overlay] robot_api_server did not establish exact ownership within ${timeout_sec}s (supervisor=${supervisor_count:-0}, node=${node_count:-0})" >&2
+  echo "[runtime-overlay] robot_api_server did not establish exact ownership within ${timeout_sec}s (status=${api_process_check_status}, supervisor=${api_supervisor_count}, node=${api_node_count})" >&2
   return 1
 }
 
@@ -448,8 +500,12 @@ start_robot_local_state_common_background_if_enabled() {
     return 0
   fi
   echo "[runtime-overlay] starting robot_local_state_common in background while common sensors initialize" >&2
-  start_robot_local_state_common &
-  robot_local_state_common_background_pid=$!
+  NJRH_LOCAL_STATE_START_READY_MODE="${NJRH_COMMON_LOCAL_STATE_START_READY_MODE:-endpoint}" \
+    start_common_canonical_helper_background "robot_local_state_common" \
+      env NJRH_LOCAL_STATE_START_READY_MODE="${NJRH_COMMON_LOCAL_STATE_START_READY_MODE:-endpoint}" \
+        LOCAL_STATE_MODE="${NAV_LOCAL_STATE_MODE}" \
+        bash "${SCRIPT_DIR}/run_local_state.sh"
+  robot_local_state_common_background_pid="${common_startup_waiters[robot_local_state_common]:-reused}"
 }
 
 wait_for_robot_local_state_common_background_if_started() {
@@ -457,7 +513,7 @@ wait_for_robot_local_state_common_background_if_started() {
     start_robot_local_state_common
     return $?
   fi
-  if wait "${robot_local_state_common_background_pid}"; then
+  if wait_for_common_startup_job "robot_local_state_common"; then
     robot_local_state_common_background_pid=""
     return 0
   fi
@@ -663,16 +719,18 @@ start_resident_navigation_autostart_if_selected() {
   autostart_display_name="${NJRH_NAV_MAP_NAME:-${autostart_display_name}}"
 
   prepare_resident_navigation_autostart
-  if common_require_flatscan_before_resident_autostart; then
+  if [[ "${NJRH_COMMON_SERVICES_MANAGED:-false}" != "true" ]] && common_require_flatscan_before_resident_autostart; then
     ensure_flatscan_ready_before_navigation_autostart || return 1
   else
     echo "[runtime-overlay] skipping common /flatscan precheck before resident navigation autostart; resident localization owns /flatscan readiness and repair gates" >&2
   fi
   start_common_process "resident_navigation_runtime" "run_navigation_runtime_services.sh" \
     env \
+      NJRH_NAVIGATION_STARTUP_RECEIPT="${NJRH_NAVIGATION_STARTUP_RECEIPT}" \
       NJRH_NAVIGATION_START_SOURCE="systemd_autostart" \
       NJRH_NAVIGATION_RESUME_LOG_FILE="${NJRH_RUNTIME_LOG_DIR}/resident_navigation_runtime.log" \
-      NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION="${NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION:-false}" \
+      NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION="${NJRH_AMCL_RESIDENT_WARMUP_BEFORE_INITIAL_LOCALIZATION:-true}" \
+      NJRH_AMCL_READINESS_BEFORE_NAV2_LIFECYCLE="${NJRH_AMCL_READINESS_BEFORE_NAV2_LIFECYCLE:-true}" \
       NJRH_INITIAL_GLOBAL_LOCALIZATION_BACKGROUND_START="${NJRH_INITIAL_GLOBAL_LOCALIZATION_BACKGROUND_START:-false}" \
       NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK="${NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK:-false}" \
       NJRH_NAV2_LIFECYCLE_PARALLEL_CORE="${NJRH_NAV2_LIFECYCLE_PARALLEL_CORE:-false}" \
@@ -682,6 +740,7 @@ start_resident_navigation_autostart_if_selected() {
       NJRH_MAP_CONTEXT_FLOOR_ID="${autostart_floor_id}" \
       bash "${SCRIPT_DIR}/run_navigation_runtime_services.sh" "${autostart_building_id}" "${autostart_floor_id}"
   resident_navigation_autostart_started=1
+  resident_navigation_autostart_pid="${common_last_started_pid}"
 }
 
 wait_for_resident_navigation_autostart_if_started() {
@@ -972,14 +1031,19 @@ latch_safety_stop_for_runtime_shutdown() {
 
 cleanup() {
   trap - EXIT INT TERM
+  if [[ -n "${NJRH_STARTUP_CPU_SESSION:-}" ]]; then
+    njrh_finish_startup_cpu_boost common_exit
+  fi
   local pid
   latch_safety_stop_for_runtime_shutdown
+  cleanup_common_startup_helpers
   cleanup_resident_navigation_runtime_layers
   for pid in "${common_pids[@]:-}"; do
     kill -INT "${pid}" 2>/dev/null || true
   done
   cleanup_overlay_helpers
   cleanup_canonical_helpers
+  rm -f "${NJRH_NAVIGATION_STARTUP_RECEIPT}"
   sleep 1
   cleanup_resident_navigation_runtime_layers
   for pid in "${common_pids[@]:-}"; do
@@ -995,28 +1059,127 @@ on_signal() {
 trap cleanup EXIT
 trap on_signal INT TERM
 
+# Create only in the full-chain owner, after exit cleanup is installed.
+if [[ "${NAV_LOCAL_STATE_MODE}" == ekf && "${FASTLIO_AUTOSTART}" != true ]]; then
+  njrh_begin_startup_cpu_boost
+fi
+
+start_docking_common_last() {
+  case "${DOCKING_SENSOR_BACKEND}" in
+    gs2)
+      if pgrep -f "[o]rbbec_camera|[o]rbbec_depth_dock_node|[r]un_orbbec_336l_depth.sh|[r]un_orbbec_docking_perception.sh" >/dev/null 2>&1; then
+        echo "[runtime-overlay] GS2 backend refused while Orbbec docking processes are still running" >&2
+        return 1
+      fi
+      if [[ "${NJRH_GS2_AUTOSTART:-true}" == "true" ]]; then
+        start_common_process "gs2_driver" "robot_eai_gs2/gs2_driver_node|gs2_driver_node --ros-args|ros2 launch robot_eai_gs2 gs2.launch.py" \
+          bash "${SCRIPT_DIR}/run_gs2_driver.sh" || return 1
+      fi
+      ;;
+    orbbec_336l)
+      if pgrep -f "robot_eai_gs2/[g]s2_driver_node|[g]s2_driver_node --ros-args|ros2 launch robot_eai_gs2 [g]s2.launch.py" >/dev/null 2>&1; then
+        echo "[runtime-overlay] Orbbec backend refused while GS2 docking processes are still running" >&2
+        return 1
+      fi
+      sensors_config="${ROBOT_DESCRIPTION_CONFIG_FILE:-${NJRH_OVERLAY_ROOT}/config/sensors.yaml}"
+      for required_key in \
+        docking_camera_x docking_camera_y docking_camera_z \
+        docking_camera_roll docking_camera_pitch docking_camera_yaw
+      do
+        if ! grep -Eq "^[[:space:]]*${required_key}:" "${sensors_config}"; then
+          echo "[runtime-overlay] Orbbec docking backend refused: missing ${required_key} in ${sensors_config}" >&2
+          return 1
+        fi
+      done
+      start_orbbec_336l_depth_common || return 1
+      start_common_process "orbbec_docking_perception" "robot_docking_perception/orbbec_depth_dock_node|orbbec_depth_dock_node" \
+        bash "${SCRIPT_DIR}/run_orbbec_docking_perception.sh" || return 1
+      ;;
+    *)
+      echo "[runtime-overlay] unsupported NJRH_DOCKING_SENSOR_BACKEND=${DOCKING_SENSOR_BACKEND}" >&2
+      return 1
+      ;;
+  esac
+  log_common_startup_stage "docking_sensor_started"
+  if [[ "${DOCKING_SENSOR_BACKEND}" == "orbbec_336l" ]]; then
+    if wait_for_fresh_header_topic_message \
+      "/dock/target_observation" \
+      "${NJRH_DOCKING_SENSOR_READY_TIMEOUT_SEC:-15}" \
+      "${NJRH_DOCKING_SENSOR_MAX_AGE_SEC:-1.0}" \
+      "${NJRH_DOCKING_SENSOR_MAX_FUTURE_SEC:-0.25}"; then
+      log_common_startup_stage "docking_sensor_ready"
+    else
+      log_common_startup_stage "docking_sensor_degraded"
+      echo "[runtime-overlay] docking observation unavailable; keeping API/navigation/common alive; manager retains its observation checks" >&2
+    fi
+  fi
+  if [[ "${NJRH_DOCKING_MANAGER_AUTOSTART:-true}" == "true" ]]; then
+    start_common_process "docking_manager" "robot_docking_manager/docking_manager_node|docking_manager_node --ros-args|run_docking_manager.sh" \
+      bash "${SCRIPT_DIR}/run_docking_manager.sh" || return 1
+    log_common_startup_stage "docking_manager_ready"
+  else
+    echo "[runtime-overlay] docking_manager autostart disabled" >&2
+  fi
+}
+
+update_common_deferred_startup() {
+  if [[ "${api_http_ready}" == 0 ]] && common_api_http_ready; then
+    api_http_ready=1
+    log_common_startup_stage "robot_api_server_ready"
+  fi
+  [[ "${docking_startup_done}" == 0 && "${api_http_ready}" == 1 ]] || return 0
+  common_navigation_initialization_finished || return 0
+  # Exactly one startup attempt in this owner; no extra producer or respawn policy.
+  docking_startup_done=1
+  if [[ -n "${NJRH_STARTUP_CPU_SESSION:-}" ]]; then
+    njrh_finish_startup_cpu_boost common_initialization_finished
+  fi
+  log_common_startup_stage "main_initialization_finished"
+  if ! start_docking_common_last; then
+    log_common_startup_stage "docking_startup_failed"
+    echo "[runtime-overlay] docking startup failed; common core remains running" >&2
+  fi
+  log_common_startup_stage "common_startup_finished"
+}
+
 require_can_interface_up
 log_common_startup_stage "can_ready"
 
-start_canonical_helper "ranger_chassis_common" bash "${SCRIPT_DIR}/run_ranger_chassis.sh"
-log_common_startup_stage "ranger_chassis_ready"
-start_canonical_helper "robot_description_static_tf_common" bash "${SCRIPT_DIR}/run_robot_description.sh"
-log_common_startup_stage "static_tf_ready"
-start_robot_local_state_common_background_if_enabled
+# Resolve/clean the selected-map branch before launching common producers;
+# its map/Isaac initialization then overlaps all sensor readiness below.
+if [[ "${NAV_LOCAL_STATE_MODE}" == "ekf" && "${NJRH_POINTCLOUD_ACCEL_PROFILE}" != "legacy" ]]; then
+  start_resident_navigation_autostart_if_selected
+fi
+
+# Launch first, join readiness later. Keep ownership in this shell, rather than
+# placing start_canonical_helper itself in a subshell and losing its PID list.
+start_common_canonical_helper_background "robot_description_static_tf_common" \
+  bash "${SCRIPT_DIR}/run_robot_description.sh"
+log_common_startup_stage "static_tf_started"
 
 if reuse_common_services_enabled && canonical_jt128_runtime_complete; then
   echo "[runtime-overlay] reusing existing jt128_driver; canonical driver/remap chain is complete" >&2
 else
   if [[ "${NJRH_POINTCLOUD_ACCEL_PROFILE}" == "legacy" ]]; then
     start_common_process "jt128_driver" "__njrh_force_start_jt128_driver_chain__" \
-      bash "${SCRIPT_DIR}/run_driver.sh"
+      env LOCAL_STATE_MODE="${NAV_LOCAL_STATE_MODE}" bash "${SCRIPT_DIR}/run_driver.sh"
   else
     stop_stale_pointcloud_accel_pipeline_processes
     start_common_process "pointcloud_accel_pipeline" "__njrh_force_start_pointcloud_accel_pipeline__" \
-      bash "${SCRIPT_DIR}/run_pointcloud_accel_pipeline.sh"
+      env LOCAL_STATE_MODE="${NAV_LOCAL_STATE_MODE}" bash "${SCRIPT_DIR}/run_pointcloud_accel_pipeline.sh"
   fi
 fi
-log_common_startup_stage "pointcloud_ready"
+log_common_startup_stage "pointcloud_started"
+start_common_canonical_helper_background "ranger_chassis_common" \
+  bash "${SCRIPT_DIR}/run_ranger_chassis.sh"
+log_common_startup_stage "ranger_chassis_started"
+start_robot_local_state_common_background_if_enabled
+# Keep the explicit FAST-LIO diagnostic dependency order unchanged. Normal
+# wheel+IMU navigation does not enter this branch or start FAST-LIO.
+if [[ "${FASTLIO_AUTOSTART}" == "true" || "${NAV_LOCAL_STATE_MODE}" == "fastlio" ]]; then
+  wait_for_common_startup_job "robot_description_static_tf_common"
+  wait_for_common_startup_job "ranger_chassis_common"
+fi
 if [[ "${FASTLIO_AUTOSTART}" == "true" ]] || { [[ "${NAV_LOCAL_STATE_MODE}" == "fastlio" ]] && fastlio_runtime_running; }; then
   start_fastlio_common
 elif [[ "${NAV_LOCAL_STATE_MODE}" == "fastlio" ]]; then
@@ -1027,59 +1190,25 @@ else
   echo "[runtime-overlay] FAST-LIO2 common autostart disabled; mapping starts FAST-LIO2 only while mapping is active" >&2
 fi
 log_common_startup_stage "fastlio_policy_done"
-case "${DOCKING_SENSOR_BACKEND}" in
-  gs2)
-    if pgrep -f "[o]rbbec_camera|[o]rbbec_depth_dock_node|[r]un_orbbec_336l_depth.sh|[r]un_orbbec_docking_perception.sh" >/dev/null 2>&1; then
-      echo "[runtime-overlay] GS2 backend refused while Orbbec docking processes are still running" >&2
-      exit 1
-    fi
-    if [[ "${NJRH_GS2_AUTOSTART:-true}" == "true" ]]; then
-      start_common_process "gs2_driver" "robot_eai_gs2/gs2_driver_node|gs2_driver_node --ros-args|ros2 launch robot_eai_gs2 gs2.launch.py" \
-        bash "${SCRIPT_DIR}/run_gs2_driver.sh"
-    fi
-    ;;
-  orbbec_336l)
-    if pgrep -f "robot_eai_gs2/[g]s2_driver_node|[g]s2_driver_node --ros-args|ros2 launch robot_eai_gs2 [g]s2.launch.py" >/dev/null 2>&1; then
-      echo "[runtime-overlay] Orbbec backend refused while GS2 docking processes are still running" >&2
-      exit 1
-    fi
-    sensors_config="${ROBOT_DESCRIPTION_CONFIG_FILE:-${NJRH_OVERLAY_ROOT}/config/sensors.yaml}"
-    for required_key in \
-      docking_camera_x docking_camera_y docking_camera_z \
-      docking_camera_roll docking_camera_pitch docking_camera_yaw
-    do
-      if ! grep -Eq "^[[:space:]]*${required_key}:" "${sensors_config}"; then
-        echo "[runtime-overlay] Orbbec docking backend refused: missing ${required_key} in ${sensors_config}" >&2
-        exit 1
-      fi
-    done
-    # Match only the commissioned 336L owner. A second Orbbec camera may run
-    # for arm/vision work and must not satisfy the docking-depth owner check.
-    start_common_process "orbbec_336l_depth" "camera336l" \
-      bash "${SCRIPT_DIR}/run_orbbec_336l_depth.sh"
-    start_common_process "orbbec_docking_perception" "robot_docking_perception/orbbec_depth_dock_node|orbbec_depth_dock_node" \
-      bash "${SCRIPT_DIR}/run_orbbec_docking_perception.sh"
-    wait_for_fresh_header_topic_message \
-      "/dock/target_observation" \
-      "${NJRH_DOCKING_SENSOR_READY_TIMEOUT_SEC:-15}" \
-      "${NJRH_DOCKING_SENSOR_MAX_AGE_SEC:-1.0}" \
-      "${NJRH_DOCKING_SENSOR_MAX_FUTURE_SEC:-0.25}" || {
-      echo "[runtime-overlay] Orbbec docking observation did not become fresh" >&2
-      exit 1
-    }
-    ;;
-  *)
-    echo "[runtime-overlay] unsupported NJRH_DOCKING_SENSOR_BACKEND=${DOCKING_SENSOR_BACKEND}" >&2
-    exit 1
-    ;;
-esac
-log_common_startup_stage "docking_sensor_ready"
 if [[ "${NJRH_RUNTIME_HEALTH_GUARD_AUTOSTART:-true}" == "true" ]]; then
   start_runtime_health_guard_common
 else
   echo "[runtime-overlay] runtime_health_guard autostart disabled; startup readiness probes are disabled" >&2
 fi
 log_common_startup_stage "runtime_health_guard_ready"
+wait_for_common_startup_job "robot_description_static_tf_common"
+log_common_startup_stage "static_tf_ready"
+wait_for_common_startup_job "ranger_chassis_common"
+log_common_startup_stage "ranger_chassis_ready"
+echo "[runtime-overlay] local_perception_common disabled; local costmap/collision_monitor consume /scan for standard marking+clearing" >&2
+start_overlay_helper "floor_manager_common" bash "${SCRIPT_DIR}/run_floor_manager.sh"
+log_common_startup_stage "floor_manager_ready"
+start_overlay_helper "robot_safety_common" bash "${SCRIPT_DIR}/run_robot_safety.sh"
+log_common_startup_stage "robot_safety_ready"
+start_overlay_helper "mode_manager_common" bash "${SCRIPT_DIR}/run_mode_manager.sh"
+log_common_startup_stage "mode_manager_ready"
+start_common_process "robot_api_server" "run_robot_api_server.sh|run_robot_api_server_supervised.sh|robot_api_server/robot_api_server_node|robot_api_server_node --ros-args" \
+  bash "${SCRIPT_DIR}/run_robot_api_server_supervised.sh"
 if [[ "${NJRH_RESIDENT_NAVIGATION_PRESTART_BEFORE_LOCAL_STATE:-false}" == "true" ]]; then
   start_resident_navigation_autostart_if_selected
 fi
@@ -1103,31 +1232,18 @@ if [[ "${NJRH_RESIDENT_NAVIGATION_EARLY_AUTOSTART:-true}" == "true" ]]; then
   start_resident_navigation_autostart_if_selected
 fi
 log_common_startup_stage "resident_navigation_started"
-echo "[runtime-overlay] local_perception_common disabled; local costmap/collision_monitor consume /scan for standard marking+clearing" >&2
-start_overlay_helper "floor_manager_common" bash "${SCRIPT_DIR}/run_floor_manager.sh"
-log_common_startup_stage "floor_manager_ready"
-start_overlay_helper "robot_safety_common" bash "${SCRIPT_DIR}/run_robot_safety.sh"
-log_common_startup_stage "robot_safety_ready"
-start_overlay_helper "mode_manager_common" bash "${SCRIPT_DIR}/run_mode_manager.sh"
-log_common_startup_stage "mode_manager_ready"
+
 log_common_startup_stage "ranger_chassis_core_ready"
-if [[ "${NJRH_DOCKING_MANAGER_AUTOSTART:-true}" == "true" ]]; then
-  start_common_process "docking_manager" "robot_docking_manager/docking_manager_node|docking_manager_node --ros-args|run_docking_manager.sh" \
-    bash "${SCRIPT_DIR}/run_docking_manager.sh"
-else
-  echo "[runtime-overlay] docking_manager autostart disabled; set NJRH_DOCKING_MANAGER_AUTOSTART=true for resident /docking services" >&2
-fi
-log_common_startup_stage "docking_manager_ready"
-start_common_process "robot_api_server" "run_robot_api_server.sh|run_robot_api_server_supervised.sh|robot_api_server/robot_api_server_node|robot_api_server_node --ros-args" \
-  bash "${SCRIPT_DIR}/run_robot_api_server_supervised.sh"
 wait_for_robot_api_server_common_ready
-log_common_startup_stage "robot_api_server_ready"
+log_common_startup_stage "robot_api_server_process_ready"
 
 if [[ "${RESIDENT_NAVIGATION_AUTOSTART}" != "false" ]]; then
   start_resident_navigation_autostart_if_selected
   wait_for_resident_navigation_autostart_if_started
 fi
-log_common_startup_stage "common_services_ready"
+log_common_startup_stage "common_core_services_started"
+echo "[runtime-overlay] docking deferred until API HTTP and navigation initialization finish (localization success is not required)" >&2
+update_common_deferred_startup
 
 echo "[runtime-overlay] common services are running; start mapping or resident navigation scripts in reuse mode" >&2
 while true; do
@@ -1135,5 +1251,8 @@ while true; do
   verify_ranger_chassis_common_health_or_exit
   verify_robot_local_state_common_health_or_exit
   verify_robot_api_server_common_health_or_exit
-  verify_docking_sensor_common_health_or_exit
+  update_common_deferred_startup
+  if [[ "${docking_startup_done}" == 1 ]]; then
+    verify_docking_sensor_common_health_or_exit
+  fi
 done

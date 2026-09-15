@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import re
 import shutil
 import subprocess
@@ -362,7 +363,7 @@ def test_resident_navigation_prioritizes_localization_stack_before_held_nav2_pre
     initial_background_index = script.index(
         'if env_flag_true "${NJRH_INITIAL_GLOBAL_LOCALIZATION_BACKGROUND_START:-false}"; then'
     )
-    initial_localization_index = script.index("wait_for_initial_global_localization || {")
+    initial_localization_index = script.index("if ! wait_for_initial_global_localization; then")
     lifecycle_activation_index = script.index("if ! activate_prestarted_nav2_lifecycle; then")
     assert (
         source_index
@@ -435,10 +436,10 @@ def test_nav_defaults_are_fixed():
     assert "vy_std: 0.0" in nav2
     assert "wz_std: 0.32" in nav2
     assert "vx_max: 1.20" in nav2
-    assert "vx_min: -0.08" in nav2
-    assert "vx_min: -0.08" in overlay_nav2
-    assert "vx_min: 0.0" not in nav2
-    assert "vx_min: 0.0" not in overlay_nav2
+    assert "vx_min: 0.0" in nav2
+    assert "vx_min: 0.0" in overlay_nav2
+    assert "vx_min: -0.08" not in nav2
+    assert "vx_min: -0.08" not in overlay_nav2
     assert "vx_min: -0.20" not in nav2
     assert "vx_min: -0.20" not in overlay_nav2
     assert "vy_max: 0.0" in nav2
@@ -486,7 +487,7 @@ def test_nav_defaults_are_fixed():
     assert "max_decel: [-0.95, -0.30, -1.10]" in nav2
     assert "max_decel: [-0.95, -0.30, -1.10]" in overlay_nav2
     assert "robot_nav_config::GoalScopedRotationShimController" in nav2
-    assert 'primary_controller: "nav2_mppi_controller::MPPIController"' in nav2
+    assert 'primary_controller: "robot_nav_config::RangerMPPIController"' in nav2
     assert "angular_dist_threshold: 0.45" in nav2
     assert "angular_disengage_threshold: 0.075" in nav2
     assert "angular_dist_threshold: 0.45" in overlay_nav2
@@ -649,7 +650,7 @@ def test_nav_defaults_are_fixed():
     assert "source_timeout: 1.5" in nav2
     assert "stop_pub_timeout: 0.3" in nav2
     assert 'polygons: ["StopZone", "SlowZone", "FootprintApproach"]' in nav2
-    assert 'points: [0.50, 0.40, 0.50, -0.40, -0.50, -0.40, -0.50, 0.40]' in nav2
+    assert 'points: [0.42, 0.28, 0.42, -0.28, -0.42, -0.28, -0.42, 0.28]' in nav2
     assert 'footprint_topic: "/local_costmap/published_footprint"' in nav2
     assert 'action_type: "approach"' in nav2
     assert "/local_state/odometry" in nav2
@@ -1406,7 +1407,7 @@ def test_phase_n3_nav2_native_goal_completion_contracts():
 
     for params in (nav2, overlay_nav2):
         assert 'plugin: "robot_nav_config::GoalScopedRotationShimController"' in params
-        assert 'primary_controller: "nav2_mppi_controller::MPPIController"' in params
+        assert 'primary_controller: "robot_nav_config::RangerMPPIController"' in params
         assert "rotate_to_heading_once: true" in params
         assert "goal_change_xy_threshold: 0.01" in params
         assert "goal_change_yaw_threshold: 0.01" in params
@@ -1837,7 +1838,7 @@ def test_phase_n4_post_nav2_final_verify_recovery_contracts():
     assert "publish_predock_yaw_align_command" not in run_goal_block
     assert 'degraded ? "degraded" : "failed"' in goal_job_cpp
 
-    assert 'primary_controller: "nav2_mppi_controller::MPPIController"' in nav2_cfg
+    assert 'primary_controller: "robot_nav_config::RangerMPPIController"' in nav2_cfg
     assert 'plugin: "nav2_smac_planner/SmacPlanner2D"' in nav2_cfg
     assert "transform_tolerance: 0.10" in nav2_cfg
     assert "max_odom_tf_age_ms: 100.0" in bridge_cfg
@@ -2148,7 +2149,10 @@ def test_tf_policy_is_canonical():
 
 def test_runtime_health_guard_replaces_hot_readiness_probes():
     scripts_root = ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts"
-    guard = (scripts_root / "runtime_health_guard.py").read_text(encoding="utf-8")
+    bringup = ROOT / "src" / "robot_bringup"
+    guard = (bringup / "src" / "runtime_health_guard.cpp").read_text(encoding="utf-8")
+    checker = (bringup / "src" / "runtime_health_check.cpp").read_text(encoding="utf-8")
+    cmake = (bringup / "CMakeLists.txt").read_text(encoding="utf-8")
     helpers = (scripts_root / "runtime_health_helpers.sh").read_text(encoding="utf-8")
     runner = (scripts_root / "run_runtime_health_guard.sh").read_text(encoding="utf-8")
     common = (scripts_root / "run_common_services.sh").read_text(encoding="utf-8")
@@ -2160,51 +2164,74 @@ def test_runtime_health_guard_replaces_hot_readiness_probes():
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "config" / "cpu_affinity.env"
     ).read_text(encoding="utf-8")
 
-    assert 'super().__init__("runtime_health_guard")' in guard
+    assert not (scripts_root / "runtime_health_guard.py").exists()
+    assert 'Node("runtime_health_guard"' in guard
     assert '"/local_state/odometry"' in guard
     assert '"/fastlio/base_odometry"' in guard
     assert '"/scan"' in guard
     assert '"/dock/target_observation"' in guard
     assert "DockTargetObservation" in guard
-    assert '"docking_sensor_healthy": docking_sensor_healthy' in guard
-    assert '"always_observed": [' in guard
-    assert guard.count('self._on_topic("/local_state/odometry")') == 1
+    assert '"docking_sensor_healthy"' in guard
+    assert '"always_observed"' in guard
+    assert guard.count('observe<nav_msgs::msg::Odometry>("/local_state/odometry"') == 1
     assert '"/dock/target_observation",' in guard
     assert "NJRH_RUNTIME_HEALTH_OBSERVE_TOPIC_MESSAGES" in guard
     assert "NJRH_RUNTIME_HEALTH_OBSERVE_HEAVY_TOPICS" in guard
-    assert "if self.observe_topic_messages:" in guard
-    assert "if self.observe_heavy_topics:" in guard
+    assert "if (messages_)" in guard
+    assert "if (heavy_)" in guard
+    assert 'NJRH_RUNTIME_HEALTH_SAMPLE_PERIOD_SEC", 1.0' in guard
     assert 'NJRH_RUNTIME_HEALTH_GRAPH_PERIOD_SEC", 5.0' in guard
     assert 'NJRH_RUNTIME_HEALTH_WRITE_PERIOD_SEC", 1.0' in guard
+    assert 'NJRH_RUNTIME_HEALTH_ODOM_NO_UPDATE_TIMEOUT_SEC", 3.0' in guard
+    assert 'NJRH_RUNTIME_HEALTH_ODOM_FRESH_SEC", 0.75' in guard
+    assert "rclcpp::QoS qos(1)" in guard
+    assert "CallbackGroupType::MutuallyExclusive, false" in guard
+    assert "sub->take(msg, info)" in guard
+    assert "rclcpp::spin" not in guard
+    assert '"sampled_messages_not_publisher_rate"' in guard
     assert "NJRH_RUNTIME_HEALTH_OBSERVE_TF" in guard
     assert "NJRH_RUNTIME_HEALTH_OBSERVE_ALL_TF" in guard
     assert "NJRH_RUNTIME_HEALTH_TF_TRACKED_EDGES" in guard
     assert '"map->odom,odom->base_link"' in guard
-    assert "if self.observe_tf:" in guard
+    assert "if (tf_)" in guard
     assert "tf_tracking" in guard
     assert "topic_tracking" in guard
-    assert '"observe_topic_messages": self.observe_topic_messages' in guard
-    assert '"observe_tf": self.observe_tf' in guard
-    assert "edge not in self.tracked_tf_edges" in guard
-    assert '"local_state_topic_ready": local_state_topic_ready' in guard
-    assert guard.count('self._make_subscription(TFMessage, "/tf"') == 1
+    assert '"observe_topic_messages", messages_' in guard
+    assert '"observe_tf", tf_' in guard
+    assert "tracked_.count(key)" in guard
+    assert '"local_state_topic_ready"' in guard
+    assert guard.count('create_subscription<tf2_msgs::msg::TFMessage>("/tf"') == 1
     assert '"/tf"' in guard
-    assert '"schema": "njrh.runtime_health.v1"' in guard
-    assert "os.replace(tmp_name, self.output_path)" in guard
+    assert '"schema", "njrh.runtime_health.v1"' in guard
+    assert '"implementation", "cpp"' in guard
+    assert '"odom_watch"' in guard
+    assert '"generation"' in guard and '"sequence"' in guard
+    assert '"updated_monotonic_sec"' in guard and '"boot_id"' in guard
+    assert "rename(pattern.c_str(), path.c_str())" in guard
     assert "--once" in guard
     assert "runtime_health_check()" in helpers
-    assert '"local_state_topic_ready": bool(summary.get("local_state_topic_ready"))' in helpers
     assert "runtime_health_local_state_diagnostic()" in helpers
-    assert 'emit("observer_stale", 42' in helpers
-    assert 'emit("odom_stamp_stale", 53' in helpers
-    assert '"docking_sensor_healthy": bool(summary.get("docking_sensor_healthy"))' in helpers
+    assert 'runtime_health_query diagnostic' in helpers
+    assert 'NJRH_RUNTIME_HEALTH_CHECK_BIN' in helpers
+    assert 'install/robot_bringup/lib/robot_bringup/runtime_health_check' in helpers
+    assert 'python' not in helpers
+    assert '"observer_stale"' in checker
+    assert 'emit("odom_stamp_stale", 53' in checker
+    assert 'emit("observer_sampling_warmup", 45' in checker
+    assert 'emit("odom_no_fresh_update", 56' in checker
     assert "runtime_health_fresh_tf_ready()" in helpers
     assert "runtime_health_topic_message_ready()" in helpers
-    assert 'item.get("last_received_at") is None' in helpers
+    assert 'runtime_health_query topic "$1"' in helpers
     assert "runtime_health_tf_seen()" in helpers
     assert "NJRH_RUNTIME_HEALTH_TF_SEEN_MAX_AGE_SEC" in helpers
-    assert 'njrh_exec_affined runtime_health_guard python3 "${guard_script}"' in runner
+    assert 'njrh_exec_affined runtime_health_guard "${guard_binary}"' in runner
+    assert 'python' not in runner
     assert 'exec njrh_exec_affined runtime_health_guard' not in runner
+    assert 'add_executable(runtime_health_guard src/runtime_health_guard.cpp)' in cmake
+    assert 'add_executable(runtime_health_check src/runtime_health_check.cpp)' in cmake
+    assert re.search(r'install\(TARGETS[^)]*\bruntime_health_guard\b[^)]*\bruntime_health_check\b', cmake)
+    assert not re.search(r'(?:ament_target_dependencies|target_link_libraries)\(runtime_health_check\b', cmake)
+    assert not re.search(r'#include\s*[<"](?:rclcpp|rmw|dds|fastdds)[/\.]', checker)
     assert "NJRH_RUNTIME_HEALTH_GUARD_AUTOSTART:-true" in common
     assert 'start_common_process "runtime_health_guard"' in common
     assert "verify_docking_sensor_common_health_or_exit" in common
@@ -2231,7 +2258,7 @@ def test_runtime_health_guard_replaces_hot_readiness_probes():
         common.index("wait_for_runtime_health_local_state_endpoint_ready()")
     ]
     assert "return 1" not in health_wait_block
-    common_main_flow = common[common.index('log_common_startup_stage "docking_sensor_ready"') :]
+    common_main_flow = common[common.index("require_can_interface_up\n") :]
     assert common_main_flow.index("NJRH_RUNTIME_HEALTH_GUARD_AUTOSTART") < common_main_flow.index(
         "wait_for_robot_local_state_common_background_if_started"
     )
@@ -2263,14 +2290,15 @@ def test_runtime_health_guard_replaces_hot_readiness_probes():
     assert 'env RMW_FASTRTPS_PUBLICATION_MODE="${LOCAL_STATE_RMW_FASTRTPS_PUBLICATION_MODE}"' in local_state_runner
 
 
-def test_runtime_health_observer_failure_cannot_restart_the_complete_runtime():
+def test_runtime_health_observer_failure_cannot_restart_the_complete_runtime(tmp_path):
     scripts_root = ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts"
     helpers = (scripts_root / "runtime_health_helpers.sh").read_text(encoding="utf-8")
     common = (scripts_root / "run_common_services.sh").read_text(encoding="utf-8")
 
     assert "runtime_health_local_state_diagnostic()" in helpers
-    assert "observer_stale" in helpers
-    assert "observer_graph_inconsistent" in helpers
+    checker = (ROOT / "src/robot_bringup/src/runtime_health_check.cpp").read_text(encoding="utf-8")
+    assert "observer_stale" in checker
+    assert "observer_graph_inconsistent" in checker
 
     match = re.search(
         r"(?ms)^verify_robot_local_state_common_health_or_exit\(\) \{\n.*?^\}\n",
@@ -2282,6 +2310,9 @@ def test_runtime_health_observer_failure_cannot_restart_the_complete_runtime():
     assert "observer degraded" in verifier
     assert "does not authorize complete-chain recovery" in verifier
     assert 'runtime_health_check "local_state_topic_ready"' not in verifier
+    assert '40|41|42|43|44|45|46)' in verifier
+    assert '50|51|52|53|54|55|56)' in verifier
+    assert 'evidence_id=' in verifier
 
     docking_match = re.search(
         r"(?ms)^verify_docking_sensor_common_health_or_exit\(\) \{\n.*?^\}\n",
@@ -2313,9 +2344,17 @@ def test_runtime_health_observer_failure_cannot_restart_the_complete_runtime():
     if bash is None:
         pytest.skip("bash is required for the runtime-health recovery policy regression")
 
+    cli_tests_path = ROOT / "src/robot_bringup/test/test_runtime_health_check.py"
+    spec = importlib.util.spec_from_file_location("health_cli_test_support", cli_tests_path)
+    cli_tests = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli_tests)
+    binary = cli_tests.resolve_runtime_health_check(tmp_path / "cli_build")
+
     harness = f"""
 set -euo pipefail
 robot_local_state_common_health_failures=0
+robot_local_state_fault_generation=""
+robot_local_state_fault_sequence=0
 runtime_health_observer_failures=0
 docking_sensor_common_health_failures=0
 docking_health_observer_failures=0
@@ -2339,11 +2378,37 @@ fi
 python3() {{
   "${{python_executable}}" "$@"
 }}
+# These functions are extracted in isolation. Never source the common main flow.
+systemctl() {{ echo "unexpected systemctl call" >&2; exit 90; }}
+ros2() {{ echo "unexpected ROS call" >&2; exit 91; }}
+ssh() {{ echo "unexpected SSH call" >&2; exit 92; }}
+docker() {{ echo "unexpected Docker call" >&2; exit 93; }}
+kill() {{ echo "unexpected signal to runtime" >&2; exit 94; }}
+checker_binary="$3"
+if command -v cygpath >/dev/null 2>&1; then
+  checker_binary="$(cygpath -u "${{checker_binary}}")"
+fi
+export NJRH_RUNTIME_HEALTH_CHECK_BIN="${{checker_binary}}"
+export NJRH_RUNTIME_HEALTH_MAX_AGE_SEC=2.0
+export NJRH_RUNTIME_HEALTH_ODOM_FRESH_SEC=0.75
+TEST_DIRECT_CONFIRM_CALLS=0
 local_state_required_processes_running() {{
-  return 0
+  [[ "${{TEST_REQUIRED_PROCESSES_RUNNING:-true}}" == "true" ]]
 }}
 direct_local_state_odom_ready_for_health_confirmation() {{
+  TEST_DIRECT_CONFIRM_CALLS=$((TEST_DIRECT_CONFIRM_CALLS + 1))
   [[ "${{TEST_DIRECT_LOCAL_STATE_READY:-false}}" == "true" ]]
+}}
+refresh_legacy_snapshot() {{
+  python3 - "${{health_file}}" <<'PY'
+import json, sys, time
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    snapshot = json.load(stream)
+snapshot["updated_at"] = time.time()
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(snapshot, stream)
+PY
 }}
 {verifier}
 {docking_verifier}
@@ -2351,6 +2416,13 @@ direct_local_state_odom_ready_for_health_confirmation() {{
 # A stale/missing observer is not evidence that robot_local_state failed. It
 # must never consume the real-fault retry budget or exit the common owner.
 printf '%s\n' '{{"updated_at":1,"summary":{{"local_state_endpoint_ready":true,"local_state_topic_ready":true,"local_odom_fresh":true}},"topics":{{"/local_state/odometry":{{"publishers":1,"last_received_at":1,"last_age_sec":0.03,"message_count":100}}}}}}' >"${{health_file}}"
+for _ in 1 2 3 4; do
+  verify_robot_local_state_common_health_or_exit
+done
+[[ "${{robot_local_state_common_health_failures}}" -eq 0 ]]
+
+# Invalid snapshots are observer failures, even across repeated reads.
+printf '%s\\n' '{{broken' >"${{health_file}}"
 for _ in 1 2 3 4; do
   verify_robot_local_state_common_health_or_exit
 done
@@ -2383,7 +2455,14 @@ export TEST_DIRECT_LOCAL_STATE_READY=false
 now="$(python3 -c 'import time; print(time.time())')"
 printf '{{"updated_at":%s,"summary":{{"local_state_endpoint_ready":true,"local_state_topic_ready":false,"local_odom_fresh":false}},"topics":{{"/local_state/odometry":{{"publishers":1,"last_received_at":%s,"last_stamp_sec":1,"last_age_sec":10.0,"message_count":100}}}}}}\n' "${{now}}" "${{now}}" >"${{health_file}}"
 verify_robot_local_state_common_health_or_exit
+for _ in 1 2 3 4; do
+  verify_robot_local_state_common_health_or_exit
+done
+[[ "${{robot_local_state_common_health_failures}}" -eq 1 ]]
+refresh_legacy_snapshot
 verify_robot_local_state_common_health_or_exit
+[[ "${{robot_local_state_common_health_failures}}" -eq 2 ]]
+refresh_legacy_snapshot
 if verify_robot_local_state_common_health_or_exit; then
   exit 31
 fi
@@ -2393,6 +2472,125 @@ fi
 now="$(python3 -c 'import time; print(time.time())')"
 printf '{{"updated_at":%s,"summary":{{"local_state_endpoint_ready":true,"local_state_topic_ready":true,"local_odom_fresh":true}},"topics":{{"/local_state/odometry":{{"publishers":1,"last_received_at":%s,"last_stamp_sec":%s,"last_age_sec":0.03,"message_count":101}}}}}}\n' "${{now}}" "${{now}}" "${{now}}" >"${{health_file}}"
 verify_robot_local_state_common_health_or_exit
+[[ "${{robot_local_state_common_health_failures}}" -eq 0 ]]
+
+# The v1 writer has a distinct runtime watch, independent from startup freshness.
+write_v1_snapshot() {{
+  python3 - "${{health_file}}" "$1" "$2" "$3" "${{4:-generation-a}}" "${{5:-false}}" <<'PY'
+import json, sys, time
+from pathlib import Path
+path, age, seen, sequence, generation, delayed = sys.argv[1:]
+now = time.time()
+snapshot = {{
+    "schema": "njrh.runtime_health.v1", "implementation": "cpp",
+    "updated_at": now, "generation": generation, "sequence": int(sequence),
+    "updated_monotonic_sec": time.monotonic(), "clock_valid": True,
+    "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8"),
+    "sampling_delayed": delayed == "true",
+    "odom_watch": {{"no_update_age_sec": float(age), "timeout_sec": 3.0,
+                   "seen_valid": seen == "true"}},
+    "summary": {{"local_state_endpoint_ready": True, "local_odom_fresh": False,
+                 "local_state_topic_ready": False}},
+    "topics": {{"/local_state/odometry": {{"publishers": 1, "last_received_at": now,
+               "last_stamp_sec": now - float(age), "last_age_sec": float(age),
+               "message_count": int(sequence)}}}}
+}}
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(snapshot, stream)
+PY
+}}
+export TEST_DIRECT_LOCAL_STATE_READY=false
+write_v1_snapshot 2.5 true 1
+verify_robot_local_state_common_health_or_exit
+[[ "${{robot_local_state_common_health_failures}}" -eq 0 ]]
+write_v1_snapshot 2.5 false 2
+verify_robot_local_state_common_health_or_exit
+[[ "${{robot_local_state_common_health_failures}}" -eq 0 ]]
+
+# Re-reading one failed generation:sequence is not another confirmation.
+write_v1_snapshot 3.0 true 3
+verify_robot_local_state_common_health_or_exit
+[[ "${{robot_local_state_common_health_failures}}" -eq 1 ]]
+for _ in 1 2 3 4; do
+  verify_robot_local_state_common_health_or_exit
+done
+[[ "${{robot_local_state_common_health_failures}}" -eq 1 ]]
+
+# Independent fresh odom contradicts a new fault snapshot and clears the count.
+export TEST_DIRECT_LOCAL_STATE_READY=true
+write_v1_snapshot 4.0 true 4
+verify_robot_local_state_common_health_or_exit
+[[ "${{robot_local_state_common_health_failures}}" -eq 0 ]]
+export TEST_DIRECT_LOCAL_STATE_READY=false
+write_v1_snapshot 4.0 true 5
+verify_robot_local_state_common_health_or_exit
+[[ "${{robot_local_state_common_health_failures}}" -eq 1 ]]
+write_v1_snapshot 5.0 true 6
+verify_robot_local_state_common_health_or_exit
+[[ "${{robot_local_state_common_health_failures}}" -eq 2 ]]
+if verify_robot_local_state_common_health_or_exit; then :; else exit 32; fi
+[[ "${{robot_local_state_common_health_failures}}" -eq 2 ]]
+write_v1_snapshot 5.0 true 5
+verify_robot_local_state_common_health_or_exit
+[[ "${{robot_local_state_common_health_failures}}" -eq 2 ]]
+
+# A new generation starts its own budget, even with the same sequence.
+write_v1_snapshot 5.0 true 6 generation-b
+verify_robot_local_state_common_health_or_exit
+[[ "${{robot_local_state_common_health_failures}}" -eq 1 ]]
+write_v1_snapshot 5.0 true 7 generation-b
+verify_robot_local_state_common_health_or_exit
+[[ "${{robot_local_state_common_health_failures}}" -eq 2 ]]
+write_v1_snapshot 5.0 true 8 generation-b
+if verify_robot_local_state_common_health_or_exit; then
+  exit 33
+fi
+[[ "${{robot_local_state_common_health_failures}}" -eq 3 ]]
+write_v1_snapshot 0.0 true 9 generation-b
+verify_robot_local_state_common_health_or_exit
+[[ "${{robot_local_state_common_health_failures}}" -eq 0 ]]
+
+# Missing process identity still requires an independent odometry confirmation.
+export TEST_REQUIRED_PROCESSES_RUNNING=false
+export TEST_DIRECT_LOCAL_STATE_READY=true
+direct_calls_before="${{TEST_DIRECT_CONFIRM_CALLS}}"
+for sequence in 10 11 12 13; do
+  write_v1_snapshot 4.0 true "${{sequence}}" generation-b
+  verify_robot_local_state_common_health_or_exit
+done
+[[ "${{TEST_DIRECT_CONFIRM_CALLS}}" -eq $((direct_calls_before + 4)) ]]
+[[ "${{robot_local_state_common_health_failures}}" -eq 0 ]]
+export TEST_REQUIRED_PROCESSES_RUNNING=true
+export TEST_DIRECT_LOCAL_STATE_READY=false
+
+# Sampling delay and invalid observer data break a consecutive fault run.
+write_v1_snapshot 4.0 true 14 generation-b
+verify_robot_local_state_common_health_or_exit
+[[ "${{robot_local_state_common_health_failures}}" -eq 1 ]]
+write_v1_snapshot 4.0 true 15 generation-b true
+for _ in 1 2 3 4; do
+  verify_robot_local_state_common_health_or_exit
+done
+[[ "${{robot_local_state_common_health_failures}}" -eq 0 ]]
+write_v1_snapshot 4.0 true 16 generation-b
+verify_robot_local_state_common_health_or_exit
+[[ "${{robot_local_state_common_health_failures}}" -eq 1 ]]
+printf '%s\\n' '{{broken' >"${{health_file}}"
+verify_robot_local_state_common_health_or_exit
+[[ "${{robot_local_state_common_health_failures}}" -eq 0 ]]
+
+# Exercise corrupted diagnostic transport, still using the actual C++ reader.
+# The normal wrapper is already covered above; only remove its evidence token.
+runtime_health_local_state_diagnostic() {{
+  local output="" rc=0
+  output="$(runtime_health_query diagnostic "${{NJRH_RUNTIME_HEALTH_ODOM_FRESH_SEC}}")" || rc=$?
+  printf '%s\\n' "${{output%% evidence_id=*}}"
+  return "${{rc}}"
+}}
+for sequence in 17 18 19 20; do
+  write_v1_snapshot 4.0 true "${{sequence}}" generation-b
+  verify_robot_local_state_common_health_or_exit
+done
 [[ "${{robot_local_state_common_health_failures}}" -eq 0 ]]
 
 # An unavailable or stale observer cannot prove a docking-camera failure and
@@ -2425,13 +2623,16 @@ verify_docking_sensor_common_health_or_exit
             "-s",
             str(scripts_root / "runtime_health_helpers.sh"),
             sys.executable,
+            str(binary),
         ],
         check=False,
         capture_output=True,
         text=True,
         input=harness,
+        timeout=60,
+        env={**os.environ, "MSYS2_ARG_CONV_EXCL": ""},
     )
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_robot_description_includes_gs2_mount():
@@ -3103,7 +3304,8 @@ def test_orbbec_336l_docking_backend_is_safe_and_rollbackable():
     assert "missing ${required_key}" in common_runner
     assert "wait_for_fresh_header_topic_message" in common_runner
     assert '"/dock/target_observation"' in common_runner
-    assert 'start_common_process "orbbec_336l_depth" "camera336l"' in common_runner
+    assert 'start_orbbec_336l_depth_common || return 1' in common_runner
+    assert 'start_common_process "orbbec_336l_depth" "camera336l"' not in common_runner
     assert 'start_common_process "orbbec_336l_depth" "orbbec_camera|camera336l"' not in common_runner
     assert 'robot_interfaces/msg/DockTargetObservation' in readiness_cpp
     assert "wait_for_fresh_stamped_topic_typed<robot_interfaces::msg::DockTargetObservation>" in readiness_cpp
@@ -6149,7 +6351,7 @@ def test_commercial_runtime_architecture_contract_is_documented():
         'ensure_common_local_state_ready_for_navigation_start "stable"'
         in resident_main_startup_flow[api_preflight_index:localization_index]
     )
-    assert "NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION:-false" in resident_runtime
+    assert "NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION:-true" in resident_runtime
     assert "NJRH_NAV2_HELD_PRESTART_AFTER_LOCAL_STATE:-true" in resident_runtime
     assert 'log_startup_stage "nav2_layer_started_after_initial_localization"' in resident_runtime
     assert "STARTUP_STAGE" in resident_runtime
@@ -6176,7 +6378,7 @@ def test_commercial_runtime_architecture_contract_is_documented():
     assert "retrying for fresh result" not in resident_runtime
     assert "transient stale map->odom during startup; retrying" not in resident_runtime
     assert "transient localization result timeout during startup; retrying" not in resident_runtime
-    assert "NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION:-false" in resident_runtime
+    assert "NJRH_NAV2_PRESTART_BEFORE_INITIAL_LOCALIZATION:-true" in resident_runtime
     assert "NJRH_NAV2_LIFECYCLE_HOLD" in resident_runtime
     assert '"nav2_layer_prestarted"' in resident_runtime
     assert "activate_prestarted_nav2_lifecycle()" in resident_runtime
@@ -6189,8 +6391,8 @@ def test_commercial_runtime_architecture_contract_is_documented():
     assert "NAV2_HOLD_READY_CONTROLLER_PID" in resident_runtime
     assert "NJRH_NAV2_HOLD_READY_FILE" in resident_runtime
     assert "NJRH_NAV2_PRESTART_HOLD_READY_TIMEOUT_SEC:-25" in resident_runtime
-    assert "NJRH_NAV2_PRESTART_HOLD_READY_MAX_AGE_SEC:-60" in resident_runtime
-    assert "NJRH_NAV2_LIFECYCLE_BACKGROUND_START:-true" in resident_runtime
+    assert "NJRH_NAV2_PRESTART_HOLD_READY_MAX_AGE_SEC" not in resident_runtime
+    assert "NJRH_NAV2_LIFECYCLE_BACKGROUND_START:-false" in resident_runtime
     assert "NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK:-false" in resident_runtime
     assert "starting prestarted Nav2 lifecycle background after localization stack readiness" in resident_runtime
     assert "final ready still waits for bridge map->odom and active Nav2" in resident_runtime
@@ -6199,7 +6401,7 @@ def test_commercial_runtime_architecture_contract_is_documented():
     assert "NJRH_NAV2_LIFECYCLE_PARALLEL_BT:-true" in resident_runtime
     assert "NJRH_NAV2_LIFECYCLE_TRUST_CHANGE_STATE_RESPONSE:-true" in resident_runtime
     assert "Nav2 lifecycle parallel core activation enabled" in resident_runtime
-    assert "Nav2 lifecycle activation running in background" in resident_runtime
+    assert "Nav2 startup worker running in background" in resident_runtime
     assert "nav2_lifecycle_sequence.py" in resident_runtime
     assert "--trust-change-state-response" in nav2_lifecycle_sequence
     assert "--configure-all-before-activate" in nav2_lifecycle_sequence
@@ -6318,9 +6520,9 @@ def test_commercial_runtime_architecture_contract_is_documented():
         resident_runtime.index("while true; do", resident_runtime.index("resident navigation runtime launched")) :
     ]
     assert "maintain_amcl_readiness_background_for_navigation" in resident_supervision_loop
-    assert resident_supervision_loop.index(
-        "maintain_amcl_readiness_background_for_navigation"
-    ) < resident_supervision_loop.index("AMCL runtime status heartbeat exited")
+    assert "AMCL runtime status heartbeat exited" not in resident_supervision_loop
+    assert "amcl_status_heartbeat_pid" not in resident_runtime
+    assert "amcl_status_client_for_navigation ping >/dev/null" in resident_runtime
     assert "AMCL readiness completion attempt=" in resident_runtime
     assert "AMCL_READINESS_TIMEOUT" in resident_runtime
     assert "NJRH_NAV2_EXTERNAL_LIFECYCLE_BRINGUP:-true" in resident_runtime
@@ -9004,7 +9206,8 @@ def test_robot_api_server_is_cpp_gateway_not_dashboard_backend():
     assert "ensure_localization_stack_ready_for_navigation ||" in resident_runtime_startup
     assert 'ensure_map_server_active "${NAV2_MAP_YAML:-}" "${map_server_timeout}"' in resident_runtime_script
     assert "MAP_SERVER_NOT_ACTIVE" in resident_runtime_script
-    assert "initial global localization did not pass trigger wrapper, bridge, and map->odom gates" in resident_runtime_script
+    assert 'log_startup_stage "waiting_for_localization"' in resident_runtime_script
+    assert "wait_for_later_initial_localization || exit 1" in resident_runtime_script
     assert "start_initial_global_localization_background()" in resident_runtime_script
     assert "wait_for_initial_global_localization()" in resident_runtime_script
     assert "NJRH_INITIAL_GLOBAL_LOCALIZATION_BACKGROUND_START:-false" in resident_runtime_script
@@ -10091,7 +10294,10 @@ def test_p6_floor_transition_negative_interlock_contract():
     assert "OP_BEGIN" in bridge_code
     assert "OP_COMMIT" in bridge_code
     assert "OP_ABORT" in bridge_code
-    assert "FAILED_LOCKED" in bridge_code
+    # Failed transaction history is not a permanent bridge lock. Invalid map
+    # context still gates localization/motion until a fresh switch establishes it.
+    assert "!floor.runtime_context_valid" in bridge_code
+    assert "FLOOR_CONTEXT_INVALID" in bridge_code
     assert "live_floor_transition_service_enabled" in bridge_code
     assert 'declare_parameter<bool>("live_floor_transition_service_enabled", false)' in bridge_code
     disabled_bridge_smoke = (
@@ -10300,7 +10506,9 @@ def test_runtime_overlay_live_2d_mapping_uses_slam_toolbox():
     assert '"ros2 run fast_lio fastlio_mapping"' not in private_fastlio_cleanup
     assert "terminate_child" in run_projected_map
     assert 'wait_for_fresh_header_topic_message "${POINTS_TOPIC}" "${FASTLIO_POINTS_READY_TIMEOUT}" "${FASTLIO_POINTS_MAX_AGE_SEC}" 0.25' in run_projected_map
-    assert 'wait_for_topic_message "${FASTLIO_ODOM_TOPIC}" "${FASTLIO_ODOM_READY_TIMEOUT}"' in run_projected_map
+    assert 'runtime_readiness_probe mapping-fastlio-ready' in run_projected_map
+    assert run_projected_map.index('log_mapping_startup_stage "odom_bridge_started"') < run_projected_map.index(
+        'wait_for_fresh_header_topic_message "${POINTS_TOPIC}" "${FASTLIO_POINTS_READY_TIMEOUT}"')
     assert 'bridge_bin="${NJRH_PROJECT_ROOT}/install/robot_fastlio_mapping/lib/robot_fastlio_mapping/fastlio_odom_bridge_node"' in run_projected_map
     assert (
         'njrh_start_affined_background fastlio_odom_bridge_pid '
@@ -10308,7 +10516,7 @@ def test_runtime_overlay_live_2d_mapping_uses_slam_toolbox():
     ) in normalized_mapping_runner
     assert 'njrh_run_affined fastlio_odom_bridge "${bridge_bin}"' not in run_projected_map
     assert 'python3 "${bridge_script}"' not in run_projected_map
-    assert 'wait_for_topic_message "/mapping/fastlio_odometry" 10' in run_projected_map
+    assert '"${POINTS_TOPIC}" "${FASTLIO_ODOM_TOPIC}" /mapping/fastlio_odometry' in run_projected_map
     assert 'odom_frame:="${slam_odom_frame}"' in run_projected_map
     assert 'tf_topic:="${slam_tf_topic}"' in run_projected_map
     assert 'kill_canonical_pattern "robot_localization/ekf_node"' not in run_projected_map
@@ -10469,19 +10677,12 @@ def test_runtime_overlay_live_2d_mapping_uses_slam_toolbox():
     assert 'command == "stamped-scan-tf"' in readiness_probe_cpp
     assert "stamped_scan_tf_fixture.py" in stamped_scan_tf_smoke
     assert "probe incorrectly accepted scans without dynamic TF" in stamped_scan_tf_smoke
-    assert 'runtime_readiness_probe stamped-scan-tf \\' in run_projected_map
-    assert '"${SLAM2D_SCAN_TOPIC}" \\' in run_projected_map
-    assert '"${slam_tf_topic}" \\' in run_projected_map
-    assert '"${slam_odom_frame}" \\' in run_projected_map
-    stamped_tf_gate = run_projected_map.split(
-        'runtime_readiness_probe stamped-scan-tf \\', 1
-    )[0]
-    assert stamped_tf_gate.index('log_mapping_startup_stage "odom_bridge_ready"') < (
-        stamped_tf_gate.rindex('slam_odom_frame="${SLAM2D_FASTLIO_ODOM_FRAME}"')
-    )
-    assert run_projected_map.index('runtime_readiness_probe stamped-scan-tf \\') > (
-        run_projected_map.index('ros2 launch "${SLAM_LAUNCH_FILE}"')
-    )
+    assert 'start_mapping_scan_observer \\' in run_projected_map
+    assert '"${SLAM2D_SCAN_TOPIC}" "${slam_tf_topic}" "${slam_odom_frame}"' in run_projected_map
+    assert run_projected_map.index('log_mapping_startup_stage "odom_bridge_ready"') < run_projected_map.index(
+        'start_mapping_scan_observer \\')
+    assert run_projected_map.index('wait_for_scan_owner_observer', run_projected_map.index('ros2 launch "${SLAM_LAUNCH_FILE}"')) < (
+        run_projected_map.index('log_mapping_startup_stage "stamped_scan_tf_ready"'))
     assert "/mapping/scan" not in slam_launch
     assert "'topic': '/map'" in dashboard_patch
     assert "slam_toolbox_map_grid" in dashboard_patch
@@ -10553,29 +10754,29 @@ def test_slam_toolbox_mapping_owns_canonical_scan_from_fastlio_slice():
     assert "restamp" not in launch.lower()
     assert 'SLAM2D_SCAN_TOPIC="${NJRH_SLAM2D_SCAN_TOPIC:-/scan}"' in mapping_runner
     assert (
-        'set_resident_scan_output false'
+        'release_navigation_scan_owner "${SLAM2D_SCAN_TOPIC}"'
     ) in mapping_runner
     assert (
         'wait_for_scan_publisher_count "${SLAM2D_SCAN_TOPIC}" 0'
-    ) in mapping_runner
+    ) not in mapping_runner
     # Start the graph-identity observer before the mapping publisher.  Fast DDS
     # can otherwise expose a unique endpoint with UNKNOWN node metadata to a
     # participant that joins after the launch graph is already active.
     assert 'SLAM2D_SCAN_OWNER_READY_TIMEOUT="${NJRH_SLAM2D_SCAN_OWNER_READY_TIMEOUT:-30}"' in mapping_runner
     assert 'SLAM2D_STAMPED_TF_READY_TIMEOUT="${NJRH_SLAM2D_STAMPED_TF_READY_TIMEOUT:-30}"' in mapping_runner
     assert 'SLAM2D_STAMPED_TF_REQUIRED_GOOD="${NJRH_SLAM2D_STAMPED_TF_REQUIRED_GOOD:-3}"' in mapping_runner
-    assert '"${SLAM2D_SCAN_TOPIC}" "pointcloud_to_laserscan" 1' in mapping_runner
+    assert 'pointcloud_to_laserscan "${SLAM2D_SCAN_MAX_AGE_SEC}"' in mapping_runner
     assert '"${SLAM2D_SCAN_OWNER_READY_TIMEOUT}"' in mapping_runner
     assert 'wait_for_scan_owner_observer' in mapping_runner
     observer_start = mapping_runner.index(
-        'start_scan_owner_observer \\\n'
+        'start_mapping_scan_observer \\\n'
     )
     launch_start = mapping_runner.index('ros2 launch "${SLAM_LAUNCH_FILE}"')
     observer_wait = mapping_runner.index('wait_for_scan_owner_observer', launch_start)
     assert observer_start < launch_start < observer_wait
     assert 'restore_navigation_scan_owner "${SLAM2D_SCAN_TOPIC}"' in mapping_runner
-    assert 'set_resident_scan_output true' in ownership_helpers
-    assert 'wait_for_scan_owner "${topic}" "${RESIDENT_SCAN_OWNER_NODE}" 1' in ownership_helpers
+    assert 'runtime_readiness_probe scan-handoff ensure' in ownership_helpers
+    assert 'runtime_readiness_probe scan-handoff release' in ownership_helpers
     assert "resident scan ownership request outcome is unknown" in ownership_helpers
     assert "resident_scan_output_matches_requested_state" in ownership_helpers
     assert ownership_helpers.count("ros2 service call") == 1
@@ -11458,10 +11659,12 @@ def test_mapping_stop_only_cleans_private_fastlio_residuals():
         ROOT / "scripts" / "jetson" / "runtime_overlay" / "scripts" / "scan_ownership_helpers.sh"
     ).read_text(encoding="utf-8")
     restore_fn = restore_fn.split("restore_navigation_scan_owner() {", 1)[1]
-    assert '"${topic}" "${RESIDENT_SCAN_OWNER_NODE}" 1 1' in restore_fn
-    assert restore_fn.index('wait_for_scan_publisher_count "${topic}" 0 1') < (
-        restore_fn.index('"${topic}" "${RESIDENT_SCAN_OWNER_NODE}" 1 "${SCAN_OWNERSHIP_TIMEOUT_SEC}"')
-    )
+    assert 'runtime_readiness_probe scan-handoff ensure' in restore_fn
+    assert 'wait_for_scan_publisher_count "${topic}" 0 1' not in restore_fn
+    handoff = (ROOT / "src/robot_bringup/src/mapping_scan_handoff.hpp").read_text(encoding="utf-8")
+    assert 'fresh_disabled && publishers.empty()' in handoff
+    assert 'acknowledged_ && publishers.empty()' in handoff
+    assert 'wire.source_timestamp < started_ns_' in handoff
 
 
 def test_localization_bridge_latches_one_shot_localizer_pose():
@@ -11708,7 +11911,7 @@ def test_phase111_pointcloud_triage_contracts():
         '"ElevatorReverseEntryStagingFollowPath", '
         '"ElevatorReverseDockingFollowPath"]'
     ) in nav2
-    assert 'primary_controller: "nav2_mppi_controller::MPPIController"' in nav2
+    assert 'primary_controller: "robot_nav_config::RangerMPPIController"' in nav2
     assert 'plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"' in nav2
 
 
@@ -12114,7 +12317,7 @@ def test_phase113_pointcloud_accel_profile_contracts():
     assert "data_type: LaserScan" in nav2
     assert "inf_is_valid: true" in nav2
     assert 'plugin: "nav2_smac_planner/SmacPlanner2D"' in nav2
-    assert 'primary_controller: "nav2_mppi_controller::MPPIController"' in nav2
+    assert 'primary_controller: "robot_nav_config::RangerMPPIController"' in nav2
     assert 'plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"' in nav2
     assert 'export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"' in common_env
     assert 'export FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}"' in common_env
@@ -12477,10 +12680,10 @@ def test_phase115_flatscan_lifecycle_hardening_contracts():
     assert "graph misses confirmed but /flatscan messages are flowing; keeping helper" in run_pipeline
     assert "restart budget exhausted; keeping supervisor alive" in run_pipeline
     assert "stable health reset restart budget" in run_pipeline
-    assert "standalone /scan exists but /flatscan publisher is missing while laser_scan_to_flatscan pid=" in run_pipeline
+    assert "independently confirmed no /flatscan flow while /scan publisher exists and helper pid=" in run_pipeline
     assert 'flatscan_helper_health_state="process_missing"' in run_pipeline
     assert 'restart_flatscan_helper_if_allowed "laser_scan_to_flatscan exited"' in run_pipeline
-    assert "standalone scan chain temporarily lacks /flatscan while /scan publisher is not ready" in run_pipeline
+    assert "FlatScan fault candidate unconfirmed upstream; keeping helper alive" in run_pipeline
     assert "FAIL standalone scan chain lost /flatscan and /scan publisher is not ready" not in run_pipeline
     assert "legacy_scan_pid=$!" not in run_pipeline
     assert "jt128_localization_sensing.launch.py" not in run_pipeline
@@ -13258,6 +13461,8 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     verify_nomotion_path = scripts_dir / "verify_amcl_nomotion_readiness.sh"
     nomotion_probe_path = scripts_dir / "amcl_nomotion_update_probe.py"
     observe_path = scripts_dir / "observe_amcl_navigation_shadow_180s.sh"
+    amcl_status = (ROOT / "src/robot_bringup/src/runtime_amcl_status_server.cpp").read_text(encoding="utf-8")
+    amcl_status_header = (ROOT / "src/robot_bringup/include/robot_bringup/runtime_amcl_status.hpp").read_text(encoding="utf-8")
     verify = verify_path.read_text(encoding="utf-8")
     verify_contract = verify_contract_path.read_text(encoding="utf-8")
     verify_status = verify_status_path.read_text(encoding="utf-8")
@@ -13315,32 +13520,43 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "AMCL_EXIT_SEED_FAILED=24" in amcl_runner
     assert "AMCL_EXIT_POSE_MISSING=25" in amcl_runner
     assert "write_amcl_runtime_status" in amcl_runner
-    assert "source_status_file_if_valid" in amcl_runner
-    assert "status_file_value()" in amcl_runner
-    assert 'existing_seed_succeeded="$(status_file_value "${STATUS_FILE}" AMCL_SEED_SUCCEEDED)' in amcl_runner
-    assert 'existing_static_standby="$(status_file_value "${STATUS_FILE}" AMCL_STATIC_STANDBY_ACCEPTED)' in amcl_runner
+    assert "source_status_file_if_valid" not in amcl_runner
+    assert "status_file_value()" not in amcl_runner
+    assert "load_existing_amcl_runtime_status" not in amcl_runner
+    assert 'amcl_status_cli submit' in amcl_runner
+    assert '--set "LIFECYCLE_VERIFIED=${AMCL_PROGRESS_LIFECYCLE:-false}"' in amcl_runner
+    assert '--set "PROGRESS_KEY=${AMCL_PROGRESS_KEY:-}"' in amcl_runner
+    assert 'local owner_pid="${NJRH_AMCL_STATUS_OWNER_PID:-${NJRH_STARTUP_OWNER_PID:-$PPID}}"' in amcl_runner
+    assert '--owner-pid "${owner_pid}" --owner-generation "${owner_generation}"' in amcl_runner
+    assert 'same_process(new_amcl, amcl)' in amcl_status
+    assert 'mg == map_generation' in amcl_status
+    assert 'og == owner_generation' in amcl_status
+    assert 'pk == progress_key' in amcl_status
     assert 'AMCL_SEED_SUCCEEDED=true' in amcl_runner
     assert 'AMCL_STATIC_STANDBY_ACCEPTED=true' in amcl_runner
-    assert 'bash -n "${file}"' in amcl_runner
-    assert 'mv -f "${tmp_file}" "${STATUS_FILE}"' in amcl_runner
+    assert 'mv -f "${tmp_file}" "${STATUS_FILE}"' not in amcl_runner
+    assert 'atomic_write(path, env_document(f))' in amcl_status
+    assert 'flock(lock.value, LOCK_EX | LOCK_NB)' in amcl_status
+    assert 'SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC' in amcl_status
+    assert 'SO_PEERCRED' in amcl_status
+    assert 'AMCL_STATUS_WRITER"] = "runtime_health_guard"' in amcl_status
     assert "heartbeat_amcl_runtime_status" in amcl_runner
-    assert "load_existing_amcl_runtime_status" in amcl_runner
-    assert 'existing_ready="$(status_file_value "${STATUS_FILE}" AMCL_READY)' in amcl_runner
-    assert 'existing_tracking_ready="$(status_file_value "${STATUS_FILE}" AMCL_TRACKING_READY)' in amcl_runner
-    assert 'AMCL_STATIC_STANDBY_ACCEPTED=true' in amcl_runner
-    assert "amcl_resident_processes_alive" in amcl_runner
-    assert "NJRH_AMCL_RUNTIME_STATUS_HEARTBEAT_SEC:-2.0" in amcl_runner
-    assert "AMCL status heartbeat started" in amcl_runner
-    assert 'if [[ "${MODE}" != "disabled" && "${start_result}" == "ready" && "${amcl_seeded}" != "true" ]]' in amcl_runner
-    assert 'effective_start_result="waiting_seed"' in amcl_runner
-    assert "AMCL seed has not completed" in amcl_runner
-    assert 'write_amcl_runtime_status waiting_seed false false "resident AMCL is alive; waiting for initial pose seed"' in amcl_runner
-    assert 'write_amcl_runtime_status ready true false ""' in amcl_runner
-    assert "AMCL_STATE" in amcl_runner
-    assert "AMCL_STATUS_STAMP_SEC" in amcl_runner
-    assert "AMCL_STATUS_STALE" in amcl_runner
-    assert '|| "${AMCL_STATIC_STANDBY_ACCEPTED}" == "true"' in amcl_runner
-    assert "AMCL_PROCESS_READY" in amcl_runner
+    assert 'amcl_status_cli ping >/dev/null' in amcl_runner
+    assert "AMCL status heartbeat started" not in amcl_runner
+    assert 'double refresh_sec{2.0}' in amcl_status_header
+    assert 'double ttl_sec{5.0}' in amcl_status_header
+    assert '!seed && result == "ready"' in amcl_status
+    assert 'result = "waiting_seed"' in amcl_status
+    assert "AMCL seed has not completed" in amcl_status
+    assert 'finish_amcl_status waiting_seed false false "resident AMCL started; waiting for initial pose seed"' in amcl_runner
+    assert 'finish_amcl_status ready true false ""' in amcl_runner
+    assert 'write_amcl_runtime_status "${start_result}" "${ready}" "${degraded}" "${reason}" || return "${AMCL_EXIT_FAILED}"' in amcl_runner
+    assert "AMCL_STATE" in amcl_status
+    assert "AMCL_STATUS_STAMP_SEC" in amcl_status
+    assert "AMCL_STATUS_STALE" in amcl_status
+    assert 'yes(evidence, "AMCL_STATIC_STANDBY_ACCEPTED")' in amcl_status
+    assert 'yes(evidence, "AMCL_NOMOTION_POSE_RECEIVED")' in amcl_status
+    assert "AMCL_PROCESS_READY" in amcl_status
     assert "AMCL_SEED_RESPONSE_OK" in amcl_runner
     assert "AMCL_NOMOTION_PROBE_USED" in amcl_runner
     assert "AMCL_NOMOTION_POSE_RECEIVED" in amcl_runner
@@ -13349,12 +13565,13 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "NJRH_AMCL_STATIC_STANDBY_SKIP_POSE_WAIT:-true" in amcl_runner
     assert "AMCL static standby accepted immediately after seed" in amcl_runner
     assert "AMCL static standby accepted after seed without a fresh/no-motion pose" in amcl_runner
-    assert "NJRH_AMCL_STATUS_GRAPH_PROBE_ENABLED:-false" in amcl_runner
-    assert 'if [[ "${graph_probe_enabled}" == "true" ]]; then' in amcl_runner
-    assert "AMCL_STATIC_STANDBY" in amcl_runner
-    assert "AMCL_CORRECTION_READY" in amcl_runner
-    assert "AMCL_DEGRADED" in amcl_runner
-    assert "AMCL_FAILED" in amcl_runner
+    assert "NJRH_AMCL_STATUS_GRAPH_PROBE_ENABLED" not in amcl_runner
+    assert "void StatusServer::observe_graph" in amcl_status
+    assert "graph.available" in amcl_status
+    assert "AMCL_STATIC_STANDBY" in amcl_status
+    assert "AMCL_CORRECTION_READY" in amcl_status
+    assert "AMCL_DEGRADED" in amcl_status
+    assert "AMCL_FAILED" in amcl_status
     assert "AMCL_PID_STALE_CLEARED" in amcl_runner
     assert "SCAN_ADMISSION_PID_STALE_CLEARED" in amcl_runner
     assert "validated_pid_from_file" in amcl_runner
@@ -13377,8 +13594,8 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "NAV2_HOLD_READY_CONTROLLER_PID" in runtime
     assert "NJRH_NAV2_HOLD_READY_FILE" in runtime
     assert "NJRH_NAV2_PRESTART_HOLD_READY_TIMEOUT_SEC:-25" in runtime
-    assert "NJRH_NAV2_PRESTART_HOLD_READY_MAX_AGE_SEC:-60" in runtime
-    assert "NJRH_NAV2_LIFECYCLE_BACKGROUND_START:-true" in runtime
+    assert "NJRH_NAV2_PRESTART_HOLD_READY_MAX_AGE_SEC" not in runtime
+    assert "NJRH_NAV2_LIFECYCLE_BACKGROUND_START:-false" in runtime
     assert "NJRH_NAV2_LIFECYCLE_BACKGROUND_AFTER_LOCALIZATION_STACK:-false" in runtime
     assert "starting prestarted Nav2 lifecycle background after localization stack readiness" in runtime
     assert "NJRH_NAV2_LIFECYCLE_CONFIGURE_ALL_FIRST:-false" in runtime
@@ -13389,8 +13606,10 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "skipping /localization_result publisher pre-gate" in runtime
     assert "NJRH_INITIAL_LOCALIZATION_FLATSCAN_WAIT_SEC:-5" in runtime
     assert "NJRH_INITIAL_LOCALIZATION_FLATSCAN_REPAIR_WAIT_SEC:-20" in runtime
-    assert 'bash -n "${NJRH_AMCL_RUNTIME_STATUS_FILE}"' in runtime
-    assert "failed to source AMCL runtime status file" in runtime
+    assert 'bash -n "${NJRH_AMCL_RUNTIME_STATUS_FILE}"' not in runtime
+    assert 'snapshot="$(amcl_status_client_for_navigation read)"' in runtime
+    assert 'printf -v "${key}"' in runtime
+    assert "failed to source AMCL runtime status file" not in runtime
     assert "run_nav2_lifecycle_sequence()" in runtime
     assert "run_nav2_lifecycle_sequence_until_active()" in runtime
     assert 'runtime_readiness_probe lifecycle-active "${node_name}"' in runtime
@@ -13401,7 +13620,7 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "NJRH_NAV2_LIFECYCLE_BACKGROUND_ACTIVE_WAIT_SEC" in runtime
     assert "NJRH_NAV2_LIFECYCLE_BACKGROUND_JOIN_TIMEOUT_SEC" not in runtime
     assert "Nav2 lifecycle parallel core activation enabled" in runtime
-    assert "Nav2 lifecycle activation running in background" in runtime
+    assert "Nav2 startup worker running in background" in runtime
     assert "--trust-change-state-response" in lifecycle_sequence
     assert "--configure-all-before-activate" in lifecycle_sequence
     assert "lifecycle sequence: configuring all managed nodes before activation" in lifecycle_sequence
@@ -13418,8 +13637,11 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert resident_lifecycle_block.index("smoother_server") < resident_lifecycle_block.index("bt_navigator")
     assert resident_lifecycle_block.index("planner_server") < resident_lifecycle_block.index("controller_server")
     assert "start_amcl_status_heartbeat_if_enabled_for_navigation" in runtime
-    assert "amcl_status_heartbeat_pid" in runtime
-    assert "AMCL runtime status heartbeat" in runtime
+    assert "amcl_status_heartbeat_pid" not in runtime
+    assert "amcl_status_client_for_navigation register" in runtime
+    assert 'export NJRH_AMCL_STATUS_OWNER_PID="${NJRH_STARTUP_OWNER_PID}"' in runtime
+    assert "amcl_status_client_for_navigation ping >/dev/null" in runtime
+    assert "AMCL observer unavailable; do not classify an observer failure as a navigation producer failure" in runtime
     assert "cleanup_stale_amcl_runtime_status_owner" in common_runner
     assert "cleanup_stale_amcl_runtime_status_owner" in runtime
     assert "resident_navigation_layer_pids()" in common_runner
@@ -13432,7 +13654,8 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "COMMON_STARTUP_STAGE stage=" in common_runner
     assert 'log_common_startup_stage "helpers_loaded"' in common_runner
     assert 'log_common_startup_stage "local_state_ready"' in common_runner
-    assert 'log_common_startup_stage "common_services_ready"' in common_runner
+    assert 'log_common_startup_stage "common_core_services_started"' in common_runner
+    assert 'log_common_startup_stage "common_startup_finished"' in common_runner
     assert 'NJRH_LOCAL_STATE_START_READY_MODE="${NJRH_COMMON_LOCAL_STATE_START_READY_MODE:-endpoint}"' in common_runner
     resident_autostart_wait_block = common_runner[
         common_runner.index("wait_for_resident_navigation_autostart_if_started()") :
@@ -13457,13 +13680,13 @@ def test_phase_a2_always_on_amcl_runtime_contracts():
     assert "stale pointcloud accel process ignored SIGTERM; killing exact pids" in common_runner
     assert "/flatscan missing before resident navigation; restarting pointcloud accel" in common_runner
     common_main_flow = common_runner[common_runner.index("require_can_interface_up") :]
-    assert common_main_flow.index('start_canonical_helper "ranger_chassis_common"') < common_main_flow.index(
+    assert common_main_flow.index('start_common_canonical_helper_background "ranger_chassis_common"') > common_main_flow.index(
         'start_common_process "pointcloud_accel_pipeline"'
     )
-    assert common_main_flow.index('start_canonical_helper "robot_description_static_tf_common"') < common_main_flow.index(
+    assert common_main_flow.index('start_common_canonical_helper_background "robot_description_static_tf_common"') < common_main_flow.index(
         'start_common_process "pointcloud_accel_pipeline"'
     )
-    assert common_main_flow.index("start_robot_local_state_common_background_if_enabled") < common_main_flow.index(
+    assert common_main_flow.index("start_robot_local_state_common_background_if_enabled") > common_main_flow.index(
         'start_common_process "pointcloud_accel_pipeline"'
     )
     assert common_main_flow.index("NJRH_RUNTIME_HEALTH_GUARD_AUTOSTART") < common_main_flow.index(
@@ -13738,6 +13961,8 @@ def test_amcl_startup_uses_one_bounded_lifecycle_client_and_heartbeat_grace():
     lifecycle_helper = (scripts_dir / "nav2_lifecycle_sequence.py").read_text(
         encoding="utf-8"
     )
+    status = (ROOT / "src/robot_bringup/src/runtime_amcl_status_server.cpp").read_text(encoding="utf-8")
+    status_header = (ROOT / "src/robot_bringup/include/robot_bringup/runtime_amcl_status.hpp").read_text(encoding="utf-8")
 
     activate_block = runner[
         runner.index("activate_amcl_lifecycle()") :
@@ -13763,21 +13988,20 @@ def test_amcl_startup_uses_one_bounded_lifecycle_client_and_heartbeat_grace():
     assert "create_client(ChangeState" in lifecycle_helper
     assert lifecycle_helper.count("rclpy.init()") == 1
 
-    assert 'starting) state="AMCL_STARTING"' in runner
+    assert '{"starting","AMCL_STARTING"}' in status
     assert "AMCL_STARTUP_EPOCH_SEC" in runner
-    assert '"${start_result}" != "starting"' in runner
-    assert "NJRH_AMCL_STARTUP_HEARTBEAT_GRACE_SEC:-45" in heartbeat_block
-    assert 'heartbeat_startup_epoch="$(date +%s)"' in heartbeat_block
-    assert 'effective_startup_epoch="${heartbeat_startup_epoch}"' in heartbeat_block
-    assert (
-        '"${existing_failure_reason}" != "AMCL_HEARTBEAT_PROCESS_NOT_ALIVE"'
-        in heartbeat_block
-    )
-    assert (
-        'write_amcl_runtime_status starting false false '
-        '"resident AMCL startup is still in progress"'
-    ) in heartbeat_block
-    assert "AMCL_HEARTBEAT_PROCESS_NOT_ALIVE" in heartbeat_block
+    assert "double startup_grace_sec{45.0}" in status_header
+    assert 'result == "starting" && m - registered_at <= options.startup_grace_sec' in status
+    assert 'if (!same_context) registered_at = json::monotonic_now()' in status
+    assert 'result != "stopped" && result != "failed"' in status
+    assert "resident AMCL startup is still in progress" in status
+    assert "AMCL_HEARTBEAT_PROCESS_NOT_ALIVE" in status
+    assert "heartbeat_startup_epoch" not in heartbeat_block
+    assert "while" not in heartbeat_block
+    assert "sleep" not in heartbeat_block
+    assert "amcl_status_cli ping >/dev/null" in heartbeat_block
+    assert "AMCL_PROGRESS_LIFECYCLE=true" in activate_block
+    assert '--set "LIFECYCLE_VERIFIED=${AMCL_PROGRESS_LIFECYCLE:-false}"' in runner
 
 
 def test_phase_a22_amcl_readiness_stale_status_and_nomotion_race_contracts():
@@ -13786,6 +14010,7 @@ def test_phase_a22_amcl_readiness_stale_status_and_nomotion_race_contracts():
     scripts_dir = overlay / "scripts"
 
     amcl_runner = (scripts_dir / "run_amcl_shadow_localization.sh").read_text(encoding="utf-8")
+    amcl_status = (ROOT / "src/robot_bringup/src/runtime_amcl_status_server.cpp").read_text(encoding="utf-8")
     verify_status_path = scripts_dir / "verify_amcl_readiness_status.sh"
     verify_nomotion_path = scripts_dir / "verify_amcl_nomotion_readiness.sh"
     nomotion_probe_path = scripts_dir / "amcl_nomotion_update_probe.py"
@@ -13811,14 +14036,14 @@ def test_phase_a22_amcl_readiness_stale_status_and_nomotion_race_contracts():
     bridge_cfg = (config_dir / "localization_bridge.yaml").read_text(encoding="utf-8")
     api_cfg = (config_dir / "robot_api_server.yaml").read_text(encoding="utf-8")
 
-    assert "AMCL_STATUS_STAMP_SEC" in amcl_runner
-    assert "AMCL_STATUS_AGE_MS" in amcl_runner
-    assert "AMCL_STATUS_STALE" in amcl_runner
-    assert "AMCL_PROCESS_READY" in amcl_runner
-    assert "AMCL_SEEDED" in amcl_runner
-    assert "AMCL_STATIC_STANDBY" in amcl_runner
-    assert "AMCL_TRACKING_READY" in amcl_runner
-    assert "AMCL_CORRECTION_READY" in amcl_runner
+    assert "AMCL_STATUS_STAMP_SEC" in amcl_status
+    assert "AMCL_STATUS_AGE_MS" in amcl_status
+    assert "AMCL_STATUS_STALE" in amcl_status
+    assert "AMCL_PROCESS_READY" in amcl_status
+    assert "AMCL_SEEDED" in amcl_status
+    assert "AMCL_STATIC_STANDBY" in amcl_status
+    assert "AMCL_TRACKING_READY" in amcl_status
+    assert "AMCL_CORRECTION_READY" in amcl_status
     assert "AMCL_NOMOTION_PROBE_USED" in amcl_runner
     assert "AMCL_NOMOTION_POSE_RECEIVED" in amcl_runner
     assert "AMCL_NOMOTION_UPDATE_ACCEPT_RECEIVED_AFTER_CALL" in amcl_runner
@@ -15283,7 +15508,7 @@ def test_phase_r0_r2_runtime_force_accept_reduction_and_bridge_smoothing_contrac
     assert "correction_active" in bridge_cpp
     assert "smoothing_enabled" in bridge_cpp
     assert "explicit_relocalization_fast_smoothing_enabled_" in bridge_cpp
-    assert "explicit_relocalization_uses_fast_smoothing" in bridge_cpp
+    assert "explicit_relocalization_immediate" in bridge_cpp
     assert "explicit_relocalization_fast_max_duration_sec_" in bridge_cpp
     assert "smoothing_policy" in bridge_cpp
     assert "online_correction_requires_recovery" in bridge_cpp
@@ -15453,22 +15678,53 @@ def test_robot_api_health_uses_process_identity_not_pgrep_command_substrings():
     end = common.index("\n}\n", start)
     body = common[start:end]
 
-    assert "process_count_for_executable()" in common
-    assert "process_count_for_executable_with_exact_argument()" in common
-    assert "process_count_for_executable" in body
-    assert "process_count_for_executable_with_exact_argument" in body
+    query_start = common.index("query_robot_api_process_ownership()")
+    query_end = common.index("\n}\n", query_start)
+    query = common[query_start:query_end]
+    assert "query_robot_api_process_ownership" in body
+    assert "process_count_for_executable()" not in common
+    assert "process_count_for_executable_with_exact_argument()" not in common
     assert "process_count_for_pattern" not in body
-    assert '"${SCRIPT_DIR}/run_robot_api_server_supervised.sh"' in body
+    assert "pgrep" not in query and "readlink" not in query
+    assert "/proc/[0-9]*/exe" not in common
+    assert query.count('output="$("${binary}"') == 1
+    assert "NJRH_RUNTIME_PROCESS_CHECK_BIN" in query
+    assert '--supervisor-exe "${bash_executable}"' in query
+    assert '--supervisor-arg "${SCRIPT_DIR}/run_robot_api_server_supervised.sh"' in query
     assert (
-        '"${PROJECT_ROOT}/install/robot_api_server/lib/robot_api_server/'
+        '--api-exe "${PROJECT_ROOT}/install/robot_api_server/lib/robot_api_server/'
         'robot_api_server_node"'
-    ) in body
+    ) in query
+    assert '"${supervisor_count}" == 1 && "${node_count}" == 1' in query
+    assert '"${rc}" == 50 && "${status}" == ownership_fault' in query
+    assert 'if [[ "${rc}" != 50 ]]; then' in body
+    assert "does not authorize complete-chain recovery" in body
+
+    native = (ROOT / "src/robot_bringup/src/runtime_process_check.cpp").read_text(encoding="utf-8")
+    assert "canonical(options.supervisor_exe)" in native
+    assert "canonical(options.api_exe)" in native
+    assert '::readlinkat(directory, "exe"' in native
+    assert "exe == supervisor_exe && exact_argument(" in native
+    assert "const bool node = exe == api_exe;" in native
+    assert "cmdline.find('\\0', start)" in native
+    assert "cmdline.compare(start, end - start, expected) == 0" in native
+    assert "supervisors == 1 && nodes == 1" in native
+    assert "return unique ? 0 : 50;" in native
+    # CTest must run the behavioral proc-fixture tests against the built CLI,
+    # including argv decoys, duplicate/missing owners, and observer failures.
+    cmake = (ROOT / "src/robot_bringup/CMakeLists.txt").read_text(encoding="utf-8")
+    assert "add_test(NAME runtime_process_cli" in cmake
+    assert "NJRH_RUNTIME_PROCESS_CHECK_BIN=$<TARGET_FILE:runtime_process_check>" in cmake
+    assert "test/test_runtime_process_check.py" in cmake
     assert "wait_for_robot_api_server_common_ready()" in common
     assert "NJRH_ROBOT_API_PROCESS_READY_TIMEOUT_SEC" in common
+    assert 'sleep "${NJRH_COMMON_MAIN_HEALTH_PERIOD_SEC:-5}"' in common
     start_call = common.index('start_common_process "robot_api_server"')
     readiness_call = common.index("wait_for_robot_api_server_common_ready", start_call)
-    ready_stage = common.index('log_common_startup_stage "robot_api_server_ready"', start_call)
+    ready_stage = common.index('log_common_startup_stage "robot_api_server_process_ready"', start_call)
     assert start_call < readiness_call < ready_stage
+    deferred = common[common.index("update_common_deferred_startup() {"):common.index("require_can_interface_up\n")]
+    assert deferred.index("common_api_http_ready") < deferred.index('log_common_startup_stage "robot_api_server_ready"')
 
 
 def test_localization_layer_does_not_own_common_runtime_processes():
@@ -15719,9 +15975,18 @@ def test_global_localization_process_is_owned_by_localization_generation():
     assert "disown" not in global_start
     assert "forget_overlay_helper_pid" not in nav_helpers
 
-    assert "robot_global_localization/global_localization_node" in cleanup
-    assert "/install/robot_global_localization/lib/robot_global_localization/global_localization_node" in cleanup
-    assert "runtime_health_guard.py|run_runtime_health_guard.sh" in cleanup
+    assert 'source "${SCRIPT_DIR}/runtime_process_patterns.sh"' in cleanup
+    process_patterns = (scripts_dir / "runtime_process_patterns.sh").read_text(encoding="utf-8")
+    assert "robot_global_localization/global_localization_node" in process_patterns
+    assert "/install/robot_global_localization/lib/robot_global_localization/global_localization_node" in process_patterns
+    node_pattern = re.search(r'^NJRH_RUNTIME_NODE_PATTERN="([^"]+)"', process_patterns, re.M)
+    assert node_pattern is not None
+    for command in (
+        "/install/robot_bringup/lib/robot_bringup/runtime_health_guard",
+        "bash /scripts/run_runtime_health_guard.sh",
+        "python3 /scripts/runtime_health_guard.py",
+    ):
+        assert re.search(node_pattern.group(1), command), command
     assert "/tmp/njrh_runtime_health.json" in cleanup
     assert "/tmp/njrh_nav2_lifecycle_ready.env" in cleanup
 
@@ -16154,6 +16419,7 @@ def test_resident_runtime_ready_context_commit_is_fail_closed():
     harness = f"""
 set -euo pipefail
 runtime_ready=0
+floor_handoff_guard() {{ return 0; }}
 cleanup_marker="$(mktemp)"
 probe_count_file="$(mktemp)"
 write_count_file="$(mktemp)"
@@ -16274,7 +16540,8 @@ set -e
 rm -f "${{cleanup_marker}}" "${{probe_count_file}}" "${{write_count_file}}"
 """
     result = subprocess.run(
-        [str(bash), "-c", harness],
+        [str(bash), "-s"],
+        input=harness,
         check=False,
         capture_output=True,
         text=True,

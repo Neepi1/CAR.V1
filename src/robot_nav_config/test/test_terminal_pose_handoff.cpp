@@ -73,6 +73,70 @@ TEST(TerminalPoseHandoff, ResidualOutsideRecoveryEnvelopeFailsClosed) {
   EXPECT_FALSE(should_start_terminal_handoff(error, path, parameters));
 }
 
+TEST(TerminalPoseHandoff, PureLongitudinalOvershootStartsAndCompletesPermittedReverse) {
+  TerminalHandoffParameters parameters;
+  parameters.minimum_abs_lateral_m = 0.06;
+  TerminalPoseError error{0.096, -0.096, 0.0, 0.0};
+  TerminalPathMetrics path{0.096, 0.096, 0.0};
+  // Exercise admission before control: a controller-only reverse test misses
+  // the bug where a pure longitudinal overshoot never enters this controller.
+  ASSERT_TRUE(should_start_terminal_handoff(error, path, parameters));
+
+  TerminalPoseHandoffController controller(parameters);
+  controller.begin(0.0);
+  TerminalControlInput input;
+  input.error = error;
+  bool saw_reverse = false;
+  bool complete = false;
+  constexpr double dt = 0.05;
+  for (int step = 0; step < 200; ++step) {
+    input.now_sec = step * dt;
+    const auto output = controller.update(input);
+    ASSERT_FALSE(output.failed);
+    EXPECT_DOUBLE_EQ(output.command.linear_y, 0.0);
+    EXPECT_DOUBLE_EQ(output.command.angular_z, 0.0);
+    EXPECT_GE(output.command.linear_x, -parameters.reverse_max_speed_mps);
+    EXPECT_LE(output.command.linear_x, 0.0);
+    EXPECT_EQ(output.reverse_permit, output.command.linear_x < 0.0);
+    saw_reverse = saw_reverse || output.reverse_permit;
+    if (output.complete) {
+      complete = true;
+      EXPECT_LE(input.error.distance_m, parameters.goal_xy_tolerance_m);
+      break;
+    }
+    input.error.forward_m -= output.command.linear_x * dt;
+    input.error.distance_m = std::abs(input.error.forward_m);
+    input.actual_linear_x_mps = output.command.linear_x;
+  }
+  EXPECT_TRUE(saw_reverse);
+  EXPECT_TRUE(complete);
+}
+
+TEST(TerminalPoseHandoff, MixedOvershootBelowLateralThresholdStillStarts) {
+  TerminalHandoffParameters parameters;
+  parameters.minimum_abs_lateral_m = 0.06;
+  TerminalPoseError error{std::hypot(0.05, 0.05), -0.05, 0.05, 0.0};
+  TerminalPathMetrics path{error.distance_m, error.distance_m, 0.0};
+  EXPECT_TRUE(should_start_terminal_handoff(error, path, parameters));
+}
+
+TEST(TerminalPoseHandoff, OvershootDoesNotWidenExistingAdmissionOrGoalTolerance) {
+  TerminalHandoffParameters parameters;
+  parameters.minimum_abs_lateral_m = 0.06;
+  TerminalPathMetrics path{0.096, 0.096, 0.0};
+  EXPECT_FALSE(should_start_terminal_handoff(
+    TerminalPoseError{0.06, -0.06, 0.0, 0.0}, path, parameters));
+  EXPECT_FALSE(should_start_terminal_handoff(
+    TerminalPoseError{0.096, 0.096, 0.0, 0.0}, path, parameters));
+  EXPECT_FALSE(should_start_terminal_handoff(
+    TerminalPoseError{0.151, -0.151, 0.0, 0.0}, path, parameters));
+  EXPECT_FALSE(should_start_terminal_handoff(
+    TerminalPoseError{4.83, -0.10, 4.829, 0.0}, path, parameters));
+  parameters.enabled = false;
+  EXPECT_FALSE(should_start_terminal_handoff(
+    TerminalPoseError{0.096, -0.096, 0.0, 0.0}, path, parameters));
+}
+
 TEST(TerminalPoseHandoff, AxisStagesKeepTaskRunningUntilStrictGoalAcceptance) {
   TerminalHandoffParameters parameters;
   TerminalPoseHandoffController controller(parameters);

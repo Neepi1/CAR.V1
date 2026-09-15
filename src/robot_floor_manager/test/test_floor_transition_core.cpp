@@ -66,6 +66,33 @@ FloorTransitionEvent success(
   return event;
 }
 
+TEST(FloorTransitionCore, ReleasedFailedTransactionDoesNotInventValidLocalization)
+{
+  FloorTransitionCore core;
+  const auto target = request();
+  auto output = core.start(target);
+  while (output.effect.kind != FloorTransitionEffectKind::kLoadFilters) {
+    ASSERT_TRUE(output.accepted);
+    output = core.dispatch(success(output, target));
+  }
+  auto failure = success(output, target);
+  failure.kind = FloorTransitionEventKind::kEffectFailed;
+  failure.detail = "mask servers inactive";
+  output = core.dispatch(failure);
+  ASSERT_EQ(output.state, FloorTransitionState::kFailureCleanup);
+  auto cleanup = success(output, target);
+  cleanup.evidence.failure_resources_released = true;
+  cleanup.evidence.motion_hold_active = false;
+  cleanup.evidence.floor_pause_owned = false;
+  cleanup.evidence.runtime_context_valid = false;
+  cleanup.evidence.runtime_context_invalid = true;
+  output = core.dispatch(cleanup);
+  EXPECT_EQ(output.state, FloorTransitionState::kFailed);
+  EXPECT_FALSE(output.recovery_required);
+  EXPECT_FALSE(output.runtime_context_valid);
+  EXPECT_EQ(output.effect.kind, FloorTransitionEffectKind::kNone);
+}
+
 TEST(FloorTransitionCore, RunsOrderedAtomicBarrierAndCommitsOnlyAtEnd)
 {
   FloorTransitionCore core;

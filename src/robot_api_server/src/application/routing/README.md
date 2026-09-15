@@ -2,8 +2,8 @@
 
 `ApplicationRouterModule` owns the authenticated robot API routing graph:
 
-- capture one elevator motion-admission epoch per request;
-- apply the global elevator execution interlock before any business handler;
+- capture admission epochs only for elevator endpoints;
+- keep the elevator test admission/interlock out of unrelated HTTP handlers;
 - preserve the exact system-status, maps, elevator, mapping, metadata,
   subscriptions, safety, floor-switch, localization, navigation, and docking
   precedence;
@@ -18,3 +18,9 @@ endpoint matching and business semantics.
 composition root's feature instances to those narrow route ports. This keeps
 the root constructor declarative without making transport infrastructure
 depend on robot features.
+
+Non-elevator handlers retain the legacy epoch argument (zero) for binary
+compatibility, but never acquire the elevator fence. Mapping start/save, maps,
+navigation, docking, floor switching, localization, safety HTTP and teleop no
+longer use test admission. Domain data/asset mutexes and the bottom safety chain
+are unchanged. This is not a removal of all robot or file-system mutexes.

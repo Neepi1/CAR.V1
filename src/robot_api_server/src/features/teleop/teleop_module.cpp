@@ -186,13 +186,6 @@ private:
     const bool mapping_active,
     std::string & reason) const
   {
-    const auto elevator_interlock = ports_.elevator_interlock();
-    if (elevator_interlock.blocked()) {
-      reason = elevator_interlock.recovery_required() ?
-        "WebSocket teleop is blocked by elevator recovery state" :
-        "WebSocket teleop is blocked during elevator execution";
-      return false;
-    }
     if (!config_.require_mapping_active || mapping_active) {
       return true;
     }
@@ -237,10 +230,6 @@ private:
   void on_repeat_timer()
   {
     if (!teleop_session_.session_active()) {
-      return;
-    }
-    if (ports_.elevator_interlock().blocked()) {
-      clear_command();
       return;
     }
     if (charging_guard_active()) {
@@ -358,7 +347,6 @@ private:
 
   void handle_teleop_websocket(const int client_fd, const HttpRequest & request)
   {
-    const auto motion_admission_epoch = ports_.capture_motion_admission_epoch();
     if (!ports_.token_allowed(request)) {
       send_response(
         client_fd,
@@ -377,15 +365,7 @@ private:
       return;
     }
 
-    auto motion_admission = ports_.acquire_motion_admission(motion_admission_epoch);
-    if (!motion_admission.admitted()) {
-      send_response(
-        client_fd,
-        motion_admission_failure_response("websocket_teleop", motion_admission));
-      return;
-    }
     mark_teleop_session_started();
-    motion_admission.unlock();
     send_websocket_handshake(client_fd, request);
     const std::string websocket_client_id = "websocket:" + std::to_string(client_fd);
     const int websocket_ttl_ms = std::clamp(
