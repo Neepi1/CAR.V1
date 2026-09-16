@@ -1,5 +1,10 @@
 # Elevator execution
 
+The ROS port uses one bounded SingleThreadedExecutor worker, exact known-action
+exception recovery, and stop/fault-aware internal waits. Original clients and
+goals survive recovery; no goal retry or business policy is added. See
+[audit, isolation tests and activation boundary](../../../../../../docs/elevator_adapter_executor_recovery.md).
+
 Owns the elevator-test transaction adapter, arm black-box HTTP client, bounded
 task polling, execution runtime policy, recovery-action barrier, and ROS-facing
 execution port.

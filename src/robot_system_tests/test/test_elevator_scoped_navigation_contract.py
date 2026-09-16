@@ -450,7 +450,8 @@ def test_scoped_clearance_uses_filled_footprint_without_mutating_inflation():
     assert source_nav == overlay_nav
     assert "maximum_center_cost" not in source_nav
     assert "maximum_center_cost" not in ranger_profile
-    assert source_nav.count("inflation_radius: 0.60") == 3
+    # Existing global/local/MPPI values plus matched local post-keepout inflation.
+    assert source_nav.count("inflation_radius: 0.60") == 4
     assert "inflation_radius: 0.35" not in source_nav
     assert "search_elevator_scoped_path(" in planner
     assert "evaluate_elevator_scoped_path_clearance(" in controller

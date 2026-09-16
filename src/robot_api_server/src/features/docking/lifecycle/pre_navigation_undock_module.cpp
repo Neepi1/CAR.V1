@@ -107,10 +107,8 @@ bool PreNavigationUndockModule::start(
   const auto runtime = ports_.runtime_snapshot();
   const std::string dock_id = !resolved_dock_id.empty() ?
     resolved_dock_id : runtime.docking_dock_id;
-  if (dock_id.empty()) {
-    detail = "controlled undock requires a resolved dock_id";
-    return false;
-  }
+  // Fixed-distance undock uses odometry, not a commissioned dock pose.
+  // Keep a known identity for diagnostics, but do not require one for motion.
   std::string ensure_detail;
   if (!ports_.ensure_manager_running(ensure_detail)) {
     detail = ensure_detail;

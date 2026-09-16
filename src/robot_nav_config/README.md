@@ -4,6 +4,12 @@ Fixed Nav2 and canonical TF defaults for the first production-oriented scaffold.
 
 ## Parameters
 
+- Ordinary MPPI enables native Humble `ConstraintCritic` (power 1, weight 4).
+  The local costmap shares the existing global keepout mask and applies matched
+  post-filter inflation (0.60 m / 6.0) for MPPI footprint checks. Geometry,
+  motion limits, terminal tolerances and elevator test policy are unchanged.
+  See [scope, tests and activation](docs/local_keepout_and_constraints.md).
+
 - Elevator direct-path endpoints use latest TF for Nav2 arrival checking,
   matching the controller's canonical map goal. Path creation time, geometry,
   0.06 m / 0.05 rad tolerances and collision policy are unchanged. See

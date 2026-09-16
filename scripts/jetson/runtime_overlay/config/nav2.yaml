@@ -497,6 +497,7 @@ controller_server:
       vy_max: 0.0
       wz_max: 0.70
       critics:
+        - "ConstraintCritic"
         - "ObstaclesCritic"
         - "RangerClearanceCritic"
         - "GoalCritic"
@@ -507,6 +508,12 @@ controller_server:
         - "PreferForwardCritic"
         - "VelocityDeadbandCritic"
         - "TwirlingCritic"
+      # Native Humble scoring of predicted velocity/curvature constraint violations.
+      # Output clipping remains independently enforced by RangerMPPIController.
+      ConstraintCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0
       GoalCritic:
         enabled: true
         cost_power: 1
@@ -741,6 +748,9 @@ local_costmap:
       footprint: "[[0.36, 0.25], [0.36, -0.25], [-0.36, -0.25], [-0.36, 0.25]]"
       footprint_padding: 0.03
       plugins: ["obstacle_layer", "local_inflation_layer"]
+      # Filters run after plugins. Inflate newly marked keepout cells so MPPI's
+      # center-cost shortcut still triggers a full-footprint collision check.
+      filters: ["keepout_filter", "keepout_inflation_layer"]
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
@@ -775,6 +785,15 @@ local_costmap:
         # Cover the padded footprint's 0.480 m circumscribed radius plus the
         # MPPI 0.08 m collision margin, rounded up to the 0.05 m grid.
         inflation_radius: 0.60
+      keepout_filter:
+        plugin: "nav2_costmap_2d::KeepoutFilter"
+        enabled: true
+        filter_info_topic: /costmap_filter_info/keepout
+      keepout_inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        enabled: true
+        inflation_radius: 0.60
+        cost_scaling_factor: 6.0
       always_send_full_costmap: true
 
 collision_monitor:

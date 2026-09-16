@@ -52,7 +52,10 @@ def test_navigation_preflight_reuses_existing_undock_or_reconciles_without_motio
     assert 'request.recovery_action == "CLEAR_STALE_INTERLOCK"' in undock
     assert "ports_.reconcile_stale_interlock(" in undock
     assert "call_undock_with_charging_retry" in undock
-    assert "controlled undock requires a resolved dock_id" in undock
+    # A fixed-distance physical departure needs odometry, not a saved dock pose.
+    # Identity remains mandatory only for the distinct no-motion reconciliation.
+    assert "controlled undock requires a resolved dock_id" not in undock
+    assert "cannot reconcile stale dock interlock without a resolved dock_id" in undock
     assert "find_floor_catalog_pose(" in wiring
     assert "current_robot_pose_snapshot()" in wiring
 

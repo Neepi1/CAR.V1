@@ -17,6 +17,12 @@ Centralized baseline tests for the first scaffold iteration.
 
 ## Coverage
 
+- `test_mppi_dynamics_contract.py` and
+  `test_nav2_footprint_inflation_contract.py` check native ConstraintCritic and
+  local keepout/post-filter inflation wiring. Real Humble plugin behavior and
+  before/after timings are tested in `robot_nav_config/test/navigation_clearance/`
+  in a network/device-isolated container; no production motion is exercised.
+
 - `test/test_local_state_startup_budget.py` runs the actual local-state/common
   startup flow with inert executables and simulated ROS readiness. It covers
   late IMU input, one deadline, exact process ownership, early child failure,

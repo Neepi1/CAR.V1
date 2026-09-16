@@ -43,6 +43,27 @@ def _points(text: str) -> list[list[float]]:
 
 
 @pytest.mark.parametrize("config_path", CONFIGS)
+def test_local_keepout_runs_before_matching_post_filter_inflation(config_path: Path):
+    nav2 = config_path.read_text(encoding="utf-8")
+    local = _section(nav2, "local_costmap:\n  local_costmap:\n", "\ncollision_monitor:\n")
+    global_map = _section(nav2, "global_costmap:\n", "\nlocal_costmap:\n")
+    assert 'filters: ["keepout_filter", "keepout_inflation_layer"]' in local
+    keepout = _section(local, "      keepout_filter:\n", "      keepout_inflation_layer:\n")
+    assert 'plugin: "nav2_costmap_2d::KeepoutFilter"' in keepout
+    assert "enabled: true" in keepout
+    topic = "filter_info_topic: /costmap_filter_info/keepout"
+    assert topic in keepout and topic in global_map
+    post = local.split("      keepout_inflation_layer:\n", 1)[1]
+    original = _section(local, "      local_inflation_layer:\n", "      keepout_filter:\n")
+    assert 'plugin: "nav2_costmap_2d::InflationLayer"' in post
+    assert "enabled: true" in post
+    for key in ("inflation_radius", "cost_scaling_factor"):
+        assert _number(post, key) == pytest.approx(_number(original, key))
+    assert 'plugins: ["obstacle_layer", "local_inflation_layer"]' in local
+    assert "global_frame: odom" in local
+
+
+@pytest.mark.parametrize("config_path", CONFIGS)
 def test_local_inflation_covers_padded_rectangular_footprint_and_margin(config_path: Path):
     nav2 = config_path.read_text(encoding="utf-8")
     controller = _section(nav2, "    FollowPath:\n", "    FollowPathFallback:\n")

@@ -40,6 +40,7 @@
 #include "std_msgs/msg/string.hpp"
 
 #include "robot_api_server/features/elevator/execution/elevator_lease_keepalive.hpp"
+#include "robot_api_server/features/elevator/execution/elevator_ros_executor.hpp"
 #include "robot_api_server/features/elevator/execution/elevator_recovery_action_barrier.hpp"
 #include "robot_api_server/features/elevator/execution/elevator_runtime_policy.hpp"
 #include "robot_api_server/features/floor_switch/floor_switch_handoff_tracker.hpp"
@@ -624,44 +625,68 @@ public:
         handle_mode_keepalive_failure(failure);
       });
 
-    executor_ = std::make_unique<rclcpp::executors::MultiThreadedExecutor>(
-      rclcpp::ExecutorOptions(), 2U);
+    rclcpp::ExecutorOptions executor_options;
+    executor_options.context = node_->get_node_base_interface()->get_context();
+    executor_ = std::make_unique<rclcpp::executors::SingleThreadedExecutor>(
+      executor_options);
     executor_->add_node(node_);
-    spin_thread_ = std::thread([this]() {
-        try {
-          executor_->spin();
-        } catch (const std::exception & exception) {
-          RCLCPP_ERROR(
-            node_->get_logger(), "elevator runtime executor stopped: %s",
-            exception.what());
-          executor_failed_.store(true);
-        } catch (...) {
-          RCLCPP_ERROR(
-            node_->get_logger(), "elevator runtime executor stopped unexpectedly");
-          executor_failed_.store(true);
-        }
+    ros_worker_ = std::make_unique<ElevatorRosExecutor>(
+      *executor_, executor_options.context,
+      [this]() {evidence_cv_.notify_all(); floor_goal_cv_.notify_all();},
+      [this](uint64_t count, uint64_t consecutive) {
+        RCLCPP_ERROR(node_->get_logger(),
+          "ELEVATOR_ACTION_NO_READY_EVENT count=%llu consecutive=%llu "
+          "node=robot_elevator_runtime_adapter; retained clients/goals; "
+          "event retry is not proof of action progress",
+          static_cast<unsigned long long>(count),
+          static_cast<unsigned long long>(consecutive));
       });
+    ros_worker_->start();
   }
 
   ~Implementation()
   {
+    // The execution module joins its business worker before releasing this
+    // shared port. Wake the remaining keepalive waits before either join.
+    if (ros_worker_) {ros_worker_->request_stop();}
     if (elevator_entry_collision_bypass_permit_pub_) {
-      publish_elevator_entry_collision_bypass_permit("");
+      try {publish_elevator_entry_collision_bypass_permit("");}
+      catch (...) {std::fputs("elevator adapter: shutdown permit publish failed\n", stderr);}
     }
-    if (mode_keepalive_) {
-      mode_keepalive_->stop();
-    }
-    if (executor_) {
-      executor_->cancel();
-    }
-    if (spin_thread_.joinable()) {
-      spin_thread_.join();
-    }
+    if (mode_keepalive_) {mode_keepalive_->stop();}
+    if (ros_worker_) {ros_worker_->stop();}
     if (executor_ && node_) {
-      try {
-        executor_->remove_node(node_);
-      } catch (...) {
+      try {executor_->remove_node(node_);}
+      catch (...) {std::fputs("elevator adapter: node removal failed\n", stderr);}
+    }
+  }
+
+  template<typename Operation>
+  RuntimeResult invoke(Operation operation)
+  {
+    try {
+      ros_worker_->check();
+      return operation();
+    } catch (const ElevatorRosExecutorUnavailable & error) {
+      return failed("ELEVATOR_RUNTIME_EXECUTOR_UNHEALTHY", error.what());
+    }
+  }
+
+  template<typename Probe>
+  bool wait_endpoint(Probe probe, std::chrono::nanoseconds budget)
+  {
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    for (;;) {
+      ros_worker_->check();
+      const auto left = deadline - std::chrono::steady_clock::now();
+      const auto slice = std::min(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(left),
+        std::chrono::duration_cast<std::chrono::nanoseconds>(50ms));
+      if (probe(std::max(slice, std::chrono::nanoseconds::zero()))) {
+        ros_worker_->check();
+        return true;
       }
+      if (std::chrono::steady_clock::now() >= deadline) {return false;}
     }
   }
 
@@ -671,7 +696,7 @@ public:
     robot_elevator_manager::ElevatorRuntimeCapabilities result;
     try {
       if (
-        !rclcpp::ok() || executor_failed_.load() || !node_ ||
+        ros_worker_->unavailable() || !node_ ||
         !options_.runtime_idle_probe)
       {
         return result;
@@ -1562,7 +1587,7 @@ public:
           recovered.detail);
       }
     }
-    if (!rclcpp::ok() || executor_failed_.load()) {
+    if (ros_worker_->unavailable()) {
       return failed(
         "ELEVATOR_RUNTIME_EXECUTOR_UNHEALTHY",
         "ROS runtime executor is unavailable");
@@ -1751,22 +1776,22 @@ private:
   RuntimeResult wait_for_recovery_safety_endpoints()
   {
     const auto endpoint_timeout = timeout(options_.endpoint_timeout_sec);
-    if (!hold_client_->wait_for_service(endpoint_timeout)) {
+    if (!wait_endpoint([&](auto slice) {return hold_client_->wait_for_service(slice);}, endpoint_timeout)) {
       return failed(
         "ELEVATOR_SAFETY_HOLD_SERVICE_UNAVAILABLE",
         options_.motion_hold_service);
     }
-    if (!recovery_hold_release_client_->wait_for_service(endpoint_timeout)) {
+    if (!wait_endpoint([&](auto slice) {return recovery_hold_release_client_->wait_for_service(slice);}, endpoint_timeout)) {
       return failed(
         "ELEVATOR_RECOVERY_HOLD_RELEASE_SERVICE_UNAVAILABLE",
         options_.recovery_hold_release_service);
     }
-    if (!mode_client_->wait_for_service(endpoint_timeout)) {
+    if (!wait_endpoint([&](auto slice) {return mode_client_->wait_for_service(slice);}, endpoint_timeout)) {
       return failed(
         "ELEVATOR_MODE_SERVICE_UNAVAILABLE",
         options_.mode_service);
     }
-    if (!correction_client_->wait_for_service(endpoint_timeout)) {
+    if (!wait_endpoint([&](auto slice) {return correction_client_->wait_for_service(slice);}, endpoint_timeout)) {
       return failed(
         "ELEVATOR_CORRECTION_PAUSE_SERVICE_UNAVAILABLE",
         options_.correction_pause_service);
@@ -1778,14 +1803,14 @@ private:
     const bool require_floor_action)
   {
     const auto endpoint_timeout = timeout(options_.endpoint_timeout_sec);
-    if (!nav_client_->wait_for_action_server(endpoint_timeout)) {
+    if (!wait_endpoint([&](auto slice) {return nav_client_->wait_for_action_server(slice);}, endpoint_timeout)) {
       return failed(
         "ELEVATOR_NAV2_ACTION_UNAVAILABLE",
         options_.navigate_to_pose_action);
     }
     if (
       require_floor_action &&
-      !floor_client_->wait_for_action_server(endpoint_timeout))
+      !wait_endpoint([&](auto slice) {return floor_client_->wait_for_action_server(slice);}, endpoint_timeout))
     {
       return failed(
         "ELEVATOR_FLOOR_SWITCH_ACTION_UNAVAILABLE",
@@ -1835,6 +1860,7 @@ private:
       timeout(options_.navigation_idle_stable_sec);
     bool sampled = false;
     while (std::chrono::steady_clock::now() < deadline) {
+      ros_worker_->check();
       std::array<bool, 3> idle{};
       try {
         idle = options_.runtime_idle_probe();
@@ -1879,6 +1905,7 @@ private:
       timeout(options_.endpoint_timeout_sec);
     std::unique_lock<std::mutex> lock(evidence_mutex_);
     while (std::chrono::steady_clock::now() < deadline) {
+      ros_worker_->check();
       const auto now = steady_now_sec();
       const bool fresh_interlock =
         have_interlock_state_ &&
@@ -1958,8 +1985,7 @@ private:
         [this]() {return nav_client_->async_cancel_all_goals();});
       request_may_have_side_effect = request_may_have_side_effect || submitted;
       if (
-        recovery_nav_cancel_all_response_.wait_for(
-          timeout(options_.service_timeout_sec)) !=
+        ros_worker_->wait_for(recovery_nav_cancel_all_response_, timeout(options_.service_timeout_sec)) !=
         std::future_status::ready)
       {
         return failed(
@@ -1969,6 +1995,8 @@ private:
           "request was sent");
       }
       response = recovery_nav_cancel_all_response_.take_ready();
+    } catch (const ElevatorRosExecutorUnavailable &) {
+        throw;
     } catch (const std::exception & exception) {
       recovery_nav_cancel_all_response_.abandon();
       if (request_may_have_side_effect) {
@@ -2036,8 +2064,7 @@ private:
         [this]() {return floor_client_->async_cancel_all_goals();});
       request_may_have_side_effect = request_may_have_side_effect || submitted;
       if (
-        recovery_floor_cancel_all_response_.wait_for(
-          timeout(options_.service_timeout_sec)) !=
+        ros_worker_->wait_for(recovery_floor_cancel_all_response_, timeout(options_.service_timeout_sec)) !=
         std::future_status::ready)
       {
         return failed(
@@ -2047,6 +2074,8 @@ private:
           "duplicate request was sent");
       }
       response = recovery_floor_cancel_all_response_.take_ready();
+    } catch (const ElevatorRosExecutorUnavailable &) {
+        throw;
     } catch (const std::exception & exception) {
       recovery_floor_cancel_all_response_.abandon();
       if (request_may_have_side_effect) {
@@ -2106,6 +2135,7 @@ private:
     std::optional<std::chrono::steady_clock::time_point> idle_since;
     std::unique_lock<std::mutex> lock(evidence_mutex_);
     while (std::chrono::steady_clock::now() < deadline) {
+      ros_worker_->check();
       const auto nav_state = recovery_nav_action_barrier_.state();
       const auto floor_state = require_floor_action ?
         recovery_floor_action_barrier_.state() :
@@ -2166,6 +2196,7 @@ private:
       timeout(options_.endpoint_timeout_sec);
     std::unique_lock<std::mutex> lock(evidence_mutex_);
     while (std::chrono::steady_clock::now() < deadline) {
+      ros_worker_->check();
       const auto age = steady_now_sec() - interlock_received_at_sec_;
       if (
         have_interlock_state_ && age >= 0.0 &&
@@ -2184,26 +2215,26 @@ private:
   RuntimeResult wait_for_endpoints()
   {
     const auto endpoint_timeout = timeout(options_.endpoint_timeout_sec);
-    if (!hold_client_->wait_for_service(endpoint_timeout)) {
+    if (!wait_endpoint([&](auto slice) {return hold_client_->wait_for_service(slice);}, endpoint_timeout)) {
       return failed(
         "ELEVATOR_SAFETY_HOLD_SERVICE_UNAVAILABLE",
         options_.motion_hold_service);
     }
-    if (!mode_client_->wait_for_service(endpoint_timeout)) {
+    if (!wait_endpoint([&](auto slice) {return mode_client_->wait_for_service(slice);}, endpoint_timeout)) {
       return failed(
         "ELEVATOR_MODE_SERVICE_UNAVAILABLE", options_.mode_service);
     }
-    if (!correction_client_->wait_for_service(endpoint_timeout)) {
+    if (!wait_endpoint([&](auto slice) {return correction_client_->wait_for_service(slice);}, endpoint_timeout)) {
       return failed(
         "ELEVATOR_CORRECTION_PAUSE_SERVICE_UNAVAILABLE",
         options_.correction_pause_service);
     }
-    if (!nav_client_->wait_for_action_server(endpoint_timeout)) {
+    if (!wait_endpoint([&](auto slice) {return nav_client_->wait_for_action_server(slice);}, endpoint_timeout)) {
       return failed(
         "ELEVATOR_NAV2_ACTION_UNAVAILABLE",
         options_.navigate_to_pose_action);
     }
-    if (!floor_client_->wait_for_action_server(endpoint_timeout)) {
+    if (!wait_endpoint([&](auto slice) {return floor_client_->wait_for_action_server(slice);}, endpoint_timeout)) {
       return failed(
         "ELEVATOR_FLOOR_SWITCH_ACTION_UNAVAILABLE",
         options_.floor_switch_action);
@@ -2218,6 +2249,7 @@ private:
       timeout(options_.navigation_idle_stable_sec);
     bool observed_status = false;
     while (std::chrono::steady_clock::now() < stable_deadline) {
+      ros_worker_->check();
       {
         std::unique_lock<std::mutex> lock(evidence_mutex_);
         observed_status = observed_status || have_navigation_status_;
@@ -2259,6 +2291,7 @@ private:
       timeout(options_.endpoint_timeout_sec);
     std::unique_lock<std::mutex> lock(evidence_mutex_);
     while (std::chrono::steady_clock::now() < deadline) {
+      ros_worker_->check();
       const auto age = steady_now_sec() - interlock_received_at_sec_;
       if (
         have_interlock_state_ && age >= 0.0 &&
@@ -2294,6 +2327,7 @@ private:
       timeout(options_.endpoint_timeout_sec);
     std::unique_lock<std::mutex> lock(evidence_mutex_);
     while (std::chrono::steady_clock::now() < deadline) {
+      ros_worker_->check();
       const auto now_sec = steady_now_sec();
       const auto health_age =
         now_sec - localization_health_received_at_sec_;
@@ -2417,6 +2451,7 @@ private:
     std::unique_lock<std::mutex> lock(evidence_mutex_);
     ElevatorCleanupRuntimeIdentityAssessment last_assessment;
     while (std::chrono::steady_clock::now() < deadline) {
+      ros_worker_->check();
       const auto now = steady_now_sec();
       const bool localizer_exact =
         have_localizer_asset_state_ && localizer_asset_state_.success &&
@@ -2596,11 +2631,11 @@ private:
     const typename rclcpp::Client<ServiceT>::SharedPtr & client,
     const std::shared_ptr<typename ServiceT::Request> & request)
   {
-    if (!client->wait_for_service(timeout(options_.service_timeout_sec))) {
+    if (!wait_endpoint([&](auto slice) {return client->wait_for_service(slice);}, timeout(options_.service_timeout_sec))) {
       return {};
     }
     auto future = client->async_send_request(request);
-    if (future.wait_for(timeout(options_.service_timeout_sec)) !=
+    if (ros_worker_->wait_for(future, timeout(options_.service_timeout_sec)) !=
       std::future_status::ready)
     {
       client->remove_pending_request(future);
@@ -2789,6 +2824,7 @@ private:
       timeout(options_.endpoint_timeout_sec);
     std::unique_lock<std::mutex> lock(evidence_mutex_);
     while (std::chrono::steady_clock::now() < deadline) {
+      ros_worker_->check();
       if (
         operating_mode_observation_generation_ > observation_generation &&
         operating_mode_received_at_sec_ > response_received_at_sec &&
@@ -2817,6 +2853,7 @@ private:
       timeout(options_.endpoint_timeout_sec);
     std::unique_lock<std::mutex> lock(evidence_mutex_);
     while (std::chrono::steady_clock::now() < deadline) {
+      ros_worker_->check();
       const bool caller_absent =
         !contains_key(correction_pause_state_.lease_keys, caller_key);
       const bool handoff_proven =
@@ -3212,6 +3249,7 @@ private:
       timeout(options_.stop_timeout_sec);
     std::unique_lock<std::mutex> lock(evidence_mutex_);
     while (std::chrono::steady_clock::now() < deadline) {
+      ros_worker_->check();
       if (
         stop_tracker_.stopped(
           steady_now_sec(),
@@ -3251,7 +3289,7 @@ private:
     if (admission_unknown) {
       if (
         !response_future.valid() ||
-        response_future.wait_for(timeout(options_.service_timeout_sec)) !=
+        ros_worker_->wait_for(response_future, timeout(options_.service_timeout_sec)) !=
         std::future_status::ready)
       {
         return failed(
@@ -3300,7 +3338,7 @@ private:
       try {
         auto cancel_future = nav_client_->async_cancel_goal(goal_handle);
         if (
-          cancel_future.wait_for(timeout(options_.service_timeout_sec)) ==
+          ros_worker_->wait_for(cancel_future, timeout(options_.service_timeout_sec)) ==
           std::future_status::ready)
         {
           try {
@@ -3331,6 +3369,8 @@ private:
         } else {
           cancel_issue = "Nav2 cancel response timed out";
         }
+      } catch (const ElevatorRosExecutorUnavailable &) {
+        throw;
       } catch (const std::exception & exception) {
         cancel_issue =
           std::string("Nav2 cancel request failed: ") + exception.what();
@@ -3338,7 +3378,7 @@ private:
         cancel_issue = "Nav2 cancel request failed";
       }
       if (
-        result_future.wait_for(timeout(options_.service_timeout_sec)) !=
+        ros_worker_->wait_for(result_future, timeout(options_.service_timeout_sec)) !=
         std::future_status::ready)
       {
         return failed(
@@ -3399,7 +3439,7 @@ private:
     if (admission_unknown) {
       if (
         !response_future.valid() ||
-        response_future.wait_for(timeout(options_.service_timeout_sec)) !=
+        ros_worker_->wait_for(response_future, timeout(options_.service_timeout_sec)) !=
         std::future_status::ready)
       {
         return failed(
@@ -3449,7 +3489,7 @@ private:
       try {
         auto cancel_future = floor_client_->async_cancel_goal(goal_handle);
         if (
-          cancel_future.wait_for(timeout(options_.service_timeout_sec)) ==
+          ros_worker_->wait_for(cancel_future, timeout(options_.service_timeout_sec)) ==
           std::future_status::ready)
         {
           try {
@@ -3480,6 +3520,8 @@ private:
         } else {
           cancel_issue = "floor cancel response timed out";
         }
+      } catch (const ElevatorRosExecutorUnavailable &) {
+        throw;
       } catch (const std::exception & exception) {
         cancel_issue =
           std::string("floor cancel request failed: ") + exception.what();
@@ -3487,7 +3529,7 @@ private:
         cancel_issue = "floor cancel request failed";
       }
       if (
-        result_future.wait_for(timeout(options_.service_timeout_sec)) !=
+        ros_worker_->wait_for(result_future, timeout(options_.service_timeout_sec)) !=
         std::future_status::ready)
       {
         return failed(
@@ -3545,6 +3587,7 @@ private:
     std::unique_lock<std::mutex> lock(evidence_mutex_);
     ElevatorMotionAdmissionAssessment last_assessment;
     while (std::chrono::steady_clock::now() < deadline) {
+      ros_worker_->check();
       if (
         nav_result_future.valid() &&
         nav_result_future.wait_for(0ms) == std::future_status::ready)
@@ -3788,10 +3831,18 @@ private:
         {
           return;
         }
-        const auto end_result = set_elevator_controller_session(
-          *controller_id, *controller_session_id,
-          ElevatorNavigationSession::Request::OP_END,
-          controller_session_terminal_reason);
+        if (ros_worker_->unavailable()) {
+          RCLCPP_ERROR(node_->get_logger(),
+            "Elevator controller session END unprocessed: local adapter unavailable; "
+            "remote goal/session outcome remains unknown");
+          return;
+        }
+        const auto end_result = invoke([&]() {
+          return set_elevator_controller_session(
+            *controller_id, *controller_session_id,
+            ElevatorNavigationSession::Request::OP_END,
+            controller_session_terminal_reason);
+        });
         if (!end_result.success) {
           RCLCPP_ERROR(
             node_->get_logger(),
@@ -3892,7 +3943,7 @@ private:
       }
     }
     if (
-      send_future.wait_for(timeout(options_.service_timeout_sec)) !=
+      ros_worker_->wait_for(send_future, timeout(options_.service_timeout_sec)) !=
       std::future_status::ready)
     {
       return with_safety_proof(
@@ -3961,7 +4012,7 @@ private:
     const auto deadline =
       std::chrono::steady_clock::now() +
       timeout(options_.navigation_timeout_sec);
-    while (nav_result_future.wait_for(100ms) != std::future_status::ready) {
+    while (ros_worker_->wait_for(nav_result_future, 100ms) != std::future_status::ready) {
       refresh_bypass_permit();
       if (const auto mode_failure = mode_keepalive_failure()) {
         const auto recovered = renew_mode_lease();
@@ -4194,7 +4245,7 @@ private:
       }
     }
     if (
-      send_future.wait_for(timeout(options_.service_timeout_sec)) !=
+      ros_worker_->wait_for(send_future, timeout(options_.service_timeout_sec)) !=
       std::future_status::ready)
     {
       return failed(
@@ -4228,6 +4279,7 @@ private:
       timeout(options_.floor_switch_timeout_sec);
     std::unique_lock<std::mutex> lock(floor_goal_mutex_);
     while (std::chrono::steady_clock::now() < deadline) {
+      ros_worker_->check();
       if (
         floor_result_future_.valid() &&
         floor_result_future_.wait_for(0ms) == std::future_status::ready)
@@ -4284,7 +4336,7 @@ private:
     const auto deadline =
       std::chrono::steady_clock::now() +
       timeout(options_.floor_switch_timeout_sec);
-    while (result_future.wait_for(100ms) != std::future_status::ready) {
+    while (ros_worker_->wait_for(result_future, 100ms) != std::future_status::ready) {
       if (cancel_requested_.load()) {
         const auto cancel_result = cancel_floor_goal_and_wait_terminal();
         return cancel_result.success ?
@@ -4376,6 +4428,7 @@ private:
       timeout(options_.endpoint_timeout_sec);
     std::unique_lock<std::mutex> lock(evidence_mutex_);
     while (std::chrono::steady_clock::now() < deadline) {
+      ros_worker_->check();
       const auto & status = floor_switch_status_;
       const bool exact =
         have_floor_switch_status_ &&
@@ -4419,6 +4472,7 @@ private:
       std::chrono::steady_clock::now() +
       timeout(options_.endpoint_timeout_sec);
     while (std::chrono::steady_clock::now() < pose_deadline) {
+      ros_worker_->check();
       try {
         const auto pose = options_.current_map_pose_probe();
         if (
@@ -4543,10 +4597,8 @@ private:
 
   ElevatorRosRuntimeOptions options_;
   rclcpp::Node::SharedPtr node_;
-  std::unique_ptr<rclcpp::executors::MultiThreadedExecutor> executor_;
-  std::thread spin_thread_;
+  std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> executor_;
   std::unique_ptr<ElevatorLeaseKeepalive> mode_keepalive_;
-  std::atomic<bool> executor_failed_{false};
   std::atomic<bool> cancel_requested_{false};
   std::unique_ptr<robot_safety::PersistentSequenceAllocator>
   hold_sequence_allocator_;
@@ -4674,6 +4726,9 @@ private:
     localization_bridge_status_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr wheel_odom_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr local_odom_sub_;
+  // Destroy first, including constructor unwinding: stop() may notify the
+  // condition variables above even after an earlier explicit stop/join.
+  std::unique_ptr<ElevatorRosExecutor> ros_worker_;
 };
 
 ElevatorRosRuntimePort::ElevatorRosRuntimePort(
@@ -4694,24 +4749,24 @@ RuntimeResult ElevatorRosRuntimePort::prepare(
   const std::string & transaction_id,
   const FrozenRelease & release)
 {
-  return implementation_->prepare(transaction_id, release);
+  return implementation_->invoke([&]() {return implementation_->prepare(transaction_id, release);});
 }
 
 RuntimeResult ElevatorRosRuntimePort::apply(const RuntimeEffect & effect)
 {
-  return implementation_->apply(effect);
+  return implementation_->invoke([&]() {return implementation_->apply(effect);});
 }
 
 RuntimeResult ElevatorRosRuntimePort::recover_locked(
   const robot_elevator_manager::ElevatorRuntimeCleanupContext & context)
 {
-  return implementation_->recover_locked(context);
+  return implementation_->invoke([&]() {return implementation_->recover_locked(context);});
 }
 
 RuntimeResult ElevatorRosRuntimePort::finalize_recovery(
   const robot_elevator_manager::ElevatorRuntimeCleanupContext & context)
 {
-  return implementation_->finalize_recovery(context);
+  return implementation_->invoke([&]() {return implementation_->finalize_recovery(context);});
 }
 
 void ElevatorRosRuntimePort::request_cancel(
@@ -4723,13 +4778,13 @@ void ElevatorRosRuntimePort::request_cancel(
 RuntimeResult ElevatorRosRuntimePort::heartbeat(
   const std::string & transaction_id)
 {
-  return implementation_->heartbeat(transaction_id);
+  return implementation_->invoke([&]() {return implementation_->heartbeat(transaction_id);});
 }
 
 RuntimeResult ElevatorRosRuntimePort::poll_health(
   const std::string & transaction_id)
 {
-  return implementation_->poll_health(transaction_id);
+  return implementation_->invoke([&]() {return implementation_->poll_health(transaction_id);});
 }
 
 }  // namespace robot_api_server

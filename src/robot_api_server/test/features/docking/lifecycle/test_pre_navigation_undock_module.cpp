@@ -290,20 +290,26 @@ TEST(PreNavigationUndockModuleTest, PersistedDockIdentityIsAppliedToControlledUn
     "dock-from-persistent-latch");
 }
 
-TEST(PreNavigationUndockModuleTest, MissingDockIdentityRejectsBlindUndock)
+TEST(PreNavigationUndockModuleTest, MissingDockIdentityStillUndocksAndRelocalizes)
 {
   PreNavigationUndockHarness harness;
   harness.runtime.set_docking_identity("");
   auto module = harness.make_module();
   auto request = required_request();
   request.resolved_dock_id.clear();
+  harness.on_sleep = [&harness]() {harness.set_relocalized_undocked(true);};
   std::string detail;
   bool performed = false;
 
-  EXPECT_FALSE(module->run_if_needed(request, detail, performed));
+  EXPECT_TRUE(module->run_if_needed(request, detail, performed));
   EXPECT_TRUE(performed);
-  EXPECT_EQ(detail, "controlled undock requires a resolved dock_id");
-  EXPECT_EQ(harness.service_count, 0);
+  EXPECT_EQ(detail, "undocked and localized");
+  EXPECT_EQ(harness.service_count, 1);
+  const auto job = harness.store->snapshot();
+  EXPECT_TRUE(job.dock_id.empty());
+  EXPECT_TRUE(job.resume_navigation);
+  EXPECT_TRUE(job.docking_service_success);
+  EXPECT_TRUE(job.pending_goal_released_after_post_undock_settle);
 }
 
 TEST(PreNavigationUndockModuleTest, FailedTakeoverDoesNotSubmitUndock)
@@ -320,6 +326,59 @@ TEST(PreNavigationUndockModuleTest, FailedTakeoverDoesNotSubmitUndock)
   EXPECT_TRUE(performed);
   EXPECT_EQ(detail, "failed to stop active docking owner");
   EXPECT_EQ(harness.takeover_count, 1);
+  EXPECT_EQ(harness.service_count, 0);
+}
+
+TEST(PreNavigationUndockModuleTest, MissingDockIdentityDoesNotHideServiceFailure)
+{
+  PreNavigationUndockHarness harness;
+  harness.runtime.set_docking_identity("");
+  harness.service_ok = false;
+  harness.service_success = false;
+  harness.service_detail = "undock service rejected";
+  auto module = harness.make_module();
+  std::string detail;
+  bool performed = false;
+
+  EXPECT_FALSE(module->run_if_needed(required_request(), detail, performed));
+  EXPECT_EQ(detail, "undock service rejected");
+  EXPECT_EQ(harness.service_count, 1);
+  const auto job = harness.store->snapshot();
+  EXPECT_EQ(job.state, "failed");
+  EXPECT_FALSE(job.ok);
+  EXPECT_FALSE(job.pending_goal_released_after_post_undock_settle);
+}
+
+TEST(PreNavigationUndockModuleTest, MissingDockIdentityStillWaitsForRelocalization)
+{
+  PreNavigationUndockHarness harness;
+  harness.runtime.set_docking_identity("");
+  auto module = harness.make_module();
+  harness.on_sleep = [&harness]() {
+      harness.set_relocalized_undocked(false, "localization result unavailable");
+    };
+  std::string detail;
+  bool performed = false;
+
+  EXPECT_FALSE(module->run_if_needed(required_request(), detail, performed));
+  EXPECT_EQ(harness.service_count, 1);
+  EXPECT_EQ(harness.store->snapshot().state, "undocked");
+  EXPECT_NE(detail.find("localization result unavailable"), std::string::npos);
+  EXPECT_FALSE(harness.store->snapshot().pending_goal_released_after_post_undock_settle);
+}
+
+TEST(PreNavigationUndockModuleTest, NoMotionReconciliationStillRequiresDockIdentity)
+{
+  PreNavigationUndockHarness harness;
+  auto module = harness.make_module();
+  PreNavigationUndockRequest request;
+  request.recovery_action = "CLEAR_STALE_INTERLOCK";
+  std::string detail;
+  bool performed = false;
+
+  EXPECT_FALSE(module->run_if_needed(request, detail, performed));
+  EXPECT_FALSE(performed);
+  EXPECT_EQ(harness.reconcile_count, 0);
   EXPECT_EQ(harness.service_count, 0);
 }
 

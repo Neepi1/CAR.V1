@@ -28,8 +28,7 @@ ordinary navigation request
        -> fresh map pose at least 1.5 m from the exact commissioned dock pose
             -> constrained no-motion reconciliation -> Nav2
        -> 1.0--1.5 m hysteresis band or position/map/dock identity uncertain
-            -> standard controlled undock when dock identity is known
-            -> fail closed when a safe undock cannot be identified
+            -> standard fixed-distance controlled undock (dock_id optional)
 ```
 
 The no-motion reconciliation is allowed only when all of these are true:
@@ -43,8 +42,40 @@ The no-motion reconciliation is allowed only when all of these are true:
 - no controlled-undock reverse permit is active;
 - no fresh docking command is active.
 
-Any failed proof blocks the pending navigation goal. It never clears a latch by
-timeout alone and never starts a blind reverse without a resolved `dock_id`.
+Any failed no-motion reconciliation proof blocks the pending navigation goal.
+It never clears a latch by timeout alone. Physical fixed-distance undocking is
+a separate path: once existing occupancy evidence requires it, missing
+`dock_id` does not block the existing odometry-confirmed departure.
+
+## Fixed-distance undock identity correction (2026-09-16)
+
+The field navigation job failed at 21:42:18 UTC+8 because the API required a
+resolved dock identity before calling `/docking/undock`, even though occupancy
+already required departure. Manual departure then completed with 0.610 m of
+measured travel. The Trigger service has no dock-ID argument; its distance and
+speed come from the existing manager configuration and its completion uses
+odometry, not a commissioned map pose.
+
+`PreNavigationUndockModule` now retains a known dock ID only as metadata and
+accepts an empty one. No placeholder identity or map/nearest-dock lookup is
+introduced. Existing status/job completion clears on-dock memory with an empty
+ID, and post-undock localization already uses `unknown_dock` only in its reason
+label. Physical completion, configured relocalization and pending-goal release
+retain their existing semantics. The separate geometry-based, no-motion stale
+interlock reconciliation still requires an exact dock identity.
+
+Only the automatic departure's empty-ID rejection changes. Occupancy admission,
+ownership cleanup, velocity/distance, safety arbitration, manual departure,
+return-to-dock and all elevator policy are unchanged. Isolated regressions cover
+missing/known identity, service failure, post-undock localization failure and
+unchanged no-motion reconciliation. Production activation completed on
+2026-09-16 through the user-authorized complete runtime restart. The running API
+matches the isolated-tested candidate SHA256
+`63e5d4893130998d2b390172e27fda594685692c50dea3c6a350be48a522ffae`.
+Navigation and AMCL are ready, and docking sensor health is confirmed. A
+supervised navigation-from-dock motion test remains required; no motion test
+was performed during deployment. Evidence is under
+`/tmp/njrh_reports/undock_optional_id_20260916TdqmyUD`.
 
 ## Interfaces and ownership
 
@@ -129,6 +160,9 @@ Run these as separate supervised cases before commercial release:
 4. Manually driven at least 1.5 m from the exact dock on the confirmed map: the
    stale latch is reconciled without chassis motion, then the original goal is
    released.
-5. Stale BMS, stale map pose, wrong map identity, hysteresis-band position, and
-   missing dock identity: each case remains stopped and reports its exact
-   fail-closed reason.
+5. Missing dock identity with retained on-dock evidence: perform the standard
+   fixed-distance departure, clear occupancy after success, relocalize, and
+   continue the original goal. A rejected or failed departure must not release
+   the goal. Missing identity still cannot authorize no-motion latch clearing.
+6. Other existing stale-evidence and map/ownership checks retain their current
+   behavior; this correction does not relax them.

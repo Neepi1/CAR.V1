@@ -1,5 +1,15 @@
 # robot_api_server
 
+Elevator ROS execution is locally single-threaded with bounded waits and exact
+known Action-event exception recovery; business workers and policies remain
+unchanged. See [scope and tests](../../docs/elevator_adapter_executor_recovery.md).
+
+Automatic fixed-distance undock no longer requires `dock_id`: known identity
+is metadata, while existing odometry-confirmed departure and post-undock
+localization still precede the held navigation goal. No-motion dock-zone
+reconciliation keeps its identity requirement. See
+[scope and activation](../../docs/pre_navigation_dock_interlock_recovery.md#fixed-distance-undock-identity-correction-2026-09-16).
+
 Release candidates must rebuild the complete API from one approved source/header
 snapshot. Do not combine historical `.o` files after a header layout change.
 The [coherent-build procedure](../../docs/api_coherent_build.md) audits compiled

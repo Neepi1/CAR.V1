@@ -55,6 +55,13 @@ unproven readiness result still prevents the pending Nav2 goal from being sent.
 The composition root only maps the immutable dock-check fields and injects
 neighboring effects; no timeout, retry, phase name, or gate was added.
 
+Fixed-distance automatic undock accepts a missing `dock_id`; a known identity
+is diagnostic metadata, not an execution prerequisite. The manager uses its
+existing distance/speed and odometry feedback. Status cleanup and post-undock
+localization work with an empty identity; only the separate no-motion,
+dock-zone-based interlock reconciliation still requires a resolved dock ID.
+See [scope and validation](../../../../../../docs/pre_navigation_dock_interlock_recovery.md#fixed-distance-undock-identity-correction-2026-09-16).
+
 `DockingRuntimeModule` owns the process/ROS/worker edge used by all three
 lifecycle collaborators. It supervises the optional docking-manager child,
 owns the `/docking/start|stop|undock` Trigger clients, consumes

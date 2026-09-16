@@ -188,6 +188,15 @@ if(BUILD_TESTING)
     nav2_controller nav2_util rclcpp rclcpp_lifecycle)
   target_compile_definitions(test_ranger_clearance_critic PRIVATE
     NAV_CONFIG_FILE="${CMAKE_CURRENT_SOURCE_DIR}/config/nav2.yaml")
+  ament_add_gtest(test_keepout_and_constraints
+    test/navigation_clearance/test_keepout_and_constraints.cpp)
+  target_include_directories(test_keepout_and_constraints PRIVATE include)
+  ament_target_dependencies(test_keepout_and_constraints nav2_mppi_controller nav2_costmap_2d
+    nav2_msgs nav2_util rclcpp rclcpp_lifecycle)
+  target_compile_definitions(test_keepout_and_constraints PRIVATE
+    NAV_CONFIG_FILE="${CMAKE_CURRENT_SOURCE_DIR}/config/nav2.yaml")
+  set_tests_properties(test_keepout_and_constraints PROPERTIES
+    ENVIRONMENT "ROS_DOMAIN_ID=212;ROS_LOCALHOST_ONLY=1;RMW_IMPLEMENTATION=rmw_fastrtps_cpp")
   ament_add_gtest(test_ordinary_recovery_state
     test/navigation_recovery/test_recovery_state.cpp
     src/navigation_recovery/recovery_state.cpp)

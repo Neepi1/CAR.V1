@@ -4,6 +4,21 @@ ROS 2 Humble multi-floor indoor/outdoor delivery robot navigation stack scaffold
 
 ## Current Status
 
+Elevator adapter executor recovery is scoped to its ROS worker and internal
+failure/stop handling. See [audit and tests](docs/elevator_adapter_executor_recovery.md);
+no whole-service restart is implied by the source change.
+
+Fixed-distance auto-undock accepts an unknown dock ID without inventing one.
+The existing departure, post-undock localization and original navigation-goal
+sequence is retained; no-motion dock-zone reconciliation is unchanged. See
+[scope and deployment record](docs/pre_navigation_dock_interlock_recovery.md#fixed-distance-undock-identity-correction-2026-09-16).
+
+Ordinary MPPI now enables native Humble `ConstraintCritic`; the local costmap
+consumes the existing keepout mask with matched post-filter inflation. Motion
+limits, footprint, goal tolerances and elevator test policy are unchanged.
+Configuration activation still needs a user-controlled navigation-service
+restart. See [scope and isolated validation](src/robot_nav_config/docs/local_keepout_and_constraints.md).
+
 App navigation resume now keeps slow map/Isaac initialization in `starting`,
 owns a fresh startup CPU session, and stages Nav2 after map/Isaac initialization
 while overlapping configure-all/activation with the localization request.
@@ -253,8 +268,9 @@ Ordinary navigation now reconciles the final BMS docking memory interlock before
 submitting a Nav2 goal. Live contact, dock-near, and uncertain cases reuse the
 existing standard controlled-undock path; only a fresh, exact-map proof that the
 robot is at least 1.5 m outside the commissioned dock can clear stale memory
-without motion. Missing safety state, stale evidence, or unresolved dock identity
-fails closed. See
+without motion. Missing safety state and stale evidence retain their existing
+checks; unresolved dock identity blocks only no-motion reconciliation, not
+fixed-distance physical departure. See
 [pre-navigation dock interlock recovery](docs/pre_navigation_dock_interlock_recovery.md).
 
 The Ranger FollowPath candidate now predicts measured chassis response inside

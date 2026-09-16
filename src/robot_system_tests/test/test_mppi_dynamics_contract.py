@@ -47,3 +47,16 @@ def test_chassis_model_has_no_new_command_or_motion_gate():
     assert "optimizer.evalControl" in source
     assert "class RangerOptimizer : public mppi::Optimizer" in source
     assert "motion_model_ = model_" in source
+
+
+def test_ackermann_rollouts_load_native_constraint_critic():
+    for path in ("src/robot_nav_config/config/nav2.yaml",
+                 "scripts/jetson/runtime_overlay/config/nav2.yaml"):
+        config = (ROOT / path).read_text(encoding="utf-8")
+        follow = config.split("    FollowPath:\n", 1)[1].split("    FollowPathFallback:", 1)[0]
+        critics = follow.split("      critics:\n", 1)[1].split("      ConstraintCritic:", 1)[0]
+        assert critics.count('- "ConstraintCritic"') == 1
+        constraint = follow.split("      ConstraintCritic:\n", 1)[1].split("      GoalCritic:", 1)[0]
+        assert value(constraint, "enabled") is True
+        assert value(constraint, "cost_power") == 1
+        assert value(constraint, "cost_weight") == 4.0

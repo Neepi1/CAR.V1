@@ -1425,6 +1425,16 @@ if(BUILD_TESTING)
     robot_safety::motion_interlock_arbiter
   )
 
+  ament_add_gtest(test_elevator_ros_executor
+    test/features/elevator/execution/test_elevator_ros_executor.cpp)
+  target_include_directories(test_elevator_ros_executor PRIVATE include)
+  ament_target_dependencies(test_elevator_ros_executor rclcpp)
+  ament_add_gtest(test_elevator_ros_events
+    test/features/elevator/execution/test_elevator_ros_events.cpp)
+  target_include_directories(test_elevator_ros_events PRIVATE include)
+  ament_target_dependencies(test_elevator_ros_events
+    rclcpp rclcpp_action nav2_msgs std_srvs robot_interfaces)
+
   add_test(
     NAME keepout_http_smoke
     COMMAND
