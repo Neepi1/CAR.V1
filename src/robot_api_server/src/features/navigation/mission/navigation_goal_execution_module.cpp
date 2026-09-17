@@ -574,6 +574,12 @@ bool NavigationGoalExecutionModule::post_nav2_final_verify_acceptance_slack_allo
   return decision.allowed;
 }
 
+bool NavigationGoalExecutionModule::post_nav2_terminal_actual_stop_confirmed(
+  std::string & detail) const
+{
+  return terminal_runtime_.actual_stop_confirmed(detail);
+}
+
 bool NavigationGoalExecutionModule::nav2_failed_near_goal_retry_allowed(
   const std::uint64_t job_id,
   const FinalPoseCheck & check,
@@ -632,6 +638,8 @@ NavigationRepositionResult NavigationGoalExecutionModule::run_post_nav2_final_ve
       return result;
     }
     PendingSideEffectEvidence pending_side_effect(ports_);
+    // A later terminal revalidation must not reuse pre-retry stop stability.
+    terminal_runtime_.reset_actual_stop_stability();
     auto future = action_runtime_.client()->async_send_goal(goal);
     if (future.wait_for(config_.service_timeout) != std::future_status::ready) {
       result.detail = "timed out sending post-Nav2 final verify retry goal";

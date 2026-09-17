@@ -120,6 +120,7 @@ public:
   void reset_yaw_actual_stop_stability();
   bool wait_for_yaw_actual_stop(const std::string & context, std::string & detail) const;
   void reset_actual_stop_stability();
+  bool actual_stop_confirmed(std::string & detail) const;
   bool wait_for_actual_stop(
     const std::string & context,
     std::string & detail,

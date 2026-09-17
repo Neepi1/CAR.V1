@@ -1,5 +1,11 @@
 # Navigation mission
 
+After a failed terminal correction, a later successful same-goal Nav2 retry
+triggers current strict XY/lateral/yaw, bridge, fresh-pose and existing stop
+evidence verification. The historical result remains failed for diagnostics;
+the correction is not re-entered, and retry policy/budgets are unchanged.
+See [repair boundaries and tests](../../../../../../docs/navigation_terminal_revalidation.md).
+
 The persistent-recovery candidate keeps the original job while Nav2 reports
 goal-correlated `waiting`/`recovering` phases. The ordinary result budget excludes
 only those fresh intervals; the final-yaw-drift reposition deadline and final

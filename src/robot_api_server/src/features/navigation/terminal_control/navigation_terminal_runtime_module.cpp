@@ -281,6 +281,11 @@ public:
       context, detail, config_.terminal_settle_require_dual_ackermann_mode);
   }
 
+  bool actual_stop_confirmed(std::string & detail) const
+  {
+    return actual_stop_stable_snapshot(detail, config_.terminal_settle_require_dual_ackermann_mode);
+  }
+
   std::uint64_t local_costmap_update_count() const
   {
     std::lock_guard<std::mutex> lock(local_costmap_mutex_);
@@ -699,6 +704,11 @@ bool NavigationTerminalRuntimeModule::wait_for_yaw_actual_stop(
 void NavigationTerminalRuntimeModule::reset_actual_stop_stability()
 {
   impl_->reset_actual_stop_stability();
+}
+
+bool NavigationTerminalRuntimeModule::actual_stop_confirmed(std::string & detail) const
+{
+  return impl_->actual_stop_confirmed(detail);
 }
 
 bool NavigationTerminalRuntimeModule::wait_for_actual_stop(

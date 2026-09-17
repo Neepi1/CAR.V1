@@ -141,6 +141,18 @@ TEST(NavigationCompletionPolicy, AllowsSlackOnlyAfterRetryBudgetIsExhausted)
   EXPECT_NE(exhausted.detail.find("retry_count=3/3"), std::string::npos);
 }
 
+TEST(NavigationCompletionPolicy, ReachedOrdinaryPoseDoesNotAuthorizeAnotherRetry)
+{
+  const navigation::NavigationCompletionPolicy policy(production_like_config());
+  const auto check = policy.evaluate_final_pose(
+    map_pose(1.02, 2.035, 0.047), target_pose(), true, "");
+  ASSERT_TRUE(check.position_reached);
+  // Ordinary XY/yaw can pass while the stricter terminal lateral/yaw fails.
+  // Revalidation belongs to the executor, not an expanded retry policy.
+  EXPECT_FALSE(policy.final_verify_retry(check, "pose_required", 1).allowed);
+  EXPECT_FALSE(policy.final_verify_retry(check, "position_only", 1).allowed);
+}
+
 TEST(NavigationCompletionPolicy, BoundsNav2FailedNearGoalRetry)
 {
   const navigation::NavigationCompletionPolicy policy(production_like_config());

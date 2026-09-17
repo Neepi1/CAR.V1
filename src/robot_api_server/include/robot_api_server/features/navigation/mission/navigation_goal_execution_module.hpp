@@ -204,6 +204,7 @@ public:
     std::uint64_t job_id,
     const FinalPoseCheck & check,
     std::string & detail) override;
+  bool post_nav2_terminal_actual_stop_confirmed(std::string & detail) const override;
   TerminalLateralCorrectionResult run_post_nav2_terminal_lateral_correction(
     std::uint64_t job_id,
     const StoredPose & target,

@@ -193,6 +193,58 @@ TEST_F(NavigationTerminalRuntimeModuleTest, OwnsStatusStopAndCostmapEvidence)
   EXPECT_TRUE(context.robot_pose_available);
 }
 
+TEST_F(NavigationTerminalRuntimeModuleTest, CurrentStopSnapshotRejectsOldMovingAndStaleEvidence)
+{
+  auto config = test_config(sequence_);
+  config.terminal_settle_odom_max_age_sec = 0.15;
+  config.terminal_settle_stable_duration_sec = 0.02;
+  module_ = std::make_unique<navigation::NavigationTerminalRuntimeModule>(
+    *node_, terminal_control_, config, complete_ports());
+  auto mode_pub = node_->create_publisher<std_msgs::msg::String>(
+    config.mode_controller_status_topic, rclcpp::QoS(10));
+  auto odom_pub = node_->create_publisher<nav_msgs::msg::Odometry>(
+    config.actual_stop_odom_topic, rclcpp::QoS(20));
+  spin_until([&]() {return mode_pub->get_subscription_count() && odom_pub->get_subscription_count();});
+  std::string detail;
+  EXPECT_FALSE(module_->actual_stop_confirmed(detail));
+  std_msgs::msg::String mode;
+  mode.data = "{\"actual_motion_mode\":{\"available\":true,\"fresh\":true,\"code\":0},\"mode_aligned\":true}";
+  mode_pub->publish(mode);
+  nav_msgs::msg::Odometry odom;
+  odom_pub->publish(odom);
+  spin_until([&]() {return module_->actual_stop_confirmed(detail);});
+  ASSERT_TRUE(module_->actual_stop_confirmed(detail)) << detail;
+
+  module_->reset_actual_stop_stability();
+  EXPECT_FALSE(module_->actual_stop_confirmed(detail));  // old samples cannot prove the retry stopped
+  odom_pub->publish(odom);
+  spin_until([&]() {return module_->actual_stop_confirmed(detail);});
+  ASSERT_TRUE(module_->actual_stop_confirmed(detail)) << detail;
+  odom.twist.twist.linear.x = 0.10;
+  odom_pub->publish(odom);
+  spin_until([&]() {return !module_->actual_stop_confirmed(detail);});
+  EXPECT_FALSE(module_->actual_stop_confirmed(detail));
+
+  odom.twist.twist.linear.x = 0.0;
+  odom_pub->publish(odom);
+  spin_until([&]() {return module_->actual_stop_confirmed(detail);});
+  ASSERT_TRUE(module_->actual_stop_confirmed(detail)) << detail;
+  std::this_thread::sleep_for(170ms);
+  EXPECT_FALSE(module_->actual_stop_confirmed(detail));
+  EXPECT_NE(detail.find("odom_stable=false"), std::string::npos);
+}
+
+TEST_F(NavigationTerminalRuntimeModuleTest, CurrentStopSnapshotPreservesDisabledSettlePolicy)
+{
+  auto config = test_config(sequence_);
+  config.terminal_settle_enabled = false;
+  module_ = std::make_unique<navigation::NavigationTerminalRuntimeModule>(
+    *node_, terminal_control_, config, complete_ports());
+  std::string detail;
+  EXPECT_TRUE(module_->actual_stop_confirmed(detail));
+  EXPECT_EQ(detail, "disabled");
+}
+
 TEST_F(NavigationTerminalRuntimeModuleTest, PublishesCommandsLimitsAndReverseHysteresis)
 {
   const auto config = test_config(sequence_);

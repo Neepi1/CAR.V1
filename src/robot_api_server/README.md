@@ -1,5 +1,11 @@
 # robot_api_server
 
+Ordinary terminal verification separates historical correction failure from
+current post-recovery acceptance; strict pose/stop checks and retry budgets are
+unchanged. See [scope and isolated tests](../../docs/navigation_terminal_revalidation.md).
+The 2026-09-17 tested candidate is synchronized and activated; running binary hash,
+unique API process and navigation readiness are verified. Motion acceptance is pending.
+
 Elevator ROS execution is locally single-threaded with bounded waits and exact
 known Action-event exception recovery; business workers and policies remain
 unchanged. See [scope and tests](../../docs/elevator_adapter_executor_recovery.md).

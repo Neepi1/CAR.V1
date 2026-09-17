@@ -4,6 +4,11 @@ ROS 2 Humble multi-floor indoor/outdoor delivery robot navigation stack scaffold
 
 ## Current Status
 
+BMS docking-contact evidence now distinguishes received docking commands from
+internally generated stop commands. The isolated candidate preserves confirmed
+dock protection and existing release rules; it was activated on 2026-09-17.
+See [scope, evidence and validation](src/robot_safety/docs/bms_contact_history.md).
+
 Elevator adapter executor recovery is scoped to its ROS worker and internal
 failure/stop handling. See [audit and tests](docs/elevator_adapter_executor_recovery.md);
 no whole-service restart is implied by the source change.
@@ -31,6 +36,12 @@ API release builds must use one complete approved source/header snapshot and
 a fresh build directory. Mixing historical object files can corrupt private
 mapping state and stall all HTTP workers. See
 [coherent API build and isolated query regression](docs/api_coherent_build.md).
+
+Ordinary-navigation terminal verification preserves correction failure history
+but revalidates the current strict pose and stop evidence after successful
+same-goal recovery. See [scope and isolated tests](docs/navigation_terminal_revalidation.md).
+The 2026-09-17 candidate is activated after the authorized whole-service restart;
+binary identity and stationary readiness are verified, not physical acceptance.
 
 Relocalization completion no longer waits for navigation admission. A current,
 accepted and settled canonical TF result completes localization even while a

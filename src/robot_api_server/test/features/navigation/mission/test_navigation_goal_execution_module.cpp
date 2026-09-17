@@ -253,6 +253,17 @@ TEST_F(NavigationGoalExecutionModuleTest, EvaluatesFinalPoseThroughInjectedSnaps
   EXPECT_NEAR(check.yaw_error_rad, 0.0, 1e-9);
 }
 
+TEST_F(NavigationGoalExecutionModuleTest, RevalidationReadsExistingStopEvidenceWithoutWaiting)
+{
+  make_module();
+  std::string expected_detail;
+  const bool expected = terminal_runtime_->actual_stop_confirmed(expected_detail);
+  std::string actual_detail;
+  EXPECT_EQ(module_->post_nav2_terminal_actual_stop_confirmed(actual_detail), expected);
+  EXPECT_EQ(actual_detail, expected_detail);
+  EXPECT_FALSE(expected);  // no odometry/mode evidence in this fixture
+}
+
 TEST_F(NavigationGoalExecutionModuleTest, RequestsAmclOnlyWhenBridgeNeedsFreshCorrection)
 {
   make_module();

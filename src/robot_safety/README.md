@@ -2,6 +2,12 @@
 
 Final command arbitration point before the chassis bridge.
 
+Contact-memory regression: internal BMS stop output is not external docking
+context. Contact thresholds, immediate stop and confirmed-memory release rules
+are unchanged. See [audit and isolated tests](docs/bms_contact_history.md).
+The 2026-09-17 candidate is installed and running; physical docking acceptance
+remains pending. Deployment did not rebuild or replace the API executable.
+
 ## Canonical Contract
 
 - normal navigation/App command input: `/cmd_vel_collision_checked`

@@ -650,6 +650,11 @@ void NavigationGoalExecutor::run(
     double terminal_pose_lateral_m = 0.0;
     std::string terminal_pose_correction_reason;
     TerminalLateralCorrectionResult terminal_lateral_result;
+    // The correction result remains historical evidence. Only a later
+    // successful retry can replace its veto with a full current-state audit.
+    bool terminal_recovery_succeeded = false;
+    std::string terminal_recovery_detail;
+    std::string terminal_completion_reason;
     auto recompute_commercial_completion = [&]() {
       audit_position_within_tolerance = pose_check.pose_available && pose_check.position_reached;
       audit_yaw_within_tolerance =
@@ -669,14 +674,39 @@ void NavigationGoalExecutor::run(
         const bool strict_lateral_reached = pose_check.pose_available &&
           std::fabs(terminal_pose_lateral_m) <=
           config_.post_nav2_final_verify_terminal_lateral_target_m;
+        const bool strict_yaw_reached = pose_check.pose_available &&
+          yaw_error <= config_.navigation_final_yaw_align_success_tolerance_rad;
+        std::string stop_detail;
+        const bool recovery_stopped = !terminal_lateral_result.succeeded &&
+          terminal_recovery_succeeded &&
+          port_.post_nav2_terminal_actual_stop_confirmed(stop_detail);
+        const bool terminal_execution_complete =
+          terminal_lateral_result.succeeded || recovery_stopped;
         commercial_position_complete = final_pose_bridge_ready &&
-          terminal_lateral_result.succeeded &&
+          terminal_execution_complete &&
           audit_position_within_tolerance &&
           strict_lateral_reached;
         commercial_yaw_complete = final_pose_bridge_ready &&
-          terminal_lateral_result.succeeded &&
-          pose_check.pose_available &&
-          yaw_error <= config_.navigation_final_yaw_align_success_tolerance_rad;
+          terminal_execution_complete && strict_yaw_reached;
+        terminal_completion_reason = !final_pose_bridge_ready ? "current_bridge_not_ready" :
+          !pose_check.pose_available ? "current_pose_unavailable" :
+          !audit_position_within_tolerance ? "current_xy_not_reached" :
+          !strict_lateral_reached ? "current_strict_lateral_not_reached" :
+          !strict_yaw_reached ? "current_strict_yaw_not_reached" :
+          !terminal_lateral_result.succeeded && !terminal_recovery_succeeded ?
+          "terminal_failure_without_successful_recovery" :
+          !terminal_execution_complete ? "current_stop_unconfirmed" :
+          "current_terminal_pose_verified";
+        terminal_completion_reason +=
+          "; current_lateral_error_m=" + std::to_string(terminal_pose_lateral_m) +
+          "; strict_lateral_target_m=" + std::to_string(config_.post_nav2_final_verify_terminal_lateral_target_m) +
+          "; strict_yaw_target_rad=" + std::to_string(config_.navigation_final_yaw_align_success_tolerance_rad);
+        if (!terminal_recovery_detail.empty()) {
+          terminal_completion_reason += "; recovery_detail=" + terminal_recovery_detail;
+        }
+        if (!stop_detail.empty()) {
+          terminal_completion_reason += "; current_stop=" + stop_detail;
+        }
       } else {
         commercial_position_complete = final_pose_bridge_ready &&
           (audit_position_within_tolerance || slack_position_within_tolerance) &&
@@ -797,6 +827,8 @@ void NavigationGoalExecutor::run(
         result_code = retry_result.nav2_result_code;
       }
       nav2_succeeded = nav2_succeeded || retry_result.nav2_succeeded;
+      terminal_recovery_succeeded = retry_result.succeeded && retry_result.nav2_succeeded;
+      terminal_recovery_detail = retry_result.detail;
 
       auto retry_bridge_wait = port_.wait_for_bridge_smoothing_before_final_verify(job_id);
       if (retry_bridge_wait.canceled) {
@@ -836,10 +868,23 @@ void NavigationGoalExecutor::run(
       recompute_commercial_completion();
     }
 
+    // Cancellation can arrive while the post-retry pose/stop snapshot is read.
+    if (port_.navigation_goal_cancel_requested(job_id, cancel_detail)) {
+      port_.finish_navigation_goal_job(
+        job_id, false, "canceled", cancel_detail, distance, yaw_error, result_code,
+        nav2_succeeded, position_reached, final_yaw_align_requested,
+        final_yaw_align_succeeded, final_yaw_align_blocked);
+      return;
+    }
+
     if (!pose_check.pose_available) {
       std::ostringstream detail;
       detail << "final pose audit unavailable after Nav2 result; " << pose_check.reason
              << "; localization unavailable for commercial completion";
+      if (terminal_lateral_correction_attempted) {
+        detail << "; terminal_lateral_correction_attempted=true "
+               << NavigationTerminalControl::lateral_correction_diagnostics(terminal_lateral_result);
+      }
       port_.finish_navigation_goal_job(
         job_id,
         false,
@@ -889,6 +934,7 @@ void NavigationGoalExecutor::run(
       }
       if (terminal_lateral_correction_attempted) {
         detail << "; terminal_lateral_correction_attempted=true"
+               << "; terminal_completion_reason=" << terminal_completion_reason
                << " " << NavigationTerminalControl::lateral_correction_diagnostics(terminal_lateral_result);
       }
       port_.finish_navigation_goal_job(
@@ -921,6 +967,7 @@ void NavigationGoalExecutor::run(
                  << (audit_yaw_within_tolerance ? "true" : "false");
     if (terminal_lateral_correction_attempted) {
       audit_reason << "; terminal_lateral_correction_attempted=true"
+                   << "; terminal_completion_reason=" << terminal_completion_reason
                    << " " << NavigationTerminalControl::lateral_correction_diagnostics(terminal_lateral_result);
     }
     const auto final_audit_reason = audit_reason.str();

@@ -732,6 +732,7 @@ private:
     last_cmd_was_docking_ = false;
     last_api_cmd_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
     last_docking_cmd_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    last_received_docking_cmd_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
     last_elevator_entry_cmd_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
     elevator_entry_collision_bypass_permit_ =
       robot_safety::ElevatorEntryCollisionBypassPermit{};
@@ -1142,6 +1143,17 @@ private:
     return have_last_docking_cmd_ && last_cmd_was_docking_ && docking_command_fresh();
   }
 
+  bool fresh_bms_docking_command_context() const
+  {
+    // A safety-generated stop may refresh the output cache, but is not an
+    // external docking command and must not establish/renew contact evidence.
+    if (!fresh_docking_command_active() || last_received_docking_cmd_time_.nanoseconds() <= 0) {
+      return false;
+    }
+    const double age = (now() - last_received_docking_cmd_time_).seconds();
+    return std::isfinite(age) && age >= 0.0 && age <= docking_cmd_priority_timeout_sec_;
+  }
+
   bool fresh_api_command_active() const
   {
     return have_last_api_cmd_ && last_cmd_was_api_ && api_command_fresh();
@@ -1292,6 +1304,7 @@ private:
 
   void on_docking_cmd(const geometry_msgs::msg::Twist::SharedPtr msg)
   {
+    last_received_docking_cmd_time_ = now();
     if (!docking_command_allowed_during_bms_contact(*msg)) {
       publish_bms_docking_interlock_stop("blocked_nonzero_docking_command");
       return;
@@ -1425,7 +1438,7 @@ private:
     if (msg.power_supply_status == sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_FULL) {
       // FULL is supporting evidence, not physical contact proof by itself.
       const auto evidence = dock_contact_latch_evidence();
-      return fresh_docking_command_active() ||
+      return fresh_bms_docking_command_context() ||
              docking_status_indicates_docked() || evidence.strong;
     }
     if (std::isfinite(msg.current) && static_cast<double>(msg.current) > charging_current_min_a_) {
@@ -1439,7 +1452,7 @@ private:
     const double soc = normalized_soc_percent(msg.percentage);
     const auto evidence = dock_contact_latch_evidence();
     return charging_full_soc_voltage_contact_enable_ &&
-      (fresh_docking_command_active() || docking_status_indicates_docked() || evidence.strong) &&
+      (fresh_bms_docking_command_context() || docking_status_indicates_docked() || evidence.strong) &&
       msg.present && std::isfinite(soc) &&
       soc >= charging_full_soc_threshold_pct_ &&
       voltage_in_contact_range(msg.voltage, charging_contact_voltage_min_v_, charging_contact_voltage_max_v_);
@@ -1447,6 +1460,7 @@ private:
 
   void on_battery_state(const sensor_msgs::msg::BatteryState::SharedPtr msg)
   {
+    const bool memory_was_latched = bms_docking_contact_latched_;
     const bool contact_was_active =
       enable_bms_contact_guard_ && fresh_battery_sample() && battery_contact_active_;
     battery_contact_active_ = battery_indicates_charging_contact(*msg);
@@ -1460,7 +1474,7 @@ private:
     if (bms_docking_interlock_enabled_ &&
       robot_safety::should_latch_bms_docking_interlock(
         battery_contact_active_,
-        fresh_docking_command_active(),
+        fresh_bms_docking_command_context(),
         docking_status_indicates_docked(),
         persistent_evidence))
     {
@@ -1468,6 +1482,25 @@ private:
         bms_docking_interlock_reason_ = "fresh_bms_contact_with_docking_context";
       }
       bms_docking_contact_latched_ = true;
+    }
+    if (bms_docking_interlock_enabled_ &&
+      ((battery_contact_active_ && !contact_was_active) ||
+      (!memory_was_latched && bms_docking_contact_latched_)))
+    {
+      // Edge-only evidence: do not equate a contact edge with memory creation.
+      RCLCPP_INFO(
+        get_logger(),
+        "BMS_CONTACT_EVIDENCE status=%u present=%s current=%.9g voltage=%.9g soc=%.9g "
+        "sample_stamp=%d.%09u external_docking_context=%s cached_docking_context=%s "
+        "docked_status=%s persistent_strong=%s contact_edge=%s memory_before=%s memory_after=%s",
+        static_cast<unsigned>(msg->power_supply_status), msg->present ? "true" : "false",
+        static_cast<double>(msg->current), static_cast<double>(msg->voltage),
+        static_cast<double>(msg->percentage), msg->header.stamp.sec, msg->header.stamp.nanosec,
+        fresh_bms_docking_command_context() ? "true" : "false",
+        fresh_docking_command_active() ? "true" : "false",
+        docking_status_indicates_docked() ? "true" : "false",
+        persistent_evidence.strong ? "true" : "false", !contact_was_active ? "true" : "false",
+        memory_was_latched ? "true" : "false", bms_docking_contact_latched_ ? "true" : "false");
     }
     if (bms_docking_interlock_enabled_ && battery_contact_active_ && !contact_was_active) {
       publish_bms_docking_interlock_stop("bms_contact_rising_edge");
@@ -2220,6 +2253,7 @@ private:
   rclcpp::Time last_normal_cmd_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_api_cmd_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_docking_cmd_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_received_docking_cmd_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_elevator_entry_cmd_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_battery_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_docking_status_time_{0, 0, RCL_ROS_TIME};

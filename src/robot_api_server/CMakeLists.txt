@@ -1169,6 +1169,26 @@ if(BUILD_TESTING)
   )
 
   ament_add_gtest(
+    test_navigation_goal_executor
+    test/features/navigation/mission/test_navigation_goal_executor.cpp
+    src/features/navigation/mission/navigation_goal_executor.cpp
+    src/features/navigation/mission/navigation_completion_policy.cpp
+    src/features/navigation/mission/navigation_goal_job.cpp
+    src/features/navigation/mission/navigation_mission_runtime.cpp
+    src/features/navigation/runtime/navigation_action_runtime.cpp
+    src/features/navigation/terminal_control/navigation_terminal_control.cpp
+    src/features/localization/tf_pose_utils.cpp
+    src/infrastructure/http/http_common.cpp
+  )
+  target_compile_features(test_navigation_goal_executor PRIVATE cxx_std_17)
+  target_link_libraries(test_navigation_goal_executor yaml-cpp)
+  target_include_directories(test_navigation_goal_executor PRIVATE include ${robot_safety_INCLUDE_DIRS})
+  ament_target_dependencies(test_navigation_goal_executor
+    action_msgs builtin_interfaces geometry_msgs lifecycle_msgs nav2_msgs nav_msgs
+    rclcpp rclcpp_action robot_elevator_manager robot_interfaces robot_map_asset_identity
+    rcl_interfaces sensor_msgs std_msgs std_srvs tf2_msgs)
+
+  ament_add_gtest(
     test_navigation_goal_execution_module
     test/features/navigation/mission/test_navigation_goal_execution_module.cpp
     src/features/navigation/mission/navigation_goal_execution_module.cpp

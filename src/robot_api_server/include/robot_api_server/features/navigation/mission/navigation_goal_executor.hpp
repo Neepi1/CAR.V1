@@ -148,6 +148,8 @@ public:
     std::uint64_t job_id,
     const FinalPoseCheck & check,
     std::string & detail) = 0;
+  // Current existing settle evidence only; no command, reset or added wait.
+  virtual bool post_nav2_terminal_actual_stop_confirmed(std::string & detail) const = 0;
   virtual TerminalLateralCorrectionResult run_post_nav2_terminal_lateral_correction(
     std::uint64_t job_id,
     const StoredPose & target,
