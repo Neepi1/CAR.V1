@@ -33,7 +33,8 @@ BatteryContactEvaluation evaluate_battery_charging_contact(
   const double voltage_min_v,
   const double voltage_max_v,
   const bool full_soc_voltage_contact_enable,
-  const double full_soc_threshold_pct)
+  const double full_soc_threshold_pct,
+  const bool confirmed_dock_context)
 {
   if (msg.power_supply_status == sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_CHARGING) {
     return {true, "power_supply_status=CHARGING"};
@@ -44,7 +45,9 @@ BatteryContactEvaluation evaluate_battery_charging_contact(
     // charging-contact session by itself.
     return {false, "full_without_physical_contact_evidence"};
   }
-  if (std::isfinite(msg.current) && static_cast<double>(msg.current) > current_min_a) {
+  const bool positive_current =
+    std::isfinite(msg.current) && static_cast<double>(msg.current) > current_min_a;
+  if (positive_current && confirmed_dock_context) {
     return {true, "current_above_threshold"};
   }
   if (msg.present && voltage_in_contact_range(msg.voltage, voltage_min_v, voltage_max_v)) {
@@ -56,6 +59,9 @@ BatteryContactEvaluation evaluate_battery_charging_contact(
     return {true, "full_soc_present_voltage_valid"};
   }
 
+  if (positive_current) {
+    return {false, "current_ignored_without_confirmed_dock_context"};
+  }
   std::ostringstream reason;
   reason << "no_contact status=" << static_cast<int>(msg.power_supply_status)
          << " present=" << (msg.present ? "true" : "false");

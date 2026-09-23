@@ -29,6 +29,11 @@ public:
     validate_dependencies(dependencies_);
 
     PowerModulePorts ports;
+    ports.confirmed_dock_context = [this]() {
+      auto *docking = dependencies_.docking();
+      return docking != nullptr &&
+             docking->contact_interlock().has_confirmed_dock_context();
+    };
     ports.on_contact_evidence = [this](const BatteryContactEvaluation &contact,
                                        const bool stable,
                                        const double stable_duration_sec) {

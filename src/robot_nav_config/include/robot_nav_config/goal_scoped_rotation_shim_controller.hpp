@@ -15,6 +15,7 @@
 #include "nav_msgs/msg/path.hpp"
 #include "rclcpp_lifecycle/lifecycle_publisher.hpp"
 #include "robot_nav_config/goal_scope_tracker.hpp"
+#include "robot_nav_config/navlite_log_gate.hpp"
 #include "robot_nav_config/ordinary_local_path_repair_runtime.hpp"
 #include "robot_nav_config/navigation_recovery/recovery_state.hpp"
 #include "robot_nav_config/srv/prepare_ordinary_navigation_recovery.hpp"
@@ -49,6 +50,11 @@ public:
     nav2_core::GoalChecker * goal_checker) override;
 
 private:
+  void log_navlite_output(const char * branch,
+    const geometry_msgs::msg::TwistStamped & command,
+    const geometry_msgs::msg::PoseStamped & pose);
+  NavliteLogGate navlite_output_log_;
+
   struct StartupHeadingMeasurement
   {
     std::optional<double> error;

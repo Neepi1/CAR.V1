@@ -199,5 +199,49 @@ TEST(FloorStartupHandoff, AckRequiresFreshExactRequestAndSupportedSchema)
   EXPECT_FALSE(read_floor_startup_handoff_ack(path, expected));
 }
 
+TEST(FloorStartupHandoff, FailedCleanupAckRejectsStringBooleansAndPartialProof)
+{
+  TemporaryDirectory temporary;
+  const auto path = temporary.path() / "ack.json";
+  const auto expected = handoff_record(temporary.path());
+  auto base = ack_body(expected);
+  base.replace(base.find("runtime_ready"), std::string("runtime_ready").size(), "failed");
+  base.pop_back();
+  for (const auto & suffix : std::vector<std::string>{
+      ",\"cleanup_completed\":\"true\",\"effects_settled\":true,\"owner_available\":false}",
+      ",\"cleanup_completed\":true,\"effects_settled\":true}",
+      ",\"cleanup_completed\":true,\"effects_settled\":true,\"owner_available\":0}"})
+  {
+    std::ofstream(path) << base + suffix;
+    EXPECT_FALSE(read_floor_startup_handoff_ack(path, expected)) << suffix;
+  }
+}
+
+TEST(FloorStartupHandoff, FailedOwnerAckKeepsSettlementSeparateFromOwnerAvailability)
+{
+  TemporaryDirectory temporary;
+  const auto path = temporary.path() / "ack.json";
+  const auto expected = handoff_record(temporary.path());
+  auto base = ack_body(expected);
+  base.replace(base.find("runtime_ready"), std::string("runtime_ready").size(), "failed");
+  base.pop_back();
+  for (const bool settled : {false, true}) {
+    std::ofstream(path) << base + ",\"cleanup_completed\":true,\"effects_settled\":" +
+      (settled ? "true" : "false") + ",\"owner_available\":false}";
+    const auto ack = read_floor_startup_handoff_ack(path, expected);
+    ASSERT_TRUE(ack);
+    EXPECT_EQ(ack->cleanup_completed, std::optional<bool>(true));
+    EXPECT_EQ(ack->effects_settled, std::optional<bool>(settled));
+    EXPECT_EQ(ack->owner_available, std::optional<bool>(false));
+  }
+  // Legacy failed ACK remains readable for its original error, not new proof.
+  std::ofstream(path) << base + "}";
+  const auto legacy = read_floor_startup_handoff_ack(path, expected);
+  ASSERT_TRUE(legacy);
+  EXPECT_FALSE(legacy->cleanup_completed.has_value());
+  EXPECT_FALSE(legacy->effects_settled.has_value());
+  EXPECT_FALSE(legacy->owner_available.has_value());
+}
+
 }  // namespace
 }  // namespace robot_floor_manager

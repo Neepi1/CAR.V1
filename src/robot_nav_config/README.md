@@ -1,13 +1,31 @@
 # robot_nav_config
 
+The optional NAVLITE internal-snapshot candidate records the true per-computation
+costmap/inputs and final pre-shift control sequence using a bounded file writer.
+Default disabled; it adds no ROS entities and does not change control/safety.
+Not activated by editing/building this source. See
+[recording and evidence limits](../../scripts/diagnostics/README_nav_event_lite.md)
+and [snapshot schema](../../scripts/diagnostics/native_mppi_snapshot_schema.md).
+
 Fixed Nav2 and canonical TF defaults for the first production-oriented scaffold.
+
+Diagnostic-only NAVLITE stop/return events are a local, unactivated candidate.
+They do not change hold, footprint, repair or velocity decisions. See
+[stop branch audit](../../docs/navlite_stop_branch_audit.md).
 
 ## Parameters
 
+- Local geometry candidate: the confirmed physical rectangle is `0.94 x 0.72 m`,
+  matching StopZone. Both costmaps retain `0.03 m` padding and use `0.75 m`
+  inflation, matched by MPPI and the local keepout inflation layer.
+  Clearing/FootprintApproach and repair envelopes grow with the footprint;
+  speeds, safety policy and repair margins are unchanged. Not deployed.
+  See [geometry, regression scope and hardware gaps](docs/body_geometry_alignment.md).
+
 - Ordinary MPPI enables native Humble `ConstraintCritic` (power 1, weight 4).
   The local costmap shares the existing global keepout mask and applies matched
-  post-filter inflation (0.60 m / 6.0) for MPPI footprint checks. Geometry,
-  motion limits, terminal tolerances and elevator test policy are unchanged.
+  post-filter inflation (0.75 m / 6.0) for MPPI footprint checks. Motion limits,
+  terminal tolerances and elevator test policy are unchanged.
   See [scope, tests and activation](docs/local_keepout_and_constraints.md).
 
 - Elevator direct-path endpoints use latest TF for Nav2 arrival checking,
@@ -345,6 +363,12 @@ mid-path spin segments in an obstacle case, so the production profile retains
 `rotation_penalty=3.0` and uses the bounded direct-corridor policy above.
 
 ## Notes
+
+Diagnostic-only MPPI failure/recovery events and isolated test boundaries:
+[NAVLITE evidence](../../docs/navlite_mppi_failure_evidence.md). Not deployed.
+The 2026-09-20 candidate adds startup schema evidence and validates real plugin
+failure/recovery through the lightweight file recorder. See the
+[cross-module evidence boundary](../../docs/navlite_chain_evidence.md).
 
 - This package owns the policy artifacts, not the live TF publication.
 - Wrapper packages must consume this policy and keep non-canonical TF disabled by default.

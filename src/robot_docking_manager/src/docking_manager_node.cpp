@@ -126,13 +126,13 @@ public:
       charging_state_topic_, rclcpp::QoS(10),
       [this](const sensor_msgs::msg::BatteryState::SharedPtr msg) {
         latest_battery_ = msg;
-        charging_detected_ = battery_indicates_charging(*msg);
-        const auto contact = battery_charging_contact(*msg);
+        const auto contact = battery_charging_contact(*msg, true);
+        charging_detected_ = contact.contact;
         charging_contact_detected_ = contact.contact;
         // A standalone BMS sample must never create durable on-dock state.
-        // Successful docking writes the strong latch after stop confirmation;
-        // the API-side charging-session path additionally requires stable
-        // contact inside an active docking context.
+        // The existing contact-stop path owns the strong latch and stop
+        // confirmation. Current-only evidence is scoped to this fine-docking
+        // callback, never a cached pre-start sample or an idle undock request.
         if (charging_detected_ && docking_is_active()) {
           begin_contact_stop("docked_charging_detected", contact.reason);
         }
@@ -1881,7 +1881,8 @@ private:
     return battery_charging_contact(msg).contact;
   }
 
-  BatteryContactEvaluation battery_charging_contact(const sensor_msgs::msg::BatteryState & msg) const
+  BatteryContactEvaluation battery_charging_contact(
+    const sensor_msgs::msg::BatteryState & msg, const bool received_sample = false) const
   {
     if (msg.power_supply_status == sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_CHARGING) {
       return {true, "power_supply_status=CHARGING"};
@@ -1893,7 +1894,9 @@ private:
         BatteryContactEvaluation{true, "power_supply_status=FULL_with_docking_session"} :
         BatteryContactEvaluation{false, "full_without_physical_contact_evidence"};
     }
-    if (std::isfinite(msg.current) && static_cast<double>(msg.current) > min_charging_current_a_) {
+    if (std::isfinite(msg.current) && static_cast<double>(msg.current) > min_charging_current_a_ &&
+      ((received_sample && docking_is_active()) || state_ == State::Docked ||
+      dock_contact_latch_is_docked() || safety_memory_allows_undock())) {
       return {true, "current_above_threshold"};
     }
     if (msg.present && voltage_in_contact_range(

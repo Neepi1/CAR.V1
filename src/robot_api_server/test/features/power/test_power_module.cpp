@@ -15,6 +15,39 @@
 namespace power = robot_api_server::features::power;
 using namespace std::chrono_literals;
 
+TEST(PowerModule, UnscopedPositiveCurrentIsNotDockContact)
+{
+  sensor_msgs::msg::BatteryState message;
+  message.voltage = 498.0F;
+  message.percentage = 85.0F;
+  for (const auto current : {0.11F, 0.7F, 1.1F}) {
+    message.current = current;
+    const auto evaluation = robot_api_server::evaluate_battery_charging_contact(
+      message, 0.10, 40.0, 1000.0, true, 99.0);
+    EXPECT_FALSE(evaluation.contact) << current;
+  }
+}
+
+TEST(PowerModule, PositiveCurrentSupportsConfirmedDockButDoesNotReplaceOtherEvidence)
+{
+  sensor_msgs::msg::BatteryState message;
+  message.current = 0.7F;
+  message.voltage = 498.0F;
+  EXPECT_TRUE(robot_api_server::evaluate_battery_charging_contact(
+    message, 0.10, 40.0, 1000.0, true, 99.0, true).contact);
+  message.current = -1.0F;
+  EXPECT_FALSE(robot_api_server::evaluate_battery_charging_contact(
+    message, 0.10, 40.0, 1000.0, true, 99.0, true).contact);
+  message.power_supply_status = sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_CHARGING;
+  EXPECT_TRUE(robot_api_server::evaluate_battery_charging_contact(
+    message, 0.10, 40.0, 1000.0, true, 99.0).contact);
+  message.power_supply_status = sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_UNKNOWN;
+  message.current = 0.7F;
+  message.present = true;
+  EXPECT_TRUE(robot_api_server::evaluate_battery_charging_contact(
+    message, 0.10, 40.0, 1000.0, true, 99.0).contact);
+}
+
 TEST(PowerModule, FullSocStatusAloneIsNotPhysicalDockContact)
 {
   sensor_msgs::msg::BatteryState message;
@@ -47,7 +80,13 @@ TEST(PowerModule, OwnsCommittedContactEvidenceCallbacksAndFreshness)
   std::vector<bool> teleop_contacts;
   bool callback_saw_committed_snapshot = false;
   power::PowerModule * module_ptr = nullptr;
+  bool confirmed_context = false;
   power::PowerModulePorts ports;
+  ports.confirmed_dock_context = [&]() {
+      // This read would deadlock if the caller held the PowerState mutex.
+      if (module_ptr) { (void)module_ptr->snapshot(); }
+      return confirmed_context;
+    };
   ports.on_contact_evidence =
     [&](const robot_api_server::BatteryContactEvaluation & evaluation,
     const bool stable,
@@ -125,6 +164,31 @@ TEST(PowerModule, OwnsCommittedContactEvidenceCallbacksAndFreshness)
   ASSERT_EQ(teleop_contacts.size(), 1U);
   EXPECT_TRUE(evidence_contacts.back());
   EXPECT_TRUE(teleop_contacts.back());
+
+  message.current = 0.7F;
+  message.present = false;
+  message.power_supply_status = sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_UNKNOWN;
+  for (const auto confirmed : {false, true, false}) {
+    confirmed_context = confirmed;
+    callback_order.clear();
+    publisher->publish(message);
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (callback_order.size() < 2U && std::chrono::steady_clock::now() < deadline) {
+      executor.spin_some();
+      std::this_thread::sleep_for(5ms);
+    }
+    ASSERT_EQ(callback_order.size(), 2U);
+    const auto snapshot = module->snapshot();
+    EXPECT_EQ(snapshot.contact, confirmed);
+    EXPECT_EQ(snapshot.contact_stable, confirmed);
+    EXPECT_EQ(evidence_contacts.back(), confirmed);
+    EXPECT_EQ(teleop_contacts.back(), confirmed);
+    EXPECT_FLOAT_EQ(snapshot.current, 0.7F);  // Raw BMS telemetry is never rewritten.
+    if (!confirmed) {
+      EXPECT_EQ(snapshot.reason, "current_ignored_without_confirmed_dock_context");
+      EXPECT_DOUBLE_EQ(snapshot.contact_stable_duration_sec, 0.0);
+    }
+  }
 
   std::this_thread::sleep_for(250ms);
   const auto stale = module->snapshot();

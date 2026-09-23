@@ -4,6 +4,44 @@ ROS 2 Humble multi-floor indoor/outdoor delivery robot navigation stack scaffold
 
 ## Current Status
 
+The [elevator navigation/floor-step recovery candidate](docs/elevator_navigation_floor_retry.md)
+retries confirmed transient failures within the current effect, without repeating
+arm steps or changing ordinary navigation. The reviewed correction must be staged
+with the matching FloorManager cleanup, bridge transaction termination, and startup
+exit receipts; an API-only deployment is insufficient. The joint candidate was
+activated on 2026-09-22 with one authorized restart; it is not hardware-accepted.
+An exited cold-start owner is reported explicitly, not retried
+as though a startup consumer still existed.
+
+The five-core profile places only the Nav2 controller/local-costmap process on
+CPU1-3; planner/API remain on CPU0,1,4 and the downstream command chain on CPU1.
+See [controller placement and validation limits](docs/navigation_five_cpu_profile.md#controller-only-placement-2026-09-20).
+
+The local [physical-body geometry candidate](src/robot_nav_config/docs/body_geometry_alignment.md)
+aligns both costmaps with the confirmed StopZone-sized body and matches inflation.
+It is not deployed; hardware acceptance is still required.
+
+For low-overhead file-only event tracing, use
+[nav_event_lite](scripts/diagnostics/README_nav_event_lite.md): no ROS/DDS/HTTP,
+local marks, explicit capture gaps and offline +/-5-second log windows.
+It does not replace raw velocity/odometry/scan evidence.
+Its offline NAVLITE CSV separates calculation returns, published commands and
+state-only changes, with per-marker missing-evidence reports. Recording remains
+file-only; suppressed or absent producer events cannot be reconstructed.
+
+The [NAVLITE stop-branch diagnostics](docs/navlite_stop_branch_audit.md)
+adds module-local branch events only; no motion or safety parameter changes.
+The [2026-09-20 evidence closure](docs/navlite_chain_evidence.md) validates real
+producer logs through the file recorder, including driver observations. Candidate
+builds were deployed and activated on 2026-09-20 with one authorized full-chain
+restart; runtime hashes and startup log routing are verified. Hardware acceptance remains pending.
+
+Read-only navigation jerk capture is available as a diagnostic-only local tool:
+`inspect`, full-message `record`, file-only `mark`, and offline `report`.
+It discovers current graph/parameters and preserves observation gaps instead of
+assuming MPPI or safety is at fault. No runtime deployment or restart is implied.
+See [usage, actual topic audit and isolated tests](scripts/diagnostics/README_nav_jerk_capture.md).
+
 BMS docking-contact evidence now distinguishes received docking commands from
 internally generated stop commands. The isolated candidate preserves confirmed
 dock protection and existing release rules; it was activated on 2026-09-17.
@@ -12,6 +50,11 @@ See [scope, evidence and validation](src/robot_safety/docs/bms_contact_history.m
 Elevator adapter executor recovery is scoped to its ROS worker and internal
 failure/stop handling. See [audit and tests](docs/elevator_adapter_executor_recovery.md);
 no whole-service restart is implied by the source change.
+
+The [elevator arm retry candidate](docs/elevator_arm_automatic_retry.md) retains
+unlimited retries for explicitly failed tasks while propagating existing adapter
+faults through the same waiting loop. It was activated on 2026-09-22 with one
+authorized whole-runtime restart; physical elevator acceptance remains pending.
 
 Fixed-distance auto-undock accepts an unknown dock ID without inventing one.
 The existing departure, post-undock localization and original navigation-goal
@@ -298,7 +341,7 @@ shift. This closes filter-generated reverse and speed-limit overshoot without
 changing chassis stop-centering or adding a low-speed stop gate. See
 [post-filter constraints](src/robot_nav_config/docs/chassis_response_model.md#post-filter-output-constraints).
 
-The 2026-09-08 navigation clearance candidate separates the unchanged
+The historical 2026-09-08 navigation clearance candidate separates the then-unchanged
 `0.39/0.28 m` scan mask / padded footprint, `0.47/0.36 m` StopZone, and
 `0.52/0.41 m` finite MPPI planning preference. Local repair shares the preference
 with an original-clearance fallback. No new velocity gate or expanded footprint
@@ -509,10 +552,10 @@ See [docs/production_jetson_provisioning.md](docs/production_jetson_provisioning
 - JT128 static translation is calibrated against that centered `base_link`: `base_link -> lidar_level_link` and `base_link -> imu_link` use the current field candidate `x=0.3450, y=0.0000, z=0.85`, with yaw `3.1764992386296798`. This supersedes the earlier approximate `x=0.25`, the intermediate `x=0.38, y=0.0`, and the first fit candidate `x=0.34152, y=-0.040216`; it still requires post-apply four-heading relocalization validation before treating it as final.
 - Field recalibration of `base_link -> lidar_level_link` XY/yaw uses `scripts/jetson/runtime_overlay/scripts/run_lidar_level_extrinsic_calibration.sh` plus the fitter in `fit_lidar_level_extrinsic_from_relocalize_samples.py`; the procedure is documented in [docs/lidar_level_extrinsic_calibration.md](docs/lidar_level_extrinsic_calibration.md). It changes only static sensor extrinsics after review and must be followed by a full `njrh-runtime.service` restart.
 - local Nav2 dynamic-obstacle handling now uses the standard 2D LaserScan flow: `local_costmap` runs `ObstacleLayer + InflationLayer`, and the single observation source is `/scan` with `marking=true`, `clearing=true`, and `inf_is_valid=true`. `collision_monitor` also consumes `/scan`. The previous custom `/perception/obstacle_points` marking cloud and `/perception/clearing_points` synthetic clearing cloud are disabled in the default accel config, so moved people are cleared by LaserScan free-space rays instead of a separate virtual PointCloud2 clearing model.
-- StopZone uses half extents `0.47 x 0.36m`, leaving an 8cm visible band outside the unchanged `0.39 x 0.28m` scan mask. MPPI separately prefers `0.52 x 0.41m` without enlarging the shared physical footprint or its clearing area. The two-return threshold (`max_points=1`), 2s FootprintApproach and velocity chain are unchanged. See [collision monitor geometry](src/robot_nav_config/docs/collision_monitor_geometry.md) for scope and outstanding low-speed hardware verification.
+- StopZone uses half extents `0.47 x 0.36m`. The 2026-09-21 user-requested Scan mask is `0.39 x 0.36m`: front/rear retain 8cm, but the central sides have no remaining scan-visible band inside StopZone. Ultrasound is not integrated. MPPI settings, the two-return threshold (`max_points=1`), 2s FootprintApproach and velocity chain are unchanged by this mask edit. Startup-cached bounds require an authorized full-runtime restart. See [collision monitor geometry](src/robot_nav_config/docs/collision_monitor_geometry.md).
 - Local-costmap clearing uses `raytrace_min_range=0.20m` while obstacle marking keeps the `/scan` cutoff at `0.25m`. With the `0.05m` costmap resolution, the earlier `0.25m` clearing start produced repeatable integer-raytracing blind cells that could retain lethal costs after an obstacle left; the one-cell inward start cleared every observed stale cell. This does not make the lidar observe the `0.20..0.25m` annulus and does not replace near-field safety sensing.
 - The production local-obstacle `/scan` worker slices `lidar_level_link` at `-0.50m..0.35m` to reduce near-ground returns that can keep refreshing local-costmap obstacles after a moved object leaves. This is a navigation/local-costmap slice and does not change the separate `jt128_scan_slam2d.yaml` mapping/localization slice.
-- The navigation-owned `/scan` worker now removes chassis/mechanical-arm self returns by transforming each candidate endpoint to `base_link` and filtering only the padded Ranger footprint (`x=-0.39..0.39m`, `y=-0.28..0.28m`). It does not increase `range_min` or clear a surrounding radius, so real obstacles immediately outside the robot remain available to both Nav2 and `collision_monitor`. The scan status reports the active bounds, per-scan/total filtered-point counts, and TF-unavailable count; an unavailable mask TF fails closed for that scan.
+- The navigation-owned `/scan` worker transforms each candidate endpoint to `base_link` and filters the configured XY exclusion (`x=-0.39..0.39m`, `y=-0.36..0.36m`, inclusive). It does not change `range_min`, but removes real obstacle returns as well as self returns inside the exclusion; downstream `/flatscan` is also affected. The scan status reports the active bounds, per-scan/total filtered-point counts, and TF-unavailable count; an unavailable mask TF fails closed for that scan. [Scope and pending hardware acceptance](src/robot_nav_config/docs/body_geometry_alignment.md#scan-mask-width-update-2026-09-21).
 - local dynamic-obstacle avoidance is tuned for Ranger Mini 3 four-wheel-drive/four-wheel-steering with the project-maintained `ranger_base_node` interpreting each post-safety Twist exactly once. `robot_safety` owns timeout/stop, reverse permits, and normal-navigation lateral rejection; `ranger_base` is the sole CAN and motion-mode owner and publishes desired/actual feedback on `/ranger_base/status`. The former `ranger_mini3_mode_controller`, custom Ackermann shaping path, and profile switch are removed.
 - Phase A2 removes the earlier plan to use Isaac as the continuous AMCL replacement. Isaac Occupancy Grid Localizer is kept for triggered global relocalization only through `/global_localization/trigger`; it consumes `/flatscan` and no runtime path forwards `/flatscan` into `/flatscan_localization`. AMCL is the continuous localization candidate source through `/scan_amcl`, which is a production AMCL admission input derived from `/scan` only in AMCL shadow/gated mode. Phase A1.4 keeps Nav2 AMCL itself unchanged and replaces only the scan admission relay with the C++ `robot_localization_bridge/amcl_scan_admission_node` by default (`NJRH_AMCL_SCAN_ADMISSION_IMPL=cpp`). AMCL and the C++ relay start through their installed binaries instead of `ros2 run` wrappers. The relay preserves the original scan stamp/frame/ranges, drops stale or non-TF-transformable scans, defaults to 5 Hz, and is pinned to `NJRH_CPUSET_AMCL_SCAN_ADMISSION` (CPU6 by default). Python `amcl_scan_admission_relay.py` remains an explicit rollback path with `NJRH_AMCL_SCAN_ADMISSION_IMPL=python`; a missing C++ binary fails fast instead of silently falling back. AMCL runs resident with `tf_broadcast=false` and now defaults to `gated`, where `robot_localization_bridge` accepts bounded covariance-gated AMCL corrections into `map -> odom`. See [docs/phase_a2_amcl_continuous_localization.md](docs/phase_a2_amcl_continuous_localization.md).
 - Phase A1/A2 AMCL support keeps `robot_localization_bridge` as the sole `map -> odom` owner. `gated` is the current field default: corrections up to `0.12 m` and `0.20 rad` are applied directly; corrections up to `0.28 m` and `0.35 rad` require 3 consecutive consistent AMCL candidates. Candidates outside the medium gate but no greater than `0.60 m` and `0.80 rad` are large corrections that require explicit Isaac recovery; only corrections above `0.60 m` or `0.80 rad` are hard-rejected. `shadow` mode remains the odom-audit rollback profile, where AMCL candidates are reported without applying them to `map -> odom`. Isaac triggered relocalization remains responsible for initial/global recovery and seeds AMCL through `/initialpose`; after the initial trigger is accepted and `map -> odom` is live, AMCL resident warmup and readiness completion run in the background while Nav2 becomes usable. Static `/amcl_pose` staleness is normal when the robot is stopped; moving stale pose is reported as AMCL not tracking. Use `verify_amcl_runtime_readiness.sh --mode gated` for a stationary seed/no-motion check and `record_navigation_amcl_odom_correlation.sh` while sending a short goal. The runtime context is confirmed ready when the bridge-owned `map -> odom` baseline and Nav2 lifecycle are ready; AMCL tracking readiness remains visible in status and can be restored as a hard startup gate with `NJRH_REQUIRE_AMCL_TRACKING_FOR_NAV_READY=true`. See [docs/phase_a1_amcl_shadow_localization.md](docs/phase_a1_amcl_shadow_localization.md).
@@ -1087,3 +1130,15 @@ Explicit stationary Isaac relocalization applies the accepted `map -> odom`
 target immediately, including small corrections; ordinary AMCL smoothing is
 unchanged. Completion still uses the published target. See
 [application contract and validation](docs/explicit_relocalization_immediate.md).
+
+## Navigation stop evidence (diagnostic candidate, 2026-09-18)
+
+[MPPI failure origin and NAVLITE evidence](docs/navlite_mppi_failure_evidence.md)
+separates computation recovery, nonzero commands, and downstream release.
+No motion-policy change or deployment is included.
+# NAVLITE diagnostic-only candidate (2026-09-20, not deployed)
+
+The lightweight recorder now has an optional native raw-message path and bounded
+MPPI internal snapshots, preserving the existing log-only mode. This candidate
+does not tune navigation or safety and requires separately authorized activation.
+See [usage, evidence coverage and validation](scripts/diagnostics/README_nav_event_lite.md).

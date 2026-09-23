@@ -59,10 +59,18 @@ struct ElevatorArmOutcome
   }
 };
 
+// Internal adapter failure only; it is neither a user cancel nor a remote task
+// terminal result. The probe reads existing runtime evidence and does no I/O.
+using ElevatorArmRuntimeFailureProbe = std::function<std::optional<ElevatorArmOutcome>()>;
+
 // Owns the functional-test-facing 8083 protocol. It submits ready, button, and
 // release tasks in order and waits for each task result. Arm health, pose,
 // busy, ready_for_press, and safe_to_drive status are deliberately not used as
 // state-machine gates during the current feature-validation phase.
+// Confirmed failed tasks retry in this same effect until success/cancellation or
+// an existing local adapter fault. Such faults retain their own error identity.
+// Unknown submission/timeout never authorizes another button POST. Cancellation
+// retains one bounded release cleanup; it does not cancel the remote arm task.
 class ElevatorArmClient
 {
 public:
@@ -76,12 +84,14 @@ public:
     std::uint64_t effect_sequence,
     const std::string & source_floor_id,
     const std::string & target_floor_id,
-    const std::function<bool()> & cancellation_requested);
+    const std::function<bool()> & cancellation_requested,
+    const ElevatorArmRuntimeFailureProbe & runtime_failure = {});
   ElevatorArmOutcome press_floor(
     const std::string & transaction_id,
     std::uint64_t effect_sequence,
     const std::string & target_floor_id,
-    const std::function<bool()> & cancellation_requested);
+    const std::function<bool()> & cancellation_requested,
+    const ElevatorArmRuntimeFailureProbe & runtime_failure = {});
 
   static std::optional<std::string> floor_button_label(
     const std::string & floor_id);
@@ -97,15 +107,18 @@ private:
     const std::string & action_field,
     const std::string & action_value,
     const std::function<bool()> & cancellation_requested,
-    bool hall_call);
+    bool hall_call,
+    const ElevatorArmRuntimeFailureProbe & runtime_failure);
   ElevatorArmOutcome run_task(
     const std::string & path,
     const std::string & request_body,
-    const std::function<bool()> & cancellation_requested);
+    const std::function<bool()> & cancellation_requested,
+    bool * confirmed_task_failure = nullptr);
   ElevatorArmOutcome await_task(
     const ElevatorArmHttpResponse & accepted_response,
     const std::string & path,
-    const std::function<bool()> & cancellation_requested);
+    const std::function<bool()> & cancellation_requested,
+    bool * confirmed_task_failure = nullptr);
 
   ElevatorArmClientOptions options_;
   std::shared_ptr<ElevatorArmHttpTransport> transport_;

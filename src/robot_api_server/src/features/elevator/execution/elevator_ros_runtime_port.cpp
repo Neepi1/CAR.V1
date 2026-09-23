@@ -40,6 +40,9 @@
 #include "std_msgs/msg/string.hpp"
 
 #include "robot_api_server/features/elevator/execution/elevator_lease_keepalive.hpp"
+#include "robot_api_server/features/elevator/execution/elevator_cached_health.hpp"
+#include "robot_api_server/features/elevator/execution/elevator_floor_retry_policy.hpp"
+#include "robot_api_server/features/elevator/execution/elevator_navigation_retry.hpp"
 #include "robot_api_server/features/elevator/execution/elevator_ros_executor.hpp"
 #include "robot_api_server/features/elevator/execution/elevator_recovery_action_barrier.hpp"
 #include "robot_api_server/features/elevator/execution/elevator_runtime_policy.hpp"
@@ -493,15 +496,32 @@ public:
           have_floor_switch_status_ = true;
           floor_switch_status_received_at_sec_ = steady_now_sec();
         }
-        if (
-          message->stage == kPauseHandoffStage ||
-          message->stage == kVerifyPauseHandoffStage)
         {
           std::lock_guard<std::mutex> lock(floor_goal_mutex_);
+          // Terminal cleanup is an event, not a heartbeat. Retain it for this
+          // unique attempt; fresh resource absence is checked independently.
+          if (message->transaction_id == floor_attempt_transaction_id_ &&
+            message->state == "FAILED" && message->stage == "FAILED")
+          {
+            floor_cleanup_complete_ = true;
+          }
           const auto handoff = floor_handoff_tracker_.snapshot();
+          if (handoff.active &&
+            handoff.submission_generation == floor_goal_submission_generation_ &&
+            handoff.transaction_id == message->transaction_id &&
+            message->transaction_id == floor_attempt_transaction_id_ &&
+            ((message->state == "FAILED_LOCKED" && message->stage == "RECOVERY_LOCKED") ||
+            (message->state == "FAILED" && message->stage == "FAILED")) &&
+            message->detail.rfind("STARTUP_OWNER_EXITED; ", 0U) == 0U)
+          {
+            // This is a terminal event for the submitted attempt, not a live
+            // telemetry sample. Later status messages cannot erase the fault.
+            floor_startup_owner_exit_detail_ = message->detail;
+          }
           if (
             handoff.active &&
-            handoff.transaction_id == message->transaction_id)
+            handoff.transaction_id == message->transaction_id &&
+            (message->stage == kPauseHandoffStage || message->stage == kVerifyPauseHandoffStage))
           {
             (void)floor_handoff_tracker_.observe_feedback(
               message->transaction_id,
@@ -991,6 +1011,7 @@ public:
       floor_result_future_ = {};
       floor_goal_admission_unknown_ = false;
       floor_handoff_tracker_.clear();
+      floor_attempt_transaction_id_.clear();
     }
     reset_stop_evidence();
     admission_fence_guard.retain_closed();
@@ -1036,7 +1057,7 @@ public:
       case EffectKind::kPauseLocalizationCorrections:
         return set_correction_pause(true, effect.effect.detail);
       case EffectKind::kResumeLocalizationCorrections:
-        return set_correction_pause(false, effect.effect.detail, true);
+        return resume_floor_corrections(effect);
       case EffectKind::kBeginFloorTransition:
         {
           std::lock_guard<std::mutex> lock(binding_mutex_);
@@ -1587,89 +1608,68 @@ public:
           recovered.detail);
       }
     }
-    if (ros_worker_->unavailable()) {
-      return failed(
-        "ELEVATOR_RUNTIME_EXECUTOR_UNHEALTHY",
-        "ROS runtime executor is unavailable");
-    }
-    if (cancel_requested_.load()) {
-      return failed(
-        "ELEVATOR_RUNTIME_CANCEL_REQUESTED",
-        "elevator transaction cancellation is pending cleanup");
+    return cached_runtime_health(false);
+  }
+
+private:
+  RuntimeResult cached_runtime_health(const bool arm_wait)
+  {
+    ElevatorCachedHealth evidence;
+    evidence.executor_unavailable = ros_worker_->unavailable();
+    evidence.cancel_requested = cancel_requested_.load();
+    if (const auto failure = check_elevator_cached_health(evidence, arm_wait)) {
+      return failed(failure->code, failure->detail);
     }
 
     std::string transaction;
     std::string mission;
     std::string mode_lease;
     std::string expected_mode;
-    bool expect_hold = false;
-    bool expect_mode = false;
-    bool expect_pause = false;
     {
       std::lock_guard<std::mutex> lock(binding_mutex_);
       transaction = transaction_id_;
       mission = mission_id_;
       mode_lease = mode_lease_id_;
       expected_mode = mode_;
-      expect_hold = hold_active_;
-      expect_mode = mode_lease_ownership_ == ResourceOwnership::kPresent;
-      expect_pause =
+      evidence.expect_hold = hold_active_;
+      evidence.expect_mode = mode_lease_ownership_ == ResourceOwnership::kPresent;
+      evidence.expect_correction_pause =
         correction_pause_ownership_ == ResourceOwnership::kPresent;
-      if (
-        mode_lease_ownership_ == ResourceOwnership::kUnknown ||
-        correction_pause_ownership_ == ResourceOwnership::kUnknown)
-      {
-        return failed(
-          "ELEVATOR_RUNTIME_RESOURCE_STATE_UNPROVEN",
-          "mode or correction-pause outcome is unknown");
-      }
+      evidence.mode_ownership_unknown =
+        mode_lease_ownership_ == ResourceOwnership::kUnknown;
+      evidence.correction_ownership_unknown =
+        correction_pause_ownership_ == ResourceOwnership::kUnknown;
     }
 
     const auto now = steady_now_sec();
     std::lock_guard<std::mutex> lock(evidence_mutex_);
-    if (
-      expect_hold &&
-      (!have_interlock_state_ ||
+    evidence.hold_current =
+      !(!have_interlock_state_ ||
       now - interlock_received_at_sec_ > options_.state_evidence_max_age_sec ||
-      !contains_key(interlock_state_.hold_keys, hold_key(transaction))))
-    {
-      return failed(
-        "ELEVATOR_SAFETY_HOLD_LOST",
-        "owner-scoped safety hold is missing or stale");
-    }
-    if (
-      expect_mode && !expect_hold &&
-      (!have_operating_mode_state_ ||
+      !contains_key(interlock_state_.hold_keys, hold_key(transaction)));
+    evidence.mode_current =
+      !(!have_operating_mode_state_ ||
       now - operating_mode_received_at_sec_ >
       options_.state_evidence_max_age_sec ||
       !operating_mode_state_.lease_active ||
       operating_mode_state_.mode != expected_mode ||
       operating_mode_state_.owner != kRuntimeOwner ||
       operating_mode_state_.mission_id != mission ||
-      operating_mode_state_.lease_id != mode_lease))
-    {
-      return failed(
-        "ELEVATOR_OPERATING_MODE_LEASE_LOST",
-        "owner-scoped operating mode lease is missing, stale, or mismatched");
-    }
-    if (
-      expect_pause &&
-      (!have_correction_pause_state_ ||
+      operating_mode_state_.lease_id != mode_lease);
+    evidence.correction_pause_current =
+      !(!have_correction_pause_state_ ||
       now - correction_pause_received_at_sec_ >
       options_.state_evidence_max_age_sec ||
       !correction_pause_state_.paused ||
       !contains_key(
         correction_pause_state_.lease_keys,
-        correction_key(kRuntimeOwner, transaction))))
-    {
-      return failed(
-        "ELEVATOR_CORRECTION_PAUSE_LOST",
-        "owner-scoped localization correction pause is missing or stale");
+        correction_key(kRuntimeOwner, transaction)));
+    if (const auto failure = check_elevator_cached_health(evidence, arm_wait)) {
+      return failed(failure->code, failure->detail);
     }
     return ok("elevator runtime ownership and health evidence are current");
   }
 
-private:
   void validate_options() const
   {
     const auto positive =
@@ -1737,18 +1737,33 @@ private:
       const auto cancellation_probe = [this]() {
           return cancel_requested_.load();
         };
+      const ElevatorArmRuntimeFailureProbe runtime_failure_probe = [this]()
+        -> std::optional<ElevatorArmOutcome> {
+          // This effect occupies the business monitor thread. Observe already
+          // available adapter/hold/correction faults without a renewal RPC or
+          // black-box status gate. Mode renewal failures retain their existing
+          // recovery and owner-hold tolerance at the next business boundary.
+          const auto health = cached_runtime_health(true);
+          if (health.success) {
+            return std::nullopt;
+          }
+          return ElevatorArmOutcome{
+            ElevatorArmOutcomeKind::kFailed, health.code, health.detail, {}};
+        };
       const auto outcome = hall_call ?
         options_.arm_client->press_hall_call(
         effect.effect.transaction_id,
         effect.effect.sequence,
         effect.effect.floor_id,
         target_floor_id,
-        cancellation_probe) :
+        cancellation_probe,
+        runtime_failure_probe) :
         options_.arm_client->press_floor(
         effect.effect.transaction_id,
         effect.effect.sequence,
         effect.effect.floor_id,
-        cancellation_probe);
+        cancellation_probe,
+        runtime_failure_probe);
       if (outcome.kind == ElevatorArmOutcomeKind::kFailed) {
         return failed(
           outcome.code.empty() ? "ELEVATOR_ARM_OPERATION_FAILED" : outcome.code,
@@ -1936,13 +1951,14 @@ private:
           correction_pause_state_.lease_keys,
           correction_key(kRuntimeOwner, transaction_id));
         const bool floor_pause_absent =
-          !contains_key(
-          correction_pause_state_.lease_keys,
-          correction_key(kFloorPauseOwner, transaction_id));
+          std::none_of(
+          correction_pause_state_.lease_keys.begin(),
+          correction_pause_state_.lease_keys.end(),
+          [&](const auto & key) {return floor_resource_belongs_to(transaction_id, key);});
         const bool floor_hold_absent =
-          !contains_key(
-          interlock_state_.hold_keys,
-          std::string(kFloorPauseOwner) + ":" + transaction_id);
+          std::none_of(
+          interlock_state_.hold_keys.begin(), interlock_state_.hold_keys.end(),
+          [&](const auto & key) {return floor_resource_belongs_to(transaction_id, key);});
         if (
           execution_absent && own_mode_absent && own_pause_absent &&
           floor_pause_absent && floor_hold_absent)
@@ -2847,7 +2863,7 @@ private:
     const double response_received_at_sec)
   {
     const auto caller_key = correction_key(kRuntimeOwner, transaction);
-    const auto floor_key = correction_key(kFloorPauseOwner, transaction);
+    const auto floor_key = correction_key(kFloorPauseOwner, floor_attempt_id());
     const auto deadline =
       std::chrono::steady_clock::now() +
       timeout(options_.endpoint_timeout_sec);
@@ -3179,7 +3195,7 @@ private:
         std::to_string(response->applied_sequence));
     }
     if (!acquire && require_floor_handoff) {
-      const auto floor_key = correction_key(kFloorPauseOwner, transaction);
+      const auto floor_key = correction_key(kFloorPauseOwner, floor_attempt_id());
       if (
         !response->state.paused ||
         !contains_key(response->state.lease_keys, floor_key))
@@ -3726,6 +3742,11 @@ private:
         "ELEVATOR_NAVIGATION_TARGET_INVALID",
         "frozen pose identity or doorway heading is invalid");
     }
+    // Freeze the first selected profile together with the already frozen target.
+    // A retry continues this effect; getting nearer must not silently change BT.
+    std::optional<ElevatorNavigationProfile> frozen_navigation_profile;
+    const auto attempt = [&](const std::uint64_t attempt_index)
+      -> ElevatorNavigationAttemptResult {
     const bool bypass_collision_monitor =
       elevator_navigation_bypasses_collision_monitor(
       request->navigation_intent);
@@ -3777,7 +3798,7 @@ private:
     }
 
     std::optional<ElevatorMapPose> current_map_pose;
-    if (options_.current_map_pose_probe) {
+    if (!frozen_navigation_profile && options_.current_map_pose_probe) {
       try {
         current_map_pose = options_.current_map_pose_probe();
       } catch (const std::exception & exception) {
@@ -3793,10 +3814,15 @@ private:
           "profile");
       }
     }
-    const auto navigation_profile = select_elevator_navigation_profile(
-      *request, current_map_pose,
-      options_.nearby_hall_call_scoped_distance_m);
-    if (request->target.role == robot_elevator_manager::PoseRole::kHallCall) {
+    if (!frozen_navigation_profile) {
+      frozen_navigation_profile = select_elevator_navigation_profile(
+        *request, current_map_pose,
+        options_.nearby_hall_call_scoped_distance_m);
+    }
+    const auto navigation_profile = *frozen_navigation_profile;
+    if (attempt_index == 0U &&
+      request->target.role == robot_elevator_manager::PoseRole::kHallCall)
+    {
       const double distance = current_map_pose ? std::hypot(
           request->target.x - current_map_pose->x,
           request->target.y - current_map_pose->y) :
@@ -3814,10 +3840,14 @@ private:
 
     const auto controller_id = elevator_controller_id_for_profile(
       navigation_profile, request->target.role);
-    const auto controller_session_id = controller_id ?
+    auto controller_session_id = controller_id ?
       make_elevator_controller_session_id(
       runtime_effect.effect.transaction_id,
       runtime_effect.effect.sequence) : std::nullopt;
+    if (controller_session_id) {
+      *controller_session_id = elevator_navigation_attempt_session(
+        *controller_session_id, attempt_index);
+    }
     bool controller_session_active = false;
     std::string controller_session_terminal_reason{
       "navigate_return_before_nav2_terminal"};
@@ -3965,9 +3995,10 @@ private:
       std::lock_guard<std::mutex> lock(nav_goal_mutex_);
       nav_goal_admission_unknown_ = false;
       nav_goal_response_future_ = {};
-      return failed(
-        "ELEVATOR_NAV2_GOAL_REJECTED",
-        "Nav2 rejected the elevator-owned goal while hold remained active");
+      return {failed(
+          "ELEVATOR_NAV2_GOAL_REJECTED",
+          "Nav2 rejected the elevator-owned goal while hold remained active"),
+        ElevatorNavigationAttemptEnd::kRejected};
     }
     const auto nav_result_future = nav_client_->async_get_result(goal_handle);
     {
@@ -4003,8 +4034,30 @@ private:
     if (!result.success) {
       controller_session_terminal_reason = "motion_admission_failed";
       clear_bypass_permit();
-      (void)set_hold(true, "navigation_motion_not_allowed");
-      (void)cancel_nav_goal_and_wait_terminal();
+      const auto hold_result = set_hold(true, "navigation_motion_not_allowed");
+      const auto terminal_result = cancel_nav_goal_and_wait_terminal();
+      // The legacy early-result branch also reports UNKNOWN/CANCELED using
+      // GOAL_FAILED. Only this exact Action's proven ABORTED result may retry.
+      if (hold_result.success && terminal_result.success &&
+        result.code == "ELEVATOR_NAV2_GOAL_FAILED" &&
+        nav_result_future.wait_for(0ms) == std::future_status::ready)
+      {
+        std::optional<rclcpp_action::ResultCode> terminal_code;
+        try {
+          terminal_code = nav_result_future.get().code;
+        } catch (const std::exception &) {
+          // Keep the original error and never infer an Action terminal state.
+        }
+        if (terminal_code == rclcpp_action::ResultCode::ABORTED) {
+          reset_stop_evidence();
+          const auto stopped = wait_for_stop();
+          if (!stopped.success) {
+            return with_safety_proof(stopped, true, false);
+          }
+          return {with_safety_proof(result, true, true),
+            ElevatorNavigationAttemptEnd::kAborted};
+        }
+      }
       return result;
     }
     refresh_bypass_permit();
@@ -4012,6 +4065,7 @@ private:
     const auto deadline =
       std::chrono::steady_clock::now() +
       timeout(options_.navigation_timeout_sec);
+    bool timed_out_with_stop_proven = false;
     while (ros_worker_->wait_for(nav_result_future, 100ms) != std::future_status::ready) {
       refresh_bypass_permit();
       if (const auto mode_failure = mode_keepalive_failure()) {
@@ -4080,12 +4134,11 @@ private:
         if (!stop_result.success) {
           return with_safety_proof(stop_result, true, false);
         }
-        return with_safety_proof(
-          failed(
-            "ELEVATOR_NAV2_TIMEOUT",
-            "elevator-owned Nav2 goal timed out and reached a terminal state "
-            "under hold"),
-          true, true);
+        // Terminal proof alone is not retry permission: this exact goal may
+        // have succeeded while the timeout hold/cancel was being processed.
+        // Keep its original future and use the normal result acceptance below.
+        timed_out_with_stop_proven = true;
+        break;
       }
     }
 
@@ -4111,14 +4164,24 @@ private:
       }
     }
     clear_bypass_permit();
-    const auto hold_result = set_hold(true, "navigation_terminal");
-    reset_stop_evidence();
-    const auto stop_result = wait_for_stop();
-    if (!hold_result.success) {
-      return hold_result;
+    if (!timed_out_with_stop_proven) {
+      const auto hold_result = set_hold(true, "navigation_terminal");
+      reset_stop_evidence();
+      const auto stop_result = wait_for_stop();
+      if (!hold_result.success) {
+        return hold_result;
+      }
+      if (!stop_result.success) {
+        return with_safety_proof(stop_result, true, false);
+      }
     }
-    if (!stop_result.success) {
-      return with_safety_proof(stop_result, true, false);
+    if (cancel_requested_.load()) {
+      controller_session_terminal_reason = "operator_cancel";
+      return with_safety_proof(
+        failed(
+          "ELEVATOR_NAV2_CANCELED",
+          "operator cancellation was requested before navigation completion"),
+        true, true);
     }
     if (!explicit_terminal) {
       return failed(
@@ -4126,18 +4189,195 @@ private:
         "Nav2 returned UNKNOWN rather than an explicit terminal result");
     }
     if (wrapped.code != rclcpp_action::ResultCode::SUCCEEDED) {
-      return with_safety_proof(
+      if (timed_out_with_stop_proven &&
+        (wrapped.code == rclcpp_action::ResultCode::ABORTED ||
+        wrapped.code == rclcpp_action::ResultCode::CANCELED))
+      {
+        return {with_safety_proof(
+          failed(
+            "ELEVATOR_NAV2_TIMEOUT",
+            "elevator-owned Nav2 goal timed out; original terminal result=" +
+            result_code_text(wrapped.code) + "; owner hold and dual odom settled"),
+          true, true), ElevatorNavigationAttemptEnd::kTimeoutTerminal};
+      }
+      return {with_safety_proof(
         failed(
           "ELEVATOR_NAV2_GOAL_FAILED",
           "Nav2 terminal result=" + result_code_text(wrapped.code)),
-        true, true);
+        true, true), wrapped.code == rclcpp_action::ResultCode::ABORTED ?
+        ElevatorNavigationAttemptEnd::kAborted :
+        ElevatorNavigationAttemptEnd::kOtherTerminal};
     }
     return with_safety_proof(
       ok("Nav2 goal succeeded; owner hold reacquired and dual odom settled"),
       true, true);
+    };
+    return run_elevator_navigation_retries(attempt,
+      [&](const std::uint64_t attempt_index, const RuntimeResult & previous)
+      -> std::optional<RuntimeResult> {
+        RCLCPP_WARN(node_->get_logger(),
+          "Elevator navigation retry: transaction=%s effect=%llu next_attempt=%llu "
+          "code=%s detail=%s", runtime_effect.effect.transaction_id.c_str(),
+          static_cast<unsigned long long>(runtime_effect.effect.sequence),
+          static_cast<unsigned long long>(attempt_index + 1U),
+          previous.code.c_str(), previous.detail.c_str());
+        const auto deadline = std::chrono::steady_clock::now() + 1s;
+        while (true) {
+          if (cancel_requested_.load()) {
+            return failed("ELEVATOR_CANCEL_FENCE_ACTIVE",
+              "cancellation stopped the current navigation retry");
+          }
+          const auto health = cached_runtime_health(true);
+          if (!health.success) {
+            return health;
+          }
+          const auto now = std::chrono::steady_clock::now();
+          if (now >= deadline) {
+            break;
+          }
+          std::unique_lock<std::mutex> lock(evidence_mutex_);
+          evidence_cv_.wait_until(lock, std::min(deadline, now + 20ms));
+        }
+        const auto mode = renew_before_state_changing_effect(EffectKind::kNavigateToPose);
+        if (!mode.success) {
+          return mode;
+        }
+        return std::nullopt;
+      });
   }
 
-  RuntimeResult begin_floor_switch(const RuntimeEffect & runtime_effect)
+  std::string floor_attempt_id() const
+  {
+    std::lock_guard<std::mutex> lock(floor_goal_mutex_);
+    return floor_attempt_transaction_id_;
+  }
+
+  RuntimeResult wait_floor_retry(const RuntimeResult & reason)
+  {
+    RCLCPP_WARN(node_->get_logger(),
+      "Elevator floor recovery: attempt=%s code=%s detail=%s",
+      floor_attempt_id().c_str(), reason.code.c_str(), reason.detail.c_str());
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (cancel_requested_.load()) {
+        return failed("ELEVATOR_CANCEL_FENCE_ACTIVE", "floor recovery canceled");
+      }
+      // Service responses can precede the matching state subscription. We are
+      // already held and backing off: let that evidence catch up, then verify
+      // ownership before any retry. Executor faults/cancel still wake promptly.
+      ros_worker_->check();
+      std::unique_lock<std::mutex> lock(evidence_mutex_);
+      evidence_cv_.wait_for(lock, 50ms);
+    }
+    return cancel_requested_.load() ?
+      failed("ELEVATOR_CANCEL_FENCE_ACTIVE", "floor recovery canceled") : cached_runtime_health(true);
+  }
+
+  // The outer elevator transaction remains unchanged. Only a settled, failed
+  // floor attempt gets a new ID: the bridge tombstones aborted transaction IDs.
+  RuntimeResult prepare_floor_retry(
+    const RuntimeEffect & effect, const RuntimeResult & failure)
+  {
+    if (cancel_requested_.load()) {return failed("ELEVATOR_CANCEL_FENCE_ACTIVE", "floor retry canceled");}
+    const bool rejected = failure.code == "ELEVATOR_FLOOR_SWITCH_REJECTED";
+    const bool timed_out = failure.code == "ELEVATOR_FLOOR_SWITCH_TIMEOUT" ||
+      failure.code == "ELEVATOR_FLOOR_SWITCH_HANDOFF_TIMEOUT";
+    std::optional<FloorGoalHandle::WrappedResult> terminal;
+    const auto attempt_id = floor_attempt_id();
+    {
+      std::lock_guard<std::mutex> lock(floor_goal_mutex_);
+      if (floor_goal_admission_unknown_) {return failure;}
+      terminal = floor_result_;
+    }
+    const bool retryable_terminal = terminal && terminal->result &&
+      ((terminal->code == rclcpp_action::ResultCode::ABORTED &&
+      floor_failure_code_retryable(terminal->result->failure_code)) ||
+      (timed_out && terminal->code == rclcpp_action::ResultCode::CANCELED &&
+      (terminal->result->failure_code == FloorSwitch::Result::CANCELLED_BEFORE_MUTATION ||
+      terminal->result->failure_code == FloorSwitch::Result::RUNTIME_CONTEXT_UNPROVEN)));
+    if (!rejected && !retryable_terminal)
+    {
+      return failure;
+    }
+    // No cancel is added here. A premature terminal has already completed;
+    // clear only its retained client references, never an unknown live goal.
+    {
+      std::lock_guard<std::mutex> lock(floor_goal_mutex_);
+      if (active_floor_goal_) {
+        if (!floor_result_future_.valid() ||
+          floor_result_future_.wait_for(0ms) != std::future_status::ready)
+        {return failure;}
+        active_floor_goal_.reset();
+        floor_goal_response_future_ = {};
+        floor_result_future_ = {};
+      }
+    }
+    for (;;) {
+      const auto wait = wait_floor_retry(failure);
+      if (!wait.success) {return wait;}
+      bool settled = rejected;
+      if (!rejected) {
+        bool cleanup_complete = false;
+        std::string startup_owner_exit_detail;
+        {
+          std::lock_guard<std::mutex> lock(floor_goal_mutex_);
+          cleanup_complete = floor_cleanup_complete_;
+          startup_owner_exit_detail = floor_startup_owner_exit_detail_;
+        }
+        if (!startup_owner_exit_detail.empty()) {
+          return failed(
+            "ELEVATOR_FLOOR_STARTUP_OWNER_EXITED",
+            startup_owner_exit_detail + "; original_failure=" + failure.code +
+            ": " + failure.detail + "; floor_failure_code=" +
+            std::to_string(terminal->result->failure_code) +
+            "; floor_failure_message=" + terminal->result->message);
+        }
+        std::lock_guard<std::mutex> lock(evidence_mutex_);
+        const auto now = steady_now_sec();
+        const auto fresh = [&](bool have, double stamp) {
+            return have && now >= stamp && now - stamp <= options_.state_evidence_max_age_sec;
+          };
+        const auto floor_key = correction_key(kFloorPauseOwner, attempt_id);
+        const bool resources_absent = fresh(have_interlock_state_, interlock_received_at_sec_) &&
+          fresh(have_correction_pause_state_, correction_pause_received_at_sec_) &&
+          !contains_key(interlock_state_.hold_keys, floor_key) &&
+          !contains_key(correction_pause_state_.lease_keys, floor_key);
+        settled = floor_attempt_cleanup_ready(
+          terminal->result->recovery_required, cleanup_complete, resources_absent);
+      }
+      if (settled) {break;}
+    }
+    // A failed switch may have consumed the caller pause. Restore precisely
+    // that existing handoff prerequisite before submitting the next attempt.
+    const auto pause = set_correction_pause(true, "retry current floor switch");
+    if (!pause.success) {return pause;}
+    const auto sequence = next_hold_command_sequence();
+    if (!sequence) {return failed("ELEVATOR_COMMAND_SEQUENCE_UNAVAILABLE", "cannot allocate floor attempt ID");}
+    {
+      std::lock_guard<std::mutex> lock(floor_goal_mutex_);
+      floor_attempt_transaction_id_ = make_floor_retry_transaction_id(
+        effect.effect.transaction_id, *sequence);
+    }
+    return ok("failed floor attempt settled; retry same frozen target");
+  }
+
+  RuntimeResult begin_floor_switch(const RuntimeEffect & effect)
+  {
+    {
+      std::lock_guard<std::mutex> lock(floor_goal_mutex_);
+      if (floor_attempt_transaction_id_.empty()) {
+        floor_attempt_transaction_id_ = effect.effect.transaction_id;
+      }
+    }
+    for (;;) {
+      const auto result = begin_floor_switch_once(effect);
+      if (result.success) {return result;}
+      const auto retry = prepare_floor_retry(effect, result);
+      if (!retry.success) {return retry;}
+    }
+  }
+
+  RuntimeResult begin_floor_switch_once(const RuntimeEffect & runtime_effect)
   {
     double source_pose_stamp_sec = 0.0;
     if (options_.current_map_pose_probe) {
@@ -4153,7 +4393,7 @@ private:
     std::uint64_t submission_generation = 0U;
     {
       std::lock_guard<std::mutex> lock(floor_goal_mutex_);
-      if (active_floor_goal_) {
+      if (active_floor_goal_ || floor_goal_admission_unknown_) {
         return failed(
           "ELEVATOR_FLOOR_SWITCH_ALREADY_ACTIVE",
           "a floor switch action is already active");
@@ -4161,14 +4401,17 @@ private:
       floor_goal_response_future_ = {};
       floor_result_future_ = {};
       floor_goal_admission_unknown_ = false;
+      floor_result_.reset();
+      floor_cleanup_complete_ = false;
+      floor_startup_owner_exit_detail_.clear();
       submission_generation = ++floor_goal_submission_generation_;
       floor_handoff_tracker_.reset(
-        runtime_effect.effect.transaction_id, submission_generation);
+        floor_attempt_transaction_id_, submission_generation);
       floor_switch_source_pose_stamp_sec_ = source_pose_stamp_sec;
     }
 
     FloorSwitch::Goal goal;
-    goal.transaction_id = runtime_effect.effect.transaction_id;
+    goal.transaction_id = floor_attempt_id();
     goal.building_id = runtime_effect.building_id;
     goal.floor_id = runtime_effect.floor_id;
     goal.map_id = runtime_effect.map_id;
@@ -4186,7 +4429,7 @@ private:
       [
         this,
         submission_generation,
-        transaction_id = runtime_effect.effect.transaction_id](
+        transaction_id = goal.transaction_id](
         FloorGoalHandle::SharedPtr callback_goal,
         const std::shared_ptr<const FloorSwitch::Feedback> feedback)
       {
@@ -4287,7 +4530,16 @@ private:
         const auto wrapped = floor_result_future_.get();
         floor_result_ = wrapped;
         (void)floor_handoff_tracker_.observe_terminal(
-          runtime_effect.effect.transaction_id, submission_generation);
+          goal.transaction_id, submission_generation);
+        if (!cancel_requested_.load() && wrapped.code == rclcpp_action::ResultCode::SUCCEEDED) {
+          const auto committed = validate_floor_result(wrapped, runtime_effect);
+          if (committed.success) {
+            active_floor_goal_.reset();
+            floor_goal_response_future_ = {};
+            floor_result_future_ = {};
+          }
+          return committed;
+        }
         return failed(
           "ELEVATOR_FLOOR_SWITCH_PREMATURE_TERMINAL",
           "floor action terminated before correction-pause handoff: " +
@@ -4313,13 +4565,83 @@ private:
     if (!cancel_result.success) {
       return cancel_result;
     }
+    if (!cancel_requested_.load()) {
+      std::lock_guard<std::mutex> result_lock(floor_goal_mutex_);
+      if (floor_result_ && floor_result_->code == rclcpp_action::ResultCode::SUCCEEDED) {
+        return validate_floor_result(*floor_result_, runtime_effect);
+      }
+    }
     return failed(
       "ELEVATOR_FLOOR_SWITCH_HANDOFF_TIMEOUT",
       "floor manager did not prove caller pause handoff before reaching a "
       "terminal state");
   }
 
-  RuntimeResult await_floor_switch(const RuntimeEffect & runtime_effect)
+  RuntimeResult resume_floor_corrections(const RuntimeEffect & effect)
+  {
+    RuntimeEffect target = effect;
+    {
+      std::lock_guard<std::mutex> lock(binding_mutex_);
+      target.building_id = release_.building_id;
+      target.floor_id = release_.target.floor_id;
+      target.map_id = release_.target.map_id;
+      target.asset_epoch = release_.target.map_asset_epoch;
+      target.asset_digest = release_.target.map_asset_digest;
+    }
+    for (;;) {
+      const auto handoff = set_correction_pause(false, effect.effect.detail, true);
+      if (handoff.success) {return handoff;}
+      if (cancel_requested_.load()) {return handoff;}
+      // The floor action can finish between releasing the caller pause and
+      // receiving its evidence. Reconcile the original goal, not a new switch.
+      const auto release = set_correction_pause(false, effect.effect.detail, false);
+      if (!release.success) {return release;}
+      const auto result = await_floor_switch_once(target);
+      if (result.success) {return result;}
+      const auto retry = prepare_floor_retry(target, result);
+      if (!retry.success) {return retry;}
+      const auto begin = begin_floor_switch(target);
+      if (!begin.success) {return begin;}
+    }
+  }
+
+  RuntimeResult await_floor_switch(const RuntimeEffect & effect)
+  {
+    for (;;) {
+      const auto result = await_floor_switch_once(effect);
+      if (result.success) {return result;}
+      const auto retry = prepare_floor_retry(effect, result);
+      if (!retry.success) {return retry;}
+      const auto begin = begin_floor_switch(effect);
+      if (!begin.success) {return begin;}
+      const auto handoff = resume_floor_corrections(effect);
+      if (!handoff.success) {return handoff;}
+    }
+  }
+
+  RuntimeResult validate_floor_result(
+    const FloorGoalHandle::WrappedResult & wrapped, const RuntimeEffect & runtime_effect)
+  {
+    if (wrapped.code != rclcpp_action::ResultCode::SUCCEEDED ||
+      !wrapped.result || !wrapped.result->success)
+    {
+      return failed("ELEVATOR_FLOOR_SWITCH_FAILED",
+        wrapped.result ? wrapped.result->message : result_code_text(wrapped.code));
+    }
+    if (wrapped.result->active_building_id != runtime_effect.building_id ||
+      wrapped.result->active_floor_id != runtime_effect.floor_id ||
+      wrapped.result->active_map_id != runtime_effect.map_id ||
+      wrapped.result->asset_epoch != runtime_effect.asset_epoch ||
+      wrapped.result->asset_digest != runtime_effect.asset_digest ||
+      !wrapped.result->runtime_context_valid)
+    {
+      return failed("ELEVATOR_FLOOR_SWITCH_RESULT_IDENTITY_MISMATCH",
+        "floor action result did not prove the exact target runtime identity");
+    }
+    return ok("floor action committed the exact target runtime identity");
+  }
+
+  RuntimeResult await_floor_switch_once(const RuntimeEffect & runtime_effect)
   {
     std::shared_future<FloorGoalHandle::WrappedResult> result_future;
     std::shared_ptr<FloorGoalHandle> goal_handle;
@@ -4327,6 +4649,9 @@ private:
       std::lock_guard<std::mutex> lock(floor_goal_mutex_);
       result_future = floor_result_future_;
       goal_handle = active_floor_goal_;
+      if (!goal_handle && floor_result_) {
+        return validate_floor_result(*floor_result_, runtime_effect);
+      }
     }
     if (!goal_handle || !result_future.valid()) {
       return failed(
@@ -4351,6 +4676,12 @@ private:
         if (!cancel_result.success) {
           return cancel_result;
         }
+        if (!cancel_requested_.load()) {
+          std::lock_guard<std::mutex> lock(floor_goal_mutex_);
+          if (floor_result_ && floor_result_->code == rclcpp_action::ResultCode::SUCCEEDED) {
+            return validate_floor_result(*floor_result_, runtime_effect);
+          }
+        }
         return failed(
           "ELEVATOR_FLOOR_SWITCH_TIMEOUT",
           "floor switch timed out and then reached an explicit terminal "
@@ -4371,30 +4702,23 @@ private:
       floor_goal_response_future_ = {};
       floor_result_future_ = {};
     }
-    if (
-      wrapped.code != rclcpp_action::ResultCode::SUCCEEDED ||
-      !wrapped.result || !wrapped.result->success)
-    {
-      const auto detail = wrapped.result ?
-        wrapped.result->message : result_code_text(wrapped.code);
-      return failed("ELEVATOR_FLOOR_SWITCH_FAILED", detail);
-    }
-    if (
-      wrapped.result->active_building_id != runtime_effect.building_id ||
-      wrapped.result->active_floor_id != runtime_effect.floor_id ||
-      wrapped.result->active_map_id != runtime_effect.map_id ||
-      wrapped.result->asset_epoch != runtime_effect.asset_epoch ||
-      wrapped.result->asset_digest != runtime_effect.asset_digest ||
-      !wrapped.result->runtime_context_valid)
-    {
-      return failed(
-        "ELEVATOR_FLOOR_SWITCH_RESULT_IDENTITY_MISMATCH",
-        "floor action result did not prove the exact target runtime identity");
-    }
-    return ok("floor action committed the exact target runtime identity");
+    return validate_floor_result(wrapped, runtime_effect);
   }
 
   RuntimeResult verify_floor_ready(const RuntimeEffect & runtime_effect)
+  {
+    for (;;) {
+      const auto result = verify_floor_ready_once(runtime_effect);
+      const bool transient = result.code == "ELEVATOR_TARGET_RUNTIME_CONTEXT_PENDING" ||
+        result.code == "ELEVATOR_TARGET_FLOOR_READINESS_UNPROVEN" ||
+        result.code == "ELEVATOR_TARGET_MAP_POSE_UNPROVEN";
+      if (result.success || !transient) {return result;}
+      const auto wait = wait_floor_retry(result);
+      if (!wait.success) {return wait;}
+    }
+  }
+
+  RuntimeResult verify_floor_ready_once(const RuntimeEffect & runtime_effect)
   {
     {
       std::lock_guard<std::mutex> lock(floor_goal_mutex_);
@@ -4410,8 +4734,11 @@ private:
     }
     const auto context =
       read_runtime_map_context_file(options_.runtime_map_context_file);
+    if (!context || !context->confirmed || context->state != "ready") {
+      return failed("ELEVATOR_TARGET_RUNTIME_CONTEXT_PENDING",
+        "committed target runtime context is not yet confirmed ready");
+    }
     if (
-      !context || !context->confirmed || context->state != "ready" ||
       context->building_id != runtime_effect.building_id ||
       context->floor_id != runtime_effect.floor_id ||
       context->map_id != runtime_effect.map_id ||
@@ -4423,16 +4750,18 @@ private:
         "API runtime map context does not confirm the target floor/map");
     }
 
+    const auto expected_attempt = floor_attempt_id();
     const auto deadline =
       std::chrono::steady_clock::now() +
       timeout(options_.endpoint_timeout_sec);
     std::unique_lock<std::mutex> lock(evidence_mutex_);
     while (std::chrono::steady_clock::now() < deadline) {
       ros_worker_->check();
+      if (cancel_requested_.load()) {return failed("ELEVATOR_CANCEL_FENCE_ACTIVE", "floor verification canceled");}
       const auto & status = floor_switch_status_;
       const bool exact =
         have_floor_switch_status_ &&
-        status.transaction_id == runtime_effect.effect.transaction_id &&
+        status.transaction_id == expected_attempt &&
         status.active_building_id == runtime_effect.building_id &&
         status.active_floor_id == runtime_effect.floor_id &&
         status.active_map_id == runtime_effect.map_id &&
@@ -4473,6 +4802,7 @@ private:
       timeout(options_.endpoint_timeout_sec);
     while (std::chrono::steady_clock::now() < pose_deadline) {
       ros_worker_->check();
+      if (cancel_requested_.load()) {return failed("ELEVATOR_CANCEL_FENCE_ACTIVE", "floor verification canceled");}
       try {
         const auto pose = options_.current_map_pose_probe();
         if (
@@ -4700,6 +5030,9 @@ private:
     recovery_floor_cancel_all_response_;
   std::atomic<bool> recovery_floor_cancel_all_response_unknown_{false};
   std::uint64_t floor_goal_submission_generation_{0U};
+  std::string floor_attempt_transaction_id_;
+  bool floor_cleanup_complete_{false};
+  std::string floor_startup_owner_exit_detail_;
   std::optional<FloorGoalHandle::WrappedResult> floor_result_;
   FloorSwitchHandoffTracker floor_handoff_tracker_;
   double floor_switch_source_pose_stamp_sec_{0.0};

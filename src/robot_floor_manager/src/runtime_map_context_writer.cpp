@@ -255,6 +255,20 @@ std::optional<FloorStartupHandoffAck> read_floor_startup_handoff_ack(
       if (ack.explicit_relocalization_sequence <= expected.explicit_sequence_baseline ||
         ack.localizer_generation == 0U) {return std::nullopt;}
     }
+    if (root["cleanup_completed"] || root["effects_settled"] || root["owner_available"]) {
+      const auto strict_bool = [](const YAML::Node & value) -> std::optional<bool> {
+          if (!value.IsScalar() || value.Tag() != "?") {return std::nullopt;}
+          if (value.Scalar() == "true") {return true;}
+          if (value.Scalar() == "false") {return false;}
+          return std::nullopt;
+        };
+      ack.cleanup_completed = strict_bool(root["cleanup_completed"]);
+      ack.effects_settled = strict_bool(root["effects_settled"]);
+      ack.owner_available = strict_bool(root["owner_available"]);
+      if (ack.state != "failed" || !ack.cleanup_completed.has_value() ||
+        !ack.effects_settled.has_value() || !ack.owner_available.has_value())
+      {return std::nullopt;}
+    }
     return ack;
   } catch (const std::exception &) {
     return std::nullopt;

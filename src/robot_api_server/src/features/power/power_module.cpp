@@ -40,13 +40,17 @@ struct PowerModule::Impl
 
   void handle_state(const sensor_msgs::msg::BatteryState & message)
   {
+    const bool confirmed_dock_context =
+      std::isfinite(message.current) && message.current > config.charging_current_min_a &&
+      ports.confirmed_dock_context && ports.confirmed_dock_context();
     const auto contact = evaluate_battery_charging_contact(
       message,
       config.charging_current_min_a,
       config.charging_contact_voltage_min_v,
       config.charging_contact_voltage_max_v,
       config.full_soc_voltage_contact_enable,
-      config.full_soc_threshold_pct);
+      config.full_soc_threshold_pct,
+      confirmed_dock_context);
     const auto now = std::chrono::steady_clock::now();
     bool contact_stable = false;
     double contact_stable_duration_sec = 0.0;

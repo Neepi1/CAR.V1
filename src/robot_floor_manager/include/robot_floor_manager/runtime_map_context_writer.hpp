@@ -43,6 +43,11 @@ struct FloorStartupHandoffAck
   std::string detail;
   std::uint64_t explicit_relocalization_sequence{0U};
   std::uint64_t localizer_generation{0U};
+  // Present only on the startup owner's exact post-cleanup terminal ACK.
+  // Missing fields in legacy ACKs are unknown, never proof of quiescence.
+  std::optional<bool> cleanup_completed;
+  std::optional<bool> effects_settled;
+  std::optional<bool> owner_available;
 };
 
 // A prior startup, another map, duplicate keys, or a reused transaction ID

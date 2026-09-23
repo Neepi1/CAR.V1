@@ -9,6 +9,9 @@ export NJRH_STARTUP_TRIGGER_OUTCOME_FILE="${NJRH_STARTUP_TRIGGER_OUTCOME_FILE:-/
 export NJRH_STARTUP_OWNER_PID="$$"
 export NJRH_STARTUP_INSTANCE="startup-$$-$(date +%s%N)"
 floor_startup_handoff_active=0
+floor_startup_old_effects_settled=0
+floor_startup_target_work_started=0
+floor_startup_exit_ack_written=0
 
 # Keep the original writer, but fence every caller including stage logging,
 # degraded AMCL, failure cleanup, and ready commit. The request lives separately
@@ -77,18 +80,23 @@ adopt_startup_floor_handoff() {
       --detail "old trigger RPC has not proven a terminal response" || true
     return 1
   fi
+  floor_startup_old_effects_settled=1
   floor_handoff_cli ack --state adopted \
     --detail "old startup workers joined; exact immutable target adopted" || return 1
   echo "[runtime-overlay] floor startup handoff adopted transaction=${NJRH_RUNTIME_TRANSACTION_ID} map=${NJRH_MAP_ID}" >&2
   # This is a read-only typed observer. floor-manager now performs BEGIN/load/
   # trigger under its hold; pending target TF need not authorize normal goals.
   floor_handoff_cli wait-target || return 1
+  # From here Nav2/AMCL startup can dispatch mutations. Existing workers do not
+  # provide per-RPC terminal receipts; exit/kill must not pretend they do.
+  floor_startup_target_work_started=1
   assignments="$(floor_handoff_cli export-evidence)" || return 1
   eval "${assignments}"
   export NJRH_RUNTIME_LAST_TRIGGERED_RELOCALIZATION_OK=true
 }
 
 complete_startup_floor_handoff() {
+  floor_startup_target_work_started=1
   floor_handoff_guard || return 1
   if [[ "${NJRH_AMCL_LOCALIZATION_MODE:-disabled}" == "disabled" ]]; then
     floor_handoff_cli ack --state failed --failure AMCL_DISABLED \
@@ -107,4 +115,22 @@ complete_startup_floor_handoff() {
   floor_handoff_cli wait-commit || return 1
   runtime_ready=1
   echo "[runtime-overlay] floor-manager COMMIT observed; startup never wrote ready" >&2
+}
+
+# Called only after the owner's existing cleanup has returned. This is an exit
+# receipt, not a ready ACK and not permission to dispatch another handoff to an
+# owner that is going away. Never infer RPC completion from child termination.
+acknowledge_startup_floor_handoff_exit() {
+  [[ "${floor_startup_handoff_active:-0}" -eq 1 ]] || return 0
+  [[ "${floor_startup_exit_ack_written:-0}" -eq 0 ]] || return 0
+  local effects_settled=false
+  if [[ "${floor_startup_old_effects_settled:-0}" -eq 1 &&
+    "${floor_startup_target_work_started:-0}" -eq 0 ]]; then
+    effects_settled=true
+  fi
+  if ! floor_handoff_cli ack-exit --effects-settled "${effects_settled}"; then
+    echo "[runtime-overlay] startup exit receipt unavailable; do not infer effect settlement" >&2
+    return 1
+  fi
+  floor_startup_exit_ack_written=1
 }

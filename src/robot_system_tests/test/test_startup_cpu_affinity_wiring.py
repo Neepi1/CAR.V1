@@ -111,7 +111,7 @@ printf 'configured=%s\n' "$NJRH_CPUSET_CONTROLLER_SERVER"
 ''')
     assert (tmp_path / "receipt").read_text().strip() == "waiting_for_initialization"
     assert (tmp_path / "effective_phase").read_text().strip() == "starting"
-    assert result.stdout.splitlines() == ["effective=0-7", "configured=0-1,4"]
+    assert result.stdout.splitlines() == ["effective=0-7", "configured=1-3"]
 
 
 @pytest.mark.parametrize("phase", ["ready", "reused", "waiting_for_localization"])
@@ -122,12 +122,12 @@ njrh_start_affined_background child_pid controller_server bash -c \
 wait "$child_pid"
 printf 'configured=%s\n' "$NJRH_CPUSET_CONTROLLER_SERVER"
 ''')
-    assert result.stdout.splitlines() == ["effective=0-1,4", "configured=0-1,4"]
+    assert result.stdout.splitlines() == ["effective=1-3", "configured=1-3"]
 
 
 @pytest.mark.parametrize("setup, expected", [
-    ("unset NJRH_STARTUP_CPU_SESSION", "0-1,4"),
-    ("export NJRH_NAVIGATION_CPU_PROFILE=site_default", "0-1,4"),
+    ("unset NJRH_STARTUP_CPU_SESSION", "1-3"),
+    ("export NJRH_NAVIGATION_CPU_PROFILE=site_default", "1-3"),
     ("export NJRH_CPU_AFFINITY_ENABLED=false", "unmodified"),
 ])
 def test_no_session_nonfive_and_disabled_paths_do_not_borrow_cpus(tmp_path, setup, expected):
@@ -139,7 +139,7 @@ njrh_exec_affined controller_server bash -c \
     assert (tmp_path / "effective_phase").read_text().strip() == "starting"
 
 
-@pytest.mark.parametrize("finish_first, expected", [(False, "0-7"), (True, "0-1,4")])
+@pytest.mark.parametrize("finish_first, expected", [(False, "0-7"), (True, "1-3")])
 def test_exec_wrapper_preserves_command_arguments_and_selects_current_phase(
     tmp_path, finish_first, expected
 ):

@@ -68,6 +68,13 @@ Do not start a second `ranger_base_node` or a standalone mode controller.
 
 ## Hardware Validation
 
+The diagnostic-only [NAVLITE chassis trace](docs/navlite.md) records final
+command receipt, existing SDK submissions, mode state and cached feedback at
+semantic changes / bounded 1 Hz sampling. It adds no CAN/ROS communication and
+does not claim SDK submission is CAN acknowledgement or that group timestamps
+prove per-frame freshness. Production activation remains separate from its
+no-CAN isolated fake-SDK tests.
+
 - 20 consecutive DUAL_ACKERMAN -> SPINNING -> DUAL_ACKERMAN transitions.
 - Verify nonzero `0x111` is absent while mode feedback reports changing.
 - Verify each transition confirms in less than 2 seconds.

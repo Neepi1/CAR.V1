@@ -4,7 +4,7 @@ This contract governs the transition from the final charging-contact push to the
 
 ## Required sequence
 
-1. The first accepted BMS charging indication is timestamped. `robot_safety` independently clears any cached forward docking command on the same event and latches the contact interlock even if later BMS samples become stale.
+1. The first accepted BMS charging indication is timestamped. For current-only evidence, the fine-docking manager owns this first stop; ordinary/predock current is not contact proof. The existing contact-stop path persists dock evidence, which safety retains even if later BMS samples become stale. See [current scope](bms_current_scope.md), deployed 2026-09-18; physical acceptance is pending.
 2. A zero command is published immediately on `/cmd_vel_docking`.
 3. The docking controller enters `ContactStopping` and republishes zero at the configured control rate.
 4. `/motion_state` must provide a new, fresh official chassis-mode feedback message after the BMS event.

@@ -1,8 +1,9 @@
 # Ordinary local path repair
 
-The 2026-09-08 [planning-clearance update](planning_clearance.md) adds a
-preferred `0.52/0.41 m` first pass and preserves the `0.47/0.36 m` hard-envelope
-fallback. The parameter shared with the MPPI critic is its separate 0.05 m
+The [body geometry candidate](body_geometry_alignment.md) changes the derived
+preferred first-pass envelope to `0.63/0.52 m` and hard fallback to
+`0.58/0.47 m`, while preserving both margin parameters and search logic.
+The parameter shared with the MPPI critic is its separate 0.05 m
 preference width, not the native inflation-derived collision penalty. Search
 passes split the existing budget; final attachment retains hard clearance.
 

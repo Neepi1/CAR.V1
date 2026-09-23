@@ -45,6 +45,7 @@
 #include "ranger_msgs/msg/motor_state.hpp"
 
 #include "ranger_base/ranger_params.hpp"
+#include "ranger_base/navlite_chassis_trace.hpp"
 
 namespace westonrobot {
 class RangerROSMessenger : public std::enable_shared_from_this<RangerROSMessenger>
@@ -95,6 +96,9 @@ class RangerROSMessenger : public std::enable_shared_from_this<RangerROSMessenge
   static const char* MotionModeName(uint8_t mode);
   static const char* MotionModeShortName(uint8_t mode);
   bool ShouldHoldZeroCommandInSpinningMode() const;
+  void TraceChassis();
+  void TraceSubmitted(double linear, double steering, double angular,
+                      const char* reason);
   geometry_msgs::msg::Quaternion createQuaternionMsgFromYaw(double yaw);
 
   double ConvertInnerAngleToCentral(double angle);
@@ -160,6 +164,7 @@ class RangerROSMessenger : public std::enable_shared_from_this<RangerROSMessenge
   std::chrono::steady_clock::time_point mode_switch_stop_stable_since_;
   std::chrono::steady_clock::time_point mode_switch_last_request_at_;
   bool parking_mode_;
+  NavliteChassisTrace navlite_trace_;
 
   rclcpp::Publisher<ranger_msgs::msg::SystemState>::SharedPtr system_state_pub_;
   rclcpp::Publisher<ranger_msgs::msg::MotionState>::SharedPtr motion_state_pub_;

@@ -1,6 +1,23 @@
 # Separate sensing, stopping and planning geometry
 
-## Candidate configuration, 2026-09-08
+## Scan-mask update (2026-09-21; restart required for activation)
+
+Only the sensing exclusion changes to X +/-0.39 m, Y +/-0.36 m; no MPPI or
+collision-monitor parameter changes. StopZone's central lateral visible band
+is now zero, while front/rear retain 8 cm. Future ultrasound is not integrated.
+See [scope and verification limits](body_geometry_alignment.md#scan-mask-width-update-2026-09-21).
+
+## Current local geometry, 2026-09-19 (not deployed)
+
+The confirmed body is now StopZone-sized, not the smaller old configured body.
+Raw footprint is `0.47/0.36`, padded is `0.50/0.39`, all four inflation radii
+are `0.75 m`. The unchanged preference critic remains `0.52/0.41`; repair's
+retained extra margins make its hard envelope `0.58/0.47` and preferred envelope
+`0.63/0.52`. These are different consumers, not interchangeable dimensions.
+Native footprint clearing expands and FootprintApproach sees the larger polygon.
+See [current verification and hardware boundaries](body_geometry_alignment.md).
+
+## Historical configuration, 2026-09-08 (dimensions below superseded)
 
 All dimensions are half extents in `base_link`:
 

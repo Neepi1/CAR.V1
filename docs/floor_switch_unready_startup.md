@@ -95,3 +95,28 @@ Nav2 控制参数或运动速度。正常已激活导航的切图仍走原路径
 或目标请求结果未知/目标定位失败，既有恢复保护仍可能保留。不能把这种情况当作
 普通可重试成功，更不能直接清掉停车状态。受控恢复需另行验证旧请求已终结、
 精确目标定位与代价地图，并由同一事务所有者完成；本轮不实现无条件清锁。
+
+## 失败退出回执（2026-09-22，候选未部署）
+
+启动 owner 现在在原有退出清理返回后，通过同一 handoff ACK 文件报告
+`state=failed`、`cleanup_completed=true`、`owner_available=false`，另以
+`effects_settled` 明确区分旧操作是否已证明结束。事务、nonce 和地图资产身份
+必须与被接管的请求完全匹配；不会覆盖另一个请求或已 COMMIT 请求。写回执
+失败会显式告警，不会改变原退出码或假称已清理。
+
+`cleanup_completed` 只证明原退出清理代码已返回，不能单独证明 RPC 已终结。
+只有旧启动 workers 已正常 join、旧 trigger 已证明结果、并且本次目标 TF
+尚未唤醒后续 Nav2/AMCL 启动工作，才报告 `effects_settled=true`。目标启动已
+推进、旧 worker 失败或旧 trigger 结果未知时，报告
+`STARTUP_EXIT_EFFECTS_UNPROVEN`；不根据 kill、子进程退出或旧 `runtime_ready`
+ACK 猜测远端请求已结束。普通 `adopted/runtime_ready/failed` ACK 均不是退出
+清理完成证明。
+
+此补丁不改变启动顺序、owner 生存期、运动与定位成功条件。owner 退出后
+不能接收下一次 handoff；调用方应明确报告 `STARTUP_OWNER_EXITED`，不能无限
+等待不存在的 owner，也不能将本补丁表述为冷启动失败已完整自动恢复。
+
+测试直接执行生产 `on_exit/on_signal/cleanup` 和 handoff helper（外部进程
+控制由隔离替身承担），验证 cleanup 后才回执、未知旧请求不被宣称 settled、
+目标工作已开始不被误判、重复调用只写一次及错 nonce/身份/已 COMMIT 拒绝。
+测试不连接生产 ROS；真实 Isaac/Nav2 故障时的 owner 退出仍需受控硬件验证。

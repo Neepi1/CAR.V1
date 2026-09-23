@@ -1026,6 +1026,16 @@ private:
     if (failure == "CANCELLED") {
       return Code::kCancelledBeforeMutation;
     }
+    if (failure == "NAV_MAP_LOAD_SERVICE_UNAVAILABLE" ||
+      failure == "FILTER_LOAD_SERVICE_UNAVAILABLE")
+    {
+      return Code::kRuntimeContextUnproven;
+    }
+    if (failure == "NAV_MAP_LOAD_INVALID_ASSET" ||
+      failure == "FILTER_LOAD_INVALID_ASSET")
+    {
+      return Code::kAssetBundleInvalid;
+    }
     if (failure.find("MOTION_HOLD") != std::string::npos) {
       return Code::kMotionHoldUnproven;
     }
@@ -1131,6 +1141,9 @@ private:
     const auto disposition =
       robot_floor_manager::floor_transition_failure_disposition(execution);
     deferred_failure_code_ = result->failure_code;
+    if (startup_owner_exited()) {
+      result->message = "STARTUP_OWNER_EXITED; " + result->message;
+    }
     publish_transition_status(
       request.transaction_id,
       disposition.state,
@@ -2118,20 +2131,36 @@ private:
     if (!startup_handoff_) {return true;}
     const auto ack = robot_floor_manager::read_floor_startup_handoff_ack(
       startup_handoff_ack_file_, *startup_handoff_);
-    if (!ack || !ack->failure.empty()) {return false;}
-    // After adoption the startup owner only waits for target localization;
-    // before we trigger that localization it cannot dispatch target startup.
-    if (!startup_target_trigger_dispatched_ && ack->state == "adopted") {return true;}
-    return ack->state == "runtime_ready" &&
-      ack->explicit_relocalization_sequence == explicit_relocalization_sequence_ &&
-      ack->explicit_relocalization_sequence > startup_handoff_->explicit_sequence_baseline &&
-      ack->localizer_generation == localizer_generation_ && localizer_generation_ > 0U;
+    // A failed request causes the startup owner to tear down its work. Neither
+    // its earlier adopted nor runtime_ready ACK proves that teardown is over.
+    return ack && ack->state == "failed" &&
+      ack->cleanup_completed == std::optional<bool>(true) &&
+      ack->effects_settled == std::optional<bool>(true);
+  }
+
+  bool startup_owner_exited()
+  {
+    std::lock_guard<std::mutex> lock(startup_handoff_mutex_);
+    if (!startup_handoff_) {return false;}
+    const auto ack = robot_floor_manager::read_floor_startup_handoff_ack(
+      startup_handoff_ack_file_, *startup_handoff_);
+    return ack && ack->state == "failed" &&
+      ack->cleanup_completed == std::optional<bool>(true) &&
+      ack->owner_available == std::optional<bool>(false);
   }
 
   void reconcile_deferred_failure()
   {
+    bool owner_exit_reported = false;
     while (deferred_failure_cleanup_.load() && !shutting_down_.load()) {
       std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      if (!owner_exit_reported && startup_owner_exited()) {
+        owner_exit_reported = true;
+        publish_transition_status(deferred_failure_effect_.transaction_id,
+          "FAILED_LOCKED", "RECOVERY_LOCKED", deferred_failure_code_,
+          "STARTUP_OWNER_EXITED; " + deferred_failure_effect_.detail +
+          "; startup owner cannot consume another handoff; cleanup evidence remains separate");
+      }
       if (!target_requests_settled() || !startup_effects_settled() ||
         shutting_down_.load()) {continue;}
       const auto effect = deferred_failure_effect_;
@@ -2140,6 +2169,7 @@ private:
         const auto cleanup = perform(effect, snapshot);
         if (cleanup.success && cleanup.evidence.failure_resources_released) {
           publish_transition_status(effect.transaction_id, "FAILED", "FAILED", deferred_failure_code_,
+            (owner_exit_reported ? std::string("STARTUP_OWNER_EXITED; ") : std::string{}) +
             effect.detail + "; late requests settled and owned resources released");
           return;
         }
@@ -2154,43 +2184,72 @@ private:
     }
   }
 
+  enum class MapLoadFailure {kOther, kServiceUnavailable, kTimeout, kInvalidAsset};
+
+  static std::string map_load_failure_code(
+    const std::string & prefix, const MapLoadFailure failure)
+  {
+    switch (failure) {
+      case MapLoadFailure::kServiceUnavailable: return prefix + "_SERVICE_UNAVAILABLE";
+      case MapLoadFailure::kTimeout: return prefix + "_TIMEOUT";
+      case MapLoadFailure::kInvalidAsset: return prefix + "_INVALID_ASSET";
+      case MapLoadFailure::kOther: return prefix + "_FAILED";
+    }
+    return prefix + "_FAILED";
+  }
+
   bool load_map_with_client(
     const rclcpp::Client<nav2_msgs::srv::LoadMap>::SharedPtr & client,
     const std::string & service_name,
     const fs::path & map_yaml,
     const std::string & label,
-    std::string & error)
+    std::string & error,
+    MapLoadFailure & failure)
   {
+    failure = MapLoadFailure::kOther;
     if (!wait_for_service(client, service_name, error)) {
+      failure = MapLoadFailure::kServiceUnavailable;
       return false;
     }
     auto request = std::make_shared<nav2_msgs::srv::LoadMap::Request>();
     request->map_url = map_yaml.string();
     auto future = dispatch_target_request(client, request);
     if (future.wait_for(service_timeout()) != std::future_status::ready) {
+      failure = MapLoadFailure::kTimeout;
       error = "timed out loading " + label + ": " + map_yaml.string();
       return false;
     }
     const auto response = future.get();
     if (response->result != nav2_msgs::srv::LoadMap::Response::RESULT_SUCCESS) {
+      using Response = nav2_msgs::srv::LoadMap::Response;
+      if (response->result == Response::RESULT_MAP_DOES_NOT_EXIST ||
+        response->result == Response::RESULT_INVALID_MAP_DATA ||
+        response->result == Response::RESULT_INVALID_MAP_METADATA)
+      {
+        failure = MapLoadFailure::kInvalidAsset;
+      }
       error = service_name + " rejected " + label + " with result code " + std::to_string(response->result);
       return false;
     }
     return true;
   }
 
-  bool load_nav_map(const FloorAssets & assets, std::string & error)
+  bool load_nav_map(
+    const FloorAssets & assets, std::string & error, MapLoadFailure & failure)
   {
+    failure = MapLoadFailure::kOther;
     if (!call_map_server_load_) {
       error = "live Nav2 map reload is disabled by configuration";
       return false;
     }
     return load_map_with_client(
-      map_load_client_, map_server_load_service_, assets.nav_map_yaml, "Nav2 map", error);
+      map_load_client_, map_server_load_service_, assets.nav_map_yaml, "Nav2 map", error, failure);
   }
 
-  bool load_filter_masks(const FloorAssets & assets, std::string & error)
+  bool load_filter_masks(
+    const FloorAssets & assets, std::string & error, MapLoadFailure & failure)
   {
+    failure = MapLoadFailure::kOther;
     if (!call_filter_mask_load_) {
       error = "live filter-mask reload is disabled by configuration";
       return false;
@@ -2207,7 +2266,8 @@ private:
       return false;
     }
     if (!load_map_with_client(
-        keepout_mask_load_client_, keepout_mask_load_service_, assets.keepout_mask_yaml, "keepout mask", error))
+        keepout_mask_load_client_, keepout_mask_load_service_, assets.keepout_mask_yaml,
+        "keepout mask", error, failure))
     {
       return false;
     }
@@ -2215,7 +2275,8 @@ private:
       return true;
     }
     return load_map_with_client(
-      speed_mask_load_client_, speed_mask_load_service_, assets.speed_mask_yaml, "speed mask", error);
+      speed_mask_load_client_, speed_mask_load_service_, assets.speed_mask_yaml,
+      "speed mask", error, failure);
   }
 
   bool apply_localizer_assets(
@@ -3066,8 +3127,10 @@ private:
         if (!revalidate_snapshot(snapshot, error)) {
           return effect_failure("ASSET_IDENTITY_CHANGED", error);
         }
-        if (!load_nav_map(assets, error)) {
-          return effect_failure("NAV_MAP_LOAD_FAILED", error);
+        MapLoadFailure failure;
+        if (!load_nav_map(assets, error, failure)) {
+          const auto code = map_load_failure_code("NAV_MAP_LOAD", failure);
+          return effect_failure(code, code + ": " + error);
         }
         {
           std::lock_guard<std::mutex> lock(evidence_mutex_);
@@ -3082,8 +3145,10 @@ private:
         if (!revalidate_snapshot(snapshot, error)) {
           return effect_failure("ASSET_IDENTITY_CHANGED", error);
         }
-        if (!load_filter_masks(assets, error)) {
-          return effect_failure("FILTER_LOAD_FAILED", error);
+        MapLoadFailure failure;
+        if (!load_filter_masks(assets, error, failure)) {
+          const auto code = map_load_failure_code("FILTER_LOAD", failure);
+          return effect_failure(code, code + ": " + error);
         }
         {
           std::lock_guard<std::mutex> lock(evidence_mutex_);
@@ -3494,7 +3559,11 @@ private:
         if (cleanup_action ==
           robot_floor_manager::FloorTransitionCleanupAction::kRestoreSource)
         {
-          source_restored = abort_bridge_and_prove_source(effect, abort_error);
+          // Restoring the bridge is itself a source-ready claim. Do not make
+          // it while the startup owner can still tear down that source.
+          if (startup_effects_settled()) {
+            source_restored = abort_bridge_and_prove_source(effect, abort_error);
+          }
         } else {
           // ABORT ends the bridge transaction, but does not prove localization
           // or that outstanding target RPCs have finished.
@@ -3514,7 +3583,7 @@ private:
         // sample prove that the source runtime is valid again, persist that
         // source identity and release this transaction's resources. This is
         // a recoverable failed transaction, not a permanent vehicle lock.
-        if (source_restored) {
+        if (source_restored && startup_effects_settled()) {
           std::string source_context_error;
           const bool source_context_written = write_source_runtime_context(
             effect,

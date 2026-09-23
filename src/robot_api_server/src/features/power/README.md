@@ -1,5 +1,11 @@
 # Power
 
+Positive current alone now requires existing confirmed dock occupancy; ordinary
+navigation, teleop and predock cannot create contact from it. Raw current is
+retained. The context callback runs without the power mutex and never calls the
+BMS-derived occupancy evaluation. Deployed 2026-09-18; physical acceptance pending; see
+[scope and tests](../../../../../docs/bms_current_scope.md).
+
 Owns the complete process-resident Ranger `BatteryState` input boundary:
 
 - the single ROS subscription and its QoS;

@@ -1,0 +1,205 @@
+diff --git a/include/nav2_collision_monitor/collision_monitor_node.hpp b/include/nav2_collision_monitor/collision_monitor_node.hpp
+index 2aed992..026863b 100644
+--- a/include/nav2_collision_monitor/collision_monitor_node.hpp
++++ b/include/nav2_collision_monitor/collision_monitor_node.hpp
+@@ -16,6 +16,7 @@
+ #define NAV2_COLLISION_MONITOR__COLLISION_MONITOR_NODE_HPP_
+ 
+ #include <string>
++#include <chrono>
+ #include <vector>
+ #include <memory>
+ 
+@@ -214,6 +215,14 @@ protected:
+   rclcpp::Time stop_stamp_;
+   /// @brief Timeout after which 0-velocity ceases to be published
+   rclcpp::Duration stop_pub_timeout_;
++  // Diagnostic-only fields; never read by the collision decision.
++  void logNavlite(const Action & action, bool published, const char * reason = "processed");
++  Velocity navlite_input_{0.0, 0.0, 0.0};
++  std::string navlite_region_;
++  std::string navlite_sources_;
++  std::string navlite_key_;
++  bool navlite_seen_{false};
++  std::chrono::steady_clock::time_point navlite_last_{};
+ };  // class CollisionMonitor
+ 
+ }  // namespace nav2_collision_monitor
+diff --git a/src/collision_monitor_node.cpp b/src/collision_monitor_node.cpp
+index 4cc6ef3..8acb81a 100644
+--- a/src/collision_monitor_node.cpp
++++ b/src/collision_monitor_node.cpp
+@@ -15,6 +15,7 @@
+ #include "nav2_collision_monitor/collision_monitor_node.hpp"
+ 
+ #include <exception>
++#include <chrono>
+ #include <utility>
+ #include <functional>
+ 
+@@ -68,6 +69,12 @@ CollisionMonitor::on_configure(const rclcpp_lifecycle::State & /*state*/)
+   cmd_vel_out_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(
+     cmd_vel_out_topic, 1);
+ 
++  RCLCPP_WARN(get_logger(),
++    "NAVLITE collision event=diagnostics_ready schema=1 source=nav2_collision_monitor_1.1.19 "
++    "cmd_in=%s cmd_out=%s emission=transition_or_persistent_failure "
++    "same_failure_max_hz=1 publication_semantics=sent_or_no_message "
++    "scan_diagnostics=enabled other_source_diagnostics=unknown",
++    cmd_vel_in_sub_->get_topic_name(), cmd_vel_out_pub_->get_topic_name());
+   return nav2_util::CallbackReturn::SUCCESS;
+ }
+ 
+@@ -150,6 +157,10 @@ void CollisionMonitor::cmdVelInCallback(geometry_msgs::msg::Twist::ConstSharedPt
+ {
+   // If message contains NaN or Inf, ignore
+   if (!nav2_util::validateTwist(*msg)) {
++    navlite_input_ = {msg->linear.x, msg->linear.y, msg->angular.z};
++    navlite_region_ = "not_evaluated";
++    navlite_sources_ = "not_evaluated";
++    logNavlite({DO_NOTHING, navlite_input_}, false, "invalid_input_no_output");
+     RCLCPP_ERROR(get_logger(), "Velocity message contains NaNs or Infs! Ignoring as invalid!");
+     return;
+   }
+@@ -166,6 +171,7 @@ void CollisionMonitor::publishVelocity(const Action & robot_action)
+     } else if (this->now() - stop_stamp_ > stop_pub_timeout_) {
+       // More than stop_pub_timeout_ passed after robot has been stopped.
+       // Cease publishing output cmd_vel.
++      logNavlite(robot_action, false, "stop_pub_timeout_no_message");
+       return;
+     }
+   }
+@@ -178,6 +184,42 @@ void CollisionMonitor::publishVelocity(const Action & robot_action)
+   // linear.z, angular.x and angular.y will remain 0.0
+ 
+   cmd_vel_out_pub_->publish(std::move(cmd_vel_out_msg));
++  logNavlite(robot_action, true);
++}
++
++void CollisionMonitor::logNavlite(const Action & action, bool published, const char * reason)
++{
++  const char * name = action.action_type == STOP ? "STOP" :
++    action.action_type == SLOWDOWN ? "SLOWDOWN" :
++    action.action_type == APPROACH ? "APPROACH" : "DO_NOTHING";
++  const bool zero = action.req_vel.isZero();
++  const std::string key = std::string(name) + ":" + navlite_region_ +
++    (zero ? ":zero" : ":nonzero") + (published ? ":published:" : ":suppressed:") +
++    reason + ":" + navlite_sources_;
++  const auto stamp = std::chrono::steady_clock::now();
++  if (navlite_seen_ && key == navlite_key_ &&
++    ((!zero && action.action_type == DO_NOTHING && published &&
++    navlite_sources_.find("timeout") == std::string::npos &&
++    navlite_sources_.find("unavailable") == std::string::npos &&
++    navlite_sources_.find("no_message") == std::string::npos) ||
++    stamp - navlite_last_ < std::chrono::seconds(1)))
++  {
++    return;
++  }
++  const std::string previous = navlite_seen_ ? navlite_key_ : "unobserved";
++  navlite_seen_ = true;
++  navlite_key_ = key;
++  navlite_last_ = stamp;
++  RCLCPP_WARN(get_logger(),
++    "NAVLITE collision action=%s region=%s published=%d zero=%d "
++    "in=(%.6f,%.6f,%.6f) requested_out=(%.6f,%.6f,%.6f) "
++    "publication=%s reason=%s sources=%s previous=%s steady_ns=%lld",
++    name, navlite_region_.c_str(), published, zero,
++    navlite_input_.x, navlite_input_.y, navlite_input_.tw,
++    action.req_vel.x, action.req_vel.y, action.req_vel.tw,
++    published ? "sent" : "no_message", reason, navlite_sources_.empty() ? "none" : navlite_sources_.c_str(), previous.c_str(),
++    static_cast<long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++      stamp.time_since_epoch()).count()));
+ }
+ 
+ bool CollisionMonitor::getParameters(
+@@ -344,9 +386,13 @@ void CollisionMonitor::process(const Velocity & cmd_vel_in)
+ {
+   // Current timestamp for all inner routines prolongation
+   rclcpp::Time curr_time = this->now();
++  navlite_input_ = cmd_vel_in;
++  navlite_region_ = "not_evaluated";
++  navlite_sources_.clear();
+ 
+   // Do nothing if main worker in non-active state
+   if (!process_active_) {
++    logNavlite({DO_NOTHING, cmd_vel_in}, false, "inactive_no_output");
+     return;
+   }
+ 
+@@ -357,6 +403,8 @@ void CollisionMonitor::process(const Velocity & cmd_vel_in)
+   for (std::shared_ptr<Source> source : sources_) {
+     if (source->getEnabled()) {
+       source->getData(curr_time, collision_points);
++      const auto * scan = dynamic_cast<const Scan *>(source.get());
++      navlite_sources_ += scan ? scan->navliteStatus() + ";" : "non_scan=unknown;";
+     }
+   }
+ 
+@@ -394,6 +442,8 @@ void CollisionMonitor::process(const Velocity & cmd_vel_in)
+   }
+ 
+   // Publish required robot velocity
++  navlite_input_ = cmd_vel_in;
++  navlite_region_ = action_polygon ? action_polygon->getName() : "none";
+   publishVelocity(robot_action);
+ 
+   // Publish polygons for better visualization
+diff --git a/include/nav2_collision_monitor/scan.hpp b/include/nav2_collision_monitor/scan.hpp
+index 690a225..b975424 100644
+--- a/include/nav2_collision_monitor/scan.hpp
++++ b/include/nav2_collision_monitor/scan.hpp
+@@ -64,6 +64,8 @@ public:
+    * and creates laser scanner subscriber.
+    */
+   void configure();
++  // Diagnostic-only, populated by the existing getData call.
++  std::string navliteStatus() const {return source_name_ + "=" + navlite_status_;}
+ 
+   /**
+    * @brief Adds latest data from laser scanner to the data array.
+@@ -89,6 +91,7 @@ protected:
+ 
+   /// @brief Latest data obtained from laser scanner
+   sensor_msgs::msg::LaserScan::ConstSharedPtr data_;
++  mutable const char * navlite_status_{"unknown"};
+ };  // class Scan
+ 
+ }  // namespace nav2_collision_monitor
+diff --git a/src/scan.cpp b/src/scan.cpp
+index 8ac4590..0a743f1 100644
+--- a/src/scan.cpp
++++ b/src/scan.cpp
+@@ -69,9 +69,11 @@ void Scan::getData(
+   // Ignore data from the source if it is not being published yet or
+   // not being published for a long time
+   if (data_ == nullptr) {
++    navlite_status_ = "no_message";
+     return;
+   }
+   if (!sourceValid(data_->header.stamp, curr_time)) {
++    navlite_status_ = "source_timeout";
+     return;
+   }
+ 
+@@ -85,6 +87,7 @@ void Scan::getData(
+         base_frame_id_, curr_time, global_frame_id_,
+         transform_tolerance_, tf_buffer_, tf_transform))
+     {
++      navlite_status_ = "transform_unavailable_with_shift";
+       return;
+     }
+   } else {
+@@ -96,11 +99,13 @@ void Scan::getData(
+         data_->header.frame_id, base_frame_id_,
+         transform_tolerance_, tf_buffer_, tf_transform))
+     {
++      navlite_status_ = "transform_unavailable_without_shift";
+       return;
+     }
+   }
+ 
+   // Calculate poses and refill data array
++  navlite_status_ = "ok";
+   float angle = data_->angle_min;
+   for (size_t i = 0; i < data_->ranges.size(); i++) {
+     if (data_->ranges[i] >= data_->range_min && data_->ranges[i] <= data_->range_max) {

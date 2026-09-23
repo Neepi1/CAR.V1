@@ -1,6 +1,22 @@
 # Collision monitor geometry
 
-## Current candidate (2026-09-08)
+## Scan-mask update (2026-09-21; restart required for activation)
+
+The user-requested Scan mask is now X +/-0.39 m, Y +/-0.36 m. StopZone itself
+is unchanged. The central sides have no remaining scan-visible band inside
+StopZone; front/rear retain 8 cm. Ultrasound is not integrated. See
+[scope and verification limits](body_geometry_alignment.md#scan-mask-width-update-2026-09-21).
+
+## Current local candidate (2026-09-19, not deployed)
+
+The user confirmed that the existing StopZone (`+/-0.47 / +/-0.36 m`) is the
+physical body. The raw global/local footprint now matches it; retained padding
+makes the planning/published footprint `+/-0.50 / +/-0.39 m`. StopZone, scan mask,
+thresholds, SlowZone and Approach settings are not changed. FootprintApproach
+does consume the larger published footprint, so its predicted action may change.
+See [geometry alignment and verification limits](body_geometry_alignment.md).
+
+## Previous candidate (2026-09-08, geometry interpretation superseded)
 
 StopZone is now `x=+/-0.47 m`, `y=+/-0.36 m` (full `0.94 x 0.72 m`).
 The self mask and padded costmap footprint remain `0.39/0.28 m`, leaving an
@@ -31,7 +47,7 @@ remains necessary for front, rear, lateral approaches and obstacle removal,
 recording which collision-monitor zone acted. No motion test is implied by the
 configuration edit; perform it only with explicit operator authorization.
 
-Tests cover both configurations, exact vertices, padded-body containment and
+Historical tests covered both configurations, exact vertices, padded-body containment and
 SlowZone containment. Preserve unrelated local/Jetson configuration differences
 when deploying this geometry-only change. Apply at the next authorized full
 `njrh-runtime.service` restart; do not restart collision_monitor separately or

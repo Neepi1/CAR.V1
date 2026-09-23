@@ -1,5 +1,18 @@
 # robot_api_server
 
+The [elevator navigation/floor recovery candidate](../../docs/elevator_navigation_floor_retry.md)
+keeps transient recovery inside the current elevator effect. Arm code, normal
+navigation and safety parameters are unchanged. The joint candidate was activated
+on 2026-09-22 with user authorization and one full-chain restart; see the linked hashes.
+Its reviewed candidate requires matching FloorManager cleanup, bridge transaction
+termination and startup exit receipts; an API-only replacement is insufficient.
+An exited cold-start owner is reported explicitly, not silently awaited forever
+or automatically restarted. This is isolated software validation, not vehicle acceptance.
+
+Positive-current contact scope was deployed on 2026-09-18: ordinary navigation
+and predock no longer infer charger contact from current alone; confirmed dock
+and controlled-undock protections remain. See [scope](../../docs/bms_current_scope.md).
+
 Ordinary terminal verification separates historical correction failure from
 current post-recovery acceptance; strict pose/stop checks and retry budgets are
 unchanged. See [scope and isolated tests](../../docs/navigation_terminal_revalidation.md).
@@ -9,6 +22,13 @@ unique API process and navigation readiness are verified. Motion acceptance is p
 Elevator ROS execution is locally single-threaded with bounded waits and exact
 known Action-event exception recovery; business workers and policies remain
 unchanged. See [scope and tests](../../docs/elevator_adapter_executor_recovery.md).
+
+The arm automatic-retry candidate observes existing local adapter faults during
+its waits, retaining the original failure and one bounded release cleanup.
+Confirmed arm-task failures still retry without an attempt limit; no arm health
+gate or black-box change is added. See [candidate scope and tests](../../docs/elevator_arm_automatic_retry.md).
+The incrementally linked candidate was activated on 2026-09-22; running hash,
+unique API process and existing readiness evidence are verified, not physical acceptance.
 
 Automatic fixed-distance undock no longer requires `dock_id`: known identity
 is metadata, while existing odometry-confirmed departure and post-undock
@@ -661,8 +681,9 @@ single elevator transaction pins one `building_id`; it cannot cross buildings.
 If a building has basement maps, their floor IDs must use the explicit numeric
 forms `-2` or `-1`. Equal numeric levels are not a valid elevator trip. Cabin
 buttons accept only explicit `-2`, `-1`, or `F1` through `F20` (plus positive
-numeric API equivalents). Transaction/effect-
-derived mission IDs make retries idempotent. For feature validation, a task
+numeric API equivalents). Transaction/effect-derived mission IDs identify
+attempts; black-box deduplication semantics have not been independently verified.
+For feature validation, a task
 completes when the black-box task endpoint reports `state=succeeded`; backend-
 specific progress states and optional result metadata are not used as gates.
 
@@ -672,7 +693,12 @@ compatible older backend explicitly returns `501 capability_unavailable`, the
 existing `CALL_BUTTON_PRESSED` operator step remains available after the
 release task and is never reported as a physical press. Source-door open,
 target-floor arrival, and target-door open always remain operator gates.
-Cabin `press-floor` failures are reported as functional failures. Runtime
+The 2026-09-21 [automatic retry candidate](../../docs/elevator_arm_automatic_retry.md)
+retries explicitly failed ready/button/release tasks until success or cancellation
+inside the same effect. Successful buttons are not repeated when release retries.
+Transient task-query failures keep the original task ID; unknown submission,
+protocol failure and task timeout do not authorize another button submission.
+This candidate was deployed on 2026-09-22 but is not physically accepted. Runtime
 prepare, normal hold release, and recovery hold release never call arm health
 or status and are not blocked by arm state during this validation phase.
 

@@ -15,6 +15,7 @@
 #include "nav_msgs/msg/path.hpp"
 #include "rclcpp_lifecycle/lifecycle_publisher.hpp"
 #include "robot_nav_config/ordinary_local_path_repair.hpp"
+#include "robot_nav_config/navlite_log_gate.hpp"
 #include "robot_nav_config/ordinary_local_path_repair_worker.hpp"
 #include "robot_nav_config/elevator_scoped_progress_state.hpp"
 #include "std_msgs/msg/u_int8.hpp"
@@ -98,6 +99,8 @@ private:
   std::unique_ptr<OrdinaryLocalPathRepairWorker> worker_;
 
   mutable std::mutex mutex_;
+  NavliteLogGate navlite_repair_log_;
+  NavliteLogGate navlite_control_log_;
   nav_msgs::msg::Path reference_path_;
   OrdinaryLocalPathRepairParameters parameters_;
   Mode mode_{Mode::kTracking};

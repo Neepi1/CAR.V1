@@ -312,9 +312,61 @@ TEST_F(PredictionTest, ProductionPluginLoadsHotUpdatesEnforcesSpeedLimitsAndPres
   } catch (const std::runtime_error & error) {
     EXPECT_STREQ(error.what(), "Optimizer fail to compute path");
   }
+  // Same client/controller, next compute call, no new plan and no retained
+  // command through the failure. Clearing this synthetic map is test-only.
+  grid->resetMap(0, 0, grid->getSizeInCellsX(), grid->getSizeInCellsY());
+  bool nonzero_recovered = false;
+  for (int n = 0; n < 8; ++n) {
+    geometry_msgs::msg::TwistStamped command;
+    ASSERT_NO_THROW(command = controller->computeVelocityCommands(
+      path.poses.front(), geometry_msgs::msg::Twist{}, &checker));
+    EXPECT_TRUE(std::isfinite(command.twist.linear.x));
+    nonzero_recovered |= command.twist.linear.x != 0 || command.twist.angular.z != 0;
+  }
+  EXPECT_TRUE(nonzero_recovered);
   controller->deactivate();
   controller->cleanup();
   controller.reset();
   rclcpp::shutdown();
   map->on_cleanup(rclcpp_lifecycle::State{});
+}
+
+namespace
+{
+class CountingCritic : public mppi::critics::CriticFunction
+{
+public:
+  int calls{0};
+  void initialize() override {}
+  void score(mppi::CriticData &) override {++calls;}
+};
+class InspectCriticManager : public mppi::CriticManager
+{
+public:
+  CountingCritic * install()
+  {
+    auto critic = std::make_unique<CountingCritic>();
+    auto * result = critic.get();
+    critics_.push_back(std::move(critic));
+    return result;
+  }
+};
+}
+
+TEST(InstalledMppiLibrary, AlreadyFailedDataSkipsScoringUntilCallerClearsFlag)
+{
+  InspectCriticManager manager;
+  auto * counter = manager.install();
+  mppi::models::State state;
+  mppi::models::Trajectories trajectory;
+  mppi::models::Path path;
+  xt::xtensor<float, 1> costs = xt::zeros<float>({1u});
+  float dt = 0.05F;
+  mppi::CriticData data{state, trajectory, path, costs, dt, true,
+    nullptr, nullptr, std::nullopt, std::nullopt};
+  manager.evalTrajectoriesScores(data);  // Calls the actual installed library.
+  EXPECT_EQ(counter->calls, 0);
+  data.fail_flag = false;  // Synthetic test data only, not a production change.
+  manager.evalTrajectoriesScores(data);
+  EXPECT_EQ(counter->calls, 1);
 }

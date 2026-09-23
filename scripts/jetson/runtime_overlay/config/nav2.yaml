@@ -534,13 +534,13 @@ controller_server:
         collision_margin_distance: 0.08
         near_goal_distance: 0.25
         # Match the local inflation layer. The padded rectangular footprint has
-        # a 0.480 m circumscribed radius; adding the 0.08 m collision margin and
-        # rounding up to the 0.05 m costmap grid requires 0.60 m.
-        inflation_radius: 0.60
+        # a 0.634 m circumscribed radius; adding the 0.08 m collision margin and
+        # rounding up to the 0.05 m costmap grid requires 0.75 m.
+        inflation_radius: 0.75
         cost_scaling_factor: 6.0
         inflation_layer_name: "local_inflation_layer"
       # Separate finite planning preference, NOT footprint_padding or a stop gate.
-      # Same width is consumed by local repair; native collision/clearing stay unchanged.
+      # Local repair uses this preference width outside its own hard envelope.
       RangerClearanceCritic:
         enabled: true
         stop_half_x: 0.47
@@ -701,7 +701,8 @@ global_costmap:
       track_unknown_space: true
       resolution: 0.05
       transform_tolerance: 0.10
-      footprint: "[[0.36, 0.25], [0.36, -0.25], [-0.36, -0.25], [-0.36, 0.25]]"
+      # Confirmed physical body equals StopZone; padding remains separate.
+      footprint: "[[0.47, 0.36], [0.47, -0.36], [-0.47, -0.36], [-0.47, 0.36]]"
       footprint_padding: 0.03
       plugins: ["static_layer", "global_inflation_layer"]
       filters: ["keepout_filter"]
@@ -715,7 +716,7 @@ global_costmap:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: true
         cost_scaling_factor: 5.0
-        inflation_radius: 0.60
+        inflation_radius: 0.75
       keepout_filter:
         plugin: "nav2_costmap_2d::KeepoutFilter"
         enabled: true
@@ -745,7 +746,8 @@ local_costmap:
       height: 10
       resolution: 0.05
       transform_tolerance: 0.15
-      footprint: "[[0.36, 0.25], [0.36, -0.25], [-0.36, -0.25], [-0.36, 0.25]]"
+      # Also drives footprint clearing and the FootprintApproach consumer.
+      footprint: "[[0.47, 0.36], [0.47, -0.36], [-0.47, -0.36], [-0.47, 0.36]]"
       footprint_padding: 0.03
       plugins: ["obstacle_layer", "local_inflation_layer"]
       # Filters run after plugins. Inflate newly marked keepout cells so MPPI's
@@ -782,9 +784,9 @@ local_costmap:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: true
         cost_scaling_factor: 6.0
-        # Cover the padded footprint's 0.480 m circumscribed radius plus the
+        # Cover the padded footprint's 0.634 m circumscribed radius plus the
         # MPPI 0.08 m collision margin, rounded up to the 0.05 m grid.
-        inflation_radius: 0.60
+        inflation_radius: 0.75
       keepout_filter:
         plugin: "nav2_costmap_2d::KeepoutFilter"
         enabled: true
@@ -792,7 +794,7 @@ local_costmap:
       keepout_inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: true
-        inflation_radius: 0.60
+        inflation_radius: 0.75
         cost_scaling_factor: 6.0
       always_send_full_costmap: true
 
@@ -811,7 +813,7 @@ collision_monitor:
     StopZone:
       type: "polygon"
       # 8 cm visible band outside the unchanged scan mask (0.39 x 0.28 m).
-      # Planning prefers a further 5 cm; neither expands footprint clearing.
+      # This is the confirmed physical body, not padded planning geometry.
       points: [0.47, 0.36, 0.47, -0.36, -0.47, -0.36, -0.47, 0.36]
       action_type: "stop"
       # Two adjacent scan returns stop the robot; one isolated return is treated

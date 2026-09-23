@@ -363,6 +363,158 @@ def test_failed_request_stops_typed_wait_before_connecting_to_ros(tmp_path):
         module.wait_target(path, tmp_path / "context.json", tmp_path / "evidence.json")
 
 
+@pytest.mark.parametrize("handler,exit_code", [("on_exit", 1), ("on_signal", 130)])
+@pytest.mark.parametrize("receipt_writable", [True, False])
+def test_failed_startup_exit_ack_follows_real_cleanup_without_waiting_for_target(
+        tmp_path, handler, exit_code, receipt_writable):
+    """Run the real exit/cleanup functions with process-control edges replaced."""
+    import re
+    source = (SCRIPTS / "run_navigation_runtime_services.sh").read_text(encoding="utf-8")
+    functions = []
+    for name in ("cleanup", handler):
+        match = re.search(rf"(?ms)^{name}\(\) \{{\n.*?^\}}\n", source)
+        assert match
+        functions.append(match.group(0))
+    helper = (SCRIPTS / "floor_startup_handoff_helpers.sh").as_posix()
+    harness = f'''#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR=unused
+write_runtime_map_context() {{ echo forbidden-context-write >> events; }}
+source "{helper}"
+floor_startup_handoff_active=1
+floor_startup_old_effects_settled=1
+floor_startup_target_work_started=0
+cleanup_started=0
+runtime_ready=0
+amcl_runtime_started=0
+navigation_start_source=api_resume
+NJRH_AMCL_LOCALIZATION_MODE=disabled
+initial_global_localization_pid=''
+nav2_lifecycle_bringup_pid=''
+navigation_pid=''
+amcl_resident_pid=''
+amcl_readiness_pid=''
+localization_pid=''
+terminate_child() {{ echo "terminate:$2" >> events; }}
+stop_existing_standard_nav_stack() {{ echo nav-cleanup-finished >> events; }}
+stop_existing_localization_stack() {{ echo localization-cleanup-finished >> events; }}
+floor_handoff_cli() {{
+  [[ "$1" == ack-exit ]]
+  grep -qx localization-cleanup-finished events
+  if [[ {int(receipt_writable)} -eq 0 ]]; then echo ack-write-failed >> events; return 1; fi
+  echo "$*" >> events
+}}
+'''
+    harness += "\n".join(functions)
+    harness += '\n(false) || ' + handler + '\n'
+    (tmp_path / "test.sh").write_text(harness, encoding="utf-8")
+    run = subprocess.run([bash_executable(), "test.sh"], cwd=tmp_path,
+                         capture_output=True, text=True, timeout=5)
+    assert run.returncode == exit_code, run.stdout + run.stderr
+    events = (tmp_path / "events").read_text().splitlines()
+    assert events[-1] == ("ack-exit --effects-settled true" if receipt_writable else "ack-write-failed"), events
+    assert events.index("localization-cleanup-finished") < len(events) - 1
+    assert "forbidden-context-write" not in events
+    if not receipt_writable:
+        assert "startup exit receipt unavailable; do not infer effect settlement" in run.stderr
+
+
+@pytest.mark.parametrize("settled", [True, False])
+def test_exit_cli_acknowledges_failed_exact_request_not_ready(tmp_path, settled):
+    path, request = fixture_request(tmp_path)
+    request["state"] = "failed"
+    path.write_text(json.dumps(request), encoding="utf-8")
+    ack = tmp_path / "ack.json"
+    env = dict(os.environ, NJRH_FLOOR_STARTUP_HANDOFF_NONCE=request["request_nonce"],
+               NJRH_STARTUP_INSTANCE="isolated-startup", NJRH_STARTUP_OWNER_PID="123")
+    for field, variable in (("transaction_id", "NJRH_RUNTIME_TRANSACTION_ID"),
+                            ("building_id", "NJRH_BUILDING_ID"), ("floor_id", "NJRH_FLOOR_ID"),
+                            ("map_id", "NJRH_MAP_ID"), ("asset_epoch", "NJRH_MAP_ASSET_EPOCH"),
+                            ("asset_digest", "NJRH_MAP_ASSET_DIGEST")):
+        env[variable] = str(request[field])
+    run = subprocess.run([sys.executable, str(SCRIPTS / "floor_startup_handoff.py"),
+                          "ack-exit", "--request", str(path), "--ack", str(ack),
+                          "--effects-settled", str(settled).lower()],
+                         env=env, capture_output=True, text=True, timeout=5)
+    assert run.returncode == 0, run.stdout + run.stderr
+    result = json.loads(ack.read_text(encoding="utf-8"))
+    assert result["state"] == "failed"
+    assert result["cleanup_completed"] is True
+    assert result["effects_settled"] is settled
+    assert result["owner_available"] is False
+    assert result["request_nonce"] == request["request_nonce"]
+    assert result["failure"] == ("STARTUP_OWNER_EXITED" if settled else "STARTUP_EXIT_EFFECTS_UNPROVEN")
+    assert "localizer_generation" not in result
+
+
+@pytest.mark.parametrize("scenario,expected", [
+    ("waiting_target_failed", "true"), ("unknown_trigger", "false"),
+    ("old_worker_failed", "false"), ("target_work_started", "false"),
+])
+def test_real_adoption_exit_does_not_infer_rpc_settlement_from_shutdown(tmp_path, scenario, expected):
+    helper = (SCRIPTS / "floor_startup_handoff_helpers.sh").as_posix()
+    harness = f'''#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR=unused
+write_runtime_map_context() {{ :; }}
+source "{helper}"
+nav2_lifecycle_bringup_pid=''
+amcl_resident_pid=''
+amcl_readiness_pid=''
+scenario={scenario}
+if [[ "$scenario" == old_worker_failed ]]; then (exit 7) & nav2_lifecycle_bringup_pid=$!; fi
+floor_handoff_cli() {{
+  case "$1" in
+    export-env) echo 'export NJRH_RUNTIME_TRANSACTION_ID=txn NJRH_MAP_ID=target' ;;
+    check-trigger-outcome) [[ "$scenario" != unknown_trigger ]] ;;
+    wait-target) [[ "$scenario" == target_work_started ]] ;;
+    export-evidence) echo 'export NJRH_RUNTIME_EXPLICIT_RELOCALIZATION_SEQUENCE=4' ;;
+    ack-exit) echo "$*" >> events ;;
+    ack) echo "ack:$3" >> events ;;
+    *) exit 91 ;;
+  esac
+}}
+adopt_startup_floor_handoff || true
+# Model cleanup returning; none of its child kills are settlement evidence.
+acknowledge_startup_floor_handoff_exit
+acknowledge_startup_floor_handoff_exit
+'''
+    (tmp_path / "test.sh").write_text(harness, encoding="utf-8")
+    run = subprocess.run([bash_executable(), "test.sh"], cwd=tmp_path,
+                         capture_output=True, text=True, timeout=5)
+    assert run.returncode == 0, run.stdout + run.stderr
+    exits = [event for event in (tmp_path / "events").read_text().splitlines()
+             if event.startswith("ack-exit")]
+    assert exits == ["ack-exit --effects-settled " + expected]
+
+
+@pytest.mark.parametrize("change", ["nonce", "identity", "committed", "no_owner"])
+def test_exit_ack_cannot_overwrite_another_or_committed_request(tmp_path, monkeypatch, change):
+    module = load_module()
+    path, request = fixture_request(tmp_path)
+    for variable, value in {
+        "NJRH_FLOOR_STARTUP_HANDOFF_NONCE": request["request_nonce"],
+        "NJRH_STARTUP_OWNER_PID": "123", "NJRH_STARTUP_INSTANCE": "startup-test",
+        "NJRH_RUNTIME_TRANSACTION_ID": request["transaction_id"],
+        "NJRH_BUILDING_ID": request["building_id"], "NJRH_FLOOR_ID": request["floor_id"],
+        "NJRH_MAP_ID": request["map_id"], "NJRH_MAP_ASSET_EPOCH": str(request["asset_epoch"]),
+        "NJRH_MAP_ASSET_DIGEST": request["asset_digest"],
+    }.items():
+        monkeypatch.setenv(variable, value)
+    request["state"] = "failed"
+    if change == "nonce":
+        request["request_nonce"] = "replacement"
+    elif change == "identity":
+        request["transaction_id"] = "replacement"
+    elif change == "committed":
+        request["state"] = "committed"
+    elif change == "no_owner":
+        monkeypatch.delenv("NJRH_FLOOR_STARTUP_HANDOFF_NONCE")
+    path.write_text(json.dumps(request), encoding="utf-8")
+    with pytest.raises(ValueError):
+        module.exit_acknowledgement(module.current_request(path, allow_failed=True), True)
+
+
 def test_retired_owner_keeps_supervision_without_starting_amcl_work(tmp_path):
     source = (SCRIPTS / "run_navigation_runtime_services.sh").read_text(encoding="utf-8")
     import re

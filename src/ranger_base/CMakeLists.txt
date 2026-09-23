@@ -76,6 +76,22 @@ install(DIRECTORY launch
 #   DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
+  add_executable(test_navlite_chassis_trace test/test_navlite_chassis_trace.cpp)
+  target_include_directories(test_navlite_chassis_trace PRIVATE include)
+  target_compile_options(test_navlite_chassis_trace PRIVATE -UNDEBUG)
+  add_test(NAME navlite_chassis_trace COMMAND test_navlite_chassis_trace)
+  # This target compiles the real messenger but replaces RangerRobot symbols.
+  # It must never link ugv_sdk or be installed/launched in the vehicle domain.
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND EXISTS "${RANGER_UGV_SDK_SOURCE_DIR}/include")
+    add_executable(test_navlite_messenger_fake_sdk
+      test/test_navlite_messenger_fake_sdk.cpp src/ranger_messenger.cpp)
+    target_include_directories(test_navlite_messenger_fake_sdk PRIVATE
+      "${RANGER_UGV_SDK_SOURCE_DIR}/include")
+    target_compile_options(test_navlite_messenger_fake_sdk PRIVATE -fno-access-control -UNDEBUG)
+    ament_target_dependencies(test_navlite_messenger_fake_sdk ${DEPENDENCIES})
+    # Intentionally not registered with CTest: run only inside an isolated
+    # network/IPC namespace, using the wrapper documented in docs/navlite.md.
+  endif()
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights
   # uncomment the line when a copyright and license is not present in all source files

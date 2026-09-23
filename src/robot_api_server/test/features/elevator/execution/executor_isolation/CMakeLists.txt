@@ -13,6 +13,12 @@ enable_testing()
 ament_add_gtest(test_elevator_ros_executor ../test_elevator_ros_executor.cpp)
 target_include_directories(test_elevator_ros_executor PRIVATE ${API_ROOT}/include)
 ament_target_dependencies(test_elevator_ros_executor rclcpp)
+ament_add_gtest(test_elevator_arm_runtime_fault
+  ../test_elevator_arm_runtime_fault.cpp
+  ${API_ROOT}/src/features/elevator/execution/elevator_arm_client.cpp)
+target_include_directories(test_elevator_arm_runtime_fault PRIVATE ${API_ROOT}/include)
+target_link_libraries(test_elevator_arm_runtime_fault yaml-cpp)
+ament_target_dependencies(test_elevator_arm_runtime_fault rclcpp)
 ament_add_gtest(test_elevator_ros_events ../test_elevator_ros_events.cpp)
 target_include_directories(test_elevator_ros_events PRIVATE ${API_ROOT}/include)
 ament_target_dependencies(test_elevator_ros_events

@@ -29,8 +29,9 @@ NJRH_MAPPING_CPU_KEYS=(
 
 # Placement only: the official driver uses CPU3; downstream pointcloud/scan
 # work may use CPU1,4. Bootstrap uses CPU3 before worker-specific placement.
-# Navigation compute/system work excludes state CPU2 and driver CPU3. FAST-LIO
-# explicitly shares CPU1-4 during mapping. Kernel/IRQ work is not isolated.
+# The controller/local costmap shares CPU1-3; other navigation compute/system
+# work stays on CPU0,1,4. FAST-LIO shares CPU1-4 during mapping. Kernel/IRQ work
+# is not isolated, and controller eligibility does not reserve CPU2/3.
 # A multi-CPU mask expresses eligibility, not a primary/overflow preference.
 njrh_navigation_five_cpuset() {
   case "$1" in
@@ -58,7 +59,9 @@ njrh_navigation_five_cpuset() {
       printf '0-1,4\n' ;;
     LIDAR_PERCEPTION|LIDAR_PIPELINE|POINTCLOUD_AXIS_REMAP|POINTCLOUD_ACCEL_CONTAINER|POINTCLOUD_ACCEL_LOCAL_WORKER|POINTCLOUD_ACCEL_SCAN_WORKER|NITROS_POINTCLOUD_CONTAINER|POINTCLOUD_PERCEPTION_PIPELINE|POINTCLOUD_DOWNSAMPLE|NAV_CLOUD_PREPROCESSOR|ROBOT_LOCAL_PERCEPTION|LASER_SCAN_TO_FLATSCAN|POINTCLOUD_TO_LASERSCAN|SCAN_REPUBLISHER)
       printf '1,4\n' ;;
-    NAV_CONTROL|NAV_PLANNING|LOCALIZATION|NAV2_CONTROLLER_CURRENT|NAV2_CONTROLLER_WIDE|DOCKING_VISION|CONTROLLER_SERVER|LOCAL_COSTMAP|OCCUPANCY_GRID_LOCALIZER|ROBOT_GLOBAL_LOCALIZATION|AMCL|AMCL_SCAN_ADMISSION|PLANNER_SERVER|BT_NAVIGATOR|BEHAVIOR_SERVER|SMOOTHER_SERVER|WAYPOINT_FOLLOWER)
+    NAV2_CONTROLLER_CURRENT|NAV2_CONTROLLER_WIDE|CONTROLLER_SERVER|LOCAL_COSTMAP)
+      printf '1-3\n' ;;
+    NAV_CONTROL|NAV_PLANNING|LOCALIZATION|DOCKING_VISION|OCCUPANCY_GRID_LOCALIZER|ROBOT_GLOBAL_LOCALIZATION|AMCL|AMCL_SCAN_ADMISSION|PLANNER_SERVER|BT_NAVIGATOR|BEHAVIOR_SERVER|SMOOTHER_SERVER|WAYPOINT_FOLLOWER)
       printf '0-1,4\n' ;;
     *) echo "[runtime-overlay] missing five-core placement for $1" >&2; return 2 ;;
   esac

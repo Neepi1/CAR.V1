@@ -482,6 +482,21 @@ OrdinaryLocalPathRepairUpdate OrdinaryLocalPathRepairRuntime::update(
       std::lock_guard<std::mutex> lock(mutex_);
       current_generation = plan_generation_;
     }
+    const char * observed_status = completed->plan_generation != current_generation ?
+      "discarded_generation" : ordinary_local_path_repair_status_name(completed->repair.status);
+    if (navlite_repair_log_.observe(observed_status,
+        completed->repair.status != OrdinaryLocalPathRepairStatus::kPathClear))
+    {
+      RCLCPP_WARN(logger_,
+        "NAVLITE repair status=%s result_generation=%zu current_generation=%zu "
+        "snapshot_nearest=%zu snapshot_blocked=%zu snapshot_rejoin=%zu "
+        "snapshot_age=%.6f hold_position=%d command_decision=false",
+        observed_status, completed->plan_generation, current_generation,
+        completed->repair.nearest_index, completed->repair.first_blocked_index,
+        completed->repair.rejoin_index,
+        std::chrono::duration<double>(now - completed->request.snapshot_time).count(),
+        update_result.hold_position);
+    }
     if (completed->plan_generation == current_generation) {
       if (completed->error) {std::rethrow_exception(completed->error);}
       auto status = completed->repair.status;
@@ -618,7 +633,8 @@ geometry_msgs::msg::TwistStamped OrdinaryLocalPathRepairRuntime::compute_command
     // command resumes the same FollowPath immediately, even without a replan.
     command = compute();
   } catch (const std::runtime_error & error) {
-    // Humble 1.1.19 MPPI throws runtime_error for exhausted control samples;
+    // Humble 1.1.19 fallback throws this exact runtime_error after fail_flag
+    // exceeds its retry limit. Do not infer a physical collision from the text.
     // controller_server's PlannerException/failure_tolerance does not catch it.
     // Other plugins, TF faults, invalid plans and programming errors propagate.
     if (!enabled_ || !mppi_primary_ ||
@@ -632,8 +648,20 @@ geometry_msgs::msg::TwistStamped OrdinaryLocalPathRepairRuntime::compute_command
     }
     command.header = pose.header;
     waiting = true;
+    if (navlite_control_log_.observe("exact_optimizer_failure_to_zero", true)) {
+      RCLCPP_WARN(logger_,
+        "NAVLITE controller event=exception_to_zero "
+        "raw=\"Optimizer fail to compute path\" match=exact_runtime_error_text "
+        "out=(0.000000,0.000000,0.000000) retained_previous_command=0");
+    }
     RCLCPP_WARN_THROTTLE(logger_, *clock_, 2000,
       "Ordinary MPPI has no valid control: zero command, retaining FollowPath and retrying");
+  }
+  if (!waiting && navlite_control_log_.observe("computed_return", false)) {
+    RCLCPP_WARN(logger_,
+      "NAVLITE controller event=computed_return layer=outer_rotation_shim "
+      "out=(%.9f,%.9f,%.9f) pure_mppi=not_proven downstream_release=unknown",
+      command.twist.linear.x, command.twist.linear.y, command.twist.angular.z);
   }
   {
     std::lock_guard<std::mutex> lock(mutex_);

@@ -165,18 +165,25 @@ protected:
 
 TEST_F(KeepoutTest, NativeMppiSeesBodyEdgeWhenCenterIsNotLethal)
 {
-  // 0.375 is on the padded front edge; the center cell itself is not lethal.
-  cell(0.375, 0.025, 100);
-  ASSERT_TRUE(publish_until(0.375, 0.025, 254));
-  EXPECT_LT(cost(0.0, 0.0), 254);
-  EXPECT_TRUE(collision(0, 0, 0));
+  // Use the loaded padded long edge, not the superseded 0.39/0.28 fixture.
+  double front = 0;
+  for (const auto & point : map->getRobotFootprint()) {
+    front = std::max(front, std::abs(point.x));
+  }
+  // Centre the pose within a cell: float yaw must not move a perimeter vertex
+  // across an exact cell boundary and make a single-cell test ambiguous.
+  const double edge = front + 0.025;
+  cell(edge, 0.025, 100);
+  ASSERT_TRUE(publish_until(edge, 0.025, 254));
+  EXPECT_LT(cost(0.025, 0.025), 254);
+  EXPECT_TRUE(collision(0.025, 0.025, 0));
   EXPECT_FALSE(collision(-0.8, 0, 0));
   // The long side rotates with the robot, not with a circular approximation.
   mask.data.assign(40000, 0);
-  cell(0.025, 0.375, 100);
-  ASSERT_TRUE(publish_until(0.025, 0.375, 254));
-  EXPECT_FALSE(collision(0, 0, 0));
-  EXPECT_TRUE(collision(0, 0, M_PI_2));
+  cell(0.025, edge, 100);
+  ASSERT_TRUE(publish_until(0.025, edge, 254));
+  EXPECT_FALSE(collision(0.025, 0.025, 0));
+  EXPECT_TRUE(collision(0.025, 0.025, M_PI_2));
 }
 
 TEST_F(KeepoutTest, MaskAddMoveDeleteAndFrameTransformLeaveNoGhostCosts)

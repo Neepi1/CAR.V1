@@ -175,7 +175,7 @@ def environment(request):
     return "\n".join(f"export {key}={shlex.quote(value)}" for key, value in values.items())
 
 
-def current_request(path):
+def current_request(path, *, allow_failed=False):
     request = load_request(path)
     expected_nonce = os.environ.get("NJRH_FLOOR_STARTUP_HANDOFF_NONCE", "")
     if expected_nonce and request["request_nonce"] != expected_nonce:
@@ -188,9 +188,32 @@ def current_request(path):
                                 ("asset_digest", "NJRH_MAP_ASSET_DIGEST")):
             if str(request[field]) != os.environ.get(variable, ""):
                 raise ValueError(f"handoff changed adopted {field}")
-    if request["state"] == "failed":
+    if request["state"] == "failed" and not allow_failed:
         raise ValueError("floor-manager marked this handoff failed")
     return request
+
+
+def exit_acknowledgement(request, effects_settled):
+    """Terminal owner receipt, never a successful target or retry permission.
+
+    Only the exit hook calls this after existing cleanup returns. Settlement
+    is separately proven by the shell owner, not inferred from process exit.
+    """
+    if (not os.environ.get("NJRH_FLOOR_STARTUP_HANDOFF_NONCE")
+            or not os.environ.get("NJRH_STARTUP_INSTANCE")
+            or not os.environ.get("NJRH_STARTUP_OWNER_PID")):
+        raise ValueError("exit acknowledgement requires the adopted startup owner")
+    if request["state"] not in ("requested", "failed"):
+        raise ValueError("cannot replace a committed handoff with an exit failure")
+    if type(effects_settled) is not bool:
+        raise ValueError("effects_settled must be explicit")
+    failure = "STARTUP_OWNER_EXITED" if effects_settled else "STARTUP_EXIT_EFFECTS_UNPROVEN"
+    result = acknowledgement(request, "failed", failure,
+                             "startup exit cleanup returned; owner cannot accept another handoff; "
+                             + ("old operations settled before target startup" if effects_settled
+                                else "one or more startup operation outcomes remain unproven"))
+    result.update(cleanup_completed=True, effects_settled=effects_settled, owner_available=False)
+    return result
 
 
 def require_current_side_effect(request_path, context_path):
@@ -269,7 +292,7 @@ def committed(request, context, evidence):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("is-requested", "export-env", "export-evidence", "assert-current", "ack",
+    parser.add_argument("command", choices=("is-requested", "export-env", "export-evidence", "assert-current", "ack", "ack-exit",
                                              "wait-target", "wait-commit", "check-trigger-outcome"))
     parser.add_argument("--request", default=os.environ.get(
         "NJRH_FLOOR_STARTUP_HANDOFF_FILE", DEFAULT_REQUEST))
@@ -282,10 +305,11 @@ def main():
     parser.add_argument("--state", choices=("adopted", "runtime_ready", "failed"))
     parser.add_argument("--failure", default="")
     parser.add_argument("--detail", default="")
+    parser.add_argument("--effects-settled", choices=("true", "false"))
     args = parser.parse_args()
     if args.command == "is-requested":
         return 0 if request_pending(args.request) else 1
-    request = current_request(args.request)
+    request = current_request(args.request, allow_failed=args.command == "ack-exit")
     if args.command == "assert-current":
         require_current_side_effect(args.request, args.context)
     elif args.command == "export-env":
@@ -305,6 +329,10 @@ def main():
     elif args.command == "ack":
         evidence = read_json(args.evidence) if args.state == "runtime_ready" else None
         atomic_json(args.ack, acknowledgement(request, args.state, args.failure, args.detail, evidence))
+    elif args.command == "ack-exit":
+        if args.effects_settled is None:
+            raise ValueError("exit acknowledgement requires explicit effect settlement")
+        atomic_json(args.ack, exit_acknowledgement(request, args.effects_settled == "true"))
     elif args.command == "wait-target":
         return wait_target(args.request, args.context, args.evidence)
     elif args.command == "wait-commit":

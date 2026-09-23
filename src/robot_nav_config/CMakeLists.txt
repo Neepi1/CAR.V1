@@ -197,6 +197,22 @@ if(BUILD_TESTING)
     NAV_CONFIG_FILE="${CMAKE_CURRENT_SOURCE_DIR}/config/nav2.yaml")
   set_tests_properties(test_keepout_and_constraints PROPERTIES
     ENVIRONMENT "ROS_DOMAIN_ID=212;ROS_LOCALHOST_ONLY=1;RMW_IMPLEMENTATION=rmw_fastrtps_cpp")
+  ament_add_gtest(test_body_geometry_contract
+    test/navigation_clearance/test_body_geometry_contract.cpp)
+  ament_target_dependencies(test_body_geometry_contract nav2_mppi_controller nav2_costmap_2d
+    nav2_util rclcpp rclcpp_lifecycle)
+  target_compile_definitions(test_body_geometry_contract PRIVATE
+    NAV_CONFIG_FILE="${CMAKE_CURRENT_SOURCE_DIR}/config/nav2.yaml")
+  set_tests_properties(test_body_geometry_contract PROPERTIES
+    ENVIRONMENT "ROS_DOMAIN_ID=212;ROS_LOCALHOST_ONLY=1;RMW_IMPLEMENTATION=rmw_fastrtps_cpp")
+  ament_add_gtest(test_body_geometry_clearing
+    test/navigation_clearance/test_body_geometry_clearing.cpp)
+  ament_target_dependencies(test_body_geometry_clearing nav2_costmap_2d nav2_util
+    rclcpp rclcpp_lifecycle sensor_msgs)
+  target_compile_definitions(test_body_geometry_clearing PRIVATE
+    NAV_CONFIG_FILE="${CMAKE_CURRENT_SOURCE_DIR}/config/nav2.yaml")
+  set_tests_properties(test_body_geometry_clearing PROPERTIES
+    ENVIRONMENT "ROS_DOMAIN_ID=212;ROS_LOCALHOST_ONLY=1;RMW_IMPLEMENTATION=rmw_fastrtps_cpp")
   ament_add_gtest(test_ordinary_recovery_state
     test/navigation_recovery/test_recovery_state.cpp
     src/navigation_recovery/recovery_state.cpp)

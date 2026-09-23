@@ -305,6 +305,10 @@ void GoalScopedRotationShimController::configure(
     goal_change_yaw_threshold_,
     same_goal_rearm_after_idle_sec_,
     terminal_rotation_braking_enabled_ ? "true" : "false");
+  RCLCPP_WARN(logger_,
+    "NAVLITE controller event=diagnostics_ready schema=1 "
+    "plugin=GoalScopedRotationShimController output_layer=outer_controller "
+    "zero_repeat_max_hz=1");
   RCLCPP_INFO(
     logger_,
     "Ranger terminal handoff: enabled=%s envelope=%.2fm max_forward=%.2fm "
@@ -595,6 +599,7 @@ geometry_msgs::msg::TwistStamped GoalScopedRotationShimController::computeVeloci
       RCLCPP_WARN_THROTTLE(
         logger_, *clock_, 2000,
         "Startup RotationShim is holding zero command until the path heading can be measured");
+      log_navlite_output("startup_heading_unavailable", command, pose);
       return command;
     }
 
@@ -602,6 +607,7 @@ geometry_msgs::msg::TwistStamped GoalScopedRotationShimController::computeVeloci
       publish_terminal_permits(false, false);
       auto command = computeRotateToHeadingCommand(*measurement.error, pose, velocity);
       last_angular_vel_ = command.twist.angular.z;
+      log_navlite_output("startup_rotation", command, pose);
       return command;
     }
   }
@@ -623,6 +629,7 @@ geometry_msgs::msg::TwistStamped GoalScopedRotationShimController::computeVeloci
     command.header = pose.header;
     last_angular_vel_ = 0.0;
     publish_terminal_permits(false, false);
+    log_navlite_output("repair_hold_position", command, pose);
     return command;
   }
 
@@ -701,9 +708,29 @@ geometry_msgs::msg::TwistStamped GoalScopedRotationShimController::computeVeloci
     }
   }
 
+  const bool no_control = ordinary_local_repair_runtime_ &&
+    ordinary_local_repair_runtime_->progress_state() ==
+    ElevatorScopedProgressState::kOrdinaryLocalWaitClear;
+  log_navlite_output(no_control ? "mppi_no_valid_control" : "rotation_shim_return", command, pose);
   return command;
 }
 
+void GoalScopedRotationShimController::log_navlite_output(
+  const char * branch, const geometry_msgs::msg::TwistStamped & command,
+  const geometry_msgs::msg::PoseStamped & pose)
+{
+  const auto & v = command.twist;
+  const bool zero = v.linear.x == 0.0 && v.linear.y == 0.0 && v.angular.z == 0.0;
+  if (!navlite_output_log_.observe(std::string(branch) + (zero ? ":zero" : ":nonzero"), zero)) {
+    return;
+  }
+  RCLCPP_WARN(logger_,
+    "NAVLITE controller branch=%s zero=%d out=(%.6f,%.6f,%.6f) "
+    "pose=(%.6f,%.6f) frame=%s source_stamp=%d.%09u",
+    branch, zero, v.linear.x, v.linear.y, v.angular.z,
+    pose.pose.position.x, pose.pose.position.y, pose.header.frame_id.c_str(),
+    pose.header.stamp.sec, pose.header.stamp.nanosec);
+}
 
 std::optional<TerminalPoseError> GoalScopedRotationShimController::terminal_pose_error(
   const geometry_msgs::msg::PoseStamped & pose)
@@ -883,6 +910,7 @@ GoalScopedRotationShimController::terminal_handoff_command(
     RCLCPP_WARN_THROTTLE(
       logger_, *clock_, 1000,
       "Ranger terminal handoff is holding zero: projected footprint is not clear");
+    log_navlite_output("terminal_footprint_not_clear", command, pose);
     return command;
   }
 
@@ -894,6 +922,7 @@ GoalScopedRotationShimController::terminal_handoff_command(
     terminal_phase_name(output.phase), error.distance_m, error.forward_m,
     error.lateral_m, error.yaw_rad, command.twist.linear.x,
     command.twist.linear.y, command.twist.angular.z);
+  log_navlite_output(terminal_phase_name(output.phase), command, pose);
   return command;
 }
 

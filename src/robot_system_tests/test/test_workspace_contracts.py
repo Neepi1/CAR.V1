@@ -641,8 +641,8 @@ def test_nav_defaults_are_fixed():
     assert "repulsion_weight: 2.0" in nav2
     assert "critical_weight: 20.0" in nav2
     assert "collision_margin_distance: 0.08" in nav2
-    assert nav2.count("inflation_radius: 0.60") == 3
-    assert overlay_nav2.count("inflation_radius: 0.60") == 3
+    assert nav2.count("inflation_radius: 0.75") == 4
+    assert overlay_nav2.count("inflation_radius: 0.75") == 4
     assert "inflation_radius: 0.35" not in nav2
     assert "inflation_radius: 0.35" not in overlay_nav2
     assert 'inflation_layer_name: "local_inflation_layer"' in nav2
@@ -650,7 +650,7 @@ def test_nav_defaults_are_fixed():
     assert "source_timeout: 1.5" in nav2
     assert "stop_pub_timeout: 0.3" in nav2
     assert 'polygons: ["StopZone", "SlowZone", "FootprintApproach"]' in nav2
-    assert 'points: [0.42, 0.28, 0.42, -0.28, -0.42, -0.28, -0.42, 0.28]' in nav2
+    assert 'points: [0.47, 0.36, 0.47, -0.36, -0.47, -0.36, -0.47, 0.36]' in nav2
     assert 'footprint_topic: "/local_costmap/published_footprint"' in nav2
     assert 'action_type: "approach"' in nav2
     assert "/local_state/odometry" in nav2

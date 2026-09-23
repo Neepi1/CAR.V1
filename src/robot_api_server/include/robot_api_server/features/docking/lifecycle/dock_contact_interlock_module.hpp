@@ -184,6 +184,8 @@ public:
   DockContactInterlockModule & operator=(const DockContactInterlockModule &) = delete;
 
   DockContactLatchSnapshot read_latch() const;
+  // Read existing non-BMS occupancy evidence without evaluating/clearing it.
+  bool has_confirmed_dock_context() const;
   void update_latch(
     bool docked,
     const std::string & source,

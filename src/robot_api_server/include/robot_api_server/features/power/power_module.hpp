@@ -32,6 +32,9 @@ struct PowerModulePorts
   std::function<void(const BatteryContactEvaluation &, bool, double)>
   on_contact_evidence;
   std::function<void(bool)> on_charging_contact;
+  // Existing confirmed occupancy only, not a return-to-dock job/predock phase.
+  // Called without the power snapshot mutex; must not derive context from BMS.
+  std::function<bool()> confirmed_dock_context;
 };
 
 // Owns the complete process-resident BatteryState edge and its derived

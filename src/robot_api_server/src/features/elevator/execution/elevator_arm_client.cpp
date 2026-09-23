@@ -5,6 +5,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstring>
+#include <cstdio>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -15,7 +16,9 @@
 
 #ifndef _WIN32
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -156,6 +159,69 @@ ElevatorArmOutcome failed(
   };
 }
 
+bool transient_query_failure(const ElevatorArmHttpResponse & response)
+{
+  if (response.status == 408 || response.status == 429 || response.status == 500 ||
+    response.status == 502 || response.status == 503 || response.status == 504)
+  {
+    return true;
+  }
+  if (response.status != 599) {
+    return false;
+  }
+  for (const auto * prefix : {"socket failed:", "connect failed:", "send failed:",
+      "receive failed:", "request deadline exceeded"})
+  {
+    if (response.transport_error.rfind(prefix, 0U) == 0U) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool cancelled(const std::function<bool()> & probe)
+{
+  return probe && probe();
+}
+
+bool wait_until_or_cancel(
+  const std::chrono::steady_clock::time_point deadline,
+  const std::function<bool()> & probe)
+{
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (cancelled(probe)) {
+      return false;
+    }
+    std::this_thread::sleep_until(std::min(
+      deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(20)));
+  }
+  return !cancelled(probe);
+}
+
+ElevatorArmOutcome cancelled_outcome()
+{
+  return failed("ELEVATOR_ARM_TASK_CANCELLED", "elevator transaction was cancelled");
+}
+
+bool retry_pause(
+  const ElevatorArmOutcome & result, const std::string & path,
+  const std::uint64_t attempt, const std::function<bool()> & probe)
+{
+  if (cancelled(probe)) {
+    return false;
+  }
+  std::fprintf(stderr,
+    "[elevator-arm] action_retry path=%s attempt=%llu task_id=%s code=%s detail=%s\n",
+    path.c_str(), static_cast<unsigned long long>(attempt), result.task_id.c_str(),
+    json_escape(result.code).c_str(), json_escape(result.detail).c_str());
+  return wait_until_or_cancel(std::chrono::steady_clock::now() + std::chrono::seconds(1), probe);
+}
+
+std::string attempt_mission(const std::string & mission, const std::uint64_t attempt)
+{
+  return attempt == 0U ? mission : mission + ":retry:" + std::to_string(attempt);
+}
+
 class LoopbackHttpTransport final : public ElevatorArmHttpTransport
 {
 public:
@@ -187,6 +253,8 @@ public:
     if ((method != "GET" && method != "POST") || path.empty() || path[0] != '/') {
       return {599, {}, "invalid loopback HTTP request"};
     }
+    const auto deadline = std::chrono::steady_clock::now() +
+      std::max(timeout, std::chrono::milliseconds(1));
     const int descriptor = ::socket(AF_INET, SOCK_STREAM, 0);
     if (descriptor < 0) {
       return {599, {}, std::string("socket failed: ") + std::strerror(errno)};
@@ -197,17 +265,32 @@ public:
       ~DescriptorGuard() {if (value >= 0) {(void)::close(value);}}
     } guard{descriptor};
 
-    const auto bounded_timeout = std::max(timeout, std::chrono::milliseconds(1));
-    timeval socket_timeout{};
-    socket_timeout.tv_sec = static_cast<time_t>(bounded_timeout.count() / 1000);
-    socket_timeout.tv_usec = static_cast<suseconds_t>(
-      (bounded_timeout.count() % 1000) * 1000);
-    (void)::setsockopt(
-      descriptor, SOL_SOCKET, SO_RCVTIMEO,
-      &socket_timeout, sizeof(socket_timeout));
-    (void)::setsockopt(
-      descriptor, SOL_SOCKET, SO_SNDTIMEO,
-      &socket_timeout, sizeof(socket_timeout));
+    const int flags = ::fcntl(descriptor, F_GETFL, 0);
+    if (flags < 0 || ::fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) < 0) {
+      return {599, {}, std::string("socket configuration failed: ") + std::strerror(errno)};
+    }
+    // One monotonic deadline spans connect, every partial send and every recv.
+    // Per-syscall SO_RCVTIMEO would renew the budget on a dripping response.
+    const auto wait_for_io = [&](const short events) {
+        while (true) {
+          const auto now = std::chrono::steady_clock::now();
+          if (now >= deadline) {return 0;}
+          const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline - now);
+          const int wait_ms = static_cast<int>(std::min<std::int64_t>(
+              remaining.count(), std::numeric_limits<int>::max()));
+          pollfd pending{descriptor, events, 0};
+          const int ready = ::poll(&pending, 1, wait_ms);
+          if (ready < 0) {
+            if (errno == EINTR) {continue;}
+            return -1;
+          }
+          if (std::chrono::steady_clock::now() >= deadline) {return 0;}
+          if (ready == 0) {continue;}
+          if ((pending.revents & POLLNVAL) != 0) {errno = EBADF; return -1;}
+          // Let connect/recv/send report the original socket error on ERR/HUP.
+          if ((pending.revents & (events | POLLERR | POLLHUP)) != 0) {return 1;}
+        }
+      };
 
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -218,7 +301,22 @@ public:
     if (::connect(
         descriptor, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0)
     {
-      return {599, {}, std::string("connect failed: ") + std::strerror(errno)};
+      if (errno != EINPROGRESS && errno != EINTR) {
+        return {599, {}, std::string("connect failed: ") + std::strerror(errno)};
+      }
+      const int ready = wait_for_io(POLLOUT);
+      if (ready == 0) {return {599, {}, "request deadline exceeded"};}
+      if (ready < 0) {
+        return {599, {}, std::string("connect failed: ") + std::strerror(errno)};
+      }
+      int error = 0;
+      socklen_t length = sizeof(error);
+      if (::getsockopt(descriptor, SOL_SOCKET, SO_ERROR, &error, &length) != 0) {
+        error = errno;
+      }
+      if (error != 0) {
+        return {599, {}, std::string("connect failed: ") + std::strerror(error)};
+      }
     }
 
     std::ostringstream request_stream;
@@ -237,8 +335,17 @@ public:
     const auto wire = request_stream.str();
     std::size_t sent = 0U;
     while (sent < wire.size()) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return {599, {}, "request deadline exceeded"};
+      }
       const auto count = ::send(
         descriptor, wire.data() + sent, wire.size() - sent, MSG_NOSIGNAL);
+      if (count < 0 && errno == EINTR) {continue;}
+      if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        const int ready = wait_for_io(POLLOUT);
+        if (ready == 0) {return {599, {}, "request deadline exceeded"};}
+        if (ready > 0) {continue;}
+      }
       if (count <= 0) {
         return {599, {}, std::string("send failed: ") + std::strerror(errno)};
       }
@@ -248,7 +355,16 @@ public:
     std::string response;
     char buffer[4096];
     while (true) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return {599, {}, "request deadline exceeded"};
+      }
       const auto count = ::recv(descriptor, buffer, sizeof(buffer), 0);
+      if (count < 0 && errno == EINTR) {continue;}
+      if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        const int ready = wait_for_io(POLLIN);
+        if (ready == 0) {return {599, {}, "request deadline exceeded"};}
+        if (ready > 0) {continue;}
+      }
       if (count == 0) {
         break;
       }
@@ -345,29 +461,50 @@ std::optional<std::string> ElevatorArmClient::hall_call_direction(
 ElevatorArmOutcome ElevatorArmClient::run_task(
   const std::string & path,
   const std::string & request_body,
-  const std::function<bool()> & cancellation_requested)
+  const std::function<bool()> & cancellation_requested,
+  bool * confirmed_task_failure)
 {
+  if (confirmed_task_failure) {
+    *confirmed_task_failure = false;
+  }
+  if (cancelled(cancellation_requested)) {
+    return cancelled_outcome();
+  }
   const auto submitted = transport_->request(
     "POST", path, request_body, options_.request_timeout);
-  return await_task(submitted, path, cancellation_requested);
+  return await_task(submitted, path, cancellation_requested, confirmed_task_failure);
 }
 
 ElevatorArmOutcome ElevatorArmClient::await_task(
   const ElevatorArmHttpResponse & submitted,
   const std::string & path,
-  const std::function<bool()> & cancellation_requested)
+  const std::function<bool()> & cancellation_requested,
+  bool * confirmed_task_failure)
 {
+  if (confirmed_task_failure) {
+    *confirmed_task_failure = false;
+  }
   std::string parse_error;
   const auto accepted = json_document(submitted, parse_error);
+  if (path == "/api/v1/elevator/call" && submitted.status == 501 && accepted &&
+    string_value(*accepted, "error_code") == "capability_unavailable")
+  {
+    return {ElevatorArmOutcomeKind::kManualConfirmationRequired,
+      "ELEVATOR_CALL_MANUAL_CONFIRMATION_REQUIRED",
+      "8083 reports physical hall-call capability unavailable", {}};
+  }
   if (submitted.status != 202 || !accepted) {
     std::string code = accepted ? string_value(*accepted, "error_code") : std::string{};
-    if (code.empty()) {
+    if (path == "/api/v1/elevator/call") {
+      code = "ELEVATOR_CALL_COMMAND_FAILED";
+    } else if (code.empty()) {
       code = "ELEVATOR_ARM_COMMAND_REJECTED";
     }
     return failed(
       code,
-      "arm command was not accepted; path=" + path + ";http_status=" +
-      std::to_string(submitted.status) + ";detail=" + parse_error);
+      "arm command acceptance was not confirmed; path=" + path + ";http_status=" +
+      std::to_string(submitted.status) + ";detail=" + parse_error + ";message=" +
+      (accepted ? string_value(*accepted, "message", string_value(*accepted, "error")) : ""));
   }
   const auto task_id = string_value(*accepted, "task_id");
   if (task_id.empty()) {
@@ -377,6 +514,8 @@ ElevatorArmOutcome ElevatorArmClient::await_task(
   }
 
   const auto deadline = std::chrono::steady_clock::now() + options_.task_timeout;
+  std::string last_query_error;
+  auto next_query_log = std::chrono::steady_clock::time_point{};
   while (std::chrono::steady_clock::now() <= deadline) {
     if (cancellation_requested && cancellation_requested()) {
       return failed(
@@ -385,10 +524,35 @@ ElevatorArmOutcome ElevatorArmClient::await_task(
         task_id);
     }
     const auto polled = transport_->request(
-      "GET", "/api/v1/tasks/" + task_id, {}, options_.request_timeout);
+      "GET", "/api/v1/tasks/" + task_id, {}, std::min(options_.request_timeout,
+      std::max(std::chrono::milliseconds(1), std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now()))));
+    if (cancelled(cancellation_requested)) {
+      return failed("ELEVATOR_ARM_TASK_CANCELLED",
+        "elevator transaction was cancelled while waiting for arm task", task_id);
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      last_query_error = "task deadline elapsed after GET;http_status=" +
+        std::to_string(polled.status) + ";detail=" + polled.transport_error;
+      break;
+    }
     parse_error.clear();
     const auto task = json_document(polled, parse_error);
     if (polled.status != 200 || !task) {
+      last_query_error = "http_status=" + std::to_string(polled.status) +
+        ";detail=" + parse_error;
+      if (transient_query_failure(polled)) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_query_log) {
+          std::fprintf(stderr, "[elevator-arm] query_retry task_id=%s %s\n",
+            task_id.c_str(), json_escape(last_query_error).c_str());
+          next_query_log = now + std::chrono::seconds(1);
+        }
+        (void)wait_until_or_cancel(std::min(deadline,
+          now + std::max(options_.poll_interval, std::chrono::milliseconds(20))),
+          cancellation_requested);
+        continue;
+      }
       return failed(
         "ELEVATOR_ARM_TASK_STATUS_UNAVAILABLE",
         "arm task status failed; task_id=" + task_id + ";http_status=" +
@@ -405,6 +569,9 @@ ElevatorArmOutcome ElevatorArmClient::await_task(
       };
     }
     if (state == "failed" || bool_value(*task, "terminal")) {
+      if (confirmed_task_failure) {
+        *confirmed_task_failure = state == "failed";
+      }
       auto code = string_value(*task, "error_code", "ELEVATOR_ARM_TASK_FAILED");
       return failed(
         code,
@@ -412,13 +579,13 @@ ElevatorArmOutcome ElevatorArmClient::await_task(
         string_value(*task, "message"),
         task_id);
     }
-    if (options_.poll_interval.count() > 0) {
-      std::this_thread::sleep_for(options_.poll_interval);
-    }
+    (void)wait_until_or_cancel(std::min(deadline,
+      std::chrono::steady_clock::now() + options_.poll_interval), cancellation_requested);
   }
   return failed(
     "ELEVATOR_ARM_TASK_TIMEOUT",
-    "arm task did not reach a terminal state before timeout; task_id=" + task_id,
+    "arm task did not reach a terminal state before timeout; task_id=" + task_id +
+    ";last_query_error=" + last_query_error,
     task_id);
 }
 
@@ -429,7 +596,8 @@ ElevatorArmOutcome ElevatorArmClient::run_button_sequence(
   const std::string & action_field,
   const std::string & action_value,
   const std::function<bool()> & cancellation_requested,
-  const bool hall_call)
+  const bool hall_call,
+  const ElevatorArmRuntimeFailureProbe & runtime_failure)
 {
   if (transaction_id.empty() || effect_sequence == 0U) {
     return failed(
@@ -437,71 +605,101 @@ ElevatorArmOutcome ElevatorArmClient::run_button_sequence(
       "transaction_id and positive effect_sequence are required");
   }
   const auto mission_prefix = transaction_id + ":" + std::to_string(effect_sequence);
-  const auto ready_body =
-    "{\"mission_id\":\"" + json_escape(mission_prefix + ":ready") + "\"}";
-  auto ready = run_task(
-    "/api/v1/arm/ready", ready_body, cancellation_requested);
-
-  ElevatorArmOutcome action = ready;
-  if (ready.succeeded()) {
-    const auto action_mission = hall_call ?
-      mission_prefix + ":call:" + action_value :
-      mission_prefix + ":press-floor:" + action_value;
-    const auto action_body =
-      "{\"mission_id\":\"" + json_escape(action_mission) + "\",\"" +
-      action_field + "\":\"" + json_escape(action_value) + "\"}";
-    if (hall_call) {
-      const auto response = transport_->request(
-        "POST", action_path, action_body, options_.request_timeout);
-      std::string parse_error;
-      const auto document = json_document(response, parse_error);
-      if (
-        response.status == 501 && document &&
-        string_value(*document, "error_code") == "capability_unavailable")
-      {
-        action = {
-          ElevatorArmOutcomeKind::kManualConfirmationRequired,
-          "ELEVATOR_CALL_MANUAL_CONFIRMATION_REQUIRED",
-          "8083 reports physical hall-call capability unavailable",
-          {},
-        };
-      } else if (response.status == 202 && document) {
-        action = await_task(response, action_path, cancellation_requested);
-      } else {
-        action = failed(
-          "ELEVATOR_CALL_COMMAND_FAILED",
-          "hall-call command failed; http_status=" +
-          std::to_string(response.status) + ";detail=" + parse_error);
+  std::optional<ElevatorArmOutcome> runtime_fault;
+  // Reuse the existing interruptible waits, but keep the local fault distinct
+  // from user cancellation and from a remote arm task's terminal state.
+  const std::function<bool()> interrupted = [&]() {
+      if (!runtime_fault && runtime_failure) {
+        try {
+          runtime_fault = runtime_failure();
+          if (runtime_fault) {runtime_fault->kind = ElevatorArmOutcomeKind::kFailed;}
+        } catch (const std::exception & exception) {
+          runtime_fault = failed("ELEVATOR_RUNTIME_HEALTH_EXCEPTION", exception.what());
+        } catch (...) {
+          runtime_fault = failed("ELEVATOR_RUNTIME_HEALTH_EXCEPTION",
+            "unknown exception while observing the elevator runtime");
+        }
       }
-    } else {
-      action = run_task(action_path, action_body, cancellation_requested);
-    }
+      return runtime_fault.has_value() || cancelled(cancellation_requested);
+    };
+  const auto interrupted_outcome = [&]() {
+      return runtime_fault ? *runtime_fault : cancelled_outcome();
+    };
+  if (interrupted()) {
+    return interrupted_outcome();
   }
-
-  const auto release_body =
-    "{\"mission_id\":\"" + json_escape(mission_prefix + ":release") + "\"}";
-  const auto release = run_task(
-    "/api/v1/arm/release", release_body, []() {return false;});
-  if (!release.succeeded()) {
-    return failed(
-      "ELEVATOR_ARM_RELEASE_FAILED",
-      "arm release task failed; release=" + release.code,
-      release.task_id);
-  }
-  if (action.kind == ElevatorArmOutcomeKind::kManualConfirmationRequired) {
-    action.detail += "; arm release task completed";
-    return action;
-  }
-  if (!action.succeeded()) {
-    action.detail += "; arm release task completed";
-    return action;
-  }
-  return {
-    ElevatorArmOutcomeKind::kSucceeded,
-    hall_call ? "ELEVATOR_HALL_CALL_PRESSED" : "ELEVATOR_TARGET_FLOOR_PRESSED",
-    "button action and arm release tasks completed",
-    action.task_id,
+  std::uint64_t ready_attempt = 0U;
+  std::uint64_t action_attempt = 0U;
+  std::uint64_t release_attempt = 0U;
+  const auto posture_task = [&](const std::string & name, std::uint64_t & attempt,
+      const std::function<bool()> & probe, const bool retry) {
+      const auto path = "/api/v1/arm/" + name;
+      while (true) {
+        const auto body = "{\"mission_id\":\"" +
+          json_escape(attempt_mission(mission_prefix + ":" + name, attempt++)) + "\"}";
+        bool confirmed_failure = false;
+        auto result = run_task(path, body, probe, &confirmed_failure);
+        if (!retry || !confirmed_failure) {
+          return result;
+        }
+        if (!retry_pause(result, path, attempt, interrupted)) {
+          // Retain the last release result for fault cleanup diagnostics.
+          return runtime_fault ? result : cancelled_outcome();
+        }
+      }
   };
+
+  while (true) {
+    auto action = posture_task("ready", ready_attempt, interrupted, true);
+    bool action_failed = false;
+    if (action.succeeded()) {
+      const auto action_mission = mission_prefix +
+        (hall_call ? ":call:" : ":press-floor:") + action_value;
+      const auto action_body = "{\"mission_id\":\"" +
+        json_escape(attempt_mission(action_mission, action_attempt++)) + "\",\"" +
+        action_field + "\":\"" + json_escape(action_value) + "\"}";
+      action = run_task(action_path, action_body, interrupted, &action_failed);
+    }
+
+    // Preserve the existing one-shot release on cancellation. Never turn that
+    // uncancellable cleanup into an infinite retry or resubmit a pending release.
+    const bool cancelling_cleanup = interrupted();
+    // A cancellation arriving between this decision and submission must not
+    // skip the existing release cleanup. Each release remains time-bounded;
+    // retry_pause checks the real cancellation flag before any further attempt.
+    const std::function<bool()> release_cancel = [] {return false;};
+    const auto release = posture_task("release", release_attempt, release_cancel,
+      !cancelling_cleanup);
+    (void)interrupted();
+    if (runtime_fault) {
+      auto result = *runtime_fault;
+      if (result.task_id.empty()) {result.task_id = action.task_id;}
+      result.detail += "; arm release cleanup=" + release.code + ";detail=" + release.detail;
+      return result;
+    }
+    if (!release.succeeded()) {
+      return failed("ELEVATOR_ARM_RELEASE_FAILED",
+        "arm release task failed; release=" + release.code + ";detail=" + release.detail +
+        ";button_result=" + action.code + ";button_detail=" + action.detail,
+        release.task_id);
+    }
+    if (cancelled(cancellation_requested)) {
+      return cancelled_outcome();
+    }
+    if (action_failed) {
+      if (!retry_pause(action, action_path, action_attempt, interrupted)) {
+        return interrupted_outcome();
+      }
+      continue;
+    }
+    if (!action.succeeded()) {
+      action.detail += "; arm release task completed";
+      return action;
+    }
+    return {ElevatorArmOutcomeKind::kSucceeded,
+      hall_call ? "ELEVATOR_HALL_CALL_PRESSED" : "ELEVATOR_TARGET_FLOOR_PRESSED",
+      "button action and arm release tasks completed", action.task_id};
+  }
 }
 
 ElevatorArmOutcome ElevatorArmClient::press_hall_call(
@@ -509,7 +707,8 @@ ElevatorArmOutcome ElevatorArmClient::press_hall_call(
   const std::uint64_t effect_sequence,
   const std::string & source_floor_id,
   const std::string & target_floor_id,
-  const std::function<bool()> & cancellation_requested)
+  const std::function<bool()> & cancellation_requested,
+  const ElevatorArmRuntimeFailureProbe & runtime_failure)
 {
   if (!floor_button_label(source_floor_id)) {
     return failed(
@@ -530,14 +729,15 @@ ElevatorArmOutcome ElevatorArmClient::press_hall_call(
   return run_button_sequence(
     transaction_id, effect_sequence,
     "/api/v1/elevator/call", "direction", *direction,
-    cancellation_requested, true);
+    cancellation_requested, true, runtime_failure);
 }
 
 ElevatorArmOutcome ElevatorArmClient::press_floor(
   const std::string & transaction_id,
   const std::uint64_t effect_sequence,
   const std::string & target_floor_id,
-  const std::function<bool()> & cancellation_requested)
+  const std::function<bool()> & cancellation_requested,
+  const ElevatorArmRuntimeFailureProbe & runtime_failure)
 {
   const auto label = floor_button_label(target_floor_id);
   if (!label) {
@@ -548,7 +748,7 @@ ElevatorArmOutcome ElevatorArmClient::press_floor(
   return run_button_sequence(
     transaction_id, effect_sequence,
     "/api/v1/elevator/press-floor", "floor", *label,
-    cancellation_requested, false);
+    cancellation_requested, false, runtime_failure);
 }
 
 }  // namespace robot_api_server

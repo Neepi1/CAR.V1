@@ -110,11 +110,42 @@ TEST_F(RuntimeTest, KnownMppiNoControlRetriesAndResumesWithoutConsumingProgressT
   EXPECT_EQ(runtime.progress_state(), robot_nav_config::ElevatorScopedProgressState::kOrdinary);
 }
 
+TEST_F(RuntimeTest, PassedObstacleDoesNotHoldAndSuccessfulZeroIsNotNoControl)
+{
+  auto * grid = map->getCostmap();
+  for (unsigned int x = 65; x < 75; ++x) {
+    for (unsigned int y = 90; y < 110; ++y) {
+      grid->setCost(x, y, nav2_costmap_2d::LETHAL_OBSTACLE);
+    }
+  }
+  pose = path.poses[60];  // x=1; obstacle is entirely on the passed prefix.
+  for (int i = 0; i < 60; ++i) {
+    const auto result = runtime.update(pose);
+    EXPECT_FALSE(result.hold_position);
+    EXPECT_FALSE(result.replacement_path.has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  runtime.compute_command(pose, []() -> geometry_msgs::msg::TwistStamped {
+    throw std::runtime_error("Optimizer fail to compute path");
+  });
+  const auto returned_zero = runtime.compute_command(pose, [] {
+    return geometry_msgs::msg::TwistStamped{};
+  });
+  EXPECT_DOUBLE_EQ(returned_zero.twist.linear.x, 0.0);
+  EXPECT_EQ(runtime.progress_state(), robot_nav_config::ElevatorScopedProgressState::kOrdinary);
+}
+
 TEST_F(RuntimeTest, UnknownControllerFailureIsNotHiddenAsObstacleWait)
 {
   EXPECT_THROW(runtime.compute_command(pose, []() -> geometry_msgs::msg::TwistStamped {
     throw std::runtime_error("TF input failed");
   }), std::runtime_error);
+  EXPECT_THROW(runtime.compute_command(pose, []() -> geometry_msgs::msg::TwistStamped {
+    throw std::runtime_error("Optimizer fail to compute path: different reason");
+  }), std::runtime_error);
+  EXPECT_THROW(runtime.compute_command(pose, []() -> geometry_msgs::msg::TwistStamped {
+    throw std::logic_error("Optimizer fail to compute path");
+  }), std::logic_error);
 }
 
 TEST_F(RuntimeTest, ActionAndLifecycleResetRetireOldWait)

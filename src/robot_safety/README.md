@@ -2,6 +2,18 @@
 
 Final command arbitration point before the chassis bridge.
 
+Local NAVLITE candidate records final interception/output and state release;
+it does not change arbitration or BMS protection and has not been deployed.
+See [stop branch audit](../../docs/navlite_stop_branch_audit.md).
+The schema-2 candidate also identifies its input/output topics at startup and
+includes the existing wheel-feedback cache and receipt age at output events.
+See [isolated output validation and evidence limits](docs/navlite_output_evidence.md).
+
+Current-scope update: positive BMS current alone no longer establishes a
+stop/contact during ordinary motion or predock. Fine docking owns the first
+current-triggered stop; confirmed occupancy and undock release protection remain.
+Deployed 2026-09-18; physical acceptance remains pending. See [scope and tests](../../docs/bms_current_scope.md).
+
 Contact-memory regression: internal BMS stop output is not external docking
 context. Contact thresholds, immediate stop and confirmed-memory release rules
 are unchanged. See [audit and isolated tests](docs/bms_contact_history.md).
@@ -376,6 +388,10 @@ only and do not authorize a real elevator entry or exit.
 - `api_lateral_max_mps`: absolute clamp for API lateral speed before final publication, default `0.10`
 
 ## Notes
+
+Diagnostic-only final output/arbitration events:
+[NAVLITE evidence](../../docs/navlite_mppi_failure_evidence.md). No arbitration
+or safety-policy changes; full production log validation awaits deployment approval.
 
 - This package does not own planners, controllers, or collision monitoring. It only arbitrates the final command.
 - The docking command hold is not a bypass: the held command is still published only by `robot_safety`, only while the docking command is fresh. Ordinary Nav2 reverse is limited to low-speed MPPI terminal correction and does not own docking/undocking motion.

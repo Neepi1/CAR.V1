@@ -1,5 +1,10 @@
 # Local keepout and MPPI constraints (2026-09-16)
 
+Geometry update, 2026-09-19: the current local candidate uses `0.75 m` rather
+than the historical `0.60 m` radii described below, with the confirmed larger
+body. Filter order and cost scaling remain unchanged. See
+[body geometry alignment](body_geometry_alignment.md); not deployed.
+
 ## Scope
 
 Both source and Jetson overlay `nav2.yaml` enable the installed Humble

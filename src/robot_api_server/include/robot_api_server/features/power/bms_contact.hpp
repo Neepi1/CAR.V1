@@ -42,6 +42,7 @@ BatteryContactEvaluation evaluate_battery_charging_contact(
   double voltage_min_v,
   double voltage_max_v,
   bool full_soc_voltage_contact_enable,
-  double full_soc_threshold_pct);
+  double full_soc_threshold_pct,
+  bool confirmed_dock_context = false);
 
 }  // namespace robot_api_server

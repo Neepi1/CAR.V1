@@ -94,7 +94,23 @@ public:
   std::uint64_t epoch{0U};
 };
 
-enum class StartupScenario {kCold, kHot, kUnknown, kForeignAck, kColdComplete, kSettledMapThenMaskFailure, kDelayedMapFailure};
+enum class StartupScenario {
+  kCold, kHot, kUnknown, kForeignAck, kColdComplete,
+  kSettledMapThenMaskFailure, kDelayedMapFailure, kMapUnavailable,
+  kMapInvalid, kMapUnknownResult, kKeepoutUnavailable, kKeepoutInvalid,
+  kColdOwnerExitSettled, kColdOwnerExitUnknown, kColdSourceRestorePending};
+
+bool is_hot_failure(const StartupScenario scenario)
+{
+  return scenario >= StartupScenario::kSettledMapThenMaskFailure &&
+    scenario <= StartupScenario::kKeepoutInvalid;
+}
+
+bool has_target_ports(const StartupScenario scenario)
+{
+  return scenario == StartupScenario::kColdComplete ||
+    scenario >= StartupScenario::kSettledMapThenMaskFailure;
+}
 
 class ScopedStartupRosRuntime
 {
@@ -126,9 +142,10 @@ private:
 
 public:
   explicit StartupActionHarness(const StartupScenario scenario)
-  : scenario_(scenario), executor_(rclcpp::ExecutorOptions(), 6)
+  : scenario_(scenario)
   {
     ports_ = std::make_shared<rclcpp::Node>("floor_startup_smoke_ports");
+    map_ports_ = std::make_shared<rclcpp::Node>("floor_startup_smoke_map_ports");
     navigator_ = std::make_shared<rclcpp::Node>("bt_navigator");
     controller_ = std::make_shared<rclcpp::Node>("controller_server");
     const auto state_qos = rclcpp::QoS(1).reliable().transient_local();
@@ -194,13 +211,14 @@ public:
           }
           ++begin_calls_;
         }
-        if (scenario_ == StartupScenario::kColdComplete ||
-          scenario_ == StartupScenario::kSettledMapThenMaskFailure ||
-          scenario_ == StartupScenario::kDelayedMapFailure)
+        if (has_target_ports(scenario_))
         {
           response->applied_sequence = request->command_sequence;
           response->accepted_asset_epoch = assets.epoch;
           response->explicit_relocalization_sequence = triggered_ ? 7U : 6U;
+          if (scenario_ == StartupScenario::kColdSourceRestorePending) {
+            response->explicit_relocalization_sequence = 1U;
+          }
           if (!exact_target(*request)) {
             response->result_code = Begin::Response::RESULT_IDENTITY_MISMATCH;
             response->message = "smoke bridge rejected foreign target";
@@ -220,6 +238,14 @@ public:
             response->success = bridge_committed_;
             response->runtime_context_valid = bridge_committed_;
             response->safe_for_goal_start = bridge_committed_;
+            return;
+          }
+          if (scenario_ == StartupScenario::kColdSourceRestorePending &&
+            request->operation == Begin::Request::OP_ABORT_PREMUTATION)
+          {
+            ++source_restore_calls_;
+            response->success = true;
+            response->runtime_context_valid = true;
             return;
           }
           response->success = true;
@@ -249,14 +275,17 @@ public:
         ++controller_probes_;
         response->current_state.id = nav_runtime_started_.load() ? 3U : 2U;
       });
-    if (scenario_ == StartupScenario::kHot || scenario_ == StartupScenario::kColdComplete) {
+    if (scenario_ == StartupScenario::kHot || has_target_ports(scenario_)) {
       status_pub_ = ports_->create_publisher<action_msgs::msg::GoalStatusArray>(
         "/navigate_to_pose/_action/status", state_qos);
     }
-    if (scenario_ == StartupScenario::kHot) {start_nav_runtime();}
-    if (scenario_ == StartupScenario::kColdComplete ||
-      scenario_ == StartupScenario::kSettledMapThenMaskFailure ||
-      scenario_ == StartupScenario::kDelayedMapFailure)
+    if (scenario_ == StartupScenario::kHot ||
+      is_hot_failure(scenario_))
+    {
+      start_nav_runtime();
+      mask_states_ = {{3U, 3U}};
+    }
+    if (has_target_ports(scenario_))
     {create_target_runtime_ports();}
 
     rclcpp::NodeOptions options;
@@ -278,13 +307,22 @@ public:
       rclcpp::Parameter("startup_handoff_ack_file", ack_path().string()),
     });
     floor_ = std::make_shared<FloorManagerNode>(options);
+    floor_status_sub_ = ports_->create_subscription<robot_interfaces::msg::FloorSwitchStatus>(
+      "/floor_manager/transition_status", state_qos,
+      [this](const robot_interfaces::msg::FloorSwitchStatus & status) {
+        if (status.detail.rfind("STARTUP_OWNER_EXITED; ", 0U) == 0U) {
+          owner_exit_status_seen_.store(true);
+        }
+      });
     client_ = rclcpp_action::create_client<FloorSwitch>(ports_, "/floor_manager/floor_switch");
     timer_ = ports_->create_wall_timer(40ms, [this]() {publish_inputs_and_startup_ack();});
     executor_.add_node(ports_);
     executor_.add_node(navigator_);
     executor_.add_node(controller_);
     executor_.add_node(floor_);
+    map_executor_.add_node(map_ports_);
     spin_ = std::thread([this]() {executor_.spin();});
+    map_spin_ = std::thread([this]() {map_executor_.spin();});
   }
 
   ~StartupActionHarness()
@@ -298,6 +336,8 @@ public:
     }
     executor_.cancel();
     if (spin_.joinable()) {spin_.join();}
+    map_executor_.cancel();
+    if (map_spin_.joinable()) {map_spin_.join();}
     floor_.reset();
   }
 
@@ -347,6 +387,7 @@ public:
   std::atomic_bool ack_written_{false};
   std::atomic_bool runtime_ready_ack_{false};
   std::atomic_int commit_calls_{0};
+  std::atomic_int source_restore_calls_{0};
   std::atomic_int map_load_calls_{0};
   std::atomic_int mask_load_calls_{0};
   std::atomic_int mask_transition_calls_{0};
@@ -357,6 +398,8 @@ public:
   std::atomic_bool final_pause_active_{false};
   std::atomic_bool release_after_durable_commit_{false};
   std::atomic_bool allow_map_response_{false};
+  std::atomic_bool allow_startup_exit_ack_{false};
+  std::atomic_bool owner_exit_status_seen_{false};
   rclcpp_action::ResultCode result_code{rclcpp_action::ResultCode::UNKNOWN};
 
 private:
@@ -390,11 +433,22 @@ private:
       "/global_costmap/costmap", rclcpp::QoS(1).reliable());
     local_costmap_pub_ = ports_->create_publisher<nav_msgs::msg::OccupancyGrid>(
       "/local_costmap/costmap", rclcpp::QoS(1).reliable());
-    map_callback_group_ = ports_->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
-    map_service_ = ports_->create_service<nav2_msgs::srv::LoadMap>("/map_server/load_map",
+    if (scenario_ != StartupScenario::kMapUnavailable &&
+      scenario_ != StartupScenario::kColdSourceRestorePending)
+    {
+      map_service_ = map_ports_->create_service<nav2_msgs::srv::LoadMap>("/map_server/load_map",
       [this](const std::shared_ptr<nav2_msgs::srv::LoadMap::Request> request,
         std::shared_ptr<nav2_msgs::srv::LoadMap::Response> response) {
         ++map_load_calls_;
+        if (scenario_ == StartupScenario::kMapInvalid ||
+          scenario_ == StartupScenario::kColdOwnerExitSettled ||
+          scenario_ == StartupScenario::kColdOwnerExitUnknown ||
+          scenario_ == StartupScenario::kMapUnknownResult)
+        {
+          response->result = scenario_ == StartupScenario::kMapUnknownResult ? 255U :
+            nav2_msgs::srv::LoadMap::Response::RESULT_INVALID_MAP_DATA;
+          return;
+        }
         if (scenario_ == StartupScenario::kDelayedMapFailure) {
           while (!allow_map_response_.load() && rclcpp::ok()) {
             std::this_thread::sleep_for(20ms);
@@ -402,11 +456,13 @@ private:
           response->result = nav2_msgs::srv::LoadMap::Response::RESULT_INVALID_MAP_DATA;
           return;
         }
-        map_loaded_ = bridge_begun_ && hold_state_.hold_active && pause_state_.paused &&
+        map_loaded_ = bridge_begun_.load() && final_hold_active_.load() &&
+          final_pause_active_.load() &&
           request->map_url == (assets.bundle / "nav/delivery.yaml").string();
         response->result = map_loaded_ ? nav2_msgs::srv::LoadMap::Response::RESULT_SUCCESS :
           nav2_msgs::srv::LoadMap::Response::RESULT_INVALID_MAP_DATA;
-      }, rmw_qos_profile_services_default, map_callback_group_);
+      });
+    }
     for (std::size_t index = 0U; index < 2U; ++index) {
       const auto stem = index == 0U ? std::string("keepout") : std::string("speed");
       const auto owner = "/" + stem + "_filter_mask_server";
@@ -437,11 +493,20 @@ private:
             response->success = true;
           }
         }));
+      if (index == 0U && scenario_ == StartupScenario::kKeepoutUnavailable) {continue;}
       mask_load_services_.push_back(ports_->create_service<nav2_msgs::srv::LoadMap>(
         owner + "/load_map", [this, index, stem](
           const std::shared_ptr<nav2_msgs::srv::LoadMap::Request> request,
           std::shared_ptr<nav2_msgs::srv::LoadMap::Response> response) {
           ++mask_load_calls_;
+          if (scenario_ == StartupScenario::kSettledMapThenMaskFailure) {
+            response->result = nav2_msgs::srv::LoadMap::Response::RESULT_INVALID_MAP_DATA;
+            return;
+          }
+          if (scenario_ == StartupScenario::kKeepoutInvalid) {
+            response->result = nav2_msgs::srv::LoadMap::Response::RESULT_INVALID_MAP_METADATA;
+            return;
+          }
           masks_loaded_[index] = map_loaded_ && mask_states_[index] == 3U &&
             hold_state_.hold_active && pause_state_.paused &&
             request->map_url == (assets.bundle / "filters" / (stem + "_mask.yaml")).string();
@@ -563,7 +628,9 @@ private:
     if (nav_runtime_started_.load()) {
       status_pub_->publish(action_msgs::msg::GoalStatusArray{});
     }
-    if (scenario_ == StartupScenario::kHot) {
+    if (scenario_ == StartupScenario::kHot ||
+      is_hot_failure(scenario_) || scenario_ == StartupScenario::kColdSourceRestorePending)
+    {
       robot_interfaces::msg::LocalizationHealth health;
       health.stamp = ports_->now();
       health.building_id = "B10";
@@ -581,6 +648,29 @@ private:
       health_pub_->publish(health);
     }
     if (scenario_ == StartupScenario::kColdComplete) {publish_target_runtime_evidence();}
+    if (allow_startup_exit_ack_.load() && fs::exists(request_path())) {
+      try {
+        const auto request = YAML::LoadFile(request_path().string());
+        if (request["state"].as<std::string>() == "failed") {
+          std::ostringstream ack;
+          ack << "{\"schema\":\"njrh.floor_startup_handoff_ack.v1\",\"version\":1,"
+              << "\"state\":\"failed\",\"failure\":\"STARTUP_OWNER_EXITED\","
+              << "\"detail\":\"isolated owner completed exit\",\"cleanup_completed\":true,"
+              << "\"effects_settled\":"
+              << (scenario_ == StartupScenario::kColdOwnerExitSettled ||
+                scenario_ == StartupScenario::kColdSourceRestorePending ? "true" : "false")
+              << ",\"owner_available\":false,";
+          for (const auto * key : {"transaction_id", "request_nonce", "building_id", "floor_id", "map_id", "asset_digest"}) {
+            ack << '"' << key << "\":\"" << request[key].as<std::string>() << "\",";
+          }
+          ack << "\"asset_epoch\":" << request["asset_epoch"].as<std::uint64_t>() << '}';
+          const auto temporary = assets.root / "ack.tmp";
+          StartupMapFixture::write(temporary, ack.str());
+          fs::rename(temporary, ack_path());
+          return;
+        }
+      } catch (const std::exception &) {}
+    }
     const bool ready = scenario_ == StartupScenario::kColdComplete && triggered_ && target_health_ticks_ >= 2U;
     if ((ack_written_.load() && (!ready || runtime_ready_ack_.load())) ||
       !fs::exists(request_path())) {return;}
@@ -622,10 +712,11 @@ private:
   }
 
   StartupScenario scenario_;
-  rclcpp::CallbackGroup::SharedPtr map_callback_group_;
-  rclcpp::executors::MultiThreadedExecutor executor_;
-  std::thread spin_;
-  rclcpp::Node::SharedPtr ports_, navigator_, controller_;
+  // One executor owns all real Action events. The deliberately blocking fake
+  // map service has its own worker; it cannot starve real node responses.
+  rclcpp::executors::SingleThreadedExecutor executor_, map_executor_;
+  std::thread spin_, map_spin_;
+  rclcpp::Node::SharedPtr ports_, map_ports_, navigator_, controller_;
   std::shared_ptr<FloorManagerNode> floor_;
   rclcpp_action::Client<FloorSwitch>::SharedPtr client_;
   rclcpp_action::ClientGoalHandle<FloorSwitch>::SharedPtr goal_;
@@ -649,6 +740,7 @@ private:
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr wheel_pub_, local_pub_;
   rclcpp::Publisher<action_msgs::msg::GoalStatusArray>::SharedPtr status_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::Subscription<robot_interfaces::msg::FloorSwitchStatus>::SharedPtr floor_status_sub_;
   robot_interfaces::msg::MotionInterlockState hold_state_;
   robot_interfaces::msg::CorrectionPauseState pause_state_;
   mutable std::mutex observations_mutex_;
@@ -657,7 +749,8 @@ private:
   std::atomic_bool nav_runtime_started_{false};
   std::array<std::uint8_t, 2U> mask_states_{{1U, 1U}};
   std::array<bool, 2U> masks_loaded_{{false, false}};
-  bool bridge_begun_{false}, bridge_committed_{false}, map_loaded_{false};
+  std::atomic_bool bridge_begun_{false}, map_loaded_{false};
+  bool bridge_committed_{false};
   bool applied_{false}, triggered_{false}, amcl_ready_{false};
   bool global_clear_seen_{false}, local_clear_seen_{false}, post_clear_costmaps_published_{false};
   std::size_t target_health_ticks_{0U};
@@ -735,7 +828,7 @@ TEST(FloorManagerStartupAction, SettledTargetFailureReleasesOwnResourcesWithoutC
   EXPECT_FALSE(result->success);
   EXPECT_EQ(harness.result_code, rclcpp_action::ResultCode::ABORTED);
   EXPECT_EQ(harness.map_load_calls_.load(), 1);
-  EXPECT_EQ(harness.mask_transition_calls_.load(), 1);
+  EXPECT_EQ(harness.mask_load_calls_.load(), 1);
   EXPECT_EQ(harness.apply_calls_.load(), 0);
   EXPECT_FALSE(result->runtime_context_valid);
   EXPECT_FALSE(result->recovery_required);
@@ -762,6 +855,10 @@ TEST(FloorManagerStartupAction, DelayedTargetRequestReturnsFailureThenAutomatica
   ASSERT_NE(result, nullptr);
   EXPECT_FALSE(result->success);
   EXPECT_TRUE(result->recovery_required);
+  EXPECT_EQ(result->failure_code, static_cast<std::uint16_t>(
+    robot_floor_manager::FloorSwitchFailureCode::kEvidenceStale)) << result->message;
+  EXPECT_NE(result->message.find("NAV_MAP_LOAD_TIMEOUT"), std::string::npos)
+    << result->message;
   EXPECT_TRUE(harness.final_hold_active_.load());
   EXPECT_LT(std::chrono::steady_clock::now() - started, 4s);
   const auto overlap = harness.run("startup-smoke-tx-overlap");
@@ -782,6 +879,132 @@ TEST(FloorManagerStartupAction, DelayedTargetRequestReturnsFailureThenAutomatica
   EXPECT_FALSE(retried->recovery_required);
   EXPECT_EQ(harness.begin_calls_.load(), 2);
   EXPECT_FALSE(harness.final_hold_active_.load());
+}
+
+TEST(FloorManagerStartupAction, MissingLoadServiceHasPreciseRetryableFailureWithoutDispatch)
+{
+  StartupActionHarness harness(StartupScenario::kMapUnavailable);
+  const auto result = harness.run();
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(result->failure_code, static_cast<std::uint16_t>(
+    robot_floor_manager::FloorSwitchFailureCode::kRuntimeContextUnproven));
+  EXPECT_NE(result->message.find("NAV_MAP_LOAD_SERVICE_UNAVAILABLE"), std::string::npos);
+  EXPECT_EQ(harness.map_load_calls_.load(), 0);
+}
+
+TEST(FloorManagerStartupAction, InvalidMapIsNotRetryableAndDoesNotBecomeInternalError)
+{
+  StartupActionHarness harness(StartupScenario::kMapInvalid);
+  const auto result = harness.run();
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(result->failure_code, static_cast<std::uint16_t>(
+    robot_floor_manager::FloorSwitchFailureCode::kAssetBundleInvalid));
+  EXPECT_NE(result->message.find("NAV_MAP_LOAD_INVALID_ASSET"), std::string::npos);
+  EXPECT_FALSE(result->success);
+  EXPECT_FALSE(result->recovery_required);
+  EXPECT_FALSE(harness.final_hold_active_.load());
+  EXPECT_FALSE(harness.final_pause_active_.load());
+}
+
+TEST(FloorManagerStartupAction, UnknownMapResultRemainsNonRetryableInternalError)
+{
+  StartupActionHarness harness(StartupScenario::kMapUnknownResult);
+  const auto result = harness.run();
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(result->failure_code, static_cast<std::uint16_t>(
+    robot_floor_manager::FloorSwitchFailureCode::kInternalError));
+  EXPECT_NE(result->message.find("result code 255"), std::string::npos);
+}
+
+TEST(FloorManagerStartupAction, MissingKeepoutLoadServiceIsRetryableAfterMapSettles)
+{
+  StartupActionHarness harness(StartupScenario::kKeepoutUnavailable);
+  const auto result = harness.run();
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(result->failure_code, static_cast<std::uint16_t>(
+    robot_floor_manager::FloorSwitchFailureCode::kRuntimeContextUnproven));
+  EXPECT_NE(result->message.find("FILTER_LOAD_SERVICE_UNAVAILABLE"), std::string::npos);
+  EXPECT_EQ(harness.map_load_calls_.load(), 1);
+  EXPECT_FALSE(result->recovery_required);
+  EXPECT_FALSE(harness.final_hold_active_.load());
+}
+
+TEST(FloorManagerStartupAction, InvalidKeepoutMapIsNotRetryable)
+{
+  StartupActionHarness harness(StartupScenario::kKeepoutInvalid);
+  const auto result = harness.run();
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(result->failure_code, static_cast<std::uint16_t>(
+    robot_floor_manager::FloorSwitchFailureCode::kAssetBundleInvalid));
+  EXPECT_NE(result->message.find("FILTER_LOAD_INVALID_ASSET"), std::string::npos);
+  EXPECT_FALSE(result->recovery_required);
+}
+
+TEST(FloorManagerStartupAction, ColdFailedOwnerNeedsPostCleanupAckAndCanReleaseWithoutLocalization)
+{
+  StartupActionHarness harness(StartupScenario::kColdOwnerExitSettled);
+  const auto result = harness.run();
+  ASSERT_NE(result, nullptr);
+  EXPECT_FALSE(result->success);
+  EXPECT_TRUE(result->recovery_required);
+  EXPECT_TRUE(harness.final_hold_active_.load());
+  EXPECT_TRUE(harness.final_pause_active_.load());
+  EXPECT_FALSE(harness.owner_exit_status_seen_.load());
+  harness.allow_startup_exit_ack_.store(true);
+  const auto deadline = std::chrono::steady_clock::now() + 4s;
+  while ((harness.final_hold_active_.load() || !harness.owner_exit_status_seen_.load()) &&
+    std::chrono::steady_clock::now() < deadline)
+  {std::this_thread::sleep_for(20ms);}
+  EXPECT_TRUE(harness.owner_exit_status_seen_.load());
+  EXPECT_FALSE(harness.final_hold_active_.load());
+  EXPECT_FALSE(harness.final_pause_active_.load());
+  EXPECT_EQ(harness.trigger_calls_.load(), 0);
+  const auto context = YAML::LoadFile((harness.assets.root / "context.json").string());
+  EXPECT_FALSE(context["confirmed"].as<bool>());
+  EXPECT_EQ(context["state"].as<std::string>(), "floor_switch_failed");
+}
+
+TEST(FloorManagerStartupAction, ColdOwnerExitDoesNotProveUnknownEffectsSettled)
+{
+  StartupActionHarness harness(StartupScenario::kColdOwnerExitUnknown);
+  const auto result = harness.run();
+  ASSERT_NE(result, nullptr);
+  ASSERT_TRUE(result->recovery_required);
+  harness.allow_startup_exit_ack_.store(true);
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (!harness.owner_exit_status_seen_.load() &&
+    std::chrono::steady_clock::now() < deadline)
+  {std::this_thread::sleep_for(20ms);}
+  EXPECT_TRUE(harness.owner_exit_status_seen_.load());
+  EXPECT_TRUE(harness.final_hold_active_.load());
+  EXPECT_TRUE(harness.final_pause_active_.load());
+  EXPECT_EQ(harness.map_load_calls_.load(), 1);
+}
+
+TEST(FloorManagerStartupAction, RestoredSourceWaitsForStartupSettlementBeforeReadyOrRelease)
+{
+  StartupActionHarness harness(StartupScenario::kColdSourceRestorePending);
+  const auto result = harness.run();
+  ASSERT_NE(result, nullptr);
+  EXPECT_TRUE(result->recovery_required);
+  EXPECT_TRUE(harness.final_hold_active_.load());
+  EXPECT_TRUE(harness.final_pause_active_.load());
+  const auto pending = YAML::LoadFile((harness.assets.root / "context.json").string());
+  EXPECT_FALSE(pending["confirmed"].as<bool>());
+  EXPECT_EQ(harness.source_restore_calls_.load(), 0);
+  harness.allow_startup_exit_ack_.store(true);
+  const auto deadline = std::chrono::steady_clock::now() + 4s;
+  while ((harness.final_hold_active_.load() || !harness.owner_exit_status_seen_.load()) &&
+    std::chrono::steady_clock::now() < deadline)
+  {std::this_thread::sleep_for(20ms);}
+  EXPECT_TRUE(harness.owner_exit_status_seen_.load());
+  EXPECT_FALSE(harness.final_hold_active_.load());
+  EXPECT_FALSE(harness.final_pause_active_.load());
+  EXPECT_EQ(harness.map_load_calls_.load(), 0);
+  EXPECT_GT(harness.source_restore_calls_.load(), 0);
+  const auto recovered = YAML::LoadFile((harness.assets.root / "context.json").string());
+  EXPECT_TRUE(recovered["confirmed"].as<bool>());
+  EXPECT_EQ(recovered["state"].as<std::string>(), "ready");
 }
 
 TEST(FloorManagerStartupAction, ColdExactTargetCompletesLocalizationCostmapsCommitAndHoldRelease)

@@ -41,7 +41,31 @@ navigation launches get their explicit group values below. The default startup d
 not add a new taskset call. CPU affinity is not a hard containment boundary against
 a future child explicitly setting a different mask; verify actual threads.
 
-### Current grouped candidate T (2026-09-11; not accepted)
+### Controller-only placement (2026-09-20)
+
+At the user's request, `navigation_5cpu` moves only `controller_server` and its
+in-process local costmap from CPU0,1,4 to CPU1-3. Both controller profile aliases
+resolve to the same `1-3` mask, including re-sourcing from an old API environment.
+The generic NAV_CONTROL group, planner, BT, API, sensors and downstream command
+chain retain their preceding masks. `site_default` is unchanged.
+
+This removes controller eligibility on CPU0/4, but allows competition with the
+existing IMU/EKF group on CPU2 and JT128 driver on CPU3. It is not exclusive core
+allocation or a proven solution to control deadline misses. No motion, MPPI,
+sensor, safety, priority, startup-boost or IRQ/RPS parameter changes are included.
+
+Activation for this specific single-process change uses the existing per-thread
+affinity mechanism after verifying that cold-start restoration has completed;
+it does not restart a node, create a startup session or alter its old records.
+Verify all controller threads and unchanged peer masks. Future launches resolve
+the new steady mask from the same profile. Whole-profile selection changes still
+follow the complete-runtime restart procedure below.
+
+Resolver/guard regressions and thread verification do not validate moving MPPI,
+IMU/EKF continuity or lidar headroom under load. Those remain hardware checks;
+no navigation goals are sent by this configuration change.
+
+### Historical grouped candidate T (2026-09-11; not accepted)
 
 T's 125-second capture measured scan 15.006 Hz, source cloud median 19.999 Hz,
 corrected IMU 98.384 Hz and odometry 49.936 Hz. Two real FlatScan CLI processes
@@ -62,7 +86,8 @@ justified by the current bridge evidence.
 | Pointcloud/scan/FlatScan processing workers | 1,4 |
 | IMU remap/filter, wheel preprocessing, EKF, localization bridge | 2 |
 | Chassis, safety, velocity smoother, collision monitor, docking manager | 1 |
-| Nav2 controller/local costmap/planner/BT, AMCL, Isaac, docking vision | 0,1,4 |
+| Nav2 controller/local costmap (updated 2026-09-20) | 1-3 |
+| Nav2 planner/BT, AMCL, Isaac, docking vision | 0,1,4 |
 | API, health guard, camera key, map servers, lifecycle supervision | 0,1,4 |
 | Common/resident runtime owner and unprefixed children | 0,1,4 |
 | Existing FlatScan graph/rate CLI checks | 0,1,4 |

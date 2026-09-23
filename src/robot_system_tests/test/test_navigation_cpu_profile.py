@@ -48,6 +48,7 @@ FIVE_CPU_GROUPS = {
     "2": """tf_state robot_local_state robot_local_state_imu_bias_filter
         robot_localization_bridge imu_axis_remap robot_local_state_odom_preprocessor""".split(),
     "3": "lidar_driver hesai_ros_driver lidar_startup".split(),
+    "1-3": "nav2_controller_current nav2_controller_wide controller_server local_costmap".split(),
     "1,4": """lidar_perception lidar_pipeline pointcloud_axis_remap
         pointcloud_accel_container pointcloud_accel_local_worker pointcloud_accel_scan_worker
         nitros_pointcloud_container pointcloud_perception_pipeline pointcloud_downsample
@@ -56,8 +57,7 @@ FIVE_CPU_GROUPS = {
     "0-1,4": """system nav_supervision robot_api_server runtime_health_guard
         docking_camera nav2_map_server nav2_lifecycle_manager
         navigation_runtime_owner nav_control nav_planning localization
-        nav2_controller_current nav2_controller_wide docking_vision controller_server
-        local_costmap occupancy_grid_localizer robot_global_localization
+        docking_vision occupancy_grid_localizer robot_global_localization
         amcl amcl_scan_admission
         planner_server bt_navigator behavior_server smoother_server waypoint_follower""".split(),
 }
@@ -127,7 +127,7 @@ emit five "$@"
     assert_grouped_profile(values["five"])
 
 
-def test_cpu3_is_driver_only_and_compute_excludes_state_cpu2(tmp_path):
+def test_only_controller_group_gains_state_and_driver_cores(tmp_path):
     values = stages(resolve_sequence(tmp_path, '''
 source "$TEST_AFFINITY_SOURCE"
 emit five "$@"
@@ -143,6 +143,8 @@ emit five "$@"
             assert cpus == {1, 4}, name
         elif name in FIVE_CPU_GROUPS["2"]:
             assert cpus == {2}, name
+        elif name in FIVE_CPU_GROUPS["1-3"]:
+            assert cpus == {1, 2, 3}, name
         else:
             assert cpus <= {0, 1, 4}, name
 
@@ -363,14 +365,14 @@ def test_actual_nav2_affinity_guard_accepts_kernel_range_notation(tmp_path, cont
 source "$TEST_AFFINITY_SOURCE"
 # Only inventory is mocked. Run the real guard and per-thread comparison.
 controller_server_pids() { printf '%s\\n' "$$"; }
-read_proc_cpuset() { printf '0-1,4\\n'; }
-awk() { printf '0-1,4\\n'; }
+read_proc_cpuset() { printf '1-3\\n'; }
+awk() { printf '1-3\\n'; }
 NJRH_NAV2_CONTROLLER_AFFINITY_CHECK_TIMEOUT_SEC=0
 ''' + guard + '\nwait_for_controller_server_affinity\n',
         inherited={"NJRH_NAVIGATION_CPU_PROFILE": "navigation_5cpu"},
         override=SITE_OVERRIDE + f'export NJRH_NAV2_CONTROLLER_CPU_PROFILE={controller_profile}\n')
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "allowed=0-1,4" in result.stderr
+    assert "allowed=1-3" in result.stderr
 
 
 def test_all_five_core_masks_use_canonical_kernel_range_notation(tmp_path):

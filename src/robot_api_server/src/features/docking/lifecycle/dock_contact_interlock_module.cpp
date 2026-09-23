@@ -283,6 +283,26 @@ public:
     }
   }
 
+  bool has_confirmed_dock_context() const
+  {
+    const auto runtime = ports_.runtime_snapshot();
+    const auto state = lower_copy(runtime.docking_state);
+    const auto status = lower_copy(runtime.docking_status);
+    if (state == "docked" || state == "charging" ||
+      starts_with(status, "docked") || starts_with(status, "charging")) {
+      return true;
+    }
+    const auto safety = ports_.safety_interlock_snapshot();
+    if (safety.available && safety.fresh && safety.enabled &&
+      safety.active && safety.memory_latched) {
+      return true;
+    }
+    const auto latch = read_latch();
+    return latch.valid && latch.latched_docked &&
+           (dock_latch_source_strength(latch.source) == "strong" ||
+           latch_source_is_manual_evidence(latch.source));
+  }
+
   bool bms_latch_write_allowed_by_runtime() const
   {
     const auto runtime = ports_.runtime_snapshot();
@@ -951,6 +971,11 @@ DockContactInterlockModule::~DockContactInterlockModule() = default;
 DockContactLatchSnapshot DockContactInterlockModule::read_latch() const
 {
   return impl_->read_latch();
+}
+
+bool DockContactInterlockModule::has_confirmed_dock_context() const
+{
+  return impl_->has_confirmed_dock_context();
 }
 
 void DockContactInterlockModule::update_latch(

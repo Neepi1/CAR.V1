@@ -74,14 +74,15 @@ pointcloud_accel_axis_node:
     worker_scan_enabled: true
     scan_output_topic: /scan
     scan_worker_frame_id: lidar_level_link
-    # Filter only returns whose XY endpoint is physically inside the padded Ranger footprint.
+    # User-selected XY self-return exclusion, not the padded planning footprint.
+    # Y matches StopZone: its central sides have no remaining scan-visible band.
     # The test is evaluated in base_link so the near-180deg JT128 installation yaw cannot rotate the mask.
     scan_worker_self_mask_enabled: true
     scan_worker_self_mask_frame_id: base_link
     scan_worker_self_mask_min_x: -0.39
     scan_worker_self_mask_max_x: 0.39
-    scan_worker_self_mask_min_y: -0.28
-    scan_worker_self_mask_max_y: 0.28
+    scan_worker_self_mask_min_y: -0.36
+    scan_worker_self_mask_max_y: 0.36
     scan_worker_rate_hz: 15.0
     scan_worker_min_height: -0.50
     scan_worker_max_height: 0.35

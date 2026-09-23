@@ -51,6 +51,11 @@ RangerROSMessenger::RangerROSMessenger(rclcpp::Node::SharedPtr& node){
   }
 
   SetupSubscription();
+  RCLCPP_WARN(node_->get_logger(),
+      "NAVLITE chassis event=diagnostics_ready schema=1 cmd_source=/cmd_vel "
+      "sdk_submission_not_can_confirmation=1 feedback_stamp=group_receive_steady "
+      "per_motion_can_age=unknown per_wheel_can_age=unknown "
+      "same_state_max_hz=1 new_ros_endpoints=0");
 }
 
 void RangerROSMessenger::Run() {
@@ -292,6 +297,14 @@ void RangerROSMessenger::PublishStateToROS() {
   latest_feedback_linear_velocity_ = state.motion_state.linear_velocity;
   latest_feedback_angular_velocity_ = state.motion_state.angular_velocity;
   motion_mode_ = feedback_motion_mode;
+  navlite_trace_.Feedback(
+      state.motion_state.linear_velocity, state.motion_state.angular_velocity,
+      state.motion_state.steering_angle,
+      {{actuator_state.motor_speeds.speed_1, actuator_state.motor_speeds.speed_2,
+        actuator_state.motor_speeds.speed_3, actuator_state.motor_speeds.speed_4}},
+      {{actuator_state.motor_angles.angle_5, actuator_state.motor_angles.angle_6,
+        actuator_state.motor_angles.angle_7, actuator_state.motor_angles.angle_8}},
+      state.time_stamp, actuator_state.time_stamp, std::chrono::steady_clock::now());
 
   // update odometry
   {
@@ -393,6 +406,7 @@ void RangerROSMessenger::PublishStateToROS() {
   }
 
   PublishModeStatus();
+  TraceChassis();
 }
 
 void RangerROSMessenger::UpdateOdometry(double linear, double angular,
@@ -529,6 +543,10 @@ void RangerROSMessenger::UpdateOdometry(double linear, double angular,
   latest_odom_twist_valid_ = true;
   latest_odom_angular_velocity_ = odom_msg.twist.twist.angular.z;
   odom_pub_->publish(odom_msg);
+  navlite_trace_.Odometry(
+      odom_msg.twist.twist.linear.x, odom_msg.twist.twist.linear.y,
+      odom_msg.twist.twist.angular.z, current_time_.nanoseconds(),
+      std::chrono::steady_clock::now());
 
   // // publish tf transformation
   if (publish_odom_tf_) {
@@ -547,6 +565,10 @@ void RangerROSMessenger::UpdateOdometry(double linear, double angular,
 }
 
 void RangerROSMessenger::TwistCmdCallback(geometry_msgs::msg::Twist::SharedPtr msg) {
+  navlite_trace_.Command(msg->linear.x, msg->linear.y, msg->angular.z,
+                        std::chrono::steady_clock::now());
+  navlite_trace_.callback_submitted = false;
+  navlite_trace_.callback_reason = "command_received";
   double steer_cmd = 0.0;
   double radius = std::numeric_limits<double>::infinity();
   constexpr double kCmdVelLateralDeadband = 1.0e-4;
@@ -557,6 +579,8 @@ void RangerROSMessenger::TwistCmdCallback(geometry_msgs::msg::Twist::SharedPtr m
   // analyze Twist msg and switch motion_mode
   // check for parking mode, only applicable to RangerMiniV2
   if (parking_mode_ && robot_type_ == RangerSubType::kRangerMiniV2) {
+    navlite_trace_.callback_reason = "parking_no_submission";
+    TraceChassis();
     return;
   }
 
@@ -586,6 +610,7 @@ void RangerROSMessenger::TwistCmdCallback(geometry_msgs::msg::Twist::SharedPtr m
   desired_motion_mode_valid_ = true;
   desired_motion_mode_ = desired_mode;
   if (!EnsureMotionModeReady(desired_mode)) {
+    TraceChassis();
     return;
   }
   motion_mode_ = desired_mode;
@@ -600,6 +625,7 @@ void RangerROSMessenger::TwistCmdCallback(geometry_msgs::msg::Twist::SharedPtr m
         steer_cmd = -robot_params_.max_steer_angle_ackermann;
       }
       robot_->SetMotionCommand(msg->linear.x, steer_cmd);
+      TraceSubmitted(msg->linear.x, steer_cmd, 0.0, "motion_command");
       break;
     }
     case MotionState::MOTION_MODE_PARALLEL: {
@@ -639,6 +665,9 @@ void RangerROSMessenger::TwistCmdCallback(geometry_msgs::msg::Twist::SharedPtr m
       robot_->SetMotionCommand(vel * sqrt(msg->linear.x * msg->linear.x +
                                           msg->linear.y * msg->linear.y),
                                steer_cmd);
+      TraceSubmitted(vel * sqrt(msg->linear.x * msg->linear.x +
+                                msg->linear.y * msg->linear.y),
+                     steer_cmd, 0.0, "motion_command");
       break;
     }
     case MotionState::MOTION_MODE_SPINNING: {
@@ -650,6 +679,7 @@ void RangerROSMessenger::TwistCmdCallback(geometry_msgs::msg::Twist::SharedPtr m
         a_v = -robot_params_.max_angular_speed;
       }
       robot_->SetMotionCommand(0.0, 0.0, a_v);
+      TraceSubmitted(0.0, 0.0, a_v, "motion_command");
       break;
     }
     case MotionState::MOTION_MODE_SIDE_SLIP: {
@@ -661,9 +691,11 @@ void RangerROSMessenger::TwistCmdCallback(geometry_msgs::msg::Twist::SharedPtr m
         l_v = -robot_params_.max_linear_speed;
       }
       robot_->SetMotionCommand(0.0, 0.0, l_v);
+      TraceSubmitted(0.0, 0.0, l_v, "motion_command");
       break;
     }
   }
+  TraceChassis();
 }
 
 
@@ -832,6 +864,7 @@ bool RangerROSMessenger::EnsureMotionModeReady(const uint8_t desired_mode) {
   // the chassis at zero and do not release the requested command until the
   // mode feedback explicitly confirms the transition.
   robot_->SetMotionCommand(0.0, 0.0, 0.0);
+  TraceSubmitted(0.0, 0.0, 0.0, "mode_switch_hold");
 
   const double linear_threshold =
       std::max(0.0, mode_switch_stop_linear_threshold_mps_);
@@ -893,6 +926,29 @@ bool RangerROSMessenger::EnsureMotionModeReady(const uint8_t desired_mode) {
   }
 
   return false;
+}
+
+void RangerROSMessenger::TraceSubmitted(double linear, double steering, double angular,
+                                      const char* reason) {
+  // The SDK call has returned. It queues asynchronous CAN work; this is not a
+  // CAN transmission acknowledgement or proof of physical motion.
+  navlite_trace_.Submitted(linear, steering, angular, reason,
+                          std::chrono::steady_clock::now());
+  navlite_trace_.callback_submitted = true;
+  navlite_trace_.callback_reason = reason;
+}
+
+void RangerROSMessenger::TraceChassis() {
+  navlite_trace_.desired_mode = desired_motion_mode_valid_ ? desired_motion_mode_ : -1;
+  navlite_trace_.actual_mode = latest_feedback_valid_ ? latest_feedback_motion_mode_ : -1;
+  navlite_trace_.mode_changing = latest_feedback_mode_changing_;
+  navlite_trace_.mode_state = ModeSwitchStateName();
+  navlite_trace_.stop_stable = mode_switch_stop_stable_;
+  const auto now = std::chrono::steady_clock::now();
+  navlite_trace_.mode_elapsed_sec = mode_switch_active_ ?
+      std::chrono::duration<double>(now - mode_switch_started_at_).count() : 0.0;
+  const auto line = navlite_trace_.Event(now);
+  if (!line.empty()) RCLCPP_WARN(node_->get_logger(), "%s", line.c_str());
 }
 
 const char* RangerROSMessenger::ModeSwitchStateName() const {

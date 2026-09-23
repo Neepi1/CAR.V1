@@ -87,7 +87,7 @@ def test_restored_source_requires_fresh_unchanged_localization():
 
 
 def test_restore_is_persisted_before_releasing_transaction_resources():
-    start = NODE.index("if (source_restored) {")
+    start = NODE.index("if (source_restored && startup_effects_settled()) {")
     end = NODE.index("const auto retained = retain_safety_resources();", start)
     restored = NODE[start:end]
     assert restored.index("write_source_runtime_context(") < restored.index(

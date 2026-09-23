@@ -20,15 +20,16 @@ longer changes the transaction to `LOCKED` after three attempts. The worker
 backs off briefly and retries. Restart recovery and final hold release follow
 the same automatic retry rule.
 
-A complete runtime restart may intentionally come up on a confirmed map that
-is unrelated to the failed transaction's frozen source and target assets. In
-non-persistent restart recovery only, that fresh runtime may supersede the
-stale transaction after the localizer, localization bridge, TF, Nav2 action
-endpoints, absence of transaction-owned mode/correction resources, and dual
-odometry stop are proven. Cleanup then conditionally releases only the stale
-transaction's owner hold and terminates it as failed; it does not switch back
-to the old map. Ordinary in-process failure cleanup still requires the exact
-frozen outside-floor identity.
+Non-persistent cleanup must not depend on a navigable map. For the existing
+source/target outside cleanup classification, the cleanup-only policy skips
+the strict runtime-map readiness probe, including during restart cleanup.
+The classification represents the existing cleanup context, not independent
+physical proof that the robot is outside the cabin. Owned action termination,
+mode/correction resource absence, fresh dual-odometry stop, unknown-side-effect
+checks and conditional owner-hold release remain independently required.
+Cleanup does not switch back to an old map and does not mark a failed task as
+successful. Persistent recovery retains the original exact map identity and
+fresh localization readiness checks.
 
 ## API admission
 
@@ -82,5 +83,26 @@ The regression contract covers:
 - Ignoring retained terminal recovery fields in the production API interlock.
 - Keeping the legacy strict policy available only for compatibility tests.
 - Loading a historical retained journal into automatic restart cleanup.
-- Retiring a stale cross-building transaction when a different complete
-  runtime is confirmed ready, while keeping ordinary live cleanup exact.
+- Non-persistent source/target cleanup does not call the strict readiness
+  probe and does not invent stopping, resource, or hold evidence.
+- Persistent cleanup preserves the strict probe's original failure result;
+  an unresolved retain-lock classification is not accepted by the policy.
+
+## 2026-09-21 deployment boundary
+
+Only the elevator ROS adapter translation unit is rebuilt for this change;
+other API objects are reused after reproducing the deployed binary hash.
+Tests and candidate/deployment manifests are recorded in
+`/tmp/njrh_reports/elevator_cleanup_deploy_20260921_t1OKhw`.
+Deployment replaces the on-disk candidate only. A separately authorized full
+runtime restart is required for the running API to load it. Isolated regression
+tests are not physical elevator acceptance, and no motion is performed here.
+
+Deployment outcome: at 15:18:08 UTC, replacing the executable caused the existing
+ownership checker to report `supervisor=1, node=0` while the old process was
+still alive. The supervisor exited and systemd automatically restarted the
+whole runtime at 15:18:42 UTC. No restart command was issued by this deployment.
+The new API process loaded the candidate; HTTP status subsequently reported
+healthy navigation. The ownership checker itself was not changed. See the
+deployment report for this unintended side effect and the remaining hardware
+acceptance boundary.

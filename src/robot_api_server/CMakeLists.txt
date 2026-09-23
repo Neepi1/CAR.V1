@@ -1415,6 +1415,16 @@ if(BUILD_TESTING)
   target_include_directories(test_elevator_arm_client PRIVATE include)
   target_link_libraries(test_elevator_arm_client yaml-cpp)
 
+  if(UNIX)
+    ament_add_gtest(
+      test_elevator_arm_transport
+      test/features/elevator/execution/test_elevator_arm_transport.cpp
+      src/features/elevator/execution/elevator_arm_client.cpp
+    )
+    target_include_directories(test_elevator_arm_transport PRIVATE include)
+    target_link_libraries(test_elevator_arm_transport yaml-cpp)
+  endif()
+
   ament_add_gtest(
     test_elevator_recovery_action_barrier
     test/features/elevator/execution/test_elevator_recovery_action_barrier.cpp
@@ -1449,6 +1459,24 @@ if(BUILD_TESTING)
     test/features/elevator/execution/test_elevator_ros_executor.cpp)
   target_include_directories(test_elevator_ros_executor PRIVATE include)
   ament_target_dependencies(test_elevator_ros_executor rclcpp)
+  ament_add_gtest(test_elevator_arm_runtime_fault
+    test/features/elevator/execution/test_elevator_arm_runtime_fault.cpp
+    src/features/elevator/execution/elevator_arm_client.cpp)
+  target_include_directories(test_elevator_arm_runtime_fault PRIVATE include)
+  target_link_libraries(test_elevator_arm_runtime_fault yaml-cpp)
+  ament_target_dependencies(test_elevator_arm_runtime_fault rclcpp)
+  ament_add_gtest(test_elevator_cached_health
+    test/features/elevator/execution/test_elevator_cached_health.cpp)
+  target_include_directories(test_elevator_cached_health PRIVATE include)
+  ament_add_gtest(test_elevator_floor_retry_policy
+    test/features/elevator/execution/test_elevator_floor_retry_policy.cpp)
+  target_include_directories(test_elevator_floor_retry_policy PRIVATE include)
+  ament_target_dependencies(test_elevator_floor_retry_policy robot_map_asset_identity)
+  ament_add_gtest(test_elevator_navigation_retry
+    test/features/elevator/execution/test_elevator_navigation_retry.cpp)
+  target_include_directories(test_elevator_navigation_retry PRIVATE
+    include ../robot_nav_config/include)
+  target_link_libraries(test_elevator_navigation_retry robot_elevator_manager::robot_elevator_core)
   ament_add_gtest(test_elevator_ros_events
     test/features/elevator/execution/test_elevator_ros_events.cpp)
   target_include_directories(test_elevator_ros_events PRIVATE include)

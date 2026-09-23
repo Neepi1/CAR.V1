@@ -9,6 +9,19 @@ still settle before a new conflicting switch. See
 [`floor_failure_terminal_cleanup.md`](../../docs/floor_failure_terminal_cleanup.md)
 for the corrected scope and verification boundary.
 
+The 2026-09-22 recovery candidate classifies actual NavMap/keepout LoadMap
+failures at their source: unavailable service -> existing code 34, response
+timeout -> existing code 33, invalid map -> existing code 22. Unknown server
+results remain code 99. Timeout retains the original request until its outcome
+settles; it never authorizes an overlapping map write. These changes and the
+previously undeployed failure cleanup require a matching bridge candidate.
+The matched set was activated on 2026-09-22 with one authorized full-chain
+restart; see [running hashes and remaining limits](../../docs/elevator_navigation_floor_retry.md).
+Cold-start failure cleanup requires an exact post-cleanup startup exit receipt,
+not an earlier `adopted`/`runtime_ready` ACK. Owner exit and unresolved effects
+are reported separately; the receipt does not create a replacement startup
+owner. See [candidate scope](../../docs/elevator_navigation_floor_retry.md).
+
 ## Services
 
 - `/floor_manager/switch_floor` (`robot_interfaces/srv/SwitchFloor`)

@@ -361,6 +361,7 @@ cleanup() {
 on_signal() {
   runtime_ready=0
   cleanup
+  acknowledge_startup_floor_handoff_exit || true
   exit 130
 }
 
@@ -376,6 +377,7 @@ on_exit() {
     fi
   fi
   cleanup
+  acknowledge_startup_floor_handoff_exit || true
   exit "${status}"
 }
 

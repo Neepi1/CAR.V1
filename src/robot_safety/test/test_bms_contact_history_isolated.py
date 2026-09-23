@@ -99,7 +99,9 @@ def test_first_contact_edge_is_not_necessarily_the_latch_time(safety, tmp_path):
 @pytest.mark.parametrize("fields, expected", [
     ({}, False),
     ({"status": BatteryState.POWER_SUPPLY_STATUS_CHARGING}, True),
-    ({"current": 0.11}, True),
+    ({"current": 0.11}, False),
+    ({"current": 0.7}, False),
+    ({"current": 1.1}, False),
     ({"present": True}, True),
     ({"present": True, "voltage": 39.0}, False),
     ({"current": -1.0}, False),
@@ -161,7 +163,7 @@ def test_normal_navigation_is_not_a_docking_context(safety):
     for _ in range(2):
         pub.publish(command)
         raw_sample(safety, current=0.11)
-    assert safety.memories[-1].live_bms_contact
+    assert not safety.memories[-1].live_bms_contact
     assert not safety.memories[-1].memory_latched
     safety.pump(0.4, status="idle")
     assert not safety.memories[-1].memory_latched
@@ -179,6 +181,37 @@ def test_strong_persistent_evidence_still_confirms_and_protects(safety):
     safety.pump(0.3, status="idle", cmd_x=0.05)
     assert safety.memories[-1].memory_latched
     assert safety.outputs and all(t.linear.x == 0.0 for t in safety.outputs)
+
+
+@pytest.mark.parametrize("source", ["normal", "api", "command"])
+def test_current_alone_does_not_interrupt_navigation_teleop_or_predock(safety, source):
+    pub = safety.node.create_publisher(Twist, PREFIX + "/" + source, 1)
+    safety.wait_for(lambda: pub.get_subscription_count() > 0, status="idle")
+    command = Twist()
+    command.linear.x = 0.05
+    for current in (0.7, 1.1):
+        safety.outputs.clear()
+        for _ in range(4):
+            pub.publish(command)
+            raw_sample(safety, current=current)
+        assert not safety.memories[-1].live_bms_contact
+        assert not safety.memories[-1].memory_latched
+        assert safety.outputs and all(t.linear.x > 0.04 for t in safety.outputs)
+
+
+def test_positive_current_cannot_release_confirmed_memory_on_undock_success(safety):
+    safety.prime_memory()
+    safety.begin_reverse()
+    raw_sample(safety, current=0.7)
+    from std_msgs.msg import String, Bool
+    safety.pubs["status"].publish(String(data="undocked phase=succeeded failure_reason=none distance=0.600"))
+    safety.pubs["reverse"].publish(Bool(data=False))
+    for _ in range(5):
+        raw_sample(safety, current=0.7)
+    assert safety.memories[-1].live_bms_contact
+    assert safety.memories[-1].memory_latched
+    safety.wait_for(lambda: not safety.memories[-1].memory_latched,
+                    status="undocked phase=succeeded failure_reason=none distance=0.600", reverse=False)
 
 
 def test_confirmed_memory_is_not_cleared_by_stale_bms(safety):

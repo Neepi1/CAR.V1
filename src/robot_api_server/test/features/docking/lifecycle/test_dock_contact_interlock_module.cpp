@@ -101,6 +101,36 @@ TEST(DockContactInterlockModuleTest, RejectsIncompletePorts)
     std::invalid_argument);
 }
 
+TEST(DockContactInterlockModuleTest, CurrentContextIsNotPredockOrUndockIntent)
+{
+  TemporaryLatchFile latch;
+  Harness harness;
+  DockContactInterlockModule module(config_for(latch.path()), harness.ports());
+  for (const auto state : {"idle", "docking", "undocking", "failed", "undocked"}) {
+    harness.runtime.docking_active = true;
+    harness.runtime.docking_state = state;
+    harness.runtime.docking_status = state;
+    EXPECT_FALSE(module.has_confirmed_dock_context()) << state;
+  }
+  for (const auto state : {"docked", "charging"}) {
+    harness.runtime.docking_state = state;
+    EXPECT_TRUE(module.has_confirmed_dock_context());
+  }
+  harness.runtime.docking_state = "idle";
+  harness.safety.active = harness.safety.memory_latched = true;
+  EXPECT_TRUE(module.has_confirmed_dock_context());
+  harness.safety.fresh = false;
+  EXPECT_FALSE(module.has_confirmed_dock_context());
+  module.update_latch(true, "bms", "weak", "");
+  EXPECT_FALSE(module.has_confirmed_dock_context());
+  module.update_latch(true, "docking_manager", "confirmed", "");
+  EXPECT_TRUE(module.has_confirmed_dock_context());
+  module.update_latch(true, "manual_confirm", "confirmed", "");
+  EXPECT_TRUE(module.has_confirmed_dock_context());
+  module.update_latch(false, "docking_manager", "undocked", "");
+  EXPECT_FALSE(module.has_confirmed_dock_context());
+}
+
 TEST(DockContactInterlockModuleTest, ConfirmedUndockedWithoutLatchAllowsNavigation)
 {
   TemporaryLatchFile latch;

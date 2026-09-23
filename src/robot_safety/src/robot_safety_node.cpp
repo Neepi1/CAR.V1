@@ -26,6 +26,7 @@
 #include "robot_safety/elevator_entry_collision_bypass_policy.hpp"
 #include "robot_safety/motion_interlock_arbiter.hpp"
 #include "robot_safety/navigation_speed_envelope.hpp"
+#include "robot_safety/navlite_log_gate.hpp"
 #include "sensor_msgs/msg/battery_state.hpp"
 #include "sensor_msgs/msg/imu.hpp"
 #include "std_msgs/msg/bool.hpp"
@@ -510,6 +511,14 @@ public:
 
     publish_motion_interlock_state(motion_interlock_->snapshot(steady_now_sec()));
     publish_dock_safety_interlock_state();
+    RCLCPP_WARN(get_logger(),
+      "NAVLITE safety event=diagnostics_ready schema=2 observation_only=1 "
+      "normal=%s api=%s docking=%s output=%s wheel_cache=%s "
+      "state_release_is_not_output=1 steady_sec=%.9f",
+      cmd_vel_in_topic_.c_str(), api_cmd_vel_in_topic_.c_str(),
+      docking_cmd_vel_in_topic_.c_str(), cmd_vel_out_topic_.c_str(),
+      spin_to_drive_odom_sub_ ? spin_to_drive_odom_topic_.c_str() : "unavailable",
+      steady_now_sec());
     if (publish_zero_on_startup) {
       publish_command(geometry_msgs::msg::Twist{}, SafetySnapshot{SafetyState::COMMAND_STALE, false});
     }
@@ -756,7 +765,7 @@ private:
     }
     const auto snapshot = current_snapshot();
     if (decision.changed || !snapshot.motion_allowed) {
-      publish_command(geometry_msgs::msg::Twist{}, snapshot);
+      publish_command(geometry_msgs::msg::Twist{}, snapshot, "motion_interlock_transition");
     } else {
       publish_snapshot(snapshot);
     }
@@ -948,7 +957,7 @@ private:
     }
     const auto snapshot = current_snapshot();
     if (changed || !snapshot.motion_allowed) {
-      publish_command(geometry_msgs::msg::Twist{}, snapshot);
+      publish_command(geometry_msgs::msg::Twist{}, snapshot, "mode_contract_transition");
     } else {
       publish_snapshot(snapshot);
     }
@@ -1094,6 +1103,10 @@ private:
     if (has_last_snapshot_ && last_snapshot_ == snapshot) {
       return;
     }
+    RCLCPP_WARN(get_logger(),
+      "NAVLITE safety_state previous=%s state=%s allowed=%d publication=state_only",
+      has_last_snapshot_ ? to_string(last_snapshot_.state) : "unknown",
+      to_string(snapshot.state), snapshot.motion_allowed);
     std_msgs::msg::String status;
     status.data = to_string(snapshot.state);
     std_msgs::msg::Bool motion_allowed;
@@ -1104,13 +1117,75 @@ private:
     has_last_snapshot_ = true;
   }
 
-  void publish_command(const geometry_msgs::msg::Twist & cmd, const SafetySnapshot & snapshot)
+  void publish_command(const geometry_msgs::msg::Twist & cmd, const SafetySnapshot & snapshot,
+    const char * branch = "snapshot_event",
+    const geometry_msgs::msg::Twist * input = nullptr, int source = -1)
   {
     cmd_pub_->publish(cmd);
     if (cmd_mirror_pub_) {
       cmd_mirror_pub_->publish(cmd);
     }
     publish_snapshot(snapshot);
+    // Observation only, after the unchanged final publish. The preparation
+    // observation is consumed only by a call explicitly tagged "prepared".
+    const bool prepared = std::string(branch) == "prepared";
+    if (prepared) {
+      branch = navlite_prepare_reason_;
+      input = &navlite_prepare_input_;
+      source = navlite_prepare_source_;
+    }
+    const bool zero = twist_near_zero(cmd, 0.0);
+    ++navlite_output_sequence_;
+    // Timer and callback publications of the same stop are not transitions.
+    const std::string reason = !snapshot.motion_allowed ? to_string(snapshot.state) :
+      ((std::string(branch) == "zero_priority_timer" ||
+      std::string(branch) == "zero_priority_window" ||
+      std::string(branch) == "upstream_zero_priority") ? "zero_priority" : branch);
+    const std::string key = reason + (zero ? ":zero" : ":nonzero:"+std::to_string(source));
+    if (navlite_output_log_.observe(key, zero || !snapshot.motion_allowed)) {
+      const double unknown = std::numeric_limits<double>::quiet_NaN();
+      const double steady = steady_now_sec();
+      const char * selected_source = source == 0 ? "normal" :
+        (source == 1 ? "api" : (source == 2 ? "docking" : "unknown"));
+      const bool wheel_known = navlite_wheel_received_steady_sec_ > 0.0;
+      RCLCPP_WARN(get_logger(),
+        "NAVLITE safety branch=%s state=%s allowed=%d source=%d input_known=%d "
+        "in=(%.6f,%.6f,%.6f) out=(%.6f,%.6f,%.6f) zero=%d "
+        "zero_window_until_ns=%lld spin_pending=%d wheel_stable_samples=%d actual_mode=%d "
+        "final_reason=%s previous=%s steady_sec=%.9f publication=sent "
+        "selected_source=%s output_seq=%llu "
+        "wheel_known=%d wheel=(%.6f,%.6f,%.6f) wheel_rx_age_sec=%.6f "
+        "wheel_stamp_ns=%lld wheel_frame=%s wheel_child=%s actual_mode_rx_age_sec=%.6f",
+        branch, to_string(snapshot.state), snapshot.motion_allowed, source, input != nullptr,
+        input ? input->linear.x : unknown, input ? input->linear.y : unknown,
+        input ? input->angular.z : unknown, cmd.linear.x, cmd.linear.y, cmd.angular.z, zero,
+        static_cast<long long>(zero_cmd_priority_until_time_.nanoseconds()),
+        spin_to_drive_settle_pending_, spin_to_drive_stable_sample_count_, actual_motion_mode_code_,
+        reason.c_str(), navlite_previous_output_.c_str(), steady, selected_source,
+        static_cast<unsigned long long>(navlite_output_sequence_), wheel_known,
+        wheel_known ? navlite_wheel_twist_.linear.x : unknown,
+        wheel_known ? navlite_wheel_twist_.linear.y : unknown,
+        wheel_known ? navlite_wheel_twist_.angular.z : unknown,
+        wheel_known ? steady - navlite_wheel_received_steady_sec_ : unknown,
+        static_cast<long long>(navlite_wheel_stamp_ns_),
+        wheel_known ? navlite_wheel_frame_.c_str() : "unknown",
+        wheel_known ? navlite_wheel_child_.c_str() : "unknown",
+        navlite_mode_received_steady_sec_ > 0.0 ?
+        steady - navlite_mode_received_steady_sec_ : unknown);
+      navlite_previous_output_ = key;
+    }
+  }
+
+  void log_navlite_unselected(const geometry_msgs::msg::Twist & input,
+    const char * selected, int input_source)
+  {
+    // Ignored input does not publish anything; never label it a zero output.
+    if (navlite_unselected_log_[input_source].observe(selected, true)) {
+      RCLCPP_WARN(get_logger(),
+        "NAVLITE safety_arbitration input_source=%d selected_source=%s "
+        "in=(%.9f,%.9f,%.9f) publication=no_message reason=other_source_selected steady_sec=%.9f",
+        input_source, selected, input.linear.x, input.linear.y, input.angular.z, steady_now_sec());
+    }
   }
 
   bool docking_command_fresh() const
@@ -1200,7 +1275,8 @@ private:
     }
   }
 
-  void publish_stop_priority_command(const CommandSource source)
+  void publish_stop_priority_command(const CommandSource source,
+    const geometry_msgs::msg::Twist & input)
   {
     const auto now_time = now();
     geometry_msgs::msg::Twist stop_cmd;
@@ -1212,7 +1288,8 @@ private:
     } else {
       zero_cmd_priority_until_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
     }
-    publish_command(stop_cmd, stop_priority_snapshot_for_source(source));
+    publish_command(stop_cmd, stop_priority_snapshot_for_source(source),
+      "upstream_zero_priority", &input, static_cast<int>(source));
   }
 
   bool handle_zero_priority_command(
@@ -1227,12 +1304,13 @@ private:
       if (!source_may_override_active_priority_with_stop(source)) {
         return false;
       }
-      publish_stop_priority_command(source);
+      publish_stop_priority_command(source, cmd);
       return true;
     }
     if (zero_cmd_priority_active()) {
       last_cmd_time_ = now();
-      publish_command(geometry_msgs::msg::Twist{}, stop_priority_snapshot_for_source(source));
+      publish_command(geometry_msgs::msg::Twist{}, stop_priority_snapshot_for_source(source),
+        "zero_priority_window", &cmd, static_cast<int>(source));
       return true;
     }
     return false;
@@ -1245,6 +1323,12 @@ private:
 
   void publish_checked_command(const geometry_msgs::msg::Twist & cmd, const CommandSource source)
   {
+    const int observed_source = static_cast<int>(source);
+    if (observed_source < 2 && navlite_unselected_log_[observed_source].observe("selected", false)) {
+      RCLCPP_WARN(get_logger(),
+        "NAVLITE safety_arbitration input_source=%d selected_source=%d event=selected "
+        "steady_sec=%.9f final_output=see_safety_event", observed_source, observed_source, steady_now_sec());
+    }
     last_cmd_time_ = now();
     const bool docking_command = source == CommandSource::DOCKING;
     last_cmd_was_docking_ = docking_command;
@@ -1254,7 +1338,8 @@ private:
       prepare_checked_command(cmd, source) : geometry_msgs::msg::Twist{};
     publish_command(
       gated_cmd,
-      snapshot);
+      snapshot, snapshot.motion_allowed ? "prepared" : "snapshot_block",
+      &cmd, static_cast<int>(source));
   }
 
   void on_elevator_entry_cmd(
@@ -1276,13 +1361,16 @@ private:
   void on_normal_cmd(const geometry_msgs::msg::Twist::SharedPtr msg)
   {
     if (elevator_entry_collision_bypass_authorized_now()) {
+      log_navlite_unselected(*msg, "elevator_entry", 0);
       return;
     }
     last_normal_cmd_time_ = now();
     if (handle_zero_priority_command(*msg, CommandSource::NORMAL)) {
       return;
     }
-    if (docking_command_fresh() || api_command_fresh()) {
+    const bool docking_fresh = docking_command_fresh();
+    if (docking_fresh || api_command_fresh()) {
+      log_navlite_unselected(*msg, docking_fresh ? "docking" : "api", 0);
       return;
     }
     publish_checked_command(*msg);
@@ -1297,6 +1385,7 @@ private:
     have_last_api_cmd_ = true;
     last_api_cmd_time_ = now();
     if (docking_command_fresh()) {
+      log_navlite_unselected(*msg, "docking", 1);
       return;
     }
     publish_checked_command(*msg, CommandSource::API);
@@ -1306,7 +1395,7 @@ private:
   {
     last_received_docking_cmd_time_ = now();
     if (!docking_command_allowed_during_bms_contact(*msg)) {
-      publish_bms_docking_interlock_stop("blocked_nonzero_docking_command");
+      publish_bms_docking_interlock_stop("blocked_nonzero_docking_command", msg.get());
       return;
     }
     if (handle_zero_priority_command(*msg, CommandSource::DOCKING)) {
@@ -1387,32 +1476,33 @@ private:
         publish_command(
           prepare_checked_command(
             last_elevator_entry_cmd_, CommandSource::NORMAL),
-          snapshot);
+          snapshot, "prepared");
       }
       return;
     }
     const bool docking_context = fresh_docking_command_active();
     const bool api_context = !docking_context && fresh_api_command_active();
     if (docking_context && !docking_command_allowed_during_bms_contact(last_docking_cmd_)) {
-      publish_bms_docking_interlock_stop("blocked_cached_docking_command");
+      publish_bms_docking_interlock_stop("blocked_cached_docking_command", &last_docking_cmd_);
       return;
     }
     const auto snapshot = current_snapshot(
       docking_context ? CommandSource::DOCKING :
       (api_context ? CommandSource::API : CommandSource::NORMAL));
     if (zero_cmd_priority_active()) {
-      publish_command(geometry_msgs::msg::Twist{}, snapshot);
+      publish_command(geometry_msgs::msg::Twist{}, snapshot, "zero_priority_timer", nullptr,
+        docking_context ? 2 : (api_context ? 1 : 0));
       return;
     }
     if (snapshot.motion_allowed) {
       if (docking_context) {
         publish_command(
           prepare_checked_command(last_docking_cmd_, CommandSource::DOCKING),
-          snapshot);
+          snapshot, "prepared");
       } else if (api_context) {
         publish_command(
           prepare_checked_command(last_api_cmd_, CommandSource::API),
-          snapshot);
+          snapshot, "prepared");
       } else if (actual_motion_mode_is_lateral() && !normal_command_fresh()) {
         RCLCPP_WARN_THROTTLE(
           get_logger(),
@@ -1420,12 +1510,13 @@ private:
           2000,
           "mode_exit_guard releasing stale lateral motion_mode=%d with exact zero dual Ackermann command",
           actual_motion_mode_code_);
-        publish_command(geometry_msgs::msg::Twist{}, snapshot);
+        publish_command(geometry_msgs::msg::Twist{}, snapshot, "stale_lateral_timer");
       } else {
         publish_snapshot(snapshot);
       }
     } else {
-      publish_command(geometry_msgs::msg::Twist{}, snapshot);
+      publish_command(geometry_msgs::msg::Twist{}, snapshot, "snapshot_block_timer", nullptr,
+        docking_context ? 2 : (api_context ? 1 : 0));
     }
   }
 
@@ -1441,7 +1532,12 @@ private:
       return fresh_bms_docking_command_context() ||
              docking_status_indicates_docked() || evidence.strong;
     }
-    if (std::isfinite(msg.current) && static_cast<double>(msg.current) > charging_current_min_a_) {
+    // Current polarity is not physical contact proof during ordinary motion.
+    // Fine docking owns the first current-triggered stop; retained dock evidence
+    // must still prevent a positive-current sample from proving undock release.
+    if (std::isfinite(msg.current) && static_cast<double>(msg.current) > charging_current_min_a_ &&
+      (bms_docking_contact_latched_ || docking_status_indicates_docked() ||
+      dock_contact_latch_evidence().strong)) {
       return true;
     }
     if (msg.present &&
@@ -1541,8 +1637,11 @@ private:
            std::abs(cmd.angular.z) <= epsilon;
   }
 
-  void publish_bms_docking_interlock_stop(const char * reason)
+  void publish_bms_docking_interlock_stop(const char * reason,
+    const geometry_msgs::msg::Twist * input = nullptr)
   {
+    // Copy only for logging: remember_stop_command_for_source overwrites the cache.
+    const auto observed_input = input ? *input : geometry_msgs::msg::Twist{};
     const auto stamp = now();
     const geometry_msgs::msg::Twist zero;
     remember_stop_command_for_source(CommandSource::DOCKING, zero, stamp);
@@ -1551,7 +1650,8 @@ private:
       zero_cmd_priority_until_time_ =
         stamp + rclcpp::Duration::from_seconds(zero_cmd_priority_burst_sec_);
     }
-    publish_command(zero, SafetySnapshot{SafetyState::DOCKED_CONTACT_BLOCK, false});
+    publish_command(zero, SafetySnapshot{SafetyState::DOCKED_CONTACT_BLOCK, false},
+      reason, input ? &observed_input : nullptr, static_cast<int>(CommandSource::DOCKING));
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), 1000,
       "BMS_DOCKING_INTERLOCK reason=%s output=zero reverse_permit=%s",
@@ -1604,6 +1704,7 @@ private:
     // Leaving SPINNING does not prove that physical yaw has settled.
     actual_motion_mode_code_ = mode_code.value();
     latest_actual_motion_mode_time_ = now();
+    navlite_mode_received_steady_sec_ = steady_now_sec();
   }
 
   void update_reverse_permit(ReversePermit & permit, const bool enabled)
@@ -1692,6 +1793,14 @@ private:
 
   void on_spin_to_drive_odom(const nav_msgs::msg::Odometry::SharedPtr msg)
   {
+    // Reuse this existing subscription only. No control condition reads these
+    // cached fields; receipt age and source stamp remain separate time domains.
+    navlite_wheel_twist_ = msg->twist.twist;
+    navlite_wheel_stamp_ns_ = static_cast<int64_t>(msg->header.stamp.sec) * 1000000000LL +
+      msg->header.stamp.nanosec;
+    navlite_wheel_frame_ = msg->header.frame_id;
+    navlite_wheel_child_ = msg->child_frame_id;
+    navlite_wheel_received_steady_sec_ = steady_now_sec();
     const double wz = msg->twist.twist.angular.z;
     latest_spin_to_drive_wz_radps_ = wz;
     latest_spin_to_drive_wz_time_ = now();
@@ -1862,10 +1971,12 @@ private:
       elevator_navigation_lateral_max_mps_);
     if (sanitized.linear.x < 0.0) {
       if (!reverse_allowed(source)) {
+        navlite_prepare_reason_ = "reverse_not_permitted";
         return geometry_msgs::msg::Twist{};
       }
       if (source == CommandSource::NORMAL) {
         if (navigation_limits.reverse_max_mps <= 0.0) {
+          navlite_prepare_reason_ = "reverse_limit_zero";
           return geometry_msgs::msg::Twist{};
         }
         sanitized.linear.x = std::max(
@@ -1879,10 +1990,12 @@ private:
       (source == CommandSource::NORMAL &&
       reverse_permit_fresh(nav_terminal_lateral_permit_));
     if (!allow_lateral) {
+      if (sanitized.linear.y != 0.0) {navlite_prepare_reason_ = "lateral_not_permitted";}
       sanitized.linear.y = 0.0;
       return sanitized;
     }
     if (std::abs(sanitized.linear.y) <= final_cmd_lateral_deadband_mps_) {
+      if (sanitized.linear.y != 0.0) {navlite_prepare_reason_ = "lateral_deadband";}
       sanitized.linear.y = 0.0;
     }
     if (source == CommandSource::API && api_lateral_max_mps_ > 0.0) {
@@ -1904,6 +2017,9 @@ private:
     const geometry_msgs::msg::Twist & cmd,
     const CommandSource source)
   {
+    navlite_prepare_input_ = cmd;
+    navlite_prepare_source_ = static_cast<int>(source);
+    navlite_prepare_reason_ = "pass";
     if (
       !std::isfinite(cmd.linear.x) ||
       !std::isfinite(cmd.linear.y) ||
@@ -1912,12 +2028,19 @@ private:
       !std::isfinite(cmd.angular.y) ||
       !std::isfinite(cmd.angular.z))
     {
+      navlite_prepare_reason_ = "nonfinite_command";
       return geometry_msgs::msg::Twist{};
     }
     auto sanitized = sanitize_command_for_mode_contract(cmd, source);
+    if (sanitized != cmd && std::string(navlite_prepare_reason_) == "pass") {
+      navlite_prepare_reason_ = "mode_contract_limit";
+    }
     auto gated = apply_spin_to_drive_settle_gate(sanitized);
+    if (gated != sanitized) {navlite_prepare_reason_ = "spin_to_drive_settle";}
     gated = sanitize_command_for_mode_contract(gated, source);
+    const auto before_mode_exit = gated;
     gated = apply_mode_exit_guard(gated, source);
+    if (gated != before_mode_exit) {navlite_prepare_reason_ = "mode_exit_guard";}
     return sanitize_command_for_mode_contract(gated, source);
   }
 
@@ -2353,6 +2476,19 @@ private:
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr
     elevator_entry_collision_bypass_permit_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
+  robot_safety::NavliteLogGate navlite_output_log_;
+  robot_safety::NavliteLogGate navlite_unselected_log_[2];
+  std::string navlite_previous_output_{"unobserved"};
+  mutable const char * navlite_prepare_reason_{"unknown"};
+  geometry_msgs::msg::Twist navlite_prepare_input_;
+  int navlite_prepare_source_{-1};
+  uint64_t navlite_output_sequence_{0};
+  geometry_msgs::msg::Twist navlite_wheel_twist_;
+  int64_t navlite_wheel_stamp_ns_{0};
+  std::string navlite_wheel_frame_;
+  std::string navlite_wheel_child_;
+  double navlite_wheel_received_steady_sec_{0.0};
+  double navlite_mode_received_steady_sec_{0.0};
 };
 
 int main(int argc, char ** argv)

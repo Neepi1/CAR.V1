@@ -2,6 +2,13 @@
 
 Bridge that synthesizes the only canonical `map -> odom` transform.
 
+The floor-transaction termination source below was activated as part of the
+2026-09-22 elevator recovery candidate. The audited pre-deployment bridge retained
+the old ABORT failure lock. Its original objects were relinked byte-identically
+before replacing only the context and node objects; localization algorithms,
+TF timing and AMCL/Isaac parameters are unchanged. See
+[joint candidate and verification](../../docs/elevator_navigation_floor_retry.md).
+
 The Jetson field profile defaults to `NJRH_AMCL_LOCALIZATION_MODE=gated`, so
 bounded AMCL corrections remain active during navigation. Apply profile changes
 with a full `njrh-runtime.service` restart; do not restart AMCL or this bridge

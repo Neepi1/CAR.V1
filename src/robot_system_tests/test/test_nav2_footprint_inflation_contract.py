@@ -106,7 +106,7 @@ def test_local_inflation_covers_padded_rectangular_footprint_and_margin(config_p
 
 
 @pytest.mark.parametrize("config_path", CONFIGS)
-def test_collision_monitor_uses_requested_stop_zone_and_covers_padded_body(config_path: Path):
+def test_physical_body_matches_stop_zone_with_separate_planning_padding(config_path: Path):
     nav2 = config_path.read_text(encoding="utf-8")
     local_costmap = _section(
         nav2,
@@ -124,28 +124,37 @@ def test_collision_monitor_uses_requested_stop_zone_and_covers_padded_body(confi
 
     padding = _number(local_costmap, "footprint_padding")
     footprint = _footprint(local_costmap)
-    required_x = max(abs(float(point[0])) for point in footprint) + padding
-    required_y = max(abs(float(point[1])) for point in footprint) + padding
+    global_costmap = _section(nav2, "global_costmap:\n", "\nlocal_costmap:\n")
 
     stop_points = _points(stop_zone)
     assert stop_points == [[0.47, 0.36], [0.47, -0.36], [-0.47, -0.36], [-0.47, 0.36]]
+    assert footprint == stop_points, "The unpadded planning body must include the confirmed physical body"
+    assert _footprint(global_costmap) == footprint
+    assert padding == pytest.approx(0.03)
+    assert _number(global_costmap, "footprint_padding") == pytest.approx(padding)
+    assert "footprint_clearing_enabled: true" in local_costmap
     stop_min_x = min(point[0] for point in stop_points)
     stop_max_x = max(point[0] for point in stop_points)
     stop_min_y = min(point[1] for point in stop_points)
     stop_max_y = max(point[1] for point in stop_points)
-    assert stop_min_x <= -required_x + 1e-9
-    assert stop_max_x >= required_x - 1e-9
-    assert stop_min_y <= -required_y + 1e-9
-    assert stop_max_y >= required_y - 1e-9
+    assert stop_max_x + padding == pytest.approx(0.50)
+    assert stop_max_y + padding == pytest.approx(0.39)
 
-    # A StopZone coincident with the scan mask cannot see lateral returns.
-    mask = (ROOT / "scripts/jetson/runtime_overlay/config/pointcloud_accel_axis.yaml").read_text(
-        encoding="utf-8"
-    )
-    assert _number(mask, "scan_worker_self_mask_max_x") == pytest.approx(0.39)
-    assert _number(mask, "scan_worker_self_mask_max_y") == pytest.approx(0.28)
-    assert stop_max_x - _number(mask, "scan_worker_self_mask_max_x") >= 0.08 - 1e-9
-    assert stop_max_y - _number(mask, "scan_worker_self_mask_max_y") >= 0.08 - 1e-9
+    # User-requested lateral self-return exclusion (2026-09-21). The central
+    # sides have NO visible band inside StopZone; ultrasound is not integrated.
+    # Front/rear 8 cm bands remain. Bind both supported startup profiles.
+    for name in ("pointcloud_accel_axis.yaml", "hesai_accel_driver.yaml"):
+        mask = (ROOT / "scripts/jetson/runtime_overlay/config" / name).read_text(
+            encoding="utf-8"
+        )
+        assert _number(mask, "scan_worker_self_mask_min_x") == pytest.approx(-0.39)
+        assert _number(mask, "scan_worker_self_mask_max_x") == pytest.approx(0.39)
+        assert _number(mask, "scan_worker_self_mask_min_y") == pytest.approx(-0.36)
+        assert _number(mask, "scan_worker_self_mask_max_y") == pytest.approx(0.36)
+        assert stop_max_x - _number(mask, "scan_worker_self_mask_max_x") == pytest.approx(0.08)
+        assert _number(mask, "scan_worker_self_mask_min_x") - stop_min_x == pytest.approx(0.08)
+        assert stop_max_y - _number(mask, "scan_worker_self_mask_max_y") == pytest.approx(0.0)
+        assert _number(mask, "scan_worker_self_mask_min_y") - stop_min_y == pytest.approx(0.0)
 
     slow_points = _points(slow_zone)
     assert min(point[0] for point in slow_points) <= stop_min_x
@@ -251,6 +260,18 @@ def test_preferred_clearance_is_separate_from_collision_and_shared_by_repair(con
         padded = max(abs(point[axis]) for point in _footprint(local_costmap)) + _number(
             local_costmap, "footprint_padding"
         )
-        assert padded == pytest.approx((0.39, 0.28)[axis])
-        assert padded + _number(controller, "ordinary_local_repair_collision_margin_m") == pytest.approx(stop)
+        assert padded == pytest.approx((0.50, 0.39)[axis])
+        # Repair retains its existing hard margin; do not silently subtract it
+        # just because the old padded body + margin happened to equal StopZone.
+        repair_hard = padded + _number(controller, "ordinary_local_repair_collision_margin_m")
+        assert repair_hard == pytest.approx((0.58, 0.47)[axis])
+        assert repair_hard + _number(preference, "preferred_margin") == pytest.approx((0.63, 0.52)[axis])
         assert stop + _number(preference, "preferred_margin") == pytest.approx((0.52, 0.41)[axis])
+
+
+@pytest.mark.parametrize("config_path", CONFIGS)
+def test_all_inflation_consumers_cover_confirmed_body(config_path: Path):
+    nav2 = config_path.read_text(encoding="utf-8")
+    radii = re.findall(r"^\s*inflation_radius:\s*([0-9.]+)\s*$", nav2, re.MULTILINE)
+    assert len(radii) == 4
+    assert [float(radius) for radius in radii] == pytest.approx([0.75] * 4)
